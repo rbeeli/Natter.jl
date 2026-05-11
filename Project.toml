@@ -1,0 +1,31 @@
+name = "Natter"
+uuid = "3e9f9f1d-70e4-4c53-8de9-2d774a7f61d1"
+authors = ["Rino Beeli <40661605+rbeeli@users.noreply.github.com>"]
+version = "0.1.0"
+
+[deps]
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+MbedTLS = "739be429-bea8-5141-9913-cc70e7f3736d"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+URIs = "5c2747f8-b7ea-4ff2-ba2e-563bfd36b1d4"
+
+[compat]
+EnumX = "1"
+JSON3 = "1"
+MbedTLS = "1"
+TestItemRunner = "1"
+TestItems = "1"
+URIs = "1"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+TestItemRunner = "f8b46487-2199-4994-9208-9a1283c18c0a"
+TestItems = "1c621080-faea-4a02-84b6-bbd5e436b8fe"
+
+[targets]
+test = ["Test", "TestItems", "TestItemRunner"]

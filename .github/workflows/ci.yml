@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        julia-version: ['1.10', '1.11', '1.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+      - uses: julia-actions/cache@v2
+      - run: julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+      - uses: julia-actions/cache@v2
+      - run: docker run -d --name nats -p 4222:4222 nats:2.11-alpine -js
+      - run: |
+          for i in {1..30}; do
+            nc -z 127.0.0.1 4222 && exit 0
+            sleep 1
+          done
+          docker logs nats
+          exit 1
+      - run: julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
+        env:
+          NATTER_RUN_INTEGRATION: 'true'
+          NATTER_RUN_JETSTREAM: 'true'

@@ -1,0 +1,38 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+  statuses: write
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+      - uses: julia-actions/cache@v2
+      - run: julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
+      - run: julia --project=docs docs/make.jl
+        env:
+          DOCUMENTER_BUILD_VITEPRESS: 'true'
+          DOCUMENTER_DEPLOY: ${{ github.event_name == 'push' && 'true' || 'false' }}
+          DOCUMENTER_DEPLOY_URL: https://${{ github.repository_owner }}.github.io/Natter.jl
+          DOCUMENTER_FORMAT_REPO: https://github.com/${{ github.repository }}
+          DOCUMENTER_REPO: github.com/${{ github.repository }}.git
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_CONFIG_AUDIT: 'false'
+          NPM_CONFIG_FUND: 'false'
