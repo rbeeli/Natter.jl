@@ -30,40 +30,9 @@ jobs:
         env:
           DOCUMENTER_BUILD_VITEPRESS: 'true'
           DOCUMENTER_DEPLOY: ${{ github.event_name == 'push' && 'true' || 'false' }}
-          DOCUMENTER_DEPLOY_URL: https://${{ github.repository_owner }}.github.io/Natter.jl
-          DOCUMENTER_FORMAT_REPO: https://github.com/${{ github.repository }}
+          DOCUMENTER_FORMAT_REPO: github.com/${{ github.repository }}
           DOCUMENTER_REPO: github.com/${{ github.repository }}.git
+          DOCUMENTER_SOURCE_REPO: https://github.com/${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_CONFIG_AUDIT: 'false'
           NPM_CONFIG_FUND: 'false'
-      - name: Ensure Pages root redirects to development docs
-        if: github.event_name == 'push'
-        run: |
-          tmpdir="$(mktemp -d)"
-          git clone --depth 1 --branch gh-pages "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$tmpdir"
-          cd "$tmpdir"
-          cat > index.html <<'HTML'
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta http-equiv="refresh" content="0; url=dev/">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Natter.jl documentation</title>
-            <script>location.replace("dev/" + location.search + location.hash);</script>
-          </head>
-          <body>
-            <p><a href="dev/">Open the Natter.jl documentation.</a></p>
-          </body>
-          </html>
-          HTML
-          touch .nojekyll
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add index.html .nojekyll
-          if ! git diff --cached --quiet; then
-            git commit -m "Add documentation root redirect"
-            git push
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

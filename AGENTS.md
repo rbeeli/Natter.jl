@@ -61,7 +61,7 @@ Documentation is built with DocumenterVitepress from the dedicated `docs/` Julia
 
 When changing public APIs, update the relevant guide, example, and `docs/src/reference.md`. When support status changes, update both `FEATURES_COVERAGE.md` and `docs/src/feature-coverage.md`.
 
-The `Documentation` GitHub Actions workflow builds the Vitepress site and deploys pushes on `main` to the `gh-pages` branch. GitHub Pages serves the `gh-pages` branch from `/`; the development docs live under `/dev/` until release tags are added.
+The `Documentation` GitHub Actions workflow builds the Vitepress site and deploys pushes on `main` to the `gh-pages` branch. GitHub Pages serves the `gh-pages` branch from `/`; main-branch docs are deployed at the site root.
 
 Build the markdown documentation before finishing docs changes:
 
