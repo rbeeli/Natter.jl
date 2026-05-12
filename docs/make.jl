@@ -43,7 +43,7 @@ function write_root_site_metadata()
     isdir(site_dir) || return nothing
 
     write(joinpath(site_dir, "siteinfo.js"), "var DOCUMENTER_CURRENT_VERSION = \"main\";\n")
-    write(joinpath(site_dir, "versions.js"), "var DOC_VERSIONS = [];\n")
+    write(joinpath(site_dir, "versions.js"), "var DOC_VERSIONS = [];\nvar DOCUMENTER_CURRENT_VERSION = \"main\";\n")
     return nothing
 end
 
