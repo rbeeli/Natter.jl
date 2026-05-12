@@ -1,1 +1,2 @@
 var DOC_VERSIONS = [];
+var DOCUMENTER_CURRENT_VERSION = "main";
