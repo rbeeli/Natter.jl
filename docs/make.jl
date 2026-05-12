@@ -34,6 +34,19 @@ function deploy_decision()
     return decision
 end
 
+const DEPLOYMENT = deploy_decision()
+
+function write_root_site_metadata()
+    DEPLOYMENT.subfolder == "" || return nothing
+
+    site_dir = joinpath(@__DIR__, "build", "1")
+    isdir(site_dir) || return nothing
+
+    write(joinpath(site_dir, "siteinfo.js"), "var DOCUMENTER_CURRENT_VERSION = \"main\";\n")
+    write(joinpath(site_dir, "versions.js"), "var DOC_VERSIONS = [];\n")
+    return nothing
+end
+
 makedocs(;
     modules=[Natter],
     authors="Natter.jl contributors",
@@ -46,7 +59,7 @@ makedocs(;
         deploy_url=DEPLOY_URL,
         description="Documentation for Natter.jl, a Julia client for NATS.",
         build_vitepress=BUILD_VITEPRESS,
-        deploy_decision=deploy_decision(),
+        deploy_decision=DEPLOYMENT,
         inventory_version=PACKAGE_VERSION,
         sidebar_drawer=true,
     ),
@@ -73,6 +86,8 @@ makedocs(;
         "Feature Coverage" => "feature-coverage.md",
     ],
 )
+
+write_root_site_metadata()
 
 if DEPLOY_DOCS
     Documenter.deploydocs(;
