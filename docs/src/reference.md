@@ -103,7 +103,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `consumer_list(js, stream; offset=0)` | List consumers for a stream. |
 | `consumer_delete(js, stream, consumer)` | Delete a consumer. |
 | `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig())` | Create or bind a pull subscription without mutating existing consumers. |
-| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Callback subscriptions auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`. |
+| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`. |
 | `fetch(psub, batch=1; timeout=..., expires=timeout, heartbeat=nothing)` | Fetch a batch from a pull subscription. Each request uses a unique reply subject and ignores stale terminal statuses from older requests. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
 | `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for JetStream messages. |
 | `metadata(msg)` | Parse JetStream delivery metadata. |

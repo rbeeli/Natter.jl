@@ -431,9 +431,11 @@ end
         ),
     ))
 
-    @test N._validate_existing_push_bind(inactive, nothing) === inactive
-    @test_throws ArgumentError N._validate_existing_push_bind(active, nothing)
-    @test N._validate_existing_push_bind(active_queue, "workers") === active_queue
+    @test N._validate_existing_push_bind(inactive, nothing, false) === inactive
+    @test_throws ArgumentError N._validate_existing_push_bind(active, nothing, false)
+    @test_throws ArgumentError N._validate_existing_push_bind(active_queue, "workers", false)
+    @test_throws ArgumentError N._validate_existing_push_bind(active_queue, "other", true)
+    @test N._validate_existing_push_bind(active_queue, "workers", true) === active_queue
 end
 
 @testitem "JetStream push subscribe installs core subscription before creating consumer" setup=[TestHelpers] begin
@@ -739,6 +741,72 @@ end
     old_client.info.version = "2.9.22"
     @test_throws UnsupportedFeatureError N._consumer_request_payload(jetstream(old_client), "ORDERS", payload, "create")
     @test_throws UnsupportedFeatureError N._consumer_request_payload(jetstream(old_client), "ORDERS", payload, "update")
+end
+
+@testitem "JetStream durable bind-or-create binds after create conflict" setup=[TestHelpers] begin
+    using Natter
+    using JSON3
+
+    const N = Natter
+
+    function respond_next_request!(client, payload::AbstractString)
+        result = timedwait(1.0; pollint=0.001) do
+            @lock client.lock begin
+                mux = client.request_mux
+                !isnothing(mux) && !isempty(mux.waiters)
+            end
+        end
+        @test result != :timed_out
+        subject, sid = @lock client.lock begin
+            mux = client.request_mux
+            token = first(keys(mux.waiters))
+            "$(mux.prefix).$token", mux.sub.sid
+        end
+        N._dispatch_msg(client, Msg(subject, nothing, TestHelpers.bytes(payload); client, sid))
+    end
+
+    consumer_response(; deliver_subject=nothing) = begin
+        cfg = Dict{String,Any}(
+            "name" => "worker",
+            "durable_name" => "worker",
+            "filter_subject" => "orders.created",
+        )
+        isnothing(deliver_subject) || (cfg["deliver_subject"] = deliver_subject)
+        JSON3.write(Dict{String,Any}("stream_name" => "ORDERS", "name" => "worker", "config" => cfg))
+    end
+
+    missing = JSON3.write(Dict("error" => Dict("code" => 404, "description" => "consumer not found")))
+    conflict = JSON3.write(Dict("error" => Dict("code" => 400, "err_code" => 10105, "description" => "consumer already exists")))
+
+    pull_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    pull_js = jetstream(pull_client)
+    pull_payload = N._js_config_payload(ConsumerConfig(name="worker", durable_name="worker", filter_subject="orders.created"))
+    pull_task = @async N._bind_or_create_consumer(pull_js, "ORDERS", "worker", pull_payload, Set(["name", "durable_name", "filter_subject"]))
+    respond_next_request!(pull_client, missing)
+    respond_next_request!(pull_client, conflict)
+    respond_next_request!(pull_client, consumer_response())
+
+    pull_info, pull_created = fetch(pull_task)
+    @test !pull_created
+    @test pull_info.name == "worker"
+
+    push_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    push_js = jetstream(push_client)
+    push_task = @async push_subscribe(push_js, "orders.created"; stream="ORDERS", durable="worker")
+    respond_next_request!(push_client, missing)
+    respond_next_request!(push_client, conflict)
+    respond_next_request!(push_client, consumer_response(deliver_subject="_INBOX.existing"))
+
+    psub = fetch(push_task)
+    try
+        @test psub.consumer == "worker"
+        @test psub.sub.subject == "_INBOX.existing"
+        written = String(take!(push_client.write_io))
+        @test occursin("UNSUB ", written)
+        @test occursin("SUB _INBOX.existing ", written)
+    finally
+        close(psub)
+    end
 end
 
 @testitem "JetStream direct get request validation and response lifting" setup=[TestHelpers] begin

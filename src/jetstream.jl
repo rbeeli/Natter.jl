@@ -52,6 +52,8 @@ const _JS_DESC_LEADERSHIP_CHANGE = "leadership change"
 const _JS_DESC_MAX_BYTES_EXCEEDED = "message size exceeds maxbytes"
 const _JS_DESC_BATCH_COMPLETED = "batch completed"
 const _JS_DESC_SERVER_SHUTDOWN = "server shutdown"
+const _JS_ERR_CONSUMER_NAME_EXISTS = 10013
+const _JS_ERR_CONSUMER_ALREADY_EXISTS = 10105
 
 function _jetstream_control_status(msg::Msg)
     isempty(msg.data) || return nothing
@@ -453,6 +455,8 @@ function _consumer_info(obj::Dict{String,Any})
 end
 
 _consumer_missing(err) = err isa JetStreamError && err.code == 404
+_consumer_create_conflict(err) =
+    err isa JetStreamError && err.err_code in (_JS_ERR_CONSUMER_NAME_EXISTS, _JS_ERR_CONSUMER_ALREADY_EXISTS)
 
 function _consumer_info_or_nothing(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; timeout::Real=js.timeout)
     try
@@ -569,12 +573,30 @@ function _validate_existing_push_queue_control(info::ConsumerInfo, queue::Union{
     info
 end
 
-function _validate_existing_push_bind(info::ConsumerInfo, queue::Union{String,Nothing})
-    isnothing(info.config.deliver_group) || return info
+function _validate_existing_push_bind(info::ConsumerInfo, queue::Union{String,Nothing}, queue_explicit::Bool)
+    deliver_group = info.config.deliver_group
+    if !isnothing(deliver_group)
+        queue_explicit ||
+            throw(ArgumentError("existing queue push consumer $(info.name) requires explicit queue $deliver_group"))
+        queue == deliver_group ||
+            throw(ArgumentError("queue $queue does not match existing push consumer $(info.name) deliver_group $deliver_group"))
+        return info
+    end
     isnothing(queue) ||
         throw(ArgumentError("existing non-queue push consumer $(info.name) cannot be joined with queue $queue"))
     info.push_bound &&
         throw(ArgumentError("existing non-queue push consumer $(info.name) is already bound to a subscription"))
+    info
+end
+
+function _bind_existing_push_consumer!(info::ConsumerInfo, config::Dict{String,Any}, bind_fields,
+                                       queue::Union{String,Nothing}, queue_explicit::Bool)
+    _validate_bound_consumer_config(info, config, bind_fields)
+    isnothing(info.config.deliver_subject) &&
+        throw(ArgumentError("existing consumer $(info.name) is configured for pull delivery"))
+    config["deliver_subject"] = info.config.deliver_subject
+    _validate_existing_push_bind(info, queue, queue_explicit)
+    _validate_existing_push_queue_control(info, queue)
     info
 end
 
@@ -609,7 +631,12 @@ function _bind_or_create_consumer(js::JetStreamContext, stream::AbstractString, 
     if !isnothing(existing)
         return _validate_bound_consumer_config(existing, config, bind_fields), false
     end
-    _consumer_create_payload_request(js, stream, config; timeout, action="create"), true
+    try
+        _consumer_create_payload_request(js, stream, config; timeout, action="create"), true
+    catch err
+        _consumer_create_conflict(err) || rethrow()
+        _validate_bound_consumer_config(consumer_info(js, stream, name; timeout), config, bind_fields), false
+    end
 end
 
 mutable struct PullSubscription
@@ -978,6 +1005,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig())
     cfg = _js_config_payload(config)
     bind_fields = Set{String}(keys(cfg))
+    queue_explicit = !isnothing(queue)
     local_queue = _resolve_push_queue!(cfg, queue)
     !isnothing(queue) && push!(bind_fields, "deliver_group")
     _validate_push_queue_control_config!(cfg, local_queue)
@@ -1009,16 +1037,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
             _set_config_default!(cfg, "deliver_subject", deliver)
             create_consumer = true
         else
-            _validate_bound_consumer_config(existing, cfg, bind_fields)
-            isnothing(existing.config.deliver_subject) &&
-                throw(ArgumentError("existing consumer $(existing.name) is configured for pull delivery"))
-            cfg["deliver_subject"] = existing.config.deliver_subject
-            if isnothing(local_queue) && !isnothing(existing.config.deliver_group)
-                local_queue = _validate_queue(existing.config.deliver_group)
-            end
-            _validate_existing_push_bind(existing, local_queue)
-            _validate_existing_push_queue_control(existing, local_queue)
-            info = existing
+            info = _bind_existing_push_consumer!(existing, cfg, bind_fields, local_queue, queue_explicit)
         end
     end
     control_handler = _JetStreamPushControlHandler(isnothing(info) ? _push_idle_heartbeat_seconds(cfg) : _push_idle_heartbeat_seconds(info))
@@ -1031,8 +1050,23 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     consumer_created = false
     try
         if create_consumer
-            info = _consumer_create_payload_request(js, stream, cfg; action="create")
-            consumer_created = true
+            try
+                info = _consumer_create_payload_request(js, stream, cfg; action="create")
+                consumer_created = true
+            catch err
+                (!isnothing(bind_name) && _consumer_create_conflict(err)) || rethrow()
+                try
+                    close(sub)
+                catch cleanup_err
+                    throw(Base.CompositeException([err, CleanupError("close provisional push subscription $deliver_subject", cleanup_err)]))
+                end
+                existing = consumer_info(js, stream, bind_name)
+                info = _bind_existing_push_consumer!(existing, cfg, bind_fields, local_queue, queue_explicit)
+                deliver_subject = String(cfg["deliver_subject"])
+                sub = subscribe(js.client, deliver_subject; queue=local_queue, callback,
+                                auto_ack=_push_callback_auto_ack(manual_ack, callback, info),
+                                _control_handler=control_handler)
+            end
         end
         info = info::ConsumerInfo
         if !haskey(cfg, "name") || isnothing(cfg["name"])

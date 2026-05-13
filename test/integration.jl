@@ -467,6 +467,8 @@ end
                 queue_only_info = consumer_info(js, stream, queue_group)
                 @test queue_only_info.config.durable_name == queue_group
                 @test queue_only_info.config.deliver_group == queue_group
+                @test_throws ArgumentError push_subscribe(js, queue_only_subject; stream=stream, durable=queue_group)
+                @test_throws ArgumentError push_subscribe(js, queue_only_subject; stream=stream, durable=queue_group, queue="other")
 
                 flush(client; timeout=2.0)
                 payloads = ["queue-only-$i" for i in 1:4]
