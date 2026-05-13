@@ -60,6 +60,35 @@ struct JetStreamError <: NatterError
     description::String
 end
 
+abstract type KeyValueError <: NatterError end
+
+struct KeyValueKeyNotFoundError <: KeyValueError
+    bucket::String
+    key::String
+    message::String
+end
+KeyValueKeyNotFoundError(bucket::AbstractString, key::AbstractString) =
+    KeyValueKeyNotFoundError(String(bucket), String(key), "")
+
+struct KeyValueKeyDeletedError{E} <: KeyValueError
+    bucket::String
+    key::String
+    entry::E
+end
+
+struct KeyValueWrongRevisionError <: KeyValueError
+    bucket::String
+    key::String
+    expected_revision::Union{Int,Nothing}
+    cause::JetStreamError
+end
+
+struct KeyValueKeyExistsError <: KeyValueError
+    bucket::String
+    key::String
+    cause::JetStreamError
+end
+
 struct UnsupportedFeatureError <: NatterError
     feature::String
 end
@@ -106,6 +135,28 @@ function Base.showerror(io::IO, err::JetStreamError)
     print(io, "Natter.JetStreamError: code=", err.code)
     isnothing(err.err_code) || print(io, " err_code=", err.err_code)
     print(io, " ", err.description)
+end
+function Base.showerror(io::IO, err::KeyValueKeyNotFoundError)
+    print(io, "Natter.KeyValueKeyNotFoundError: key not found bucket=", err.bucket, " key=", err.key)
+    isempty(err.message) || print(io, " ", err.message)
+end
+function Base.showerror(io::IO, err::KeyValueKeyDeletedError)
+    print(io, "Natter.KeyValueKeyDeletedError: key deleted bucket=", err.bucket, " key=", err.key)
+    if hasproperty(err.entry, :revision)
+        print(io, " revision=", getproperty(err.entry, :revision))
+    end
+    if hasproperty(err.entry, :operation)
+        print(io, " operation=", getproperty(err.entry, :operation))
+    end
+end
+function Base.showerror(io::IO, err::KeyValueWrongRevisionError)
+    print(io, "Natter.KeyValueWrongRevisionError: wrong revision bucket=", err.bucket, " key=", err.key)
+    isnothing(err.expected_revision) || print(io, " expected_revision=", err.expected_revision)
+    isempty(err.cause.description) || print(io, " ", err.cause.description)
+end
+function Base.showerror(io::IO, err::KeyValueKeyExistsError)
+    print(io, "Natter.KeyValueKeyExistsError: key exists bucket=", err.bucket, " key=", err.key)
+    isempty(err.cause.description) || print(io, " ", err.cause.description)
 end
 function Base.showerror(io::IO, err::UnsupportedFeatureError)
     print(io, "Natter.UnsupportedFeatureError: ", err.feature)

@@ -172,6 +172,9 @@ kv_open_async(js::JetStreamContext, bucket::AbstractString; kwargs...)::NatterTa
 kv_delete_bucket_async(kv::KeyValue; kwargs...)::NatterTask =
     _natter_async(kv_delete_bucket, kv; kwargs...)
 
+kv_status_async(kv::KeyValue; kwargs...)::NatterTask =
+    _natter_async(kv_status, kv; kwargs...)
+
 kv_get_async(kv::KeyValue, key::AbstractString; kwargs...)::NatterTask =
     _natter_async(kv_get, kv, key; kwargs...)
 

@@ -40,6 +40,8 @@ using TestItems
             write_io,
             ReentrantLock(),
             ReentrantLock(),
+            Channel{Bool}(1),
+            nothing,
             0,
             Dict{Int,N.Subscription}(),
             nothing,

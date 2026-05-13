@@ -11,7 +11,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
 | `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. |
 | `Msg` | Received message with `subject`, `reply`, `data`, `headers`, and acknowledgement state. |
-| `Headers` | Alias for `Dict{String,Vector{String}}`. |
+| `Headers` | Alias for received headers, `Dict{String,Vector{String}}`; publish and request APIs also accept dictionaries with string or vector values and pair iterators. Header keys preserve source casing, while `header(msg, key)` lookup is case-insensitive. |
 | `Subscription` | Core subscription handle. |
 | `Stats` | Snapshot of message, byte, reconnect, error, and drop counters. |
 
@@ -31,7 +31,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `drain(client; timeout=...)` | Drain subscriptions, flush, and close the client. |
 | `close(client; throw_errors=false)` | Close transports, tasks, subscriptions, and callbacks. |
 | `new_inbox(client; prefix=...)` | Generate a reply inbox subject. |
-| `header(msg, key)` | Return the first header value or `nothing`. |
+| `header(msg, key)` | Return the first header value by case-insensitive key lookup or `nothing`. |
 | `headers(msg)` | Return a copy of all message headers. |
 | `status(client)` | Return current `ConnectionStatus`. |
 | `stats(client)` | Return a `Stats` snapshot. |
@@ -57,8 +57,8 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | Type | Purpose |
 | :--- | :--- |
 | `JetStreamContext` | JetStream API context for a client. |
-| `StreamConfig` | Typed stream configuration. |
-| `ConsumerConfig` | Typed consumer configuration. |
+| `StreamConfig` | Typed stream configuration. Raw `Dict` configs use the same seconds-based duration conversion for known stream fields. |
+| `ConsumerConfig` | Typed consumer configuration. Raw `Dict` configs use the same seconds-based duration conversion for known consumer fields. |
 | `StreamInfo` | Stream info response with typed config, state, and raw data. |
 | `ConsumerInfo` | Consumer info response with typed config and raw data. |
 | `PubAck` | Publish acknowledgement with stream, sequence, duplicate, and domain. |
@@ -134,20 +134,25 @@ This page summarizes the public API. Optional keyword defaults are documented in
 
 ## KeyValue Functions
 
+`KeyValueEntry` contains `bucket`, `key`, `value`, `revision`, `created`, `delta`, `operation`, and the underlying `msg`.
+`operation` uses the `KeyValueOperation` enum namespace: `PUT`, `DELETE`, and `PURGE`.
+`KeyValueStatus` contains `bucket`, `stream`, `values`, `history`, `ttl`, `bytes`, `storage`, `replicas`, `direct`, and the backing `stream_info`.
+
 | Function | Purpose |
 | :--- | :--- |
 | `kv_create(js, bucket; history=1, storage="file", replicas=1, direct=false)` | Create a bucket. |
 | `kv_open(js, bucket)` | Open an existing bucket. |
 | `kv_delete_bucket(kv)` | Delete a bucket. |
-| `kv_get(kv, key; revision=nothing, direct=nothing)` | Get the latest value or a revision. |
+| `kv_status(kv)` | Return bucket status and stream-backed configuration. |
+| `kv_get(kv, key; revision=nothing, direct=nothing)` | Get the latest value or a revision as `KeyValueEntry`. |
 | `kv_put(kv, key, value; revision=nothing)` | Put a value, optionally expecting a revision. |
-| `kv_create_key(kv, key, value)` | Put a value only if the key is absent. |
+| `kv_create_key(kv, key, value)` | Put a value only if the key is absent or currently deleted. |
 | `kv_update(kv, key, value, revision)` | Put a value only if the key is at `revision`. |
 | `kv_delete(kv, key)` | Mark a key deleted. |
 | `kv_purge(kv, key)` | Purge a key with rollup. |
-| `kv_history(kv, key; batch=256)` | Return historical messages for a key. |
+| `kv_history(kv, key; batch=256)` | Return historical `KeyValueEntry` values for a key. |
 | `kv_keys(kv)` | Return active keys. |
-| `kv_watch(callback, kv; key=">", history=false)` | Watch bucket updates with a push subscription. |
+| `kv_watch(callback, kv; key=">", history=false)` | Watch bucket updates as `KeyValueEntry` values with a push subscription. |
 
 ## KeyValue Task Handle Helpers
 
@@ -156,6 +161,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `kv_create_async(js, bucket; kwargs...)` | Start `kv_create` and return `NatterTask`. |
 | `kv_open_async(js, bucket)` | Start `kv_open` and return `NatterTask`. |
 | `kv_delete_bucket_async(kv)` | Start `kv_delete_bucket` and return `NatterTask`. |
+| `kv_status_async(kv)` | Start `kv_status` and return `NatterTask`. |
 | `kv_get_async(kv, key; kwargs...)` | Start `kv_get` and return `NatterTask`. |
 | `kv_put_async(kv, key, value; kwargs...)` | Start `kv_put` and return `NatterTask`. |
 | `kv_create_key_async(kv, key, value)` | Start `kv_create_key` and return `NatterTask`. |
@@ -168,4 +174,6 @@ This page summarizes the public API. Optional keyword defaults are documented in
 
 ## Errors
 
-Public error types derive from `NatterError`: `TimeoutError`, `NoRespondersError`, `ConnectionClosedError`, `ConnectionReconnectingError`, `ConnectionDrainingError`, `ProtocolError`, `AuthorizationError`, `NoServersError`, `MaxPayloadError`, `OutboundBufferLimitError`, `SlowConsumerError`, `JetStreamError`, `UnsupportedFeatureError`, and `CleanupError`.
+Public error types derive from `NatterError`: `TimeoutError`, `NoRespondersError`, `ConnectionClosedError`, `ConnectionReconnectingError`, `ConnectionDrainingError`, `ProtocolError`, `AuthorizationError`, `NoServersError`, `MaxPayloadError`, `OutboundBufferLimitError`, `SlowConsumerError`, `JetStreamError`, `KeyValueError`, `UnsupportedFeatureError`, and `CleanupError`.
+
+KeyValue-specific errors derive from `KeyValueError`: `KeyValueKeyNotFoundError`, `KeyValueKeyDeletedError`, `KeyValueWrongRevisionError`, and `KeyValueKeyExistsError`.

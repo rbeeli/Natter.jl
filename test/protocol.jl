@@ -24,12 +24,18 @@ using TestItems
     @test op == :MSG
     @test msg.subject == "events"
     @test header(msg, "Trace") == "abc"
+    @test header(msg, "trace") == "abc"
+    @test header(msg, "TRACE") == "abc"
     @test String(msg) == "body"
 
     status_headers = N._parse_headers(TestHelpers.bytes("NATS/1.0 503 No Responders\r\n\r\n"))
     status_msg = Msg("reply", nothing, UInt8[]; headers=status_headers)
     @test N._status_header(status_msg) == 503
     @test N._status_description(status_msg) == "No Responders"
+
+    lower_status = Msg("reply", nothing, UInt8[]; headers=Headers("status" => ["404"], "description" => ["missing"]))
+    @test N._status_header(lower_status) == 404
+    @test N._status_description(lower_status) == "missing"
 
     op, err = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("-ERR 'Authorization Violation'\r\n")))
     @test op == :ERR

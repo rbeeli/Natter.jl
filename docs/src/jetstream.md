@@ -47,6 +47,8 @@ stream_update(js, Dict(
 ))
 ```
 
+Known typed fields in raw dictionaries use the same Julia-side units as typed configs. Duration values such as `ack_wait`, `max_age`, and `backoff` are seconds and are serialized to the NATS wire format in nanoseconds.
+
 ## Publish
 
 `js_publish` waits for a publish acknowledgement and returns a `PubAck`.
@@ -54,7 +56,7 @@ stream_update(js, Dict(
 ```julia
 ack = js_publish(js, "orders.created", """{"id":1001}""";
     stream="ORDERS",
-    headers=Headers("Nats-Msg-Id" => ["order-1001"]),
+    headers=Dict("Nats-Msg-Id" => "order-1001"),
 )
 
 @info "stored" stream=ack.stream seq=ack.seq duplicate=ack.duplicate

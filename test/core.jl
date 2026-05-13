@@ -23,6 +23,12 @@ using TestItems
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
     @test client.stats.out_msgs == 1
 
+    ergonomic_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    publish(ergonomic_headers, "foo", "bar"; headers=Dict("Trace" => "abc"))
+    publish_frame = String(take!(ergonomic_headers.pending))
+    @test startswith(publish_frame, "HPUB foo ")
+    @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nbar\r\n", publish_frame)
+
     headers = Headers("Trace" => [repeat("x", 16)])
     payload = TestHelpers.bytes("body")
     total = N._pub_payload_size(payload, N._headers_bytes(headers))
@@ -57,6 +63,114 @@ end
     @test sub.sid in keys(client.subscriptions)
     @test !sub.server_active
     @test client.pending_bytes == 0
+end
+
+@testitem "publish writes use buffered flusher" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct BufferedTransport <: IO
+        bytes::Vector{UInt8}
+        flushes::Int
+        closed::Bool
+    end
+    BufferedTransport() = BufferedTransport(UInt8[], 0, false)
+
+    Base.write(t::BufferedTransport, data::Vector{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::BufferedTransport, data::Base.CodeUnits{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::BufferedTransport, data::AbstractString) = (append!(t.bytes, codeunits(data)); ncodeunits(data))
+    Base.flush(t::BufferedTransport) = (t.flushes += 1; nothing)
+    Base.close(t::BufferedTransport) = (t.closed = true; nothing)
+
+    transport = BufferedTransport()
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(write_buffer_size=1024 * 1024),
+                                     status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport,
+                                     write_io=N.BufferedWriteIO(transport))
+    N._start_flusher_task!(client, client.generation)
+
+    for i in 1:5
+        publish(client, "foo", "bar-$i")
+    end
+    @test isempty(transport.bytes)
+
+    result = timedwait(1.0; pollint=0.001) do
+        count(==('\n'), String(copy(transport.bytes))) >= 10
+    end
+    @test result != :timed_out
+    @test transport.flushes == 1
+    @test count(line -> startswith(line, "PUB foo "), split(String(copy(transport.bytes)), "\r\n"; keepempty=false)) == 5
+
+    close(client)
+    @test transport.closed
+end
+
+@testitem "reconnect preserves replayable buffered publishes after flusher failure" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct FailingFlushTransport <: IO
+        writes::Int
+        closed::Bool
+    end
+    FailingFlushTransport() = FailingFlushTransport(0, false)
+
+    Base.write(t::FailingFlushTransport, data::Vector{UInt8}) = (t.writes += 1; throw(ErrorException("write failed")))
+    Base.flush(::FailingFlushTransport) = nothing
+    Base.close(t::FailingFlushTransport) = (t.closed = true; nothing)
+
+    reported = Any[]
+    opts = N.ConnectOptions(write_buffer_size=1024 * 1024, max_reconnect_attempts=0,
+                            error_cb=err -> push!(reported, err))
+    transport = FailingFlushTransport()
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=N.BufferedWriteIO(transport))
+
+    N._write_raw(client, "SUB foo 1\r\n")
+    publish(client, "foo", "bar")
+    @test client.pending_bytes == 0
+
+    @test_throws ErrorException N._flush_buffered_writes(client)
+    N._trigger_reconnect(client, ErrorException("flush failed"))
+
+    expected = "PUB foo 3\r\nbar\r\n"
+    @test client.pending_bytes == ncodeunits(expected)
+    @test String(take!(client.pending)) == expected
+    @test isnothing(client.write_io)
+    @test transport.closed
+    !isnothing(client.reconnect_task) && wait(client.reconnect_task)
+end
+
+@testitem "foreground buffered publish flush failure is pending once" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct FailingWriteTransport <: IO
+        writes::Int
+        closed::Bool
+    end
+    FailingWriteTransport() = FailingWriteTransport(0, false)
+
+    Base.write(t::FailingWriteTransport, data::Vector{UInt8}) = (t.writes += 1; throw(ErrorException("write failed")))
+    Base.flush(::FailingWriteTransport) = nothing
+    Base.close(t::FailingWriteTransport) = (t.closed = true; nothing)
+
+    opts = N.ConnectOptions(write_buffer_size=0, max_reconnect_attempts=0,
+                            error_cb=err -> nothing)
+    transport = FailingWriteTransport()
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=N.BufferedWriteIO(transport))
+
+    publish(client, "foo", "bar")
+
+    expected = "PUB foo 3\r\nbar\r\n"
+    @test client.pending_bytes == ncodeunits(expected)
+    @test String(take!(client.pending)) == expected
+    @test stats(client).out_msgs == 1
+    !isnothing(client.reconnect_task) && wait(client.reconnect_task)
 end
 
 @testitem "pending buffer is restored after reconnect write failure" setup=[TestHelpers] begin
@@ -106,6 +220,21 @@ end
     @test isempty(client.subscriptions)
     @test client.sid == 0
     @test client.pending_bytes == 0
+end
+
+@testitem "request accepts pair-style header input" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    transport = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
+
+    @test_throws TimeoutError request(client, "svc", "body"; timeout=0.001, headers=("Trace" => "abc", "Trace" => "def"))
+    request_frame = TestHelpers.capture_text(transport)
+    @test occursin("HPUB svc _INBOX.", request_frame)
+    @test occursin("NATS/1.0\r\nTrace: abc\r\nTrace: def\r\n\r\nbody\r\n", request_frame)
+    close(client)
 end
 
 @testitem "request publish write failure starts reconnect without buffering" setup=[TestHelpers] begin
@@ -356,6 +485,83 @@ end
     @test closes[] == 0
 end
 
+@testitem "reconnect exhaustion closes subscriptions and wakes consumers" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    reported = Any[]
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(max_reconnect_attempts=0, error_cb=err -> push!(reported, err)),
+                                     status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "foo")
+    next_task = @async next(sub; timeout=30.0)
+    callback_sub = subscribe(client, "bar") do _
+        nothing
+    end
+    processor = callback_sub.processor
+    @test !isnothing(processor)
+
+    sleep(0.01)
+    N._reconnect_loop(client, client.generation)
+
+    @test status(client) == N.ConnectionStatus.DISCONNECTED
+    @test isempty(client.subscriptions)
+    @test sub.closed
+    @test callback_sub.closed
+    @test !isopen(sub.messages)
+    @test !isopen(callback_sub.messages)
+
+    @test timedwait(1.0; pollint=0.001) do
+        istaskdone(next_task)
+    end != :timed_out
+    err = try
+        fetch(next_task)
+        nothing
+    catch caught
+        caught isa TaskFailedException ? first(Base.current_exceptions(next_task)).exception : caught
+    end
+    @test err isa ConnectionClosedError
+    @test timedwait(1.0; pollint=0.001) do
+        istaskdone(processor)
+    end != :timed_out
+    @test only(reported) isa NoServersError
+end
+
+@testitem "terminal disconnect without reconnect closes subscriptions" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    reported = Any[]
+    opts = N.ConnectOptions(allow_reconnect=false, error_cb=err -> push!(reported, err))
+    transport = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+    sub = subscribe(client, "foo")
+    next_task = @async next(sub; timeout=30.0)
+
+    sleep(0.01)
+    reason = ErrorException("lost")
+    N._trigger_reconnect(client, reason)
+
+    @test status(client) == N.ConnectionStatus.DISCONNECTED
+    @test isempty(client.subscriptions)
+    @test sub.closed
+    @test !isopen(sub.messages)
+    @test transport.closed
+    @test timedwait(1.0; pollint=0.001) do
+        istaskdone(next_task)
+    end != :timed_out
+    err = try
+        fetch(next_task)
+        nothing
+    catch caught
+        caught isa TaskFailedException ? first(Base.current_exceptions(next_task)).exception : caught
+    end
+    @test err isa ConnectionClosedError
+    @test only(reported) === reason
+end
+
 @testitem "connect timeout covers protocol handshake" begin
     using Natter
     using Sockets
@@ -550,4 +756,8 @@ end
     @test ConnectOptions().tls_verify == true
     @test N._tls_authmode(ConnectOptions()) == MbedTLS.MBEDTLS_SSL_VERIFY_REQUIRED
     @test N._tls_authmode(ConnectOptions(tls_verify=false)) == MbedTLS.MBEDTLS_SSL_VERIFY_NONE
+
+    conf = N._tls_config(ConnectOptions())
+    @test isdefined(conf, :chain)
+    @test conf.chain isa MbedTLS.CRT
 end

@@ -256,16 +256,14 @@ function _parse_headers(raw::AbstractVector{UInt8})
 end
 
 function _status_header(msg::Msg)
-    if haskey(msg.headers, "Status")
-        value = first(msg.headers["Status"])
-        all(isdigit, value) && return parse(Int, value)
-    end
+    value = header(msg, "Status")
+    !isnothing(value) && !isempty(value) && all(isdigit, value) && return parse(Int, value)
     nothing
 end
 
 function _status_description(msg::Msg)
-    values = get(msg.headers, "Description", String[])
-    isempty(values) ? "" : first(values)
+    value = header(msg, "Description")
+    isnothing(value) ? "" : value
 end
 
 function _validate_header_pair(key::AbstractString, value::AbstractString)

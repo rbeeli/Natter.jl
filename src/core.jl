@@ -6,11 +6,12 @@ function _ensure_usable_for_publish(client::Client)
     nothing
 end
 
-function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; buffer_on_reconnect::Bool=false)
+function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; buffer_on_reconnect::Bool=false,
+                   force_flush::Bool=false)
     st = status(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
-            _write_raw(client, data)
+            _write_raw(client, data; force_flush)
         catch err
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
                 if buffer_on_reconnect
@@ -37,12 +38,25 @@ function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; bu
     nothing
 end
 
-function _write_publish(client::Client, frame::PublishFrame)
+_write_replayable_pub_frame(io::IO, frame::PublishFrame) = (_write_pub_frame(io, frame); false)
+
+function _write_replayable_pub_frame(io::BufferedWriteIO, frame::PublishFrame)
+    _ensure_open(io)
+    _write_pub_frame(io.replayable, frame)
+    _write_pub_frame(io, frame)
+    true
+end
+
+function _write_publish(client::Client, frame::PublishFrame; force_flush::Bool=false,
+                        replayable::Bool=false, replayable_captured::Union{Nothing,Base.RefValue{Bool}}=nothing)
     @lock client.write_lock begin
         io = @lock client.lock client.write_io
         isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
-        _write_pub_frame(io, frame)
-        flush(io)
+        captured = replayable ? _write_replayable_pub_frame(io, frame) : (_write_pub_frame(io, frame); false)
+        if !isnothing(replayable_captured)
+            replayable_captured[] = captured
+        end
+        _flush_or_signal_locked(client, io; force_flush)
     end
     nothing
 end
@@ -63,12 +77,13 @@ end
 function _send_publish(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true)
     st = status(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
+        replayable_captured = Ref(false)
         try
-            _write_publish(client, frame)
+            _write_publish(client, frame; replayable=buffer_on_reconnect, replayable_captured)
         catch err
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
                 if buffer_on_reconnect
-                    _enqueue_pending(client, frame)
+                    replayable_captured[] || _enqueue_pending(client, frame)
                     return nothing
                 end
                 throw(ConnectionReconnectingError())
@@ -136,12 +151,12 @@ function _enqueue_pending(client::Client, data)
 end
 
 function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{String,Nothing}=nothing,
-                  headers::Union{Headers,Nothing}=nothing, buffer_on_reconnect::Bool=true)
+                  headers=nothing, buffer_on_reconnect::Bool=true)
     _ensure_usable_for_publish(client)
     subject = _validate_publish_subject(subject)
     !isnothing(reply) && _validate_publish_subject(reply)
     payload = _payload_bytes(data)
-    hdr = isnothing(headers) ? EMPTY_BYTES : _headers_bytes(headers)
+    hdr = isnothing(headers) ? EMPTY_BYTES : _headers_bytes(_headers_from_input(headers))
     frame = PublishFrame(subject, reply, payload, hdr)
     total = _pub_payload_size(frame)
     max_payload = @lock client.lock something(client.info.max_payload, typemax(Int))
@@ -151,7 +166,7 @@ function _publish(client::Client, subject::AbstractString, data=nothing; reply::
     nothing
 end
 
-function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{String,Nothing}=nothing, headers::Union{Headers,Nothing}=nothing)
+function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{String,Nothing}=nothing, headers=nothing)
     _publish(client, subject, data; reply, headers)
 end
 
@@ -418,7 +433,7 @@ function flush(client::Client; timeout::Real=10.0)
     waiter = PongWaiter(ch)
     @lock client.lock push!(client.pongs, waiter)
     try
-        _send_raw(client, "PING$CRLF")
+        _send_raw(client, "PING$CRLF"; force_flush=true)
     catch err
         @lock client.lock filter!(x -> x !== waiter, client.pongs)
         rethrow()
@@ -488,6 +503,7 @@ function close(client::Client; throw_errors::Bool=false)
         end
     end
     already && return nothing
+    _wake_flusher(client)
     errors = Any[]
     append!(errors, _notify_pong_waiters!(client, false))
     append!(errors, _notify_request_waiters!(client, ConnectionClosedError(); clear_mux=true))
@@ -608,7 +624,7 @@ function _wait_request_reply(ch::Channel{Any}, timeout::Real)
     value::Msg
 end
 
-function _request_raw(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0, headers::Union{Headers,Nothing}=nothing)
+function _request_raw(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0, headers=nothing)
     mux = _ensure_request_mux(client)
     token, ch = _register_request_waiter!(client, mux)
     reply = "$(mux.prefix).$token"
@@ -620,7 +636,7 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     end
 end
 
-function request(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0, headers::Union{Headers,Nothing}=nothing)
+function request(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0, headers=nothing)
     msg = _request_raw(client, subject, data; timeout, headers)
     code = _status_header(msg)
     if code == 503

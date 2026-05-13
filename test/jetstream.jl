@@ -122,6 +122,78 @@ end
     @test startswith(payload["pause_until"], "2026-01-03T00:00:00")
 end
 
+@testitem "JetStream raw dict config serialization matches typed config units" begin
+    using Dates
+    using Natter
+
+    const N = Natter
+
+    stream = N._js_config_payload(Dict{String,Any}(
+        "retention" => RetentionPolicy.LIMITS,
+        "max_age" => 2.5,
+        "duplicate_window" => 1.25,
+        "subject_delete_marker_ttl" => 4.0,
+        "metadata" => Dict("owner" => "core"),
+        "mirror" => Dict("name" => "UPSTREAM", "opt_start_time" => DateTime(2026, 1, 2, 3, 4, 5)),
+        "consumer_limits" => Dict("inactive_threshold" => 3.0),
+    ))
+
+    @test stream["retention"] == "limits"
+    @test stream["max_age"] == 2_500_000_000
+    @test stream["duplicate_window"] == 1_250_000_000
+    @test stream["subject_delete_marker_ttl"] == 4_000_000_000
+    @test stream["metadata"] == Dict("owner" => "core")
+    @test startswith(stream["mirror"]["opt_start_time"], "2026-01-02T03:04:05")
+    @test stream["consumer_limits"]["inactive_threshold"] == 3_000_000_000
+
+    consumer = N._js_config_payload(Dict{String,Any}(
+        "ack_policy" => AckPolicy.EXPLICIT,
+        "ack_wait" => 0.5,
+        "backoff" => [0.1, 0.2],
+        "idle_heartbeat" => 1.0,
+        "inactive_threshold" => 2.0,
+        "max_expires" => 3.0,
+        "priority_policy" => PriorityPolicy.PINNED_CLIENT,
+        "priority_timeout" => 4.0,
+        "pause_until" => DateTime(2026, 1, 3, 0, 0, 0),
+    ))
+
+    @test consumer["ack_policy"] == "explicit"
+    @test consumer["ack_wait"] == 500_000_000
+    @test consumer["backoff"] == [100_000_000, 200_000_000]
+    @test consumer["idle_heartbeat"] == 1_000_000_000
+    @test consumer["inactive_threshold"] == 2_000_000_000
+    @test consumer["max_expires"] == 3_000_000_000
+    @test consumer["priority_policy"] == "pinned_client"
+    @test consumer["priority_timeout"] == 4_000_000_000
+    @test startswith(consumer["pause_until"], "2026-01-03T00:00:00")
+end
+
+@testitem "JetStream normalized consumer payload is not converted twice" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    payload = N._js_config_payload(Dict{String,Any}(
+        "name" => "worker",
+        "ack_wait" => 0.5,
+        "backoff" => [0.1, 0.2],
+    ))
+
+    @test_throws TimeoutError N._consumer_create_payload_request(js, "ORDERS", payload; timeout=0.001, action="create")
+
+    written = TestHelpers.capture_text(capture)
+    json_match = match(r"\{.*\}", written)
+    @test !isnothing(json_match)
+    request = N._json_dict(json_match.match)
+    config = N._consumer_normalized_config_value(request["config"])
+    @test config["ack_wait"] == 500_000_000
+    @test config["backoff"] == [100_000_000, 200_000_000]
+end
+
 @testitem "JetStream typed config response parsing" begin
     using Natter
 
@@ -438,6 +510,7 @@ end
 
 @testitem "JetStream direct get request validation and response lifting" setup=[TestHelpers] begin
     using Natter
+    using Dates
 
     const N = Natter
 
@@ -453,19 +526,34 @@ end
 
     client = TestHelpers.fake_client()
     js = jetstream(client)
+    api_msg, api_seq, api_created = N._stream_message_from_api_payload(js, Dict{String,Any}(
+        "subject" => "orders.created",
+        "seq" => 7,
+        "data" => "cGF5bG9hZA==",
+        "time" => "2026-01-01T00:00:00.123456789Z",
+    ))
+    @test api_seq == 7
+    @test api_created == DateTime(2026, 1, 1, 0, 0, 0, 123)
+    @test api_msg.subject == "orders.created"
+    @test String(api_msg) == "payload"
+
     response = Msg("_INBOX.reply", nothing, Vector{UInt8}(codeunits("payload"));
                    headers=Headers(
-                       "Nats-Stream" => ["ORDERS"],
-                       "Nats-Subject" => ["orders.created"],
-                       "Nats-Sequence" => ["7"],
+                       "NATS-Stream" => ["ORDERS"],
+                       "nats-subject" => ["orders.created"],
+                       "nats-sequence" => ["7"],
                        "Nats-Time-Stamp" => ["2026-01-01T00:00:00Z"],
-                       "X-Test" => ["ok"],
+                       "x-test" => ["ok"],
                    ))
     msg = N._direct_message_response(js, "\$JS.API.DIRECT.GET.ORDERS", response)
     @test msg.subject == "orders.created"
     @test String(msg) == "payload"
     @test header(msg, "X-Test") == "ok"
     @test isnothing(header(msg, "Nats-Sequence"))
+    info_msg, info_seq, info_created = N._direct_message_response_info(js, "\$JS.API.DIRECT.GET.ORDERS", response)
+    @test info_msg.subject == "orders.created"
+    @test info_seq == 7
+    @test info_created == DateTime(2026, 1, 1)
 
     not_found = Msg("_INBOX.reply", nothing, UInt8[]; headers=Headers("Status" => ["404"], "Description" => ["no message found"]))
     @test_throws JetStreamError N._direct_message_response(js, "\$JS.API.DIRECT.GET.ORDERS", not_found)

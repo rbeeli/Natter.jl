@@ -14,6 +14,7 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `connect_timeout` | `2.0` | Socket and handshake timeout in seconds. |
 | `allow_reconnect` | `true` | Enable automatic reconnect after transient failures. |
 | `pending_size` | `2 MiB` | Maximum buffered outbound publish data while reconnecting. |
+| `write_buffer_size` | `32 KiB` | Outbound write buffer size before a foreground write forces a transport flush. |
 | `max_control_line` | `16 KiB` | Maximum inbound protocol control line length. |
 | `max_inbound_payload` | `64 MiB` | Maximum inbound message payload allocation. |
 | `max_header_bytes` | `64 KiB` | Maximum inbound header block size. |
@@ -57,12 +58,12 @@ The `_async` APIs return `NatterTask` handles for explicit handle-oriented code.
 ```julia
 publish(client, "events.created", "payload")
 publish(client, "events.created", UInt8[0x01, 0x02])
-publish(client, "events.created"; headers=Headers("trace-id" => ["abc-123"]))
+publish(client, "events.created"; headers=Dict("trace-id" => "abc-123"))
 ```
 
 Payloads are converted to bytes. `String`, `Vector{UInt8}`, `AbstractVector{UInt8}`, and `nothing` are supported by the public API.
 
-`publish` validates subjects and server `max_payload`. If the client is reconnecting, publish data is buffered up to `pending_size` and replayed after reconnect.
+`publish` validates subjects and server `max_payload`. Connected clients use a buffered write flusher for throughput; call `flush(client)` when the application needs a server round trip confirming earlier commands were processed. If the client is reconnecting, publish data is buffered up to `pending_size` and replayed after reconnect.
 
 ## Subscribe
 
@@ -103,18 +104,19 @@ No responder responses are raised as `NoRespondersError`.
 
 ## Headers
 
-Headers are represented as `Dict{String,Vector{String}}` through the `Headers` alias.
+Received headers are represented as `Dict{String,Vector{String}}` through the `Headers` alias. Publish and request calls accept `Headers`, dictionaries with string or vector values, or pair iterators.
 
 ```julia
-headers = Headers(
-    "Nats-Msg-Id" => ["event-1001"],
-    "trace-id" => ["abc-123"],
+headers = Dict(
+    "Nats-Msg-Id" => "event-1001",
+    "trace-id" => "abc-123",
 )
 
 publish(client, "events.created", "payload"; headers)
+request(client, "events.lookup", "payload"; headers=("trace-id" => "abc-123",))
 ```
 
-Read headers from received messages with `header(msg, "name")` or copy all headers with `headers(msg)`.
+Read headers from received messages with `header(msg, "name")` or copy all headers with `headers(msg)`. Header lookup is case-insensitive; copied headers preserve the casing received on the wire.
 
 ## Flush, Drain, And Close
 

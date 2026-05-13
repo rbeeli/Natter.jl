@@ -27,6 +27,8 @@ function connect(url_or_urls=nothing; kwargs...)
         nothing,
         ReentrantLock(),
         ReentrantLock(),
+        Channel{Bool}(1),
+        nothing,
         0,
         Dict{Int,Subscription}(),
         nothing,
@@ -84,6 +86,25 @@ end
 
 function _tls_authmode(opts::ConnectOptions)::Int
     opts.tls_verify ? MbedTLS.MBEDTLS_SSL_VERIFY_REQUIRED : MbedTLS.MBEDTLS_SSL_VERIFY_NONE
+end
+
+function _tls_config(opts::ConnectOptions)
+    entropy = MbedTLS.Entropy()
+    rng = MbedTLS.CtrDrbg()
+    MbedTLS.seed!(rng, entropy)
+    conf = MbedTLS.SSLConfig()
+    MbedTLS.config_defaults!(conf)
+    MbedTLS.rng!(conf, rng)
+    MbedTLS.authmode!(conf, _tls_authmode(opts))
+    if isnothing(opts.tls_ca_path)
+        MbedTLS.ca_chain!(conf)
+    else
+        MbedTLS.ca_chain!(conf, MbedTLS.crt_parse_file(opts.tls_ca_path))
+    end
+    if !isnothing(opts.tls_cert_path) && !isnothing(opts.tls_key_path)
+        MbedTLS.own_cert!(conf, MbedTLS.crt_parse_file(opts.tls_cert_path), MbedTLS.parse_keyfile(opts.tls_key_path))
+    end
+    conf
 end
 
 function _connect_tcp(host::String, port::Int, timeout::Real)
@@ -163,19 +184,7 @@ end
 _remaining_timeout(deadline::Float64)::Float64 = max(0.0, deadline - time())
 
 function _tls_wrap(sock, opts::ConnectOptions, hostname::String)
-    entropy = MbedTLS.Entropy()
-    rng = MbedTLS.CtrDrbg()
-    MbedTLS.seed!(rng, entropy)
-    conf = MbedTLS.SSLConfig()
-    MbedTLS.config_defaults!(conf)
-    MbedTLS.rng!(conf, rng)
-    MbedTLS.authmode!(conf, _tls_authmode(opts))
-    if !isnothing(opts.tls_ca_path)
-        MbedTLS.ca_chain!(conf, MbedTLS.crt_parse_file(opts.tls_ca_path))
-    end
-    if !isnothing(opts.tls_cert_path) && !isnothing(opts.tls_key_path)
-        MbedTLS.own_cert!(conf, MbedTLS.crt_parse_file(opts.tls_cert_path), MbedTLS.parse_keyfile(opts.tls_key_path))
-    end
+    conf = _tls_config(opts)
     ctx = MbedTLS.SSLContext()
     MbedTLS.setup!(ctx, conf)
     MbedTLS.set_bio!(ctx, sock)
@@ -214,12 +223,46 @@ function _record_reconnect!(client::Client)
     nothing
 end
 
-function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}})
+function _signal_flusher_locked(client::Client)
+    ch = @lock client.lock client.flush_signal
+    isready(ch) || put!(ch, true)
+    nothing
+end
+
+function _wake_flusher(client::Client)
+    @lock client.write_lock _signal_flusher_locked(client)
+    nothing
+end
+
+function _flush_buffered_writes(client::Client; allow_missing::Bool=false)
+    @lock client.write_lock begin
+        io = @lock client.lock client.write_io
+        if isnothing(io)
+            allow_missing && return false
+            throw(ConnectionClosedError("connection transport is closed"))
+        end
+        flush(io)
+    end
+    true
+end
+
+function _flush_or_signal_locked(client::Client, io; force_flush::Bool=false)
+    buffered = _buffered_bytes(io)
+    threshold = max(0, client.options.write_buffer_size)
+    if force_flush || (buffered > 0 && threshold == 0) || (threshold > 0 && buffered >= threshold)
+        flush(io)
+    elseif buffered > 0
+        _signal_flusher_locked(client)
+    end
+    nothing
+end
+
+function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; force_flush::Bool=false)
     @lock client.write_lock begin
         io = @lock client.lock client.write_io
         isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
         write(io, data)
-        flush(io)
+        _flush_or_signal_locked(client, io; force_flush)
     end
     nothing
 end
@@ -239,26 +282,35 @@ function _close_transport(read_io, write_io, sock)
     seen = Any[]
     for (operation, io) in (("close read transport", read_io), ("close write transport", write_io), ("close socket", sock))
         isnothing(io) && continue
-        any(x -> x === io, seen) && continue
-        push!(seen, io)
-        _close_resource!(errors, operation, io)
+        transport = _underlying_transport(io)
+        any(x -> x === transport, seen) && continue
+        push!(seen, transport)
+        _close_resource!(errors, operation, transport)
     end
     errors
 end
 
-function _take_transport!(client::Client)
-    @lock client.write_lock begin
-        @lock client.lock begin
+function _take_transport!(client::Client; preserve_replayable::Bool=false)
+    replayable = UInt8[]
+    transports = @lock client.write_lock begin
+        read_io, write_io, sock, preserve = @lock client.lock begin
             read_io = client.read_io
             write_io = client.write_io
             sock = client.socket
+            preserve = preserve_replayable && client.status != ConnectionStatus.CLOSED
             client.read_io = nothing
             client.reader = nothing
             client.write_io = nothing
             client.socket = nothing
-            read_io, write_io, sock
+            read_io, write_io, sock, preserve
         end
+        if preserve && !isnothing(write_io)
+            replayable = _take_replayable_writes!(write_io)
+        end
+        read_io, write_io, sock
     end
+    isempty(replayable) || _prepend_pending!(client, replayable)
+    transports
 end
 
 function _report_cleanup_errors(client::Client, errors::Vector)
@@ -279,8 +331,8 @@ function _close_transport!(client::Client)
     nothing
 end
 
-function _close_transport_report_errors!(client::Client)
-    errors = _close_transport(_take_transport!(client)...)
+function _close_transport_report_errors!(client::Client; preserve_replayable::Bool=false)
+    errors = _close_transport(_take_transport!(client; preserve_replayable)...)
     _report_cleanup_errors(client, errors)
     nothing
 end
@@ -333,6 +385,59 @@ function _notify_request_waiters!(client::Client, err::Exception; clear_mux::Boo
     errors
 end
 
+function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
+    subs = Subscription[]
+    request_waiters = Channel{Any}[]
+    terminal = @lock client.lock begin
+        if client.generation == generation && client.status in (ConnectionStatus.RECONNECTING, ConnectionStatus.DISCONNECTED)
+            client.status = ConnectionStatus.DISCONNECTED
+            client.current_server = nothing
+            client.connected_url = nothing
+            client.flusher_task = nothing
+            client.reader_task = nothing
+            client.ping_task = nothing
+            client.reconnect_task = nothing
+            client.pings_out = 0
+
+            subs = collect(values(client.subscriptions))
+            empty!(client.subscriptions)
+            for sub in subs
+                sub.closed = true
+                sub.server_active = false
+            end
+
+            mux = client.request_mux
+            if !isnothing(mux)
+                request_waiters = collect(values(mux.waiters))
+                empty!(mux.waiters)
+                client.request_mux = nothing
+            end
+            true
+        else
+            false
+        end
+    end
+    terminal || return false
+
+    _wake_flusher(client)
+    errors = Any[]
+    append!(errors, _notify_pong_waiters!(client, false))
+    for ch in request_waiters
+        try
+            isopen(ch) && put!(ch, ConnectionClosedError("connection is disconnected"))
+        catch notify_err
+            push!(errors, CleanupError("notify request waiter", notify_err))
+        end
+    end
+    for sub in subs
+        _close_subscription_channel!(errors, sub)
+    end
+    _report_cleanup_errors(client, errors)
+    _close_transport_report_errors!(client)
+    _report_error(client, err)
+    true
+end
+
 function _trim_stale_pong_waiters_locked!(client::Client)
     limit = max(0, client.options.max_stale_pong_waiters)
     stale = count(waiter -> isnothing(waiter.channel), client.pongs)
@@ -364,10 +469,12 @@ function _take_client_tasks!(client::Client)
             ("stop reader task", client.reader_task),
             ("stop ping task", client.ping_task),
             ("stop reconnect task", client.reconnect_task),
+            ("stop flusher task", client.flusher_task),
         )
         client.reader_task = nothing
         client.ping_task = nothing
         client.reconnect_task = nothing
+        client.flusher_task = nothing
         tasks
     end
 end
@@ -476,7 +583,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
                     client.socket = sock
                     client.read_io = read_io
                     client.reader = reader
-                    client.write_io = write_io
+                    client.write_io = BufferedWriteIO(write_io)
                     mark_connected && (client.status = ConnectionStatus.CONNECTED)
                     client.pings_out = 0
                     true
@@ -520,7 +627,30 @@ function _connect_initial!(client::Client)
     isnothing(last_err) ? throw(NoServersError()) : throw(last_err)
 end
 
+function _start_flusher_task!(client::Client, generation::Int=(@lock client.lock client.generation))
+    assigned = @lock client.lock begin
+        existing = client.flusher_task
+        if client.generation == generation &&
+           client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING) &&
+           (isnothing(existing) || istaskdone(existing))
+            :start
+        else
+            :skip
+        end
+    end
+    assigned == :start || return nothing
+    flusher_task = @async _flusher_loop(client, generation)
+    @lock client.lock begin
+        if client.generation == generation &&
+           client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING)
+            client.flusher_task = flusher_task
+        end
+    end
+    nothing
+end
+
 function _start_background_tasks!(client::Client, generation::Int=(@lock client.lock client.generation))
+    _start_flusher_task!(client, generation)
     reader_task = @async _reader_loop(client, generation)
     ping_task = @async _ping_loop(client, generation)
     assigned = @lock client.lock begin
@@ -534,6 +664,30 @@ function _start_background_tasks!(client::Client, generation::Int=(@lock client.
     end
     assigned || return nothing
     nothing
+end
+
+function _flusher_loop(client::Client, generation::Int)
+    while _generation_matches(client, generation) &&
+          status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING)
+        ch = @lock client.lock client.flush_signal
+        try
+            take!(ch)
+        catch err
+            err isa InvalidStateException && return
+            _report_error(client, err)
+            return
+        end
+        _generation_matches(client, generation) &&
+            status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING) || return
+        try
+            _flush_buffered_writes(client; allow_missing=true)
+        catch err
+            status(client) == ConnectionStatus.CLOSED && return
+            _report_error(client, err)
+            _trigger_reconnect(client, err)
+            return
+        end
+    end
 end
 
 function _report_error(client::Client, err)
@@ -605,7 +759,7 @@ function _reader_loop(client::Client, generation::Int)
                 msg.client = client
                 _dispatch_msg(client, msg)
             elseif op == :PING
-                _send_raw(client, "PONG$CRLF")
+                _send_raw(client, "PONG$CRLF"; force_flush=true)
             elseif op == :PONG
                 _notify_pong(client)
             elseif op == :INFO
@@ -644,7 +798,7 @@ function _ping_loop(client::Client, generation::Int)
             return
         end
         try
-            _send_raw(client, "PING$CRLF")
+            _send_raw(client, "PING$CRLF"; force_flush=true)
         catch err
             _report_error(client, err)
             _trigger_reconnect(client, err)
@@ -680,6 +834,7 @@ function _trigger_reconnect(client::Client, reason)
             client.generation += 1
             generation = client.generation
             client.status = opts.allow_reconnect ? ConnectionStatus.RECONNECTING : ConnectionStatus.DISCONNECTED
+            client.flusher_task = nothing
             should_start = opts.allow_reconnect
             for sub in values(client.subscriptions)
                 sub.server_active = false
@@ -687,11 +842,11 @@ function _trigger_reconnect(client::Client, reason)
         end
     end
     generation == 0 && return nothing
-    request_err = opts.allow_reconnect ? ConnectionReconnectingError() : ConnectionClosedError("connection is disconnected")
-    _report_cleanup_errors(client, _notify_request_waiters!(client, request_err))
-    _report_cleanup_errors(client, _notify_pong_waiters!(client, false))
-    _close_transport_report_errors!(client)
     if should_start
+        _wake_flusher(client)
+        _report_cleanup_errors(client, _notify_request_waiters!(client, ConnectionReconnectingError()))
+        _report_cleanup_errors(client, _notify_pong_waiters!(client, false))
+        _close_transport_report_errors!(client; preserve_replayable=true)
         try opts.disconnected_cb() catch err _report_error(client, err) end
         should_spawn = @lock client.lock client.generation == generation && client.status == ConnectionStatus.RECONNECTING
         should_spawn || return nothing
@@ -706,7 +861,7 @@ function _trigger_reconnect(client::Client, reason)
         end
         assigned || return nothing
     else
-        _report_error(client, reason)
+        _terminal_disconnect!(client, generation, reason)
     end
     nothing
 end
@@ -736,8 +891,7 @@ function _reconnect_loop(client::Client, generation::Int)
     while _generation_matches(client, generation) && status(client) == ConnectionStatus.RECONNECTING
         attempts += 1
         if opts.max_reconnect_attempts >= 0 && attempts > opts.max_reconnect_attempts
-            @lock client.lock client.status = ConnectionStatus.DISCONNECTED
-            _report_error(client, NoServersError())
+            _terminal_disconnect!(client, generation, NoServersError())
             return
         end
         servers = @lock client.lock begin
@@ -749,6 +903,7 @@ function _reconnect_loop(client::Client, generation::Int)
             _generation_matches(client, generation) && status(client) == ConnectionStatus.RECONNECTING || return
             try
                 _connect_once!(client, server; mark_connected=false, generation)
+                _start_flusher_task!(client, generation)
                 _record_reconnect!(client)
                 _replay_subscriptions(client)
                 _flush_pending_buffer(client)
@@ -766,6 +921,7 @@ function _reconnect_loop(client::Client, generation::Int)
                 end
                 _replay_subscriptions(client)
                 _flush_pending_buffer(client)
+                _flush_buffered_writes(client)
                 _start_background_tasks!(client, generation)
                 try opts.reconnected_cb() catch err _report_error(client, err) end
                 return
@@ -778,7 +934,7 @@ function _reconnect_loop(client::Client, generation::Int)
                         end
                     end
                 end
-                _close_transport_report_errors!(client)
+                _close_transport_report_errors!(client; preserve_replayable=true)
                 _report_error(client, err)
             end
         end
@@ -834,7 +990,7 @@ function _flush_pending_buffer(client::Client)
     end
     isempty(data) && return
     try
-        _write_raw(client, data)
+        _write_raw(client, data; force_flush=true)
     catch err
         _prepend_pending!(client, data)
         rethrow()

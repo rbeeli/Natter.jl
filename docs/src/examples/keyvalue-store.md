@@ -18,14 +18,15 @@ created = kv_create_key(kv, "users.42.name", "Ada")
 kv_update(kv, "users.42.name", "Ada Lovelace", created.seq)
 
 current = kv_get(kv, "users.42.name")
-@assert String(current.data) == "Ada Lovelace"
+@assert current.key == "users.42.name"
+@assert String(current.value) == "Ada Lovelace"
 
 for version in kv_history(kv, "users.42.name")
-    @info "profile version" value=String(version.data)
+    @info "profile version" revision=version.revision value=String(version.value)
 end
 
-watcher = kv_watch(kv; key="users.*.name") do msg
-    @info "profile changed" subject=msg.subject value=String(msg.data)
+watcher = kv_watch(kv; key="users.*.name") do entry
+    @info "profile changed" key=entry.key operation=entry.operation value=String(entry.value)
 end
 
 kv_put(kv, "users.7.name", "Grace Hopper")
@@ -40,8 +41,8 @@ close(client)
 Independent KeyValue reads can run concurrently with Julia tasks:
 
 ```julia
-name = Ref{Msg}()
-email = Ref{Msg}()
+name = Ref{KeyValueEntry}()
+email = Ref{KeyValueEntry}()
 
 @sync begin
     @async name[] = kv_get(kv, "users.42.name")

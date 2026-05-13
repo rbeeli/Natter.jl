@@ -2,6 +2,7 @@ using TestItems
 
 @testitem "real nats-server core integration" begin
     using Natter
+    using Dates
     using Random
 
     const N = Natter
@@ -107,6 +108,7 @@ end
 
 @testitem "real nats-server JetStream integration" begin
     using Natter
+    using Dates
     using Random
 
     if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" && get(ENV, "NATTER_RUN_JETSTREAM", "false") == "true"
@@ -278,23 +280,81 @@ end
             end
 
             bucket = "NATTERKV_$(randstring(8))"
-            kv[] = kv_create(js, bucket; storage="memory", direct=true)
+            kv[] = kv_create(js, bucket; history=5, storage="memory", direct=true)
             try
                 @test kv[].direct
+                empty_status = kv_status(kv[])
+                @test empty_status isa KeyValueStatus
+                @test empty_status.bucket == bucket
+                @test empty_status.stream == "KV_$bucket"
+                @test empty_status.values == 0
+                @test empty_status.history == 5
+                @test empty_status.storage == StorageType.MEMORY
+                @test empty_status.direct
+                @test fetch(kv_status_async(kv[])).bucket == bucket
+                @test_throws KeyValueKeyNotFoundError kv_get(kv[], "missing")
                 pa2 = kv_put(kv[], "alpha", "one")
                 @test pa2.seq >= 1
-                @test String(kv_get(kv[], "alpha")) == "one"
-                @test String(kv_get(kv[], "alpha"; revision=pa2.seq)) == "one"
+                alpha = kv_get(kv[], "alpha")
+                @test alpha isa KeyValueEntry
+                @test alpha.bucket == bucket
+                @test alpha.key == "alpha"
+                @test alpha.revision == pa2.seq
+                @test alpha.created isa Dates.DateTime
+                @test alpha.delta == 0
+                @test alpha.operation == KeyValueOperation.PUT
+                @test String(alpha) == "one"
+                revision_alpha = kv_get(kv[], "alpha"; revision=pa2.seq)
+                @test revision_alpha.revision == pa2.seq
+                @test String(revision_alpha) == "one"
                 kv_update(kv[], "alpha", "two", pa2.seq)
-                @test String(kv_get(kv[], "alpha")) == "two"
+                updated_alpha = kv_get(kv[], "alpha")
+                @test updated_alpha.revision > pa2.seq
+                @test String(updated_alpha) == "two"
+                alpha_history = kv_history(kv[], "alpha"; batch=2)
+                @test length(alpha_history) >= 2
+                @test all(entry -> entry isa KeyValueEntry && entry.key == "alpha", alpha_history)
+                @test alpha_history[end].revision == updated_alpha.revision
                 pa3 = fetch(kv_put_async(kv[], "beta", "async-one"))
                 @test pa3.seq >= 1
                 @test String(fetch(kv_get_async(kv[], "beta"))) == "async-one"
+                @test_throws KeyValueWrongRevisionError kv_update(kv[], "beta", "wrong-revision", pa3.seq + 100)
+                updates = Channel{KeyValueEntry}(4)
+                watcher = kv_watch(kv[]; key="gamma") do entry
+                    put!(updates, entry)
+                end
+                try
+                    kv_put(kv[], "gamma", "watched")
+                    flush(client)
+                    @test timedwait(2.0; pollint=0.01) do
+                        isready(updates)
+                    end != :timed_out
+                    watched = take!(updates)
+                    @test watched.key == "gamma"
+                    @test watched.operation == KeyValueOperation.PUT
+                    @test String(watched) == "watched"
+                finally
+                    close(watcher)
+                end
                 fetch(kv_delete_async(kv[], "beta"))
-                @test_throws KeyError fetch(kv_get_async(kv[], "beta"))
+                @test_throws KeyValueKeyDeletedError fetch(kv_get_async(kv[], "beta"))
                 kv_delete(kv[], "alpha")
-                @test_throws KeyError kv_get(kv[], "alpha")
+                @test_throws KeyValueKeyDeletedError kv_get(kv[], "alpha")
                 @test !("alpha" in kv_keys(kv[]))
+                recreated = kv_create_key(kv[], "alpha", "three")
+                @test recreated.seq > pa2.seq
+                @test String(kv_get(kv[], "alpha")) == "three"
+                @test "alpha" in kv_keys(kv[])
+                @test_throws KeyValueKeyExistsError kv_create_key(kv[], "alpha", "duplicate")
+                large_key = "large"
+                kv_put(kv[], large_key, repeat("x", 8192))
+                limited_client = connect(url; ping_interval=2.0, max_outstanding_pings=2, max_inbound_payload=4096)
+                try
+                    limited_kv = kv_open(jetstream(limited_client), bucket)
+                    @test large_key in kv_keys(limited_kv)
+                finally
+                    close(limited_client)
+                end
             finally
                 isnothing(kv[]) || kv_delete_bucket(kv[])
             end

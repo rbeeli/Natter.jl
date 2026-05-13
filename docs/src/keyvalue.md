@@ -26,16 +26,27 @@ kv = kv_open(js, "settings")
 
 When a bucket is created or opened with direct access enabled on its backing stream, `kv_get` uses direct reads by default. Override that per call with `direct=false` or `direct=true`.
 
+Inspect bucket state with `kv_status`:
+
+```julia
+st = kv_status(kv)
+@assert st.history == 5
+@assert st.direct == true
+```
+
 ## Put And Get
 
 ```julia
 ack = kv_put(kv, "theme", "dark")
-msg = kv_get(kv, "theme")
+entry = kv_get(kv, "theme")
 
-@assert String(msg.data) == "dark"
+@assert entry.key == "theme"
+@assert entry.revision == ack.seq
+@assert entry.operation == KeyValueOperation.PUT
+@assert String(entry.value) == "dark"
 ```
 
-Create only if the key does not already exist:
+Create only if the key does not currently exist. A deleted key can be created again:
 
 ```julia
 kv_create_key(kv, "first-run", "complete")
@@ -55,13 +66,15 @@ kv_delete(kv, "theme")
 kv_purge(kv, "theme")
 ```
 
-Deleted and purged keys raise `KeyError` from `kv_get`.
+Absent keys raise `KeyValueKeyNotFoundError` from `kv_get`. Deleted and purged keys raise `KeyValueKeyDeletedError` with the tombstone entry attached.
+
+Optimistic writes raise KV-specific errors. `kv_update` and `kv_put(...; revision=rev)` raise `KeyValueWrongRevisionError` when the expected revision does not match, and `kv_create_key` raises `KeyValueKeyExistsError` when the key is already active.
 
 ## History And Keys
 
 ```julia
-for msg in kv_history(kv, "theme")
-    println(String(msg.data))
+for entry in kv_history(kv, "theme")
+    println(entry.revision, ": ", String(entry.value))
 end
 
 for key in kv_keys(kv)
@@ -74,8 +87,8 @@ end
 Use Julia tasks for independent KeyValue operations:
 
 ```julia
-profile = Ref{Msg}()
-settings = Ref{Msg}()
+profile = Ref{KeyValueEntry}()
+settings = Ref{KeyValueEntry}()
 
 @sync begin
     @async profile[] = kv_get(kv, "users.42.profile")
@@ -88,8 +101,8 @@ end
 `kv_watch` returns a push subscription. Close it when the watcher is no longer needed.
 
 ```julia
-watcher = kv_watch(kv; key=">", history=false) do msg
-    @info "key changed" subject=msg.subject value=String(msg.data)
+watcher = kv_watch(kv; key=">", history=false) do entry
+    @info "key changed" key=entry.key revision=entry.revision value=String(entry.value)
 end
 
 close(watcher)

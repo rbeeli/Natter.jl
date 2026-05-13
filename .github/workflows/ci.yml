@@ -29,13 +29,53 @@ jobs:
       - uses: julia-actions/cache@v2
       - run: docker run -d --name nats -p 4222:4222 nats:2.11-alpine -js
       - run: |
-          for i in {1..30}; do
-            nc -z 127.0.0.1 4222 && exit 0
-            sleep 1
+          set -euo pipefail
+          cert_dir="${RUNNER_TEMP}/natter-tls"
+          mkdir -p "${cert_dir}"
+          openssl genrsa -out "${cert_dir}/ca.key" 2048
+          openssl req -x509 -new -nodes -key "${cert_dir}/ca.key" -sha256 -days 2 \
+            -subj "/CN=Natter Test CA" -out "${cert_dir}/ca.pem"
+          openssl genrsa -out "${cert_dir}/server.key" 2048
+          openssl req -new -key "${cert_dir}/server.key" \
+            -subj "/CN=127.0.0.1" -out "${cert_dir}/server.csr"
+          cat > "${cert_dir}/server.ext" <<'EOF'
+          subjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1
+          extendedKeyUsage=serverAuth
+          keyUsage=digitalSignature,keyEncipherment
+          EOF
+          openssl x509 -req -in "${cert_dir}/server.csr" \
+            -CA "${cert_dir}/ca.pem" -CAkey "${cert_dir}/ca.key" -CAcreateserial \
+            -out "${cert_dir}/server.pem" -days 2 -sha256 -extfile "${cert_dir}/server.ext"
+          cat > "${cert_dir}/nats.conf" <<'EOF'
+          port: 4222
+          tls {
+            cert_file: "/certs/server.pem"
+            key_file: "/certs/server.key"
+            handshake_first: true
+          }
+          EOF
+      - run: docker run -d --name nats-tls -p 4223:4222 -v "${RUNNER_TEMP}/natter-tls:/certs:ro" nats:2.11-alpine -js -c /certs/nats.conf
+      - run: |
+          set -euo pipefail
+          for port in 4222 4223; do
+            ready=false
+            for i in {1..30}; do
+              if nc -z 127.0.0.1 "${port}"; then
+                ready=true
+                break
+              fi
+              sleep 1
+            done
+            if [ "${ready}" != "true" ]; then
+              docker logs nats
+              docker logs nats-tls
+              exit 1
+            fi
           done
-          docker logs nats
-          exit 1
       - run: julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
         env:
           NATTER_RUN_INTEGRATION: 'true'
           NATTER_RUN_JETSTREAM: 'true'
+          NATTER_RUN_TLS: 'true'
+          NATTER_TLS_URL: 'tls://127.0.0.1:4223'
+          NATTER_TLS_CA: ${{ runner.temp }}/natter-tls/ca.pem

@@ -32,12 +32,14 @@ export pull_subscribe, push_subscribe, fetch
 export pull_subscribe_async, push_subscribe_async, fetch_async
 export ack, ack_sync, nak, in_progress, term, metadata
 export ack_async, ack_sync_async, nak_async, in_progress_async, term_async
-export KeyValue, kv_create, kv_open, kv_delete_bucket, kv_get, kv_put, kv_create_key, kv_update, kv_delete, kv_purge, kv_history, kv_keys, kv_watch
-export kv_create_async, kv_open_async, kv_delete_bucket_async, kv_get_async, kv_put_async, kv_create_key_async, kv_update_async
+export KeyValue, KeyValueEntry, KeyValueOperation, KeyValueStatus
+export kv_create, kv_open, kv_delete_bucket, kv_status, kv_get, kv_put, kv_create_key, kv_update, kv_delete, kv_purge, kv_history, kv_keys, kv_watch
+export kv_create_async, kv_open_async, kv_delete_bucket_async, kv_status_async, kv_get_async, kv_put_async, kv_create_key_async, kv_update_async
 export kv_delete_async, kv_purge_async, kv_history_async, kv_keys_async, kv_watch_async
 export NatterError, TimeoutError, NoRespondersError, ConnectionClosedError, ConnectionReconnectingError
 export ConnectionDrainingError, ProtocolError, AuthorizationError, NoServersError, MaxPayloadError
-export OutboundBufferLimitError, SlowConsumerError, JetStreamError, UnsupportedFeatureError, CleanupError
+export OutboundBufferLimitError, SlowConsumerError, JetStreamError, KeyValueError, KeyValueKeyNotFoundError
+export KeyValueKeyDeletedError, KeyValueWrongRevisionError, KeyValueKeyExistsError, UnsupportedFeatureError, CleanupError
 
 const CRLF = "\r\n"
 const CRLF_BYTES = UInt8[0x0d, 0x0a]
@@ -46,6 +48,7 @@ const DEFAULT_INBOX_PREFIX = "_INBOX"
 const EMPTY_BYTES = UInt8[]
 const CLIENT_VERSION = "0.1.0"
 const NUID_ALPHABET = collect("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+const DEFAULT_WRITE_BUFFER_SIZE = 32 * 1024
 const DEFAULT_MAX_CONTROL_LINE = 16 * 1024
 const DEFAULT_MAX_INBOUND_PAYLOAD = 64 * 1024 * 1024
 const DEFAULT_MAX_HEADER_BYTES = 64 * 1024

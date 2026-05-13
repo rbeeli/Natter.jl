@@ -57,7 +57,7 @@ function _puback(obj)
 end
 
 function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing; timeout::Real=js.timeout, stream::Union{String,Nothing}=nothing,
-                    headers::Union{Headers,Nothing}=nothing)
+                    headers=nothing)
     hdrs = isnothing(headers) ? Headers() : _headers_copy(headers)
     isnothing(stream) || push!(get!(hdrs, "Nats-Expected-Stream", String[]), stream)
     msg = request(js.client, subject, data; timeout, headers=hdrs)
@@ -169,7 +169,30 @@ end
 
 const _DIRECT_GET_METADATA_HEADERS = Set(["Nats-Stream", "Nats-Subject", "Nats-Sequence", "Nats-Time-Stamp"])
 
-function _direct_message_response(js::JetStreamContext, request_subject::String, response::Msg)::Msg
+function _parse_rfc3339_datetime(value::AbstractString)::DateTime
+    m = match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?Z$", String(value))
+    isnothing(m) && throw(ProtocolError("timestamp is not UTC RFC3339: $value"))
+    fraction = isnothing(m.captures[2]) ? "000" : rpad(first(m.captures[2], min(3, ncodeunits(m.captures[2]))), 3, '0')
+    DateTime("$(m.captures[1]).$fraction", dateformat"yyyy-mm-ddTHH:MM:SS.sss")
+end
+
+function _direct_metadata_header(response::Msg, name::AbstractString)::String
+    value = header(response, name)
+    isnothing(value) && throw(ProtocolError("direct get response missing $name header"))
+    value
+end
+
+function _parse_direct_sequence(response::Msg)::Int
+    value = _direct_metadata_header(response, "Nats-Sequence")
+    try
+        return parse(Int, value)
+    catch err
+        err isa ArgumentError || rethrow()
+        throw(ProtocolError("direct get response has invalid Nats-Sequence header: $value"))
+    end
+end
+
+function _direct_message_response_info(js::JetStreamContext, request_subject::String, response::Msg)
     code = _status_header(response)
     if code == 503
         throw(NoRespondersError(request_subject))
@@ -179,16 +202,22 @@ function _direct_message_response(js::JetStreamContext, request_subject::String,
         throw(JetStreamError(code, nothing, description))
     end
 
-    subject = header(response, "Nats-Subject")
-    isnothing(subject) && throw(ProtocolError("direct get response missing Nats-Subject header"))
+    subject = _direct_metadata_header(response, "Nats-Subject")
+    sequence = _parse_direct_sequence(response)
+    created = _parse_rfc3339_datetime(_direct_metadata_header(response, "Nats-Time-Stamp"))
     headers = _headers_copy(response.headers)
     for name in _DIRECT_GET_METADATA_HEADERS
-        delete!(headers, name)
+        _delete_header!(headers, name)
     end
-    Msg(subject, nothing, copy(response.data); headers, client=js.client)
+    Msg(subject, nothing, copy(response.data); headers, client=js.client), sequence, created
 end
 
-function _stream_message_get_direct(js::JetStreamContext, stream::String, req::Dict{String,Any}; timeout::Real)
+function _direct_message_response(js::JetStreamContext, request_subject::String, response::Msg)::Msg
+    msg, _sequence, _created = _direct_message_response_info(js, request_subject, response)
+    msg
+end
+
+function _stream_message_get_direct_info(js::JetStreamContext, stream::String, req::Dict{String,Any}; timeout::Real)
     request_subject =
         if haskey(req, "last_by_subj") && !haskey(req, "seq")
             "$(js.prefix).DIRECT.GET.$stream.$(req["last_by_subj"])"
@@ -197,7 +226,30 @@ function _stream_message_get_direct(js::JetStreamContext, stream::String, req::D
         end
     payload = haskey(req, "last_by_subj") && !haskey(req, "seq") ? "" : JSON3.write(req)
     response = _request_raw(js.client, request_subject, payload; timeout)
-    _direct_message_response(js, request_subject, response)
+    _direct_message_response_info(js, request_subject, response)
+end
+
+function _stream_message_get_direct(js::JetStreamContext, stream::String, req::Dict{String,Any}; timeout::Real)
+    msg, _sequence, _created = _stream_message_get_direct_info(js, stream, req; timeout)
+    msg
+end
+
+function _stream_message_from_api_payload(js::JetStreamContext, raw_msg)
+    msg = _string_key_dict(raw_msg)
+    data = haskey(msg, "data") ? base64decode(String(msg["data"])) : UInt8[]
+    hdrs = haskey(msg, "hdrs") ? _parse_headers(base64decode(String(msg["hdrs"]))) : Headers()
+    created = haskey(msg, "time") ? _parse_rfc3339_datetime(String(msg["time"])) : nothing
+    Msg(String(msg["subject"]), nothing, data; headers=hdrs, client=js.client), Int(msg["seq"]), created
+end
+
+function _stream_message_get_api(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any}; timeout::Real)
+    obj = _api_request(js, "$(js.prefix).STREAM.MSG.GET.$stream", JSON3.write(req); timeout)
+    _stream_message_from_api_payload(js, obj["message"])
+end
+
+function _stream_message_get_info(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any}; direct::Bool, timeout::Real)
+    direct && return _stream_message_get_direct_info(js, stream, req; timeout)
+    _stream_message_get_api(js, stream, req; timeout)
 end
 
 function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::Union{Int,Nothing}=nothing, subject::Union{String,Nothing}=nothing,
@@ -205,11 +257,8 @@ function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::U
     stream = _validate_api_name("stream", stream)
     req = _stream_message_get_request(seq, subject, next_by_subject)
     direct && return _stream_message_get_direct(js, stream, req; timeout)
-    obj = _api_request(js, "$(js.prefix).STREAM.MSG.GET.$stream", JSON3.write(req); timeout)
-    msg = obj["message"]
-    data = haskey(msg, "data") ? base64decode(String(msg["data"])) : UInt8[]
-    hdrs = haskey(msg, "hdrs") ? _parse_headers(base64decode(String(msg["hdrs"]))) : Headers()
-    Msg(String(msg["subject"]), nothing, data; headers=hdrs, client=js.client)
+    msg, _seq, _created = _stream_message_get_api(js, stream, req; timeout)
+    msg
 end
 
 stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Int; timeout::Real=js.timeout) =
@@ -260,6 +309,12 @@ function _consumer_create_request(js::JetStreamContext, stream::AbstractString, 
                                   action::Union{String,Nothing}=nothing)
     stream = _validate_api_name("stream", stream)
     payload = _js_config_payload(config)
+    _consumer_create_payload_request(js, stream, payload; timeout, action)
+end
+
+function _consumer_create_payload_request(js::JetStreamContext, stream::AbstractString, payload::Dict{String,Any};
+                                          timeout::Real=js.timeout, action::Union{String,Nothing}=nothing)
+    stream = _validate_api_name("stream", stream)
     subject = _consumer_create_subject(js, stream, payload)
     _consumer_info(_api_request(js, subject, JSON3.write(_consumer_request_payload(js, stream, payload, action)); timeout))
 end
@@ -457,7 +512,7 @@ function _bind_or_create_consumer(js::JetStreamContext, stream::AbstractString, 
     if !isnothing(existing)
         return _validate_bound_consumer_config(existing, config, bind_fields), false
     end
-    consumer_create(js, stream, config; timeout), true
+    _consumer_create_payload_request(js, stream, config; timeout, action="create"), true
 end
 
 mutable struct PullSubscription
@@ -519,7 +574,7 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     info =
         if isnothing(bind_name)
             _set_config_default!(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
-            consumer_create(js, stream, cfg)
+            _consumer_create_payload_request(js, stream, cfg; action="create")
         else
             consumer, _created = _bind_or_create_consumer(js, stream, bind_name, cfg, bind_fields)
             isnothing(consumer.config.deliver_subject) ||
@@ -617,12 +672,12 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         if isnothing(bind_name)
             _set_config_default!(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
             _set_config_default!(cfg, "deliver_subject", deliver)
-            consumer_create(js, stream, cfg)
+            _consumer_create_payload_request(js, stream, cfg; action="create")
         else
             existing = _consumer_info_or_nothing(js, stream, bind_name)
             if isnothing(existing)
                 _set_config_default!(cfg, "deliver_subject", deliver)
-                consumer_create(js, stream, cfg)
+                _consumer_create_payload_request(js, stream, cfg; action="create")
             else
                 _validate_bound_consumer_config(existing, cfg, bind_fields)
                 isnothing(existing.config.deliver_subject) &&

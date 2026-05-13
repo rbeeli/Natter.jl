@@ -263,7 +263,9 @@ _js_enum_value(value::PriorityPolicy.T)::String =
     throw(ArgumentError("invalid priority policy: $value"))
 
 function _js_field_value(field::Symbol, value)
-    if field in _JS_DURATION_FIELDS
+    if isnothing(value)
+        return nothing
+    elseif field in _JS_DURATION_FIELDS
         return _seconds_to_nanoseconds(value)
     elseif field in _JS_TIMESTAMP_FIELDS
         return _timestamp_to_rfc3339(value)
@@ -303,7 +305,7 @@ function _js_config_payload(config::_JSConfigObject)::Dict{String,Any}
 end
 
 function _js_config_payload(config::AbstractDict)::Dict{String,Any}
-    Dict{String,Any}(String(k) => v for (k, v) in pairs(config))
+    Dict{String,Any}(String(k) => _js_field_value(Symbol(String(k)), v) for (k, v) in pairs(config))
 end
 
 _present(d::Dict{String,Any}, field::Symbol)::Bool = haskey(d, String(field)) && !isnothing(d[String(field)])

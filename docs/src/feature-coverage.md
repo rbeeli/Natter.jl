@@ -7,10 +7,10 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
 | Connect handshake | Supported | Includes authentication fields, client name, no echo, TLS requirements, and server INFO parsing. |
-| Publish and subscribe | Supported | Includes wildcards, queue groups, headers, max payload checks, and per-subscription pending limits. |
+| Publish and subscribe | Supported | Includes wildcards, queue groups, headers, max payload checks, buffered outbound writes, and per-subscription pending limits. |
 | Request reply | Supported | Uses a shared request inbox mux and maps no-responder status to `NoRespondersError`. |
 | Direct APIs and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code. |
-| Flush and ping | Supported | Uses PING/PONG synchronization. |
+| Flush and ping | Supported | Drains buffered outbound writes and uses PING/PONG synchronization. |
 | Drain and close | Supported | Drains subscriptions and reports cleanup failures. |
 | Automatic reconnect | Supported | Reconnects in the background, replays subscriptions, and flushes bounded pending publishes. |
 | Discovered servers | Supported | Server-discovered URLs are retained for reconnects. |
@@ -49,10 +49,10 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
-| Bucket create/open/delete | Supported | Backed by JetStream streams. |
-| Put/create/update | Supported | Includes optimistic revision checks. |
-| Get by latest or revision | Supported | Direct reads are used when bucket direct access is enabled. |
+| Bucket create/open/delete/status | Supported | Backed by JetStream streams; `kv_status` exposes values, history, TTL, storage, replicas, direct-read support, and the backing stream info. |
+| Put/create/update | Supported | Includes optimistic revision checks, create after delete/purge markers, and KV-specific conflict errors. |
+| Get by latest or revision | Supported | Returns typed entries with key, value, revision, created timestamp, delta, and operation. Direct reads are used when bucket direct access is enabled; missing and deleted keys raise KV-specific errors. |
 | Delete and purge | Supported | Uses KeyValue operation headers. |
-| History and keys | Supported | Implemented through pull consumers. |
-| Watch | Supported | Implemented through push consumers. |
-| Task handle helpers | Supported | Bucket, key, history, keys, and watch operations have `_async` helpers. |
+| History and keys | Supported | Implemented through pull consumers; history returns typed entries. |
+| Watch | Supported | Implemented through push consumers and typed entry callbacks. |
+| Task handle helpers | Supported | Bucket, status, key, history, keys, and watch operations have `_async` helpers. |

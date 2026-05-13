@@ -20,7 +20,7 @@ executes JetStream and KeyValue tests.
 | TLS transport | Partial | CA/client cert/key options are available; broad platform verification still needs integration hardening. |
 | WebSocket transport | Planned | `ws://` and `wss://` are not implemented yet. |
 | INFO / CONNECT / PING / PONG | Supported | Includes async INFO updates and ping-based flush. |
-| PUB / HPUB / SUB / UNSUB | Supported | Headers and queue groups included. |
+| PUB / HPUB / SUB / UNSUB | Supported | Headers and queue groups included. Outbound writes use a buffered flusher, with explicit flush/ping forcing a transport flush. |
 | Wildcard subscriptions | Supported | `*` and terminal `>` subscriptions are validated. Publish subjects reject wildcards. |
 | MSG / HMSG parser | Supported | Streaming line/payload parser written from scratch. |
 | Request/reply | Supported | Uses a shared request inbox mux with per-request waiters. |
@@ -55,10 +55,10 @@ executes JetStream and KeyValue tests.
 | JetStream context | Supported | `jetstream(client)` creates a context. |
 | Publish with ack | Supported | Parses `PubAck` and API errors. |
 | Task handle helpers | Supported | JetStream management, publish, message get/delete, consumers, fetch, close, and ack operations have `_async` helpers returning `NatterTask`. |
-| Typed stream configs | Supported | `StreamConfig` covers current stream schema fields with typed nested structs, enums, duration conversion, and raw `Dict` escape hatch. |
+| Typed stream configs | Supported | `StreamConfig` covers current stream schema fields with typed nested structs, enums, duration conversion, and raw `Dict` escape hatch using the same duration units for known fields. |
 | Stream create/update/info/list/names/purge/delete | Supported | Common management APIs, including list pagination. Stream info returns typed config plus raw response. |
 | Message get/delete | Supported | Common API path. |
-| Typed consumer configs | Supported | `ConsumerConfig` covers current consumer schema fields with typed enums, duration conversion, local validation, and raw `Dict` escape hatch. |
+| Typed consumer configs | Supported | `ConsumerConfig` covers current consumer schema fields with typed enums, duration conversion, local validation, and raw `Dict` escape hatch using the same duration units for known fields. |
 | Consumer create/update/info/list/delete | Supported | Common management APIs, including newer named consumer subjects and legacy durable subjects. `consumer_create` and `consumer_update` use strict server actions when supported; `consumer_create_or_update` is the explicit upsert API. Consumer info returns typed config plus raw response. |
 | Pull subscribe/fetch | Partial | Common batch fetch works; fetches on one pull subscription are serialized. Durable and named consumers bind without mutation and validate supplied config fields; random ephemeral consumers are strictly created and deleted on close. |
 | Push subscribe | Partial | Common durable/ephemeral delivery works; durable and named consumers bind without mutation and validate supplied config fields. Queue groups can be supplied through `queue` or `deliver_group`. Returned subscriptions are closable and random ephemeral consumers are deleted on close. |
@@ -75,12 +75,12 @@ executes JetStream and KeyValue tests.
 
 | Feature | Status | Notes |
 |---|---:|---|
-| Create/open/delete bucket | Supported | Built on stream APIs and covered by real-server tests. |
-| Get/put/create/update/delete/purge | Supported | Revision checks use expected-last-subject-sequence headers; common paths covered by real-server tests. |
-| Keys/history | Partial | Common paths implemented with temporary consumer cleanup and looped fetches. |
-| Watch/watchall | Partial | Callback watcher implemented with a closable push subscription; default watch delivers last value per subject plus updates. |
+| Create/open/delete/status bucket | Supported | Built on stream APIs and covered by real-server tests. `kv_status` exposes values, history, TTL, bytes, storage, replicas, direct-read support, and backing stream info. |
+| Get/put/create/update/delete/purge | Supported | `kv_get` returns typed entries with key, value, revision, created timestamp, delta, and operation. Revision checks use expected-last-subject-sequence headers, including create after delete/purge markers; common paths covered by real-server tests. Missing/deleted keys and optimistic-write conflicts raise KV-specific errors. |
+| Keys/history | Partial | Common paths implemented with temporary consumer cleanup and looped fetches; history returns typed entries including delete and purge operations. |
+| Watch/watchall | Partial | Callback watcher delivers typed entries through a closable push subscription; default watch delivers last value per subject plus updates. |
 | Direct get | Supported | `kv_create(...; direct=true)` enables direct reads, `kv_open` detects existing direct buckets, and `kv_get` uses direct access by default when available. |
-| Task handle helpers | Supported | Bucket, key, history, keys, and watch operations have `_async` helpers returning `NatterTask`. |
+| Task handle helpers | Supported | Bucket, status, key, history, keys, and watch operations have `_async` helpers returning `NatterTask`. |
 
 ## Services / Micro
 
