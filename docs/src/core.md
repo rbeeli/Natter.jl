@@ -100,11 +100,12 @@ response = request(client, "time.now", ""; timeout=1.0)
 println(String(response.data))
 ```
 
-No responder responses are raised as `NoRespondersError`.
+When negotiated with a server that supports header status messages, no responder responses are raised as `NoRespondersError`.
 
 ## Headers
 
 Received headers are represented as `Dict{String,Vector{String}}` through the `Headers` alias. Publish and request calls accept `Headers`, dictionaries with string or vector values, or pair iterators.
+Header publish and request calls require server header support advertised in INFO; older servers that do not advertise it raise `UnsupportedFeatureError` before Natter writes an `HPUB`.
 
 ```julia
 headers = Dict(

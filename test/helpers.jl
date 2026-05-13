@@ -27,14 +27,14 @@ using TestItems
     clear_capture!(t::WriteCapture) = (empty!(t.bytes); nothing)
 
     function fake_client(; opts=N.ConnectOptions(), status=N.ConnectionStatus.DISCONNECTED,
-                         read_io=nothing, write_io=nothing)
+                         info=N.ServerInfo(; headers=true), read_io=nothing, write_io=nothing)
         N.Client(
             opts,
             N.Server[],
             nothing,
             nothing,
             status,
-            N.ServerInfo(),
+            info,
             nothing,
             read_io,
             write_io,

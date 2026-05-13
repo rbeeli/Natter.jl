@@ -5,10 +5,17 @@ using TestItems
 
     const N = Natter
 
-    op, data = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("INFO {\"server_id\":\"srv\",\"max_payload\":64}\r\n")))
+    op, data = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("INFO {\"server_id\":\"srv\",\"max_payload\":64,\"headers\":true}\r\n")))
     @test op == :INFO
     @test data isa N.ServerInfo
     @test data.max_payload == 64
+    @test data.headers == true
+
+    info = N.ServerInfo(; headers=true)
+    N._merge_server_info!(info, N.ServerInfo(; connect_urls=["127.0.0.1:4222"]))
+    @test info.headers == true
+    N._merge_server_info!(info, N.ServerInfo(; headers=false))
+    @test info.headers == false
 
     op, msg = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\n")))
     @test op == :MSG
@@ -94,9 +101,14 @@ end
     m = match(r"^CONNECT (.*)\r\n$", connect_cmd)
     @test m !== nothing
     body = JSON3.read(only(m.captures))
-    @test body.headers == true
-    @test body.no_responders == true
+    @test body.headers == false
+    @test body.no_responders == false
     @test body.lang == "julia"
+
+    headers_cmd = N._connect_command(client, N.ServerInfo(; headers=true), nothing, nothing)
+    headers_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", headers_cmd).captures))
+    @test headers_body.headers == true
+    @test headers_body.no_responders == true
 
     token_client = TestHelpers.fake_client()
     token_cmd = N._connect_command(token_client, N.ServerInfo(), "secret", nothing)

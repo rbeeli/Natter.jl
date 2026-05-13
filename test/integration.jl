@@ -542,6 +542,57 @@ end
     end
 end
 
+@testitem "real nats-server JetStream fetch disconnect integration" begin
+    using Natter
+    using Random
+
+    const N = Natter
+
+    if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" && get(ENV, "NATTER_RUN_JETSTREAM", "false") == "true"
+        url = get(ENV, "NATTER_URL", "nats://127.0.0.1:4222")
+        reconnected = Ref(false)
+        client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
+                         reconnect_wait=0.05, max_reconnect_attempts=20,
+                         reconnected_cb=() -> (reconnected[] = true))
+        js = jetstream(client)
+        stream = "NATTER_FETCH_$(randstring(8))"
+        subject = "natter.fetch.$(randstring(8))"
+        durable = "FETCH_$(randstring(6))"
+        stream_created = Ref(false)
+        psub = Ref{Any}(nothing)
+        try
+            stream_create(js, StreamConfig(name=stream, subjects=[subject], storage=StorageType.MEMORY))
+            stream_created[] = true
+            psub[] = pull_subscribe(js, subject; stream, durable)
+
+            before_out = stats(client).out_msgs
+            fetch_task = @async fetch(psub[], 1; timeout=5.0, expires=5.0, heartbeat=0)
+            @test timedwait(2.0; pollint=0.01) do
+                stats(client).out_msgs > before_out
+            end != :timed_out
+            close(client.socket)
+
+            err = try
+                fetch(fetch_task)
+                nothing
+            catch caught
+                caught isa TaskFailedException ? first(Base.current_exceptions(fetch_task)).exception : caught
+            end
+            @test err isa FetchDisconnectedError
+
+            @test timedwait(5.0; pollint=0.02) do
+                reconnected[] && status(client) == N.ConnectionStatus.CONNECTED
+            end != :timed_out
+        finally
+            isnothing(psub[]) || close(psub[])
+            stream_created[] && status(client) == N.ConnectionStatus.CONNECTED && stream_delete(js, stream)
+            close(client)
+        end
+    else
+        @info "Skipping real nats-server JetStream fetch disconnect integration test; set NATTER_RUN_INTEGRATION=true and NATTER_RUN_JETSTREAM=true to enable it."
+    end
+end
+
 @testitem "real nats-server TLS first integration" begin
     using Natter
     using Random

@@ -82,6 +82,11 @@ struct JetStreamError <: NatterError
     description::String
 end
 
+struct FetchDisconnectedError <: NatterError
+    message::String
+end
+FetchDisconnectedError() = FetchDisconnectedError("disconnected during fetch")
+
 abstract type KeyValueError <: NatterError end
 
 struct KeyValueKeyNotFoundError <: KeyValueError
@@ -169,6 +174,9 @@ function Base.showerror(io::IO, err::JetStreamError)
     print(io, "Natter.JetStreamError: code=", err.code)
     isnothing(err.err_code) || print(io, " err_code=", err.err_code)
     print(io, " ", err.description)
+end
+function Base.showerror(io::IO, err::FetchDisconnectedError)
+    print(io, "Natter.FetchDisconnectedError: ", err.message)
 end
 function Base.showerror(io::IO, err::KeyValueKeyNotFoundError)
     print(io, "Natter.KeyValueKeyNotFoundError: key not found bucket=", err.bucket, " key=", err.key)

@@ -190,6 +190,7 @@ Base.@kwdef mutable struct ServerInfo
     tls_available::Union{Bool,Nothing} = nothing
     connect_urls::Union{Vector{String},Nothing} = nothing
     version::Union{String,Nothing} = nothing
+    headers::Union{Bool,Nothing} = nothing
     ldm::Bool = false
 end
 
@@ -199,6 +200,7 @@ function _merge_server_info!(dest::ServerInfo, src::ServerInfo)
     isnothing(src.tls_available) || (dest.tls_available = src.tls_available)
     isnothing(src.connect_urls) || (dest.connect_urls = copy(src.connect_urls))
     isnothing(src.version) || (dest.version = src.version)
+    isnothing(src.headers) || (dest.headers = src.headers)
     dest.ldm = src.ldm
     dest
 end
@@ -340,10 +342,16 @@ mutable struct _JetStreamPushControlHandler
     idle_heartbeat::Float64
     last_seen::Float64
     consumer_deleted::Bool
+    flow_incoming::UInt64
+    flow_delivered::UInt64
+    flow_reply::Union{String,Nothing}
+    flow_target::UInt64
     lock::ReentrantLock
 end
 _JetStreamPushControlHandler(idle_heartbeat::Real=0.0) =
-    _JetStreamPushControlHandler(Float64(idle_heartbeat), time(), false, ReentrantLock())
+    _JetStreamPushControlHandler(Float64(idle_heartbeat), time(), false,
+                                 UInt64(0), UInt64(0), nothing, UInt64(0),
+                                 ReentrantLock())
 struct _RequestMuxControlHandler end
 
 const _SubscriptionControlHandler = Union{_NoSubscriptionControlHandler,_JetStreamPushControlHandler,_RequestMuxControlHandler}

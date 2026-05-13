@@ -18,6 +18,8 @@ function _server_info(bytes_or_string)::ServerInfo
             info.connect_urls = String[String(url) for url in value]
         elseif key == "version" && !isnothing(value)
             info.version = String(value)
+        elseif key == "headers" && !isnothing(value)
+            info.headers = Bool(value)
         elseif key == "ldm" && !isnothing(value)
             info.ldm = Bool(value)
         end

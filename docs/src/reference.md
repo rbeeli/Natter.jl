@@ -20,10 +20,10 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | Function | Purpose |
 | :--- | :--- |
 | `connect(url_or_urls=nothing; kwargs...)` | Connect to one or more servers. |
-| `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | Publish a core message. |
+| `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | Publish a core message; header publishes require server INFO header support. |
 | `subscribe(client, subject; queue=nothing, callback=nothing, max_msgs=0, ...)` | Create a core subscription. |
 | `next(sub; timeout=1.0)` | Wait for the next message from a subscription. |
-| `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | Send a request and wait for one response. |
+| `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | Send a request and wait for one response; request headers require server INFO header support. |
 | `flush(client; timeout=10.0)` | Wait until the server has processed previous commands. |
 | `ping(client; timeout=10.0)` | Alias for `flush`. |
 | `unsubscribe(sub; max_msgs=0)` | Unsubscribe immediately or after `max_msgs` additional messages. |
@@ -104,7 +104,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `consumer_delete(js, stream, consumer)` | Delete a consumer. |
 | `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig())` | Create or bind a pull subscription without mutating existing consumers. |
 | `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. |
-| `fetch(psub, batch=1; timeout=..., expires=timeout, heartbeat=nothing)` | Fetch a batch from a pull subscription. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
+| `fetch(psub, batch=1; timeout=..., expires=timeout, heartbeat=nothing)` | Fetch a batch from a pull subscription. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
 | `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for JetStream messages. |
 | `metadata(msg)` | Parse JetStream delivery metadata. |
 
@@ -174,6 +174,6 @@ This page summarizes the public API. Optional keyword defaults are documented in
 
 ## Errors
 
-Public error types derive from `NatterError`: `TimeoutError`, `NoRespondersError`, `ConnectionClosedError`, `ConnectionReconnectingError`, `ConnectionDrainingError`, `ProtocolError`, `AuthenticationError`, `AuthorizationError`, `AuthenticationExpiredError`, `AuthenticationRevokedError`, `AccountAuthenticationExpiredError`, `PermissionViolationError`, `NoServersError`, `MaxPayloadError`, `OutboundBufferLimitError`, `SlowConsumerError`, `JetStreamError`, `KeyValueError`, `UnsupportedFeatureError`, and `CleanupError`.
+Public error types derive from `NatterError`: `TimeoutError`, `NoRespondersError`, `ConnectionClosedError`, `ConnectionReconnectingError`, `ConnectionDrainingError`, `ProtocolError`, `AuthenticationError`, `AuthorizationError`, `AuthenticationExpiredError`, `AuthenticationRevokedError`, `AccountAuthenticationExpiredError`, `PermissionViolationError`, `NoServersError`, `MaxPayloadError`, `OutboundBufferLimitError`, `SlowConsumerError`, `JetStreamError`, `FetchDisconnectedError`, `KeyValueError`, `UnsupportedFeatureError`, and `CleanupError`.
 
 KeyValue-specific errors derive from `KeyValueError`: `KeyValueKeyNotFoundError`, `KeyValueKeyDeletedError`, `KeyValueWrongRevisionError`, and `KeyValueKeyExistsError`.

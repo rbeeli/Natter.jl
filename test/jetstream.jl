@@ -463,6 +463,83 @@ end
     close(sub)
 end
 
+@testitem "JetStream push flow control waits for channel delivery" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+    data = Msg("_INBOX.push", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("work");
+               client, sid=sub.sid)
+    flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
+                       headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
+                       client, sid=sub.sid)
+
+    N._dispatch_msg(client, data)
+    N._dispatch_msg(client, flow_control)
+
+    @test isready(sub.messages)
+    @test client.pending_bytes == 0
+    @test String(next(sub; timeout=0.1)) == "work"
+
+    expected = "PUB _INBOX.fc 0\r\n\r\n"
+    @test client.pending_bytes == ncodeunits(expected)
+    @test String(take!(client.pending)) == expected
+    close(sub)
+end
+
+@testitem "JetStream push flow control waits for callback delivery" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    started = Channel{String}(2)
+    release = Channel{Bool}(1)
+    sub = subscribe(client, "_INBOX.callback";
+                    callback=msg -> begin
+                        put!(started, String(msg))
+                        String(msg) == "busy" && take!(release)
+                    end,
+                    _control_handler=N._JetStreamPushControlHandler())
+
+    try
+        busy = Msg("_INBOX.callback", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("busy");
+                   client, sid=sub.sid)
+        data = Msg("_INBOX.callback", "\$JS.ACK.S.C.1.2.2.0.0", TestHelpers.bytes("work");
+                   client, sid=sub.sid)
+        flow_control = Msg("_INBOX.callback", "_INBOX.fc", UInt8[];
+                           headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
+                           client, sid=sub.sid)
+
+        N._dispatch_msg(client, busy)
+        @test timedwait(1.0; pollint=0.01) do
+            isready(started)
+        end != :timed_out
+        @test take!(started) == "busy"
+
+        N._dispatch_msg(client, data)
+        N._dispatch_msg(client, flow_control)
+        @test client.pending_bytes == 0
+
+        put!(release, true)
+        expected = "PUB _INBOX.fc 0\r\n\r\n"
+        @test timedwait(1.0; pollint=0.01) do
+            client.pending_bytes == ncodeunits(expected)
+        end != :timed_out
+        @test String(take!(client.pending)) == expected
+
+        @test timedwait(1.0; pollint=0.01) do
+            isready(started)
+        end != :timed_out
+        @test take!(started) == "work"
+    finally
+        isready(release) || put!(release, true)
+        close(sub)
+    end
+end
+
 @testitem "JetStream push flow control reply failures use error callback" setup=[TestHelpers] begin
     using Natter
 
@@ -689,15 +766,92 @@ end
     @test client.pending_bytes == 0
 end
 
+@testitem "JetStream pull fetch is reconnect-aware" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    reconnecting_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    reconnecting_js = jetstream(reconnecting_client)
+    reconnecting_sub = subscribe(reconnecting_client, "_INBOX.reconnecting")
+    reconnecting_psub = N.PullSubscription(reconnecting_js, reconnecting_sub, "ORDERS", "WORKER", "_INBOX.reconnecting", ReentrantLock(), ReentrantLock(), false, false)
+
+    @test_throws FetchDisconnectedError fetch(reconnecting_psub, 1; timeout=0.1, expires=0.1, heartbeat=0)
+    @test reconnecting_client.pending_bytes == 0
+    @test isempty(take!(reconnecting_client.pending))
+    close(reconnecting_psub)
+
+    function task_error(task)
+        try
+            fetch(task)
+            nothing
+        catch caught
+            caught isa TaskFailedException ? first(Base.current_exceptions(task)).exception : caught
+        end
+    end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull")
+    TestHelpers.clear_capture!(capture)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+
+    fetch_task = @async fetch(psub, 1; timeout=5.0, expires=5.0, heartbeat=0)
+    @test timedwait(1.0; pollint=0.001) do
+        occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))
+    end != :timed_out
+    @lock client.lock client.status = N.ConnectionStatus.RECONNECTING
+    @test task_error(fetch_task) isa FetchDisconnectedError
+    close(psub)
+
+    terminal_capture = TestHelpers.WriteCapture()
+    terminal_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=terminal_capture)
+    terminal_js = jetstream(terminal_client)
+    terminal_core_sub = subscribe(terminal_client, "_INBOX.terminal")
+    TestHelpers.clear_capture!(terminal_capture)
+    terminal_psub = N.PullSubscription(terminal_js, terminal_core_sub, "ORDERS", "WORKER", "_INBOX.terminal", ReentrantLock(), ReentrantLock(), false, false)
+
+    terminal_task = @async fetch(terminal_psub, 1; timeout=5.0, expires=5.0, heartbeat=0)
+    @test timedwait(1.0; pollint=0.001) do
+        occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(terminal_capture))
+    end != :timed_out
+    @lock terminal_client.lock begin
+        terminal_client.status = N.ConnectionStatus.DISCONNECTED
+        terminal_core_sub.closed = true
+    end
+    @test task_error(terminal_task) isa FetchDisconnectedError
+    close(terminal_psub)
+
+    partial_capture = TestHelpers.WriteCapture()
+    partial_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=partial_capture)
+    partial_js = jetstream(partial_client)
+    partial_core_sub = subscribe(partial_client, "_INBOX.partial")
+    TestHelpers.clear_capture!(partial_capture)
+    partial_psub = N.PullSubscription(partial_js, partial_core_sub, "ORDERS", "WORKER", "_INBOX.partial", ReentrantLock(), ReentrantLock(), false, false)
+    N._dispatch_msg(partial_client, Msg("_INBOX.partial", nothing, TestHelpers.bytes("payload"); client=partial_client, sid=partial_core_sub.sid))
+
+    partial_task = @async fetch(partial_psub, 2; timeout=5.0, expires=5.0, heartbeat=0)
+    @test timedwait(1.0; pollint=0.001) do
+        occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(partial_capture))
+    end != :timed_out
+    @lock partial_client.lock partial_client.status = N.ConnectionStatus.RECONNECTING
+    msgs = fetch(partial_task)
+    @test length(msgs) == 1
+    @test String(first(msgs)) == "payload"
+    close(partial_psub)
+end
+
 @testitem "JetStream pull fetch maps status controls" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
 
     function run_fetch(headers::Headers; data=UInt8[])
-        client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
         js = jetstream(client)
         core_sub = subscribe(client, "_INBOX.pull")
+        take!(client.write_io)
         psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, data; headers, client, sid=core_sub.sid))
         try
@@ -729,20 +883,22 @@ end
 
     const N = Natter
 
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     js = jetstream(client)
     core_sub = subscribe(client, "_INBOX.pull")
+    take!(client.write_io)
     psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
     N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                 headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
                                 client, sid=core_sub.sid))
     @test isempty(fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0.02))
-    @test occursin("\"idle_heartbeat\":20000000", String(take!(client.pending)))
+    @test occursin("\"idle_heartbeat\":20000000", String(take!(client.write_io)))
     close(psub)
 
-    timeout_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    timeout_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     timeout_js = jetstream(timeout_client)
     timeout_sub = subscribe(timeout_client, "_INBOX.timeout")
+    take!(timeout_client.write_io)
     timeout_psub = N.PullSubscription(timeout_js, timeout_sub, "ORDERS", "WORKER", "_INBOX.timeout", ReentrantLock(), ReentrantLock(), false, false)
     try
         @test_throws JetStreamError fetch(timeout_psub, 1; timeout=0.12, expires=0.12, heartbeat=0.02)
@@ -756,9 +912,10 @@ end
 
     const N = Natter
 
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     js = jetstream(client)
     core_sub = subscribe(client, "_INBOX.pull")
+    take!(client.write_io)
     psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
 
     try
@@ -767,13 +924,13 @@ end
                                     client, sid=core_sub.sid))
         @test String(first(fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0))) == "payload"
         @test psub.pin_id == "pin-a"
-        take!(client.pending)
+        take!(client.write_io)
 
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
                                     client, sid=core_sub.sid))
         @test isempty(fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0))
-        @test occursin("\"pin_id\":\"pin-a\"", String(take!(client.pending)))
+        @test occursin("\"pin_id\":\"pin-a\"", String(take!(client.write_io)))
 
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["423"], "Description" => ["Pin ID Mismatch"]),

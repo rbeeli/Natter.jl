@@ -209,7 +209,10 @@ function _publish(client::Client, subject::AbstractString, data=nothing; reply::
     hdr = isnothing(headers) ? EMPTY_BYTES : _headers_bytes(_headers_from_input(headers))
     frame = PublishFrame(subject, reply, payload, hdr)
     total = _pub_payload_size(frame)
-    max_payload = @lock client.lock something(client.info.max_payload, typemax(Int))
+    max_payload, headers_supported = @lock client.lock begin
+        something(client.info.max_payload, typemax(Int)), client.info.headers === true
+    end
+    !isempty(hdr) && !headers_supported && throw(UnsupportedFeatureError("headers are not supported by the connected server"))
     total > max_payload && throw(MaxPayloadError(max_payload, total))
     _send_publish(client, frame; buffer_on_reconnect)
     _record_out!(client, length(payload))
@@ -281,10 +284,12 @@ function _subscription_processor(sub::Subscription, callback::Callback) where {C
             _report_error(sub.client, err)
             continue
         end
-        @lock sub.client.lock begin
+        control_handler = @lock sub.client.lock begin
             sub.pending_bytes = max(0, sub.pending_bytes - length(msg.data))
             sub.processing += 1
+            sub.control_handler
         end
+        _maybe_reply_to_subscription_flow_control!(sub, control_handler)
         try
             callback(msg)
             sub.auto_ack && ack(msg)
@@ -297,6 +302,8 @@ function _subscription_processor(sub::Subscription, callback::Callback) where {C
 end
 
 _handle_subscription_control(::_NoSubscriptionControlHandler, _sub::Subscription, _msg::Msg)::Bool = false
+_record_subscription_data_received!(::_SubscriptionControlHandler) = nothing
+_maybe_reply_to_subscription_flow_control!(::Subscription, ::_SubscriptionControlHandler) = nothing
 
 function _request_mux_token(prefix::String, subject::String)::Union{String,Nothing}
     prefix_len = ncodeunits(prefix)
@@ -393,6 +400,7 @@ function _dispatch_msg(client::Client, msg::Msg)
         end
         rethrow()
     end
+    _record_subscription_data_received!(control_handler)
     if should_close
         @lock client.lock begin
             delete!(client.subscriptions, sub.sid)
@@ -404,6 +412,16 @@ function _dispatch_msg(client::Client, msg::Msg)
     end
 end
 
+function _take_subscription_msg!(sub::Subscription)
+    msg = take!(sub.messages)
+    control_handler = @lock sub.client.lock begin
+        sub.pending_bytes = max(0, sub.pending_bytes - length(msg.data))
+        sub.control_handler
+    end
+    _maybe_reply_to_subscription_flow_control!(sub, control_handler)
+    msg
+end
+
 function next(sub::Subscription; timeout::Real=1.0)
     (@lock sub.client.lock sub.closed) && !isready(sub.messages) && throw(ConnectionClosedError("subscription is closed"))
     result = timedwait(timeout; pollint=0.001) do
@@ -411,9 +429,7 @@ function next(sub::Subscription; timeout::Real=1.0)
     end
     result == :timed_out && throw(TimeoutError("next message timed out"))
     isready(sub.messages) || throw(ConnectionClosedError("subscription is closed"))
-    msg = take!(sub.messages)
-    @lock sub.client.lock sub.pending_bytes = max(0, sub.pending_bytes - length(msg.data))
-    msg
+    _take_subscription_msg!(sub)
 end
 
 function unsubscribe(sub::Subscription; max_msgs::Int=0)

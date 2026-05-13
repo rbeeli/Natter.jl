@@ -546,14 +546,15 @@ end
 
 function _connect_command(client::Client, info::ServerInfo, url_user, url_pass)
     opts = client.options
+    hdrs = info.headers === true
     body = Dict{String,Any}(
         "verbose" => opts.verbose,
         "pedantic" => opts.pedantic,
         "lang" => "julia",
         "version" => CLIENT_VERSION,
         "protocol" => 1,
-        "headers" => true,
-        "no_responders" => true,
+        "headers" => hdrs,
+        "no_responders" => hdrs,
         "echo" => !opts.no_echo,
     )
     isnothing(opts.name) || (body["name"] = opts.name)

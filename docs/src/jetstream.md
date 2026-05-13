@@ -140,7 +140,7 @@ for msg in fetch(sub, 10; timeout=2.0)
 end
 ```
 
-For fetches with `expires >= 10`, Natter requests JetStream idle heartbeats and reports missed heartbeats as `JetStreamError`. Use `heartbeat=0` to disable heartbeat monitoring or set a shorter positive heartbeat explicitly; `expires` must be at least twice the heartbeat.
+Fetch requests are not replayed after reconnect. If the connection is lost before any messages arrive, `fetch` throws `FetchDisconnectedError` so callers can retry after reconnect without leaving a stale pull request behind. For fetches with `expires >= 10`, Natter requests JetStream idle heartbeats and reports missed heartbeats as `JetStreamError`. Use `heartbeat=0` to disable heartbeat monitoring or set a shorter positive heartbeat explicitly; `expires` must be at least twice the heartbeat.
 
 To process a fetched batch concurrently, use a structured `@sync` boundary:
 

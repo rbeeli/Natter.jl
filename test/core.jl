@@ -29,6 +29,15 @@ using TestItems
     @test startswith(publish_frame, "HPUB foo ")
     @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nbar\r\n", publish_frame)
 
+    unsupported_headers = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=false),
+        write_io=IOBuffer(),
+    )
+    @test_throws UnsupportedFeatureError publish(unsupported_headers, "foo", "bar"; headers=Dict("Trace" => "abc"))
+    @test String(take!(unsupported_headers.write_io)) == ""
+    @test unsupported_headers.pending_bytes == 0
+
     headers = Headers("Trace" => [repeat("x", 16)])
     payload = TestHelpers.bytes("body")
     total = N._pub_payload_size(payload, N._headers_bytes(headers))

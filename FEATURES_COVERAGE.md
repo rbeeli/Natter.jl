@@ -20,12 +20,12 @@ executes JetStream and KeyValue tests.
 | TLS transport | Partial | CA/client cert/key options are available; broad platform verification still needs integration hardening. |
 | WebSocket transport | Planned | `ws://` and `wss://` are not implemented yet. |
 | INFO / CONNECT / PING / PONG | Supported | Includes async INFO updates and ping-based flush. |
-| PUB / HPUB / SUB / UNSUB | Supported | Headers and queue groups included. Outbound writes use a buffered flusher, with explicit flush/ping forcing a transport flush. |
+| PUB / HPUB / SUB / UNSUB | Supported | Headers are negotiated from server INFO before advertising or emitting HPUB. Queue groups are included. Outbound writes use a buffered flusher, with explicit flush/ping forcing a transport flush. |
 | Wildcard subscriptions | Supported | `*` and terminal `>` subscriptions are validated. Publish subjects reject wildcards. |
 | MSG / HMSG parser | Supported | Streaming line/payload parser written from scratch. |
 | Request/reply | Supported | Uses a shared request inbox mux with per-request waiters. |
 | Direct public API and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code and `fetch(handle)` returns the sync result or rethrows the original operation error. |
-| No responders | Supported | Status `503` replies become `NoRespondersError`. |
+| No responders | Supported | Advertised only when server INFO reports header support; status `503` replies become `NoRespondersError`. |
 | Flush | Supported | Implemented as a ping/pong round trip. |
 | Drain | Supported | Subscription and client drain are implemented with timeout and covered by real-server tests. |
 | Close | Supported | Closes tasks and transport without further reconnects. |
@@ -60,7 +60,7 @@ executes JetStream and KeyValue tests.
 | Message get/delete | Supported | Common API path. |
 | Typed consumer configs | Supported | `ConsumerConfig` covers current consumer schema fields with typed enums, duration conversion, local validation, and raw `Dict` escape hatch using the same duration units for known fields. |
 | Consumer create/update/info/list/delete | Supported | Common management APIs, including newer named consumer subjects and legacy durable subjects. `consumer_create` and `consumer_update` use strict server actions when supported; `consumer_create_or_update` is the explicit upsert API. Consumer info returns typed config plus raw response. |
-| Pull subscribe/fetch | Partial | Common batch fetch works; fetches on one pull subscription are serialized. Fetch maps JetStream status/control replies for no messages, timeouts, batch completion, max-bytes conflicts, consumer deletion, leadership changes, server shutdown, pin mismatches, and no responders. Durable and named consumers bind without mutation and validate supplied config fields; random ephemeral consumers are strictly created and deleted on close. |
+| Pull subscribe/fetch | Partial | Common batch fetch works; fetches on one pull subscription are serialized. Pull fetch requests are not replayed after reconnect, and a disconnect before any messages arrive is reported as `FetchDisconnectedError`. Fetch maps JetStream status/control replies for no messages, timeouts, batch completion, max-bytes conflicts, consumer deletion, leadership changes, server shutdown, pin mismatches, and no responders. Durable and named consumers bind without mutation and validate supplied config fields; random ephemeral consumers are strictly created and deleted on close. |
 | Push subscribe | Partial | Common durable/ephemeral delivery works; durable and named consumers bind without mutation and validate supplied config fields. Queue groups can be supplied through `queue` or `deliver_group`. Push status/control messages are handled internally, flow control is answered only for flow-control requests, consumer deletion/leadership statuses are reported through `error_cb`, and returned subscriptions are closable. Random ephemeral consumers are deleted on close. |
 | Manual ack APIs | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, and `term`. |
 | JetStream message metadata | Supported | V1 and domain-aware V2 ack metadata parsing. |

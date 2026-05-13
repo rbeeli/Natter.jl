@@ -651,12 +651,40 @@ function _close_subscription_from_control!(sub::Subscription)
     nothing
 end
 
+function _record_subscription_data_received!(handler::_JetStreamPushControlHandler)
+    @lock handler.lock handler.flow_incoming += one(UInt64)
+    nothing
+end
+
+function _update_flow_delivered_locked!(handler::_JetStreamPushControlHandler, queued::UInt64)
+    delivered = handler.flow_incoming > queued ? handler.flow_incoming - queued : UInt64(0)
+    delivered > handler.flow_delivered && (handler.flow_delivered = delivered)
+    handler.flow_delivered
+end
+
+function _maybe_reply_to_subscription_flow_control!(sub::Subscription, handler::_JetStreamPushControlHandler)
+    queued = @lock sub.client.lock UInt64(Base.n_avail(sub.messages))
+    reply = @lock handler.lock begin
+        _update_flow_delivered_locked!(handler, queued)
+        if !isnothing(handler.flow_reply) && handler.flow_delivered >= handler.flow_target
+            reply = handler.flow_reply
+            handler.flow_reply = nothing
+            handler.flow_target = UInt64(0)
+            reply
+        else
+            nothing
+        end
+    end
+    isnothing(reply) || _publish_flow_control_reply(sub, reply)
+    nothing
+end
+
 function _handle_subscription_control(handler::_JetStreamPushControlHandler, sub::Subscription, msg::Msg)::Bool
     _touch_push_control_handler!(handler)
     action, err = _jetstream_status_action(msg)
     action == :message && return false
     if action == :flow_control
-        _reply_to_flow_control(sub, msg)
+        _schedule_or_reply_to_flow_control(sub, handler, msg)
     elseif !isnothing(err)
         _report_error(sub.client, err)
     end
@@ -681,6 +709,7 @@ function _push_heartbeat_monitor(psub::PushSubscription, handler::_JetStreamPush
             _touch_push_control_handler!(handler)
             continue
         end
+        _maybe_reply_to_subscription_flow_control!(psub.sub, handler)
         missed = @lock handler.lock time() - handler.last_seen > 2 * interval
         if missed
             _report_error(psub.js.client, _jetstream_heartbeat_error())
@@ -699,16 +728,34 @@ function _push_idle_heartbeat_seconds(info::ConsumerInfo)::Float64
     isnothing(heartbeat) ? 0.0 : Float64(heartbeat)
 end
 
-function _reply_to_flow_control(sub::Subscription, msg::Msg)
-    if !isnothing(msg.reply)
-        try
-            publish(sub.client, msg.reply, EMPTY_BYTES)
-        catch err
-            _report_error(sub.client, err)
-        end
-    else
-        _report_error(sub.client, JetStreamError(_JS_STATUS_CONTROL, nothing, "flow control request missing reply subject"))
+function _publish_flow_control_reply(sub::Subscription, reply::String)
+    try
+        publish(sub.client, reply, EMPTY_BYTES)
+    catch err
+        _report_error(sub.client, err)
     end
+    nothing
+end
+
+function _schedule_or_reply_to_flow_control(sub::Subscription, handler::_JetStreamPushControlHandler, msg::Msg)
+    if isnothing(msg.reply)
+        _report_error(sub.client, JetStreamError(_JS_STATUS_CONTROL, nothing, "flow control request missing reply subject"))
+        return nothing
+    end
+
+    reply = msg.reply
+    queued = @lock sub.client.lock UInt64(Base.n_avail(sub.messages))
+    send_now = @lock handler.lock begin
+        _update_flow_delivered_locked!(handler, queued)
+        if handler.flow_delivered >= handler.flow_incoming
+            true
+        else
+            handler.flow_reply = reply
+            handler.flow_target = handler.flow_incoming
+            false
+        end
+    end
+    send_now && _publish_flow_control_reply(sub, reply)
     nothing
 end
 
@@ -788,6 +835,42 @@ function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real,
     _pull_fetch_heartbeat(expires, heartbeat)
 end
 
+function _throw_pull_fetch_wait_interrupted(closed::Bool, st::ConnectionStatus.T)
+    st in (ConnectionStatus.RECONNECTING, ConnectionStatus.DISCONNECTED, ConnectionStatus.CONNECTING) &&
+        throw(FetchDisconnectedError())
+    st == ConnectionStatus.DRAINING && throw(ConnectionDrainingError())
+    st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
+    closed && throw(ConnectionClosedError("subscription is closed"))
+    throw(TimeoutError("next message timed out"))
+end
+
+function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
+    sub = psub.sub
+    client = sub.client
+    closed, st = @lock client.lock (sub.closed, client.status)
+    closed && !isready(sub.messages) && _throw_pull_fetch_wait_interrupted(closed, st)
+    result = timedwait(timeout; pollint=0.001) do
+        isready(sub.messages) || (@lock client.lock sub.closed || client.status != ConnectionStatus.CONNECTED)
+    end
+    result == :timed_out && throw(TimeoutError("next message timed out"))
+    isready(sub.messages) && return _take_subscription_msg!(sub)
+    closed, st = @lock client.lock (sub.closed, client.status)
+    _throw_pull_fetch_wait_interrupted(closed, st)
+end
+
+function _publish_pull_fetch_request(psub::PullSubscription, request_subject::String, payload::AbstractString)
+    try
+        _publish(psub.js.client, request_subject, payload; reply=psub.deliver, buffer_on_reconnect=false)
+    catch err
+        if err isa ConnectionReconnectingError ||
+           (err isa ConnectionClosedError && status(psub.js.client) == ConnectionStatus.DISCONNECTED)
+            throw(FetchDisconnectedError())
+        end
+        rethrow()
+    end
+    nothing
+end
+
 function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeout, expires::Real=timeout,
                heartbeat::Union{Nothing,Real}=nothing)
     heartbeat_seconds = _validate_pull_fetch(psub, batch, timeout, expires, heartbeat)
@@ -796,7 +879,7 @@ function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeo
         heartbeat_seconds > 0 && (req["idle_heartbeat"] = round(Int, heartbeat_seconds * 1_000_000_000))
         !isnothing(psub.pin_id) && (req["pin_id"] = psub.pin_id)
         request_subject = "$(psub.js.prefix).CONSUMER.MSG.NEXT.$(psub.stream).$(psub.consumer)"
-        publish(psub.js.client, request_subject, JSON3.write(req); reply=psub.deliver)
+        _publish_pull_fetch_request(psub, request_subject, JSON3.write(req))
         msgs = Msg[]
         deadline = time() + timeout
         heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
@@ -804,7 +887,7 @@ function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeo
             wait_deadline = min(deadline, heartbeat_deadline)
             remaining = max(0.001, wait_deadline - time())
             try
-                msg = next(psub.sub; timeout=remaining)
+                msg = _next_pull_fetch_msg(psub, remaining)
                 heartbeat_seconds > 0 && (heartbeat_deadline = time() + 2 * heartbeat_seconds)
                 pin_id = header(msg, "Nats-Pin-Id")
                 !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
@@ -826,6 +909,8 @@ function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeo
                         throw(_jetstream_heartbeat_error())
                     end
                     break
+                elseif err isa FetchDisconnectedError
+                    isempty(msgs) || break
                 end
                 rethrow()
             end
