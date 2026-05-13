@@ -36,9 +36,11 @@ client = connect([
 
 `max_reconnect_attempts=-1` means unlimited reconnect attempts.
 
+Reconnect coverage currently includes same-server reconnect and multi-URL failover in real-server tests. Multi-node cluster churn, discovered-route changes, and auth failover are still tracked as partial hardening work in the feature coverage matrix.
+
 ## Publish Buffering
 
-Core publishes made while reconnecting are buffered up to `pending_size`. If the transport fails after the server has accepted some bytes but before the client observes success, replay can duplicate delivery. Use idempotent consumers, application message IDs, or JetStream publish expectations when duplicate effects are unacceptable.
+Core publishes retained for reconnect replay are buffered up to `pending_size`. This includes publishes made while reconnecting and connected publishes that have not yet been flushed successfully. If the transport fails after the server has accepted some bytes but before the client observes success, replay can duplicate delivery. Use idempotent consumers, application message IDs, or JetStream publish expectations when duplicate effects are unacceptable.
 
 ## Subscription Backpressure
 

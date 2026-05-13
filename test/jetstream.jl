@@ -381,7 +381,7 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     push_sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
 
-    heartbeat = Msg("_INBOX.push", nothing, UInt8[];
+    heartbeat = Msg("_INBOX.push", "_INBOX.hb", UInt8[];
                     headers=Headers("Status" => ["100"], "Description" => ["Idle Heartbeat"]),
                     client, sid=push_sub.sid)
     N._dispatch_msg(client, heartbeat)
@@ -397,6 +397,50 @@ end
 
     close(push_sub)
     close(plain_sub)
+end
+
+@testitem "JetStream push control dispatch maps lifecycle statuses" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    errors = Channel{Any}(4)
+    opts = ConnectOptions(error_cb=err -> put!(errors, err))
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
+
+    deleted_sub = subscribe(client, "_INBOX.deleted"; _control_handler=N._JetStreamPushControlHandler())
+    deleted = Msg("_INBOX.deleted", nothing, UInt8[];
+                  headers=Headers("Status" => ["409"], "Description" => ["Consumer Deleted"]),
+                  client, sid=deleted_sub.sid)
+    N._dispatch_msg(client, deleted)
+
+    @test !isready(deleted_sub.messages)
+    @test (@lock client.lock deleted_sub.closed)
+    @test timedwait(1.0; pollint=0.01) do
+        isready(errors)
+    end != :timed_out
+    deleted_err = take!(errors)
+    @test deleted_err isa JetStreamError
+    @test deleted_err.code == 409
+    @test occursin("Consumer Deleted", deleted_err.description)
+
+    leader_sub = subscribe(client, "_INBOX.leader"; _control_handler=N._JetStreamPushControlHandler())
+    leadership = Msg("_INBOX.leader", nothing, UInt8[];
+                     headers=Headers("Status" => ["409"], "Description" => ["Leadership Change"]),
+                     client, sid=leader_sub.sid)
+    N._dispatch_msg(client, leadership)
+
+    @test !isready(leader_sub.messages)
+    @test !(@lock client.lock leader_sub.closed)
+    @test timedwait(1.0; pollint=0.01) do
+        isready(errors)
+    end != :timed_out
+    leadership_err = take!(errors)
+    @test leadership_err isa JetStreamError
+    @test leadership_err.code == 409
+    @test occursin("Leadership Change", leadership_err.description)
+
+    close(leader_sub)
 end
 
 @testitem "JetStream push flow control replies internally" setup=[TestHelpers] begin
@@ -441,6 +485,33 @@ end
     end != :timed_out
     @test take!(errors) isa ConnectionClosedError
     close(sub)
+end
+
+@testitem "JetStream push heartbeat monitor reports missed heartbeats" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    errors = Channel{Any}(1)
+    opts = ConnectOptions(error_cb=err -> put!(errors, err))
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    js = jetstream(client)
+    handler = N._JetStreamPushControlHandler(0.02)
+    sub = subscribe(client, "_INBOX.push"; _control_handler=handler)
+    psub = N.PushSubscription(js, sub, "S", "C", ReentrantLock(), false, false)
+    psub.heartbeat_task = N._start_push_heartbeat_monitor(psub, handler)
+
+    try
+        @test timedwait(1.0; pollint=0.01) do
+            isready(errors)
+        end != :timed_out
+        err = take!(errors)
+        @test err isa JetStreamError
+        @test err.code == 408
+        @test occursin("heartbeat", lowercase(err.description))
+    finally
+        close(psub)
+    end
 end
 
 @testitem "JetStream push control dispatch does not invoke callbacks" setup=[TestHelpers] begin
@@ -602,6 +673,10 @@ end
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=2.0)
     @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=1.0, heartbeat=-0.1)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=1.0, heartbeat=0.6)
+    @test client.pending_bytes == 0
 
     close(psub)
     @test_throws ConnectionClosedError fetch(psub, 1; timeout=1.0)
@@ -612,6 +687,102 @@ end
     close(underlying)
     @test_throws ConnectionClosedError fetch(underlying_psub, 1; timeout=1.0)
     @test client.pending_bytes == 0
+end
+
+@testitem "JetStream pull fetch maps status controls" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function run_fetch(headers::Headers; data=UInt8[])
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+        js = jetstream(client)
+        core_sub = subscribe(client, "_INBOX.pull")
+        psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, data; headers, client, sid=core_sub.sid))
+        try
+            fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0)
+        finally
+            close(psub)
+        end
+    end
+
+    @test isempty(run_fetch(Headers("Status" => ["404"], "Description" => ["No Messages"])))
+    @test isempty(run_fetch(Headers("Status" => ["408"], "Description" => ["Request Timeout"])))
+    @test isempty(run_fetch(Headers("Status" => ["409"], "Description" => ["Batch Completed"])))
+
+    @test_throws JetStreamError run_fetch(Headers("Status" => ["400"], "Description" => ["Bad Request"]))
+    @test_throws JetStreamError run_fetch(Headers("Status" => ["409"], "Description" => ["Message Size Exceeds MaxBytes"]))
+    @test_throws JetStreamError run_fetch(Headers("Status" => ["409"], "Description" => ["Consumer Deleted"]))
+    @test_throws JetStreamError run_fetch(Headers("Status" => ["409"], "Description" => ["Leadership Change"]))
+    @test_throws JetStreamError run_fetch(Headers("Status" => ["409"], "Description" => ["Server Shutdown"]))
+    @test_throws JetStreamError run_fetch(Headers("Status" => ["423"], "Description" => ["Pin ID Mismatch"]))
+    @test_throws NoRespondersError run_fetch(Headers("Status" => ["503"], "Description" => ["No Responders"]))
+
+    msgs = run_fetch(Headers("Status" => ["409"], "Description" => ["Consumer Deleted"]); data=TestHelpers.bytes("payload"))
+    @test length(msgs) == 1
+    @test String(first(msgs)) == "payload"
+end
+
+@testitem "JetStream pull fetch uses and monitors idle heartbeats" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull")
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+    N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+                                headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
+                                client, sid=core_sub.sid))
+    @test isempty(fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0.02))
+    @test occursin("\"idle_heartbeat\":20000000", String(take!(client.pending)))
+    close(psub)
+
+    timeout_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    timeout_js = jetstream(timeout_client)
+    timeout_sub = subscribe(timeout_client, "_INBOX.timeout")
+    timeout_psub = N.PullSubscription(timeout_js, timeout_sub, "ORDERS", "WORKER", "_INBOX.timeout", ReentrantLock(), ReentrantLock(), false, false)
+    try
+        @test_throws JetStreamError fetch(timeout_psub, 1; timeout=0.12, expires=0.12, heartbeat=0.02)
+    finally
+        close(timeout_psub)
+    end
+end
+
+@testitem "JetStream pull fetch tracks pinned consumer ids" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull")
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+
+    try
+        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, TestHelpers.bytes("payload");
+                                    headers=Headers("Nats-Pin-Id" => ["pin-a"]),
+                                    client, sid=core_sub.sid))
+        @test String(first(fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0))) == "payload"
+        @test psub.pin_id == "pin-a"
+        take!(client.pending)
+
+        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+                                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
+                                    client, sid=core_sub.sid))
+        @test isempty(fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0))
+        @test occursin("\"pin_id\":\"pin-a\"", String(take!(client.pending)))
+
+        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+                                    headers=Headers("Status" => ["423"], "Description" => ["Pin ID Mismatch"]),
+                                    client, sid=core_sub.sid))
+        @test_throws JetStreamError fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0)
+        @test isnothing(psub.pin_id)
+    finally
+        close(psub)
+    end
 end
 
 @testitem "JetStream subscription close is idempotent" setup=[TestHelpers] begin

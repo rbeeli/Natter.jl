@@ -180,8 +180,9 @@ mutable struct Server
     reconnects::Int
     last_attempt::Float64
     discovered::Bool
+    last_auth_error::Union{AuthenticationError,Nothing}
 end
-Server(url::String; discovered=false) = Server(url, 0, 0.0, discovered)
+Server(url::String; discovered=false) = Server(url, 0, 0.0, discovered, nothing)
 
 Base.@kwdef mutable struct ServerInfo
     max_payload::Union{Int,Nothing} = nothing
@@ -219,11 +220,11 @@ ProtocolReader{I}(io; read_size::Int=4096) where {I} =
 mutable struct BufferedWriteIO{I} <: IO
     io::I
     buffer::IOBuffer
-    replayable::IOBuffer
+    replayable_ranges::Vector{Tuple{Int,Int}}
     closed::Bool
 end
 
-BufferedWriteIO(io::I) where {I} = BufferedWriteIO{I}(io, IOBuffer(), IOBuffer(), false)
+BufferedWriteIO(io::I) where {I} = BufferedWriteIO{I}(io, IOBuffer(), Tuple{Int,Int}[], false)
 
 function _ensure_open(io::BufferedWriteIO)
     io.closed && throw(Base.IOError("buffered write transport is closed", 0))
@@ -273,16 +274,24 @@ end
 function Base.flush(io::BufferedWriteIO)
     _ensure_open(io)
     data = take!(io.buffer)
+    ranges = io.replayable_ranges
+    io.replayable_ranges = Tuple{Int,Int}[]
     try
         isempty(data) || write(io.io, data)
         flush(io.io)
     catch
         newer = take!(io.buffer)
+        newer_ranges = io.replayable_ranges
+        io.replayable_ranges = Tuple{Int,Int}[]
         write(io.buffer, data)
         write(io.buffer, newer)
+        io.replayable_ranges = ranges
+        offset = length(data)
+        for (first, last) in newer_ranges
+            push!(io.replayable_ranges, (first + offset, last + offset))
+        end
         rethrow()
     end
-    take!(io.replayable)
     nothing
 end
 
@@ -296,7 +305,25 @@ Base.isopen(io::BufferedWriteIO) = !io.closed && isopen(io.io)
 _buffered_bytes(::IO) = 0
 _buffered_bytes(io::BufferedWriteIO) = position(io.buffer)
 _take_replayable_writes!(::IO) = UInt8[]
-_take_replayable_writes!(io::BufferedWriteIO) = take!(io.replayable)
+function _take_replayable_writes!(io::BufferedWriteIO)
+    data = take!(io.buffer)
+    ranges = io.replayable_ranges
+    io.replayable_ranges = Tuple{Int,Int}[]
+    isempty(ranges) && return UInt8[]
+
+    bytes = 0
+    for (first, last) in ranges
+        bytes += last - first + 1
+    end
+    replayable = Vector{UInt8}(undef, bytes)
+    pos = 1
+    for (first, last) in ranges
+        n = last - first + 1
+        copyto!(replayable, pos, data, first, n)
+        pos += n
+    end
+    replayable
+end
 _underlying_transport(io) = io
 _underlying_transport(io::BufferedWriteIO) = io.io
 
@@ -309,7 +336,14 @@ _write_transport_field_type(::Nothing) = DefaultWriteTransportIO
 _write_transport_field_type(io) = typeof(io)
 
 struct _NoSubscriptionControlHandler end
-struct _JetStreamPushControlHandler end
+mutable struct _JetStreamPushControlHandler
+    idle_heartbeat::Float64
+    last_seen::Float64
+    consumer_deleted::Bool
+    lock::ReentrantLock
+end
+_JetStreamPushControlHandler(idle_heartbeat::Real=0.0) =
+    _JetStreamPushControlHandler(Float64(idle_heartbeat), time(), false, ReentrantLock())
 struct _RequestMuxControlHandler end
 
 const _SubscriptionControlHandler = Union{_NoSubscriptionControlHandler,_JetStreamPushControlHandler,_RequestMuxControlHandler}

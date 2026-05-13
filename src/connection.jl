@@ -13,6 +13,9 @@ function _parse_options(url_or_urls; kwargs...)
     ConnectOptions(; servers, kwargs...)
 end
 
+_write_transport_for_options(io, opts::ConnectOptions) =
+    max(0, opts.write_buffer_size) == 0 ? io : BufferedWriteIO(io)
+
 function connect(url_or_urls=nothing; kwargs...)
     opts = _parse_options(url_or_urls; kwargs...)
     client = Client(
@@ -241,16 +244,63 @@ function _flush_buffered_writes(client::Client; allow_missing::Bool=false)
             allow_missing && return false
             throw(ConnectionClosedError("connection transport is closed"))
         end
-        flush(io)
+        _flush_write_io(client, io)
     end
     true
+end
+
+function _reserve_pending_bytes_locked!(client::Client, bytes::Int)
+    projected = client.pending_bytes + bytes
+    if projected > client.options.pending_size
+        throw(OutboundBufferLimitError(client.options.pending_size, projected))
+    end
+    client.pending_bytes = projected
+    nothing
+end
+
+function _reserve_pending_bytes!(client::Client, bytes::Int)
+    @lock client.lock _reserve_pending_bytes_locked!(client, bytes)
+    nothing
+end
+
+function _release_pending_bytes!(client::Client, bytes::Int)
+    bytes <= 0 && return nothing
+    @lock client.lock client.pending_bytes = max(0, client.pending_bytes - bytes)
+    nothing
+end
+
+function _clear_pending_buffer_locked!(client::Client)
+    client.pending = IOBuffer()
+    client.pending_bytes = 0
+    nothing
+end
+
+function _clear_pending_buffer!(client::Client)
+    @lock client.lock _clear_pending_buffer_locked!(client)
+    nothing
+end
+
+_replayable_bytes(::IO) = 0
+function _replayable_bytes(io::BufferedWriteIO)
+    bytes = 0
+    for (first, last) in io.replayable_ranges
+        bytes += last - first + 1
+    end
+    bytes
+end
+
+function _flush_write_io(client::Client, io)
+    replayed = _replayable_bytes(io)
+    flush(io)
+    _release_pending_bytes!(client, replayed)
+    nothing
 end
 
 function _flush_or_signal_locked(client::Client, io; force_flush::Bool=false)
     buffered = _buffered_bytes(io)
     threshold = max(0, client.options.write_buffer_size)
     if force_flush || (buffered > 0 && threshold == 0) || (threshold > 0 && buffered >= threshold)
-        flush(io)
+        _flush_write_io(client, io)
     elseif buffered > 0
         _signal_flusher_locked(client)
     end
@@ -292,6 +342,7 @@ end
 
 function _take_transport!(client::Client; preserve_replayable::Bool=false)
     replayable = UInt8[]
+    dropped_replayable = 0
     transports = @lock client.write_lock begin
         read_io, write_io, sock, preserve = @lock client.lock begin
             read_io = client.read_io
@@ -306,10 +357,13 @@ function _take_transport!(client::Client; preserve_replayable::Bool=false)
         end
         if preserve && !isnothing(write_io)
             replayable = _take_replayable_writes!(write_io)
+        elseif !isnothing(write_io)
+            dropped_replayable = length(_take_replayable_writes!(write_io))
         end
         read_io, write_io, sock
     end
-    isempty(replayable) || _prepend_pending!(client, replayable)
+    isempty(replayable) || _prepend_pending!(client, replayable; already_counted=true)
+    _release_pending_bytes!(client, dropped_replayable)
     transports
 end
 
@@ -389,7 +443,8 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     subs = Subscription[]
     request_waiters = Channel{Any}[]
     terminal = @lock client.lock begin
-        if client.generation == generation && client.status in (ConnectionStatus.RECONNECTING, ConnectionStatus.DISCONNECTED)
+        if client.generation == generation &&
+           client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.RECONNECTING, ConnectionStatus.DISCONNECTED)
             client.status = ConnectionStatus.DISCONNECTED
             client.current_server = nothing
             client.connected_url = nothing
@@ -434,6 +489,7 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     end
     _report_cleanup_errors(client, errors)
     _close_transport_report_errors!(client)
+    _clear_pending_buffer!(client)
     _report_error(client, err)
     true
 end
@@ -583,9 +639,10 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
                     client.socket = sock
                     client.read_io = read_io
                     client.reader = reader
-                    client.write_io = BufferedWriteIO(write_io)
+                    client.write_io = _write_transport_for_options(write_io, client.options)
                     mark_connected && (client.status = ConnectionStatus.CONNECTED)
                     client.pings_out = 0
+                    server.last_auth_error = nothing
                     true
                 end
             end
@@ -699,12 +756,60 @@ function _report_error(client::Client, err)
     end
 end
 
-function _throw_server_err(message::AbstractString)
-    lower = lowercase(String(message))
-    if occursin("authorization", lower)
-        throw(AuthorizationError(String(message)))
+function _server_err(message::AbstractString)::NatterError
+    text = String(message)
+    lower = lowercase(text)
+    if startswith(lower, "permissions violation")
+        return PermissionViolationError(text)
+    elseif startswith(lower, "authorization violation")
+        return AuthorizationError(text)
+    elseif startswith(lower, "user authentication expired")
+        return AuthenticationExpiredError(text)
+    elseif startswith(lower, "user authentication revoked")
+        return AuthenticationRevokedError(text)
+    elseif startswith(lower, "account authentication expired")
+        return AccountAuthenticationExpiredError(text)
     else
-        throw(ProtocolError(String(message)))
+        return ProtocolError(text)
+    end
+end
+
+_throw_server_err(message::AbstractString) = throw(_server_err(message))
+
+_same_auth_error(left::AuthenticationError, right::AuthenticationError)::Bool =
+    typeof(left) === typeof(right)
+
+function _record_auth_error!(client::Client, server::Server, err::AuthenticationError)::Bool
+    @lock client.lock begin
+        abort = !isnothing(server.last_auth_error) && _same_auth_error(server.last_auth_error, err)
+        server.last_auth_error = err
+        abort
+    end
+end
+
+function _record_current_auth_error!(client::Client, err::AuthenticationError)::Bool
+    server = @lock client.lock client.current_server
+    isnothing(server) && return false
+    _record_auth_error!(client, server, err)
+end
+
+function _handle_server_err!(client::Client, generation::Int, message::AbstractString)::Bool
+    err = _server_err(message)
+    if err isa PermissionViolationError
+        _report_error(client, err)
+        return false
+    elseif err isa AuthenticationError
+        if _record_current_auth_error!(client, err)
+            _terminal_disconnect!(client, generation, err)
+        else
+            _report_error(client, err)
+            _trigger_reconnect(client, err)
+        end
+        return true
+    else
+        _report_error(client, err)
+        _trigger_reconnect(client, err)
+        return true
     end
 end
 
@@ -771,10 +876,7 @@ function _reader_loop(client::Client, generation::Int)
                     return
                 end
             elseif op == :ERR
-                err = ProtocolError(String(data))
-                _report_error(client, err)
-                _trigger_reconnect(client, err)
-                return
+                _handle_server_err!(client, generation, data) && return
             end
         catch err
             status(client) in (ConnectionStatus.CLOSED, ConnectionStatus.DRAINING) && return
@@ -867,12 +969,18 @@ function _trigger_reconnect(client::Client, reason)
 end
 
 function _recover_after_write_failure!(client::Client, err)
-    st = status(client)
+    st, generation = @lock client.lock (client.status, client.generation)
     if st == ConnectionStatus.CONNECTED
         if client.options.allow_reconnect
             _report_error(client, err)
+            should_reconnect = @lock client.lock begin
+                client.status == ConnectionStatus.CONNECTED && client.generation == generation
+            end
+            should_reconnect || return false
             _trigger_reconnect(client, err)
-            return true
+            return @lock client.lock begin
+                client.status == ConnectionStatus.RECONNECTING && client.generation == generation + 1
+            end
         else
             _trigger_reconnect(client, err)
             return false
@@ -906,7 +1014,7 @@ function _reconnect_loop(client::Client, generation::Int)
                 _start_flusher_task!(client, generation)
                 _record_reconnect!(client)
                 _replay_subscriptions(client)
-                _flush_pending_buffer(client)
+                _flush_pending_buffer(client; generation=generation)
                 committed = @lock client.lock begin
                     if client.generation == generation && client.status == ConnectionStatus.RECONNECTING
                         client.status = ConnectionStatus.CONNECTED
@@ -920,12 +1028,16 @@ function _reconnect_loop(client::Client, generation::Int)
                     return
                 end
                 _replay_subscriptions(client)
-                _flush_pending_buffer(client)
+                _flush_pending_buffer(client; generation=generation)
                 _flush_buffered_writes(client)
                 _start_background_tasks!(client, generation)
                 try opts.reconnected_cb() catch err _report_error(client, err) end
                 return
             catch err
+                if err isa AuthenticationError && _record_auth_error!(client, server, err)
+                    _terminal_disconnect!(client, generation, err)
+                    return
+                end
                 @lock client.lock begin
                     if client.generation == generation && client.status != ConnectionStatus.CLOSED
                         client.status = ConnectionStatus.RECONNECTING
@@ -971,28 +1083,45 @@ function _replay_subscriptions(client::Client)
     end
 end
 
-function _prepend_pending!(client::Client, data::Vector{UInt8})
+function _prepend_pending_locked!(client::Client, data::Vector{UInt8}; already_counted::Bool=false)
+    bytes = length(data)
+    already_counted || _reserve_pending_bytes_locked!(client, bytes)
+    existing = take!(client.pending)
+    client.pending = IOBuffer()
+    write(client.pending, data)
+    write(client.pending, existing)
+    nothing
+end
+
+function _prepend_pending!(client::Client, data::Vector{UInt8}; already_counted::Bool=false)
+    @lock client.lock _prepend_pending_locked!(client, data; already_counted=already_counted)
+    nothing
+end
+
+function _restore_pending_after_replay_failure!(client::Client, data::Vector{UInt8}, generation::Int)
     @lock client.lock begin
-        existing = take!(client.pending)
-        client.pending = IOBuffer()
-        write(client.pending, data)
-        write(client.pending, existing)
-        client.pending_bytes = length(data) + length(existing)
+        if client.generation == generation && client.status in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTED)
+            _prepend_pending_locked!(client, data; already_counted=true)
+        else
+            client.pending_bytes = max(0, client.pending_bytes - length(data))
+        end
     end
     nothing
 end
 
-function _flush_pending_buffer(client::Client)
+function _flush_pending_buffer(client::Client; generation::Union{Int,Nothing}=nothing)
     data = UInt8[]
+    replay_generation = 0
     @lock client.lock begin
+        replay_generation = isnothing(generation) ? client.generation : generation
         data = take!(client.pending)
-        client.pending_bytes = 0
     end
     isempty(data) && return
     try
         _write_raw(client, data; force_flush=true)
+        _release_pending_bytes!(client, length(data))
     catch err
-        _prepend_pending!(client, data)
+        _restore_pending_after_replay_failure!(client, data, replay_generation)
         rethrow()
     end
 end

@@ -27,6 +27,84 @@ end
 
 jetstream(client::Client; prefix::String="\$JS.API", timeout::Real=5.0) = JetStreamContext(client, prefix, Float64(timeout))
 
+const _JS_STATUS_CONTROL = 100
+const _JS_STATUS_BAD_REQUEST = 400
+const _JS_STATUS_NO_MESSAGES = 404
+const _JS_STATUS_TIMEOUT = 408
+const _JS_STATUS_CONFLICT = 409
+const _JS_STATUS_PIN_ID_MISMATCH = 423
+const _JS_STATUS_NO_RESPONDERS = 503
+
+const _JS_DESC_IDLE_HEARTBEAT = "idle heartbeat"
+const _JS_DESC_FLOW_CONTROL = "flowcontrol request"
+const _JS_DESC_CONSUMER_DELETED = "consumer deleted"
+const _JS_DESC_LEADERSHIP_CHANGE = "leadership change"
+const _JS_DESC_MAX_BYTES_EXCEEDED = "message size exceeds maxbytes"
+const _JS_DESC_BATCH_COMPLETED = "batch completed"
+const _JS_DESC_SERVER_SHUTDOWN = "server shutdown"
+
+function _jetstream_control_status(msg::Msg)
+    isempty(msg.data) || return nothing
+    code = _status_header(msg)
+    isnothing(code) && return nothing
+    code, _status_description(msg)
+end
+
+function _jetstream_default_status_description(code::Int)::String
+    code == _JS_STATUS_CONTROL && return "control message"
+    code == _JS_STATUS_BAD_REQUEST && return "bad request"
+    code == _JS_STATUS_NO_MESSAGES && return "no messages"
+    code == _JS_STATUS_TIMEOUT && return "timeout"
+    code == _JS_STATUS_CONFLICT && return "conflict"
+    code == _JS_STATUS_PIN_ID_MISMATCH && return "pin id mismatch"
+    code == _JS_STATUS_NO_RESPONDERS && return "no responders"
+    "JetStream status $code"
+end
+
+function _jetstream_status_action(msg::Msg; request_subject::Union{String,Nothing}=nothing)
+    status = _jetstream_control_status(msg)
+    isnothing(status) && return :message, nothing
+    code, description = status
+    desc = isempty(description) ? _jetstream_default_status_description(code) : description
+    lower = lowercase(strip(desc))
+    subject = isnothing(request_subject) ? msg.subject : request_subject
+
+    if code == _JS_STATUS_CONTROL
+        lower == _JS_DESC_IDLE_HEARTBEAT && return :idle_heartbeat, nothing
+        lower == _JS_DESC_FLOW_CONTROL && return :flow_control, nothing
+        return :control, nothing
+    elseif code == _JS_STATUS_NO_MESSAGES
+        return :no_messages, nothing
+    elseif code == _JS_STATUS_TIMEOUT
+        return :timeout, nothing
+    elseif code == _JS_STATUS_NO_RESPONDERS
+        return :no_responders, NoRespondersError(subject)
+    elseif code == _JS_STATUS_PIN_ID_MISMATCH
+        return :pin_id_mismatch, JetStreamError(code, nothing, desc)
+    elseif code == _JS_STATUS_CONFLICT
+        if occursin(_JS_DESC_MAX_BYTES_EXCEEDED, lower) || occursin("maxbytes", lower) || occursin("exceeded", lower)
+            return :max_bytes_exceeded, JetStreamError(code, nothing, desc)
+        elseif occursin(_JS_DESC_BATCH_COMPLETED, lower)
+            return :batch_completed, nothing
+        elseif occursin(_JS_DESC_CONSUMER_DELETED, lower)
+            return :consumer_deleted, JetStreamError(code, nothing, desc)
+        elseif occursin(_JS_DESC_LEADERSHIP_CHANGE, lower)
+            return :leadership_change, JetStreamError(code, nothing, desc)
+        elseif occursin(_JS_DESC_SERVER_SHUTDOWN, lower)
+            return :server_shutdown, JetStreamError(code, nothing, desc)
+        else
+            return :error, JetStreamError(code, nothing, desc)
+        end
+    elseif code >= 400
+        return :error, JetStreamError(code, nothing, desc)
+    end
+
+    :control, nothing
+end
+
+_jetstream_heartbeat_error() =
+    JetStreamError(_JS_STATUS_TIMEOUT, nothing, "JetStream idle heartbeat timed out")
+
 function _js_decode(msg::Msg)
     obj = isempty(msg.data) ? Dict{String,Any}() : _json_dict(String(msg.data))
     if haskey(obj, "error")
@@ -525,7 +603,15 @@ mutable struct PullSubscription
     close_lock::ReentrantLock
     delete_on_close::Bool
     closed::Bool
+    server_deleted::Bool
+    pin_id::Union{String,Nothing}
 end
+
+PullSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
+                 deliver::AbstractString, fetch_lock::ReentrantLock, close_lock::ReentrantLock,
+                 delete_on_close::Bool, closed::Bool) =
+    PullSubscription(js, sub, String(stream), String(consumer), String(deliver), fetch_lock, close_lock,
+                     delete_on_close, closed, false, nothing)
 
 mutable struct PushSubscription
     js::JetStreamContext
@@ -535,18 +621,95 @@ mutable struct PushSubscription
     close_lock::ReentrantLock
     delete_on_close::Bool
     closed::Bool
+    heartbeat_task::Union{Task,Nothing}
+    control_handler::Union{_JetStreamPushControlHandler,Nothing}
 end
 
-function _handle_subscription_control(::_JetStreamPushControlHandler, sub::Subscription, msg::Msg)::Bool
-    _status_header(msg) == 100 || return false
+PushSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
+                 close_lock::ReentrantLock, delete_on_close::Bool, closed::Bool) =
+    PushSubscription(js, sub, String(stream), String(consumer), close_lock, delete_on_close, closed, nothing, nothing)
+
+function _touch_push_control_handler!(handler::_JetStreamPushControlHandler)
+    handler.idle_heartbeat > 0 || return nothing
+    @lock handler.lock handler.last_seen = time()
+    nothing
+end
+
+function _close_subscription_from_control!(sub::Subscription)
+    already_closed = @lock sub.client.lock begin
+        was_closed = sub.closed
+        if !was_closed
+            delete!(sub.client.subscriptions, sub.sid)
+            sub.closed = true
+        end
+        was_closed
+    end
+    already_closed && return nothing
+    errors = Any[]
+    _close_subscription_channel!(errors, sub)
+    _report_cleanup_errors(sub.client, errors)
+    nothing
+end
+
+function _handle_subscription_control(handler::_JetStreamPushControlHandler, sub::Subscription, msg::Msg)::Bool
+    _touch_push_control_handler!(handler)
+    action, err = _jetstream_status_action(msg)
+    action == :message && return false
+    if action == :flow_control
+        _reply_to_flow_control(sub, msg)
+    elseif !isnothing(err)
+        _report_error(sub.client, err)
+    end
+    if action == :consumer_deleted
+        @lock handler.lock handler.consumer_deleted = true
+        _close_subscription_from_control!(sub)
+    end
+    true
+end
+
+function _push_heartbeat_monitor(psub::PushSubscription, handler::_JetStreamPushControlHandler)
+    interval = handler.idle_heartbeat
+    interval > 0 || return nothing
+    poll = min(0.25, max(0.01, interval / 2))
+    while true
+        sleep(poll)
+        closed = (@lock psub.close_lock psub.closed) ||
+                 (@lock psub.sub.client.lock psub.sub.closed || psub.sub.client.status in (ConnectionStatus.CLOSED, ConnectionStatus.DISCONNECTED))
+        closed && return nothing
+        st = status(psub.js.client)
+        if st in (ConnectionStatus.CONNECTING, ConnectionStatus.RECONNECTING)
+            _touch_push_control_handler!(handler)
+            continue
+        end
+        missed = @lock handler.lock time() - handler.last_seen > 2 * interval
+        if missed
+            _report_error(psub.js.client, _jetstream_heartbeat_error())
+            _touch_push_control_handler!(handler)
+        end
+    end
+end
+
+function _start_push_heartbeat_monitor(psub::PushSubscription, handler::_JetStreamPushControlHandler)
+    handler.idle_heartbeat > 0 || return nothing
+    @async _push_heartbeat_monitor(psub, handler)
+end
+
+function _push_idle_heartbeat_seconds(info::ConsumerInfo)::Float64
+    heartbeat = info.config.idle_heartbeat
+    isnothing(heartbeat) ? 0.0 : Float64(heartbeat)
+end
+
+function _reply_to_flow_control(sub::Subscription, msg::Msg)
     if !isnothing(msg.reply)
         try
             publish(sub.client, msg.reply, EMPTY_BYTES)
         catch err
             _report_error(sub.client, err)
         end
+    else
+        _report_error(sub.client, JetStreamError(_JS_STATUS_CONTROL, nothing, "flow control request missing reply subject"))
     end
-    true
+    nothing
 end
 
 function _stream_by_subject(js::JetStreamContext, subject::AbstractString)
@@ -600,44 +763,71 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     end
 end
 
-function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real, expires::Real)
+function _pull_fetch_heartbeat(expires::Real, heartbeat::Union{Nothing,Real})::Float64
+    hb =
+        if isnothing(heartbeat)
+            expires >= 10 ? 5.0 : 0.0
+        else
+            heartbeat isa Bool && throw(ArgumentError("fetch heartbeat must be a non-negative number of seconds"))
+            Float64(heartbeat)
+        end
+    hb >= 0 || throw(ArgumentError("fetch heartbeat must be a non-negative number of seconds"))
+    hb == 0 && return 0.0
+    expires >= 2 * hb || throw(ArgumentError("fetch expires must be at least twice the heartbeat"))
+    hb
+end
+
+function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real, expires::Real,
+                              heartbeat::Union{Nothing,Real})
     batch > 0 || throw(ArgumentError("fetch batch must be greater than zero"))
     timeout > 0 || throw(ArgumentError("fetch timeout must be greater than zero"))
     expires > 0 || throw(ArgumentError("fetch expires must be greater than zero"))
     timeout >= expires || throw(ArgumentError("fetch timeout must be greater than or equal to expires"))
     (@lock psub.close_lock psub.closed) && throw(ConnectionClosedError("pull subscription is closed"))
     (@lock psub.sub.client.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
-    nothing
+    _pull_fetch_heartbeat(expires, heartbeat)
 end
 
-function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeout, expires::Real=timeout)
-    _validate_pull_fetch(psub, batch, timeout, expires)
+function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeout, expires::Real=timeout,
+               heartbeat::Union{Nothing,Real}=nothing)
+    heartbeat_seconds = _validate_pull_fetch(psub, batch, timeout, expires, heartbeat)
     @lock psub.fetch_lock begin
         req = Dict{String,Any}("batch" => batch, "expires" => round(Int, expires * 1_000_000_000))
-        publish(psub.js.client, "$(psub.js.prefix).CONSUMER.MSG.NEXT.$(psub.stream).$(psub.consumer)", JSON3.write(req); reply=psub.deliver)
+        heartbeat_seconds > 0 && (req["idle_heartbeat"] = round(Int, heartbeat_seconds * 1_000_000_000))
+        !isnothing(psub.pin_id) && (req["pin_id"] = psub.pin_id)
+        request_subject = "$(psub.js.prefix).CONSUMER.MSG.NEXT.$(psub.stream).$(psub.consumer)"
+        publish(psub.js.client, request_subject, JSON3.write(req); reply=psub.deliver)
         msgs = Msg[]
         deadline = time() + timeout
+        heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
         while length(msgs) < batch && time() < deadline
-            remaining = max(0.001, deadline - time())
+            wait_deadline = min(deadline, heartbeat_deadline)
+            remaining = max(0.001, wait_deadline - time())
             try
                 msg = next(psub.sub; timeout=remaining)
-                code = _status_header(msg)
-                description = _status_description(msg)
-                if code == 100
+                heartbeat_seconds > 0 && (heartbeat_deadline = time() + 2 * heartbeat_seconds)
+                pin_id = header(msg, "Nats-Pin-Id")
+                !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
+                action, err = _jetstream_status_action(msg; request_subject)
+                if action in (:idle_heartbeat, :flow_control, :control)
                     continue
-                elseif code in (404, 408)
+                elseif action in (:no_messages, :timeout, :batch_completed)
                     break
-                elseif code == 409 && occursin("exceeded", lowercase(description))
-                    throw(JetStreamError(code, nothing, description))
-                elseif code == 409
-                    break
-                elseif !isnothing(code) && code >= 400
-                    throw(JetStreamError(code, nothing, description))
-                else
+                elseif action == :message
                     push!(msgs, msg)
+                else
+                    action == :consumer_deleted && (@lock psub.close_lock psub.server_deleted = true)
+                    action == :pin_id_mismatch && (psub.pin_id = nothing)
+                    throw(err)
                 end
             catch err
-                err isa TimeoutError ? break : rethrow()
+                if err isa TimeoutError
+                    if heartbeat_seconds > 0 && time() < deadline && time() >= heartbeat_deadline
+                        throw(_jetstream_heartbeat_error())
+                    end
+                    break
+                end
+                rethrow()
             end
         end
         msgs
@@ -694,10 +884,14 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         cfg["name"] = info.name
     end
     try
+        control_handler = _JetStreamPushControlHandler(_push_idle_heartbeat_seconds(info))
         sub = subscribe(js.client, String(cfg["deliver_subject"]); queue=local_queue, callback,
                         auto_ack=!manual_ack && !isnothing(callback),
-                        _control_handler=_JetStreamPushControlHandler())
-        PushSubscription(js, sub, stream, info.name, ReentrantLock(), delete_on_close, false)
+                        _control_handler=control_handler)
+        psub = PushSubscription(js, sub, String(stream), String(info.name), ReentrantLock(), delete_on_close, false,
+                                nothing, control_handler)
+        psub.heartbeat_task = _start_push_heartbeat_monitor(psub, control_handler)
+        psub
     catch err
         if delete_on_close
             try
@@ -723,7 +917,8 @@ function close(psub::PullSubscription)
     catch err
         push!(errors, err)
     end
-    if psub.delete_on_close
+    server_deleted = @lock psub.close_lock psub.server_deleted
+    if psub.delete_on_close && !server_deleted
         try
             consumer_delete(psub.js, psub.stream, psub.consumer)
         catch err
@@ -747,7 +942,10 @@ function close(psub::PushSubscription)
     catch err
         push!(errors, err)
     end
-    if psub.delete_on_close
+    _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task)
+    handler = psub.control_handler
+    server_deleted = !isnothing(handler) && (@lock handler.lock handler.consumer_deleted)
+    if psub.delete_on_close && !server_deleted
         try
             consumer_delete(psub.js, psub.stream, psub.consumer)
         catch err

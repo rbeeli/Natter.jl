@@ -12,8 +12,9 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | Direct APIs and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code. |
 | Flush and ping | Supported | Drains buffered outbound writes and uses PING/PONG synchronization. |
 | Drain and close | Supported | Drains subscriptions and reports cleanup failures. |
-| Automatic reconnect | Supported | Reconnects in the background, replays subscriptions, and flushes bounded pending publishes. |
-| Discovered servers | Supported | Server-discovered URLs are retained for reconnects. |
+| Automatic reconnect | Partial | Reconnects in the background, replays subscriptions, and flushes bounded pending publishes. Real-server coverage includes same-server reconnect and multi-URL failover; multi-node cluster chaos, discovered-route churn, and auth failover need more coverage before treating this as fully hardened cluster behavior. |
+| Discovered servers | Partial | Server-discovered URLs are retained for reconnects; discovered-route churn under cluster changes still needs real-server hardening. |
+| Server errors | Supported | Permission violations are reported without reconnecting; repeated auth failures abort reconnect with auth-specific errors. |
 | Slow consumer handling | Supported | Drops over-limit messages and reports `SlowConsumerError`. |
 | WebSocket transport | Not implemented | Planned only if there is clear demand. |
 
@@ -38,8 +39,8 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | Consumer CRUD and list APIs | Supported | Includes server-version-aware create subjects, strict create/update actions, and explicit create-or-update upsert. |
 | Publish acknowledgements | Supported | `js_publish` returns `PubAck`. |
 | Task handle helpers | Supported | Management, publish, message get/delete, consumer, fetch, close, and ack operations have `_async` helpers. |
-| Pull consumers | Supported | Durable and named consumers bind without mutation; missing consumers and random ephemerals are strictly created. Batch fetch and expiration handling are covered. |
-| Push consumers | Supported | Durable and named consumers bind without mutation; queue groups, callbacks, and manual or automatic acknowledgement are supported. Non-queue push consumers also support idle heartbeat filtering and flow-control replies. |
+| Pull consumers | Supported | Durable and named consumers bind without mutation; missing consumers and random ephemerals are strictly created. Batch fetch, expiration handling, idle heartbeat monitoring, and JetStream status/control error mapping are covered. |
+| Push consumers | Supported | Durable and named consumers bind without mutation; queue groups, callbacks, and manual or automatic acknowledgement are supported. Non-queue push consumers also support idle heartbeat filtering, missed-heartbeat reporting, flow-control replies, and lifecycle status reporting. |
 | Message acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, and `term`. |
 | Message get | Supported | Sequence, last by subject, next by subject, and direct get. |
 | Ordered consumers | Not implemented | Can be added later if needed. |

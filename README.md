@@ -59,10 +59,11 @@ that use INFO-first TLS upgrade. Certificate verification is enabled by default;
 `tls_verify=false` only when connecting to a trusted endpoint where verification is
 intentionally disabled.
 
-Core publishes issued while reconnecting are buffered and replayed after reconnect.
-If the transport fails after the server has accepted part of a write, replay can
-produce duplicate delivery. Use application idempotency or JetStream publish
-expectations/message IDs when exactly-once effects matter.
+Core publishes retained for reconnect replay are bounded by `pending_size`; this
+includes publishes issued while reconnecting and connected publishes that have not
+yet flushed successfully. If the transport fails after the server has accepted part
+of a write, replay can produce duplicate delivery. Use application idempotency or
+JetStream publish expectations/message IDs when exactly-once effects matter.
 
 `close(client)` is conservative for application cleanup paths: transport, task, and
 callback cleanup failures are reported through `error_cb` and warnings by default.

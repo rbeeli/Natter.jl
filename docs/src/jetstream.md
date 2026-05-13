@@ -140,6 +140,8 @@ for msg in fetch(sub, 10; timeout=2.0)
 end
 ```
 
+For fetches with `expires >= 10`, Natter requests JetStream idle heartbeats and reports missed heartbeats as `JetStreamError`. Use `heartbeat=0` to disable heartbeat monitoring or set a shorter positive heartbeat explicitly; `expires` must be at least twice the heartbeat.
+
 To process a fetched batch concurrently, use a structured `@sync` boundary:
 
 ```julia
@@ -165,7 +167,7 @@ close(sub)
 
 ## Push Consumers
 
-Push subscriptions deliver messages to a normal NATS subscription. Durable or named push consumers bind to existing consumers without updating server-side config; supplied config fields must match. Queue groups can be set with `queue` or `ConsumerConfig(deliver_group=...)`; when both are present, they must match. If no durable or name is supplied for a queue push subscription, the queue group is used as the durable consumer name so additional subscribers join the same server-side consumer. Set `manual_ack=true` when the callback will acknowledge messages itself.
+Push subscriptions deliver messages to a normal NATS subscription. Durable or named push consumers bind to existing consumers without updating server-side config; supplied config fields must match. Queue groups can be set with `queue` or `ConsumerConfig(deliver_group=...)`; when both are present, they must match. If no durable or name is supplied for a queue push subscription, the queue group is used as the durable consumer name so additional subscribers join the same server-side consumer. Non-queue push consumers with idle heartbeats report missed heartbeats through `error_cb`, ignore heartbeat control messages, and reply only to flow-control requests. Set `manual_ack=true` when the callback will acknowledge messages itself.
 
 ```julia
 sub = push_subscribe(js, "orders.created";

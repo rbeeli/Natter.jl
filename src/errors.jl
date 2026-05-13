@@ -28,10 +28,32 @@ struct ProtocolError <: NatterError
     message::String
 end
 
-struct AuthorizationError <: NatterError
+abstract type AuthenticationError <: NatterError end
+
+struct AuthorizationError <: AuthenticationError
     message::String
 end
 AuthorizationError() = AuthorizationError("authorization failed")
+
+struct AuthenticationExpiredError <: AuthenticationError
+    message::String
+end
+AuthenticationExpiredError() = AuthenticationExpiredError("authentication expired")
+
+struct AuthenticationRevokedError <: AuthenticationError
+    message::String
+end
+AuthenticationRevokedError() = AuthenticationRevokedError("authentication revoked")
+
+struct AccountAuthenticationExpiredError <: AuthenticationError
+    message::String
+end
+AccountAuthenticationExpiredError() = AccountAuthenticationExpiredError("account authentication expired")
+
+struct PermissionViolationError <: NatterError
+    message::String
+end
+PermissionViolationError() = PermissionViolationError("permissions violation")
 
 struct NoServersError <: NatterError
     message::String
@@ -118,6 +140,18 @@ function Base.showerror(io::IO, err::ProtocolError)
 end
 function Base.showerror(io::IO, err::AuthorizationError)
     print(io, "Natter.AuthorizationError: ", err.message)
+end
+function Base.showerror(io::IO, err::AuthenticationExpiredError)
+    print(io, "Natter.AuthenticationExpiredError: ", err.message)
+end
+function Base.showerror(io::IO, err::AuthenticationRevokedError)
+    print(io, "Natter.AuthenticationRevokedError: ", err.message)
+end
+function Base.showerror(io::IO, err::AccountAuthenticationExpiredError)
+    print(io, "Natter.AccountAuthenticationExpiredError: ", err.message)
+end
+function Base.showerror(io::IO, err::PermissionViolationError)
+    print(io, "Natter.PermissionViolationError: ", err.message)
 end
 function Base.showerror(io::IO, err::NoServersError)
     print(io, "Natter.NoServersError: ", err.message)

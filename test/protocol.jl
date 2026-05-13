@@ -37,6 +37,20 @@ using TestItems
     @test N._status_header(lower_status) == 404
     @test N._status_description(lower_status) == "missing"
 
+    parsed_headers = N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nTrace:abc\r\nTabbed:\tvalue\r\nSpaced:   value\r\nEmpty:\r\n: skipped\r\n\r\n"))
+    @test parsed_headers["Trace"] == ["abc"]
+    @test parsed_headers["Tabbed"] == ["value"]
+    @test parsed_headers["Spaced"] == ["value"]
+    @test parsed_headers["Empty"] == [""]
+    @test !haskey(parsed_headers, "")
+    @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nMalformed\r\n\r\n"))
+    @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nTrace: abc\r\n"))
+
+    malformed_hdr = TestHelpers.bytes("NATS/1.0\r\nMalformed\r\n\r\n")
+    malformed_payload = vcat(malformed_hdr, TestHelpers.bytes("body"))
+    malformed_raw = vcat(TestHelpers.bytes("HMSG events 9 $(length(malformed_hdr)) $(length(malformed_payload))\r\n"), malformed_payload, N.CRLF_BYTES)
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(malformed_raw))
+
     op, err = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("-ERR 'Authorization Violation'\r\n")))
     @test op == :ERR
     @test err == "Authorization Violation"

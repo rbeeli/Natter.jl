@@ -38,13 +38,50 @@ function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; bu
     nothing
 end
 
-_write_replayable_pub_frame(io::IO, frame::PublishFrame) = (_write_pub_frame(io, frame); false)
+_should_write_publish_direct(frame::PublishFrame, threshold::Int)::Bool =
+    threshold <= 0 || _serialized_size(frame) >= threshold
 
-function _write_replayable_pub_frame(io::BufferedWriteIO, frame::PublishFrame)
-    _ensure_open(io)
-    _write_pub_frame(io.replayable, frame)
+function _write_publish_frame(client::Client, io::IO, frame::PublishFrame; replayable::Bool=false, threshold::Int=0)
     _write_pub_frame(io, frame)
-    true
+    false
+end
+
+function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::PublishFrame; replayable::Bool=false, threshold::Int=0)
+    _ensure_open(io)
+    if _should_write_publish_direct(frame, threshold)
+        _flush_write_io(client, io)
+        transport = _underlying_transport(io)
+        _write_pub_frame(transport, frame)
+        flush(transport)
+        return false
+    end
+
+    start = position(io.buffer) + 1
+    range_count = length(io.replayable_ranges)
+    bytes = _pending_size(frame)
+    if replayable
+        _reserve_pending_bytes!(client, bytes)
+        try
+            push!(io.replayable_ranges, (start, start - 1))
+        catch
+            _release_pending_bytes!(client, bytes)
+            rethrow()
+        end
+    end
+    try
+        _write_pub_frame(io, frame)
+    catch
+        truncate(io.buffer, start - 1)
+        seekend(io.buffer)
+        resize!(io.replayable_ranges, range_count)
+        replayable && _release_pending_bytes!(client, bytes)
+        rethrow()
+    end
+    if replayable
+        io.replayable_ranges[end] = (start, position(io.buffer))
+        return true
+    end
+    false
 end
 
 function _write_publish(client::Client, frame::PublishFrame; force_flush::Bool=false,
@@ -52,7 +89,8 @@ function _write_publish(client::Client, frame::PublishFrame; force_flush::Bool=f
     @lock client.write_lock begin
         io = @lock client.lock client.write_io
         isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
-        captured = replayable ? _write_replayable_pub_frame(io, frame) : (_write_pub_frame(io, frame); false)
+        threshold = max(0, client.options.write_buffer_size)
+        captured = _write_publish_frame(client, io, frame; replayable, threshold)
         if !isnothing(replayable_captured)
             replayable_captured[] = captured
         end
@@ -81,6 +119,7 @@ function _send_publish(client::Client, frame::PublishFrame; buffer_on_reconnect:
         try
             _write_publish(client, frame; replayable=buffer_on_reconnect, replayable_captured)
         catch err
+            err isa OutboundBufferLimitError && rethrow()
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
                 if buffer_on_reconnect
                     replayable_captured[] || _enqueue_pending(client, frame)
@@ -138,15 +177,26 @@ _pending_size(frame::PublishFrame) = _serialized_size(frame)
 _write_pending(io::IO, data::Union{AbstractString,Vector{UInt8}}) = write(io, data)
 _write_pending(io::IO, frame::PublishFrame) = _write_pub_frame(io, frame)
 
+function _ensure_pending_enqueue_allowed_locked(client::Client)
+    st = client.status
+    st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING) && return nothing
+    st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
+    st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
+    st == ConnectionStatus.DRAINING && throw(ConnectionDrainingError())
+    throw(ConnectionReconnectingError())
+end
+
 function _enqueue_pending(client::Client, data)
     @lock client.lock begin
+        _ensure_pending_enqueue_allowed_locked(client)
         bytes = _pending_size(data)
-        projected = client.pending_bytes + bytes
-        if projected > client.options.pending_size
-            throw(OutboundBufferLimitError(client.options.pending_size, projected))
+        _reserve_pending_bytes_locked!(client, bytes)
+        try
+            _write_pending(client.pending, data)
+        catch
+            client.pending_bytes = max(0, client.pending_bytes - bytes)
+            rethrow()
         end
-        _write_pending(client.pending, data)
-        client.pending_bytes = projected
     end
 end
 
@@ -500,6 +550,8 @@ function close(client::Client; throw_errors::Bool=false)
             for sub in subs
                 sub.closed = true
             end
+        else
+            _clear_pending_buffer_locked!(client)
         end
     end
     already && return nothing
@@ -511,6 +563,7 @@ function close(client::Client; throw_errors::Bool=false)
         _close_subscription_channel!(errors, sub)
     end
     append!(errors, _close_transport(_take_transport!(client)...))
+    _clear_pending_buffer!(client)
     append!(errors, _stop_client_tasks!(client; timeout=min(5.0, max(0.5, client.options.connect_timeout + 0.2))))
     for sub in subs
         _wait_task!(errors, "stop subscription processor $(sub.sid)", sub.processor)

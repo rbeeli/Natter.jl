@@ -29,11 +29,11 @@ executes JetStream and KeyValue tests.
 | Flush | Supported | Implemented as a ping/pong round trip. |
 | Drain | Supported | Subscription and client drain are implemented with timeout and covered by real-server tests. |
 | Close | Supported | Closes tasks and transport without further reconnects. |
-| Reconnect | Partial | Automatic reconnect is enabled by default with server pool, discovered URLs, backoff, subscription replay, pending buffer restore-on-failure, and generation-bound background tasks. Core publishes are replayed after reconnect; duplicate delivery is possible if a transport fails after partial server acceptance. Cluster chaos coverage needs expansion. |
+| Reconnect | Partial | Automatic reconnect is enabled by default with server pool, discovered URLs, backoff, subscription replay, pending buffer restore-on-failure, and generation-bound background tasks. Core publishes are replayed after reconnect; duplicate delivery is possible if a transport fails after partial server acceptance. Real-server tests cover same-server reconnect and multi-URL failover through a local proxy; multi-node cluster chaos, discovered-route churn, and auth failover coverage still need expansion. |
 | Lame Duck Mode | Supported | Async INFO with `ldm=true` triggers reconnect. |
 | Max payload enforcement | Supported | Uses server `max_payload` from INFO. |
 | Slow consumer handling | Supported | Per-subscription pending message/byte limits raise `SlowConsumerError` through `error_cb`. |
-| Typed errors | Supported | Common connection, protocol, auth, buffer, timeout, slow consumer, and JetStream errors. |
+| Typed errors | Supported | Common connection, protocol, auth, permission, buffer, timeout, slow consumer, and JetStream errors. |
 | Optimized request inbox multiplexing | Supported | Requests share one wildcard inbox subscription per client and clean waiters on timeout, reconnect, and close. |
 
 ## Auth And Security
@@ -60,12 +60,12 @@ executes JetStream and KeyValue tests.
 | Message get/delete | Supported | Common API path. |
 | Typed consumer configs | Supported | `ConsumerConfig` covers current consumer schema fields with typed enums, duration conversion, local validation, and raw `Dict` escape hatch using the same duration units for known fields. |
 | Consumer create/update/info/list/delete | Supported | Common management APIs, including newer named consumer subjects and legacy durable subjects. `consumer_create` and `consumer_update` use strict server actions when supported; `consumer_create_or_update` is the explicit upsert API. Consumer info returns typed config plus raw response. |
-| Pull subscribe/fetch | Partial | Common batch fetch works; fetches on one pull subscription are serialized. Durable and named consumers bind without mutation and validate supplied config fields; random ephemeral consumers are strictly created and deleted on close. |
-| Push subscribe | Partial | Common durable/ephemeral delivery works; durable and named consumers bind without mutation and validate supplied config fields. Queue groups can be supplied through `queue` or `deliver_group`. Returned subscriptions are closable and random ephemeral consumers are deleted on close. |
+| Pull subscribe/fetch | Partial | Common batch fetch works; fetches on one pull subscription are serialized. Fetch maps JetStream status/control replies for no messages, timeouts, batch completion, max-bytes conflicts, consumer deletion, leadership changes, server shutdown, pin mismatches, and no responders. Durable and named consumers bind without mutation and validate supplied config fields; random ephemeral consumers are strictly created and deleted on close. |
+| Push subscribe | Partial | Common durable/ephemeral delivery works; durable and named consumers bind without mutation and validate supplied config fields. Queue groups can be supplied through `queue` or `deliver_group`. Push status/control messages are handled internally, flow control is answered only for flow-control requests, consumer deletion/leadership statuses are reported through `error_cb`, and returned subscriptions are closable. Random ephemeral consumers are deleted on close. |
 | Manual ack APIs | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, and `term`. |
 | JetStream message metadata | Supported | V1 and domain-aware V2 ack metadata parsing. |
 | Ordered consumers | Not implemented | Ordered consumer helpers and reset handling are intentionally absent for now. |
-| Flow control / heartbeats | Supported | Pull fetch consumes status messages; non-queue push consumers hide idle heartbeats and answer flow-control requests internally. |
+| Flow control / heartbeats | Supported | Pull fetch consumes status/control messages and monitors requested idle heartbeats. Non-queue push consumers hide idle heartbeats, report missed heartbeats through `error_cb`, and answer flow-control requests internally. |
 | Object Store | Planned | Not implemented in the first milestone. |
 | Direct get | Supported | `stream_message_get(...; direct=true)` supports sequence, last-by-subject, and next-by-subject direct reads. KeyValue stores remember `allow_direct` and use direct reads automatically. |
 | Stream templates | Ignored as esoteric | Legacy/rare API surface. |
@@ -105,4 +105,4 @@ executes JetStream and KeyValue tests.
 - Services/micro framework.
 - Full ordered-consumer automatic reset behavior.
 - Dedicated JetStream publish batching and pending-window APIs beyond `NatterTask` concurrency and reconnect buffering.
-- Cluster chaos tests covering server pool rotation, discovered routes, and failover under load.
+- Cluster chaos tests covering discovered route churn, auth failover, and failover under load.

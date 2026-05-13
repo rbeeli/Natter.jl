@@ -37,7 +37,9 @@ export kv_create, kv_open, kv_delete_bucket, kv_status, kv_get, kv_put, kv_creat
 export kv_create_async, kv_open_async, kv_delete_bucket_async, kv_status_async, kv_get_async, kv_put_async, kv_create_key_async, kv_update_async
 export kv_delete_async, kv_purge_async, kv_history_async, kv_keys_async, kv_watch_async
 export NatterError, TimeoutError, NoRespondersError, ConnectionClosedError, ConnectionReconnectingError
-export ConnectionDrainingError, ProtocolError, AuthorizationError, NoServersError, MaxPayloadError
+export ConnectionDrainingError, ProtocolError, AuthenticationError, AuthorizationError
+export AuthenticationExpiredError, AuthenticationRevokedError, AccountAuthenticationExpiredError, PermissionViolationError
+export NoServersError, MaxPayloadError
 export OutboundBufferLimitError, SlowConsumerError, JetStreamError, KeyValueError, KeyValueKeyNotFoundError
 export KeyValueKeyDeletedError, KeyValueWrongRevisionError, KeyValueKeyExistsError, UnsupportedFeatureError, CleanupError
 

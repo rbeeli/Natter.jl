@@ -233,7 +233,8 @@ function _parse_headers(raw::AbstractVector{UInt8})
     h = Headers()
     isempty(raw) && return h
     text = String(raw)
-    lines = split(text, CRLF; keepempty=false)
+    occursin("\r\n\r\n", text) || throw(ProtocolError("NATS header block missing terminator"))
+    lines = split(text, CRLF; keepempty=true)
     isempty(lines) && return h
     protocol_line = first(lines)
     startswith(protocol_line, "NATS/1.0") || throw(ProtocolError("invalid NATS header block"))
@@ -243,13 +244,18 @@ function _parse_headers(raw::AbstractVector{UInt8})
         length(status_parts) >= 3 && (h["Description"] = [String(status_parts[3])])
     end
     for line in Iterators.drop(lines, 1)
-        isempty(line) && continue
-        idx = findfirst(": ", line)
+        isempty(line) && break
+        idx = findfirst(==(':'), line)
         if isnothing(idx)
-            continue
+            throw(ProtocolError("malformed NATS header line"))
         end
-        key = String(line[firstindex(line):prevind(line, first(idx))])
-        value = String(line[nextind(line, last(idx)):lastindex(line)])
+        idx == firstindex(line) && continue
+        value_start = nextind(line, idx)
+        while value_start <= lastindex(line) && line[value_start] in (' ', '\t')
+            value_start = nextind(line, value_start)
+        end
+        key = String(line[firstindex(line):prevind(line, idx)])
+        value = value_start <= lastindex(line) ? String(line[value_start:lastindex(line)]) : ""
         push!(get!(h, key, String[]), value)
     end
     h

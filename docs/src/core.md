@@ -13,8 +13,8 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `no_echo` | `false` | Prevent this connection from receiving its own publishes. |
 | `connect_timeout` | `2.0` | Socket and handshake timeout in seconds. |
 | `allow_reconnect` | `true` | Enable automatic reconnect after transient failures. |
-| `pending_size` | `2 MiB` | Maximum buffered outbound publish data while reconnecting. |
-| `write_buffer_size` | `32 KiB` | Outbound write buffer size before a foreground write forces a transport flush. |
+| `pending_size` | `2 MiB` | Maximum outbound publish data retained for reconnect replay, including unflushed connected publishes. |
+| `write_buffer_size` | `32 KiB` | Outbound write buffer size for coalescing small writes. Set to `0` to disable it; publish frames at or above this size bypass the buffer. |
 | `max_control_line` | `16 KiB` | Maximum inbound protocol control line length. |
 | `max_inbound_payload` | `64 MiB` | Maximum inbound message payload allocation. |
 | `max_header_bytes` | `64 KiB` | Maximum inbound header block size. |
@@ -63,7 +63,7 @@ publish(client, "events.created"; headers=Dict("trace-id" => "abc-123"))
 
 Payloads are converted to bytes. `String`, `Vector{UInt8}`, `AbstractVector{UInt8}`, and `nothing` are supported by the public API.
 
-`publish` validates subjects and server `max_payload`. Connected clients use a buffered write flusher for throughput; call `flush(client)` when the application needs a server round trip confirming earlier commands were processed. If the client is reconnecting, publish data is buffered up to `pending_size` and replayed after reconnect.
+`publish` validates subjects and server `max_payload`. Connected clients use a buffered write flusher for throughput; call `flush(client)` when the application needs a server round trip confirming earlier commands were processed. Publish data retained for reconnect replay, whether queued during reconnect or still unflushed on a connected transport, is bounded by `pending_size` and replayed after reconnect.
 
 ## Subscribe
 
