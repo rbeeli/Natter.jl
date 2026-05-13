@@ -5,10 +5,11 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 ## Core NATS
 
 | Feature | Status | Notes |
-| --- | --- | --- |
+| :--- | :--- | :--- |
 | Connect handshake | Supported | Includes authentication fields, client name, no echo, TLS requirements, and server INFO parsing. |
 | Publish and subscribe | Supported | Includes wildcards, queue groups, headers, max payload checks, and per-subscription pending limits. |
-| Request reply | Supported | Uses temporary inbox subscriptions and maps no-responder status to `NoRespondersError`. |
+| Request reply | Supported | Uses a shared request inbox mux and maps no-responder status to `NoRespondersError`. |
+| Direct APIs and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code. |
 | Flush and ping | Supported | Uses PING/PONG synchronization. |
 | Drain and close | Supported | Drains subscriptions and reports cleanup failures. |
 | Automatic reconnect | Supported | Reconnects in the background, replays subscriptions, and flushes bounded pending publishes. |
@@ -19,7 +20,7 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 ## TLS And Security
 
 | Feature | Status | Notes |
-| --- | --- | --- |
+| :--- | :--- | :--- |
 | TLS-first handshake | Supported | `tls://` defaults to TLS before INFO. |
 | INFO-first TLS upgrade | Supported | Use `tls_first=false` for deployments that require it. |
 | CA and client certificates | Supported | `tls_ca_path`, `tls_cert_path`, and `tls_key_path`. |
@@ -29,15 +30,16 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 ## JetStream
 
 | Feature | Status | Notes |
-| --- | --- | --- |
+| :--- | :--- | :--- |
 | Typed stream configs | Supported | Mirrors known stream schema fields with Julia structs and EnumX enums. |
 | Typed consumer configs | Supported | Mirrors known consumer schema fields with Julia structs and EnumX enums. |
 | Raw config dictionaries | Supported | Escape hatch for newer server fields. |
 | Stream CRUD and list APIs | Supported | Includes pagination. |
-| Consumer CRUD and list APIs | Supported | Includes server-version-aware create subjects. |
+| Consumer CRUD and list APIs | Supported | Includes server-version-aware create subjects, strict create/update actions, and explicit create-or-update upsert. |
 | Publish acknowledgements | Supported | `js_publish` returns `PubAck`. |
-| Pull consumers | Supported | Durable and ephemeral consumers, batch fetch, and expiration handling. |
-| Push consumers | Supported | Queue groups, callbacks, and manual or automatic acknowledgement. |
+| Task handle helpers | Supported | Management, publish, message get/delete, consumer, fetch, close, and ack operations have `_async` helpers. |
+| Pull consumers | Supported | Durable and named consumers bind without mutation; missing consumers and random ephemerals are strictly created. Batch fetch and expiration handling are covered. |
+| Push consumers | Supported | Durable and named consumers bind without mutation; queue groups, callbacks, and manual or automatic acknowledgement are supported. Non-queue push consumers also support idle heartbeat filtering and flow-control replies. |
 | Message acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, and `term`. |
 | Message get | Supported | Sequence, last by subject, next by subject, and direct get. |
 | Ordered consumers | Not implemented | Can be added later if needed. |
@@ -46,10 +48,11 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 ## KeyValue
 
 | Feature | Status | Notes |
-| --- | --- | --- |
+| :--- | :--- | :--- |
 | Bucket create/open/delete | Supported | Backed by JetStream streams. |
 | Put/create/update | Supported | Includes optimistic revision checks. |
 | Get by latest or revision | Supported | Direct reads are used when bucket direct access is enabled. |
 | Delete and purge | Supported | Uses KeyValue operation headers. |
 | History and keys | Supported | Implemented through pull consumers. |
 | Watch | Supported | Implemented through push consumers. |
+| Task handle helpers | Supported | Bucket, key, history, keys, and watch operations have `_async` helpers. |

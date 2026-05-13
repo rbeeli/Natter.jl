@@ -69,6 +69,17 @@ sub = subscribe(client, "orders.created") do msg
 end
 ```
 
+Run independent work concurrently with Julia tasks:
+
+```julia
+@sync begin
+    @async publish(client, "orders.created", "order-1002")
+    @async publish(client, "orders.created", "order-1003")
+end
+
+flush(client)
+```
+
 ## Close Cleanly
 
 Use `drain` when a service is shutting down and should finish in-flight messages first. Use `close` for immediate teardown.

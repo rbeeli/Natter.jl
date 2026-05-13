@@ -33,3 +33,15 @@ catch err
     end
 end
 ```
+
+Fan out independent requests with Julia tasks:
+
+```julia
+time_response = Ref{Msg}()
+date_response = Ref{Msg}()
+
+@sync begin
+    @async time_response[] = request(client, "time.now", ""; timeout=1.0)
+    @async date_response[] = request(client, "date.today", ""; timeout=1.0)
+end
+```

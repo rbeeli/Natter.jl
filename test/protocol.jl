@@ -7,8 +7,8 @@ using TestItems
 
     op, data = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("INFO {\"server_id\":\"srv\",\"max_payload\":64}\r\n")))
     @test op == :INFO
-    @test data["server_id"] == "srv"
-    @test data["max_payload"] == 64
+    @test data isa N.ServerInfo
+    @test data.max_payload == 64
 
     op, msg = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\n")))
     @test op == :MSG
@@ -34,6 +34,24 @@ using TestItems
     op, err = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("-ERR 'Authorization Violation'\r\n")))
     @test op == :ERR
     @test err == "Authorization Violation"
+
+    reader = N.ProtocolReader(IOBuffer(TestHelpers.bytes("PING\r\nPONG\r\n")))
+    @test first(N._read_control_or_msg(reader)) == :PING
+    @test first(N._read_control_or_msg(reader)) == :PONG
+end
+
+@testitem "protocol parser enforces configured resource limits" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(TestHelpers.bytes("PING\r\n")); max_control_line=3)
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 1 5\r\nhello\r\n")); max_payload=4)
+
+    hdr = N._headers_bytes(Headers("Trace" => ["abc"]))
+    payload = vcat(hdr, TestHelpers.bytes("body"))
+    raw = vcat(TestHelpers.bytes("HMSG events 9 $(length(hdr)) $(length(payload))\r\n"), payload, N.CRLF_BYTES)
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(raw); max_header_bytes=length(hdr) - 1)
 end
 
 @testitem "protocol writer" setup=[TestHelpers] begin
@@ -52,7 +70,7 @@ end
     @test_throws ArgumentError N._headers_bytes(Headers("Good" => ["bad\r\nvalue"]))
 
     client = TestHelpers.fake_client()
-    connect_cmd = N._connect_command(client, Dict{String,Any}(), nothing, nothing)
+    connect_cmd = N._connect_command(client, N.ServerInfo(), nothing, nothing)
     m = match(r"^CONNECT (.*)\r\n$", connect_cmd)
     @test m !== nothing
     body = JSON3.read(only(m.captures))
@@ -61,7 +79,7 @@ end
     @test body.lang == "julia"
 
     token_client = TestHelpers.fake_client()
-    token_cmd = N._connect_command(token_client, Dict{String,Any}(), "secret", nothing)
+    token_cmd = N._connect_command(token_client, N.ServerInfo(), "secret", nothing)
     token_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", token_cmd).captures))
     @test token_body.auth_token == "secret"
 end

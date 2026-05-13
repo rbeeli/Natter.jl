@@ -36,3 +36,15 @@ close(client)
 ```
 
 `kv_get(kv, key; direct=false)` can force the management API path for troubleshooting or compatibility.
+
+Independent KeyValue reads can run concurrently with Julia tasks:
+
+```julia
+name = Ref{Msg}()
+email = Ref{Msg}()
+
+@sync begin
+    @async name[] = kv_get(kv, "users.42.name")
+    @async email[] = kv_get(kv, "users.42.email")
+end
+```

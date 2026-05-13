@@ -47,3 +47,21 @@ close(client)
 ```
 
 For long-running workers, fetch in a loop and stop on your service shutdown signal. Use `in_progress(msg)` for jobs that need longer than `ack_wait`.
+
+To process a fetched batch concurrently, keep the same Natter calls and add a Julia task boundary:
+
+```julia
+msgs = fetch(worker, 20; timeout=2.0)
+
+@sync for msg in msgs
+    @async begin
+        try
+            job_id = parse(Int, String(msg.data))
+            @info "processing job" job_id
+            ack(msg)
+        catch err
+            nak(msg; delay=1.0)
+        end
+    end
+end
+```

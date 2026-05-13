@@ -24,9 +24,34 @@ using TestItems
             end
             response = request(client, "$subject.req", "ok"; timeout=2.0)
             @test String(response) == "OK"
+            async_response = fetch(request_async(client, "$subject.req", "async"; timeout=2.0))
+            @test String(async_response) == "ASYNC"
             close(service)
 
             @test_throws NoRespondersError request(client, "$subject.none", ""; timeout=2.0)
+            @test_throws NoRespondersError fetch(request_async(client, "$subject.none", ""; timeout=2.0))
+
+            slow_started = Channel{Bool}(1)
+            slow_service = subscribe(client, "$subject.slow") do req
+                put!(slow_started, true)
+                sleep(0.3)
+                publish(client, req.reply, "late")
+            end
+            before_timeout_sids = sort(collect(keys(client.subscriptions)))
+            @test_throws TimeoutError request(client, "$subject.slow", "slow"; timeout=0.05)
+            @test timedwait(1.0; pollint=0.01) do
+                isready(slow_started)
+            end != :timed_out
+            @test sort(collect(keys(client.subscriptions))) == before_timeout_sids
+            sleep(0.4)
+            @test sort(collect(keys(client.subscriptions))) == before_timeout_sids
+            close(slow_service)
+
+            async_sub = fetch(subscribe_async(client, "$subject.async"))
+            fetch(publish_async(client, "$subject.async", "from task"))
+            fetch(flush_async(client; timeout=2.0))
+            @test String(fetch(next_async(async_sub; timeout=2.0))) == "from task"
+            fetch(unsubscribe_async(async_sub))
 
             close(client.socket)
             result = timedwait(5.0; pollint=0.05) do
@@ -114,17 +139,143 @@ end
             direct_next = stream_message_get(js, stream; seq=pa.seq + 1, subject, next_by_subject=true, direct=true)
             @test direct_next.subject == subject
             @test String(direct_next) == "payload2"
+            pa_async = fetch(js_publish_async(js, subject, "async-payload"; stream=stream))
+            @test pa_async.stream == stream
+            async_direct = fetch(stream_message_get_async(js, stream; seq=pa_async.seq, direct=true))
+            @test String(async_direct) == "async-payload"
 
             durable = "DUR_$(randstring(6))"
-            psub = pull_subscribe(js, subject; stream=stream, durable)
+            psub = pull_subscribe(js, subject; stream=stream, durable, config=ConsumerConfig(max_ack_pending=33))
             cinfo = consumer_info(js, stream, durable)
             @test cinfo.config isa ConsumerConfig
             @test cinfo.config.durable_name == durable
+            @test cinfo.config.max_ack_pending == 33
+            @test_throws JetStreamError consumer_create(js, stream, ConsumerConfig(
+                name=durable,
+                durable_name=durable,
+                filter_subject=subject,
+                max_ack_pending=44,
+            ))
+            @test consumer_info(js, stream, durable).config.max_ack_pending == 33
+            @test_throws ArgumentError pull_subscribe(js, subject; stream=stream, durable, config=ConsumerConfig(max_ack_pending=44))
+            @test consumer_info(js, stream, durable).config.max_ack_pending == 33
+            missing_durable = "MISSING_$(randstring(6))"
+            @test_throws JetStreamError consumer_update(js, stream, ConsumerConfig(
+                name=missing_durable,
+                durable_name=missing_durable,
+                filter_subject=subject,
+                ack_policy=AckPolicy.EXPLICIT,
+            ))
+            @test_throws ArgumentError fetch(psub, 1; timeout=0.0)
             msgs = fetch(psub, 1; timeout=2.0)
             @test length(msgs) == 1
             @test String(first(msgs)) == "payload"
             ack(first(msgs))
             close(psub)
+            bound_psub = pull_subscribe(js, subject; stream=stream, durable)
+            try
+                @test bound_psub.consumer == durable
+                @test consumer_info(js, stream, durable).config.max_ack_pending == 33
+            finally
+                close(bound_psub)
+            end
+
+            async_durable = "DURASYNC_$(randstring(6))"
+            async_psub = fetch(pull_subscribe_async(js, subject; stream=stream, durable=async_durable))
+            async_msgs = fetch(fetch_async(async_psub, 1; timeout=2.0))
+            @test length(async_msgs) == 1
+            fetch(ack_async(first(async_msgs)))
+            fetch(close_async(async_psub))
+
+            heartbeat_subject = "$subject_root.heartbeat"
+            heartbeat_sub = push_subscribe(js, heartbeat_subject; stream=stream,
+                                           config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW,
+                                                                 ack_policy=AckPolicy.EXPLICIT,
+                                                                 idle_heartbeat=0.1))
+            try
+                @test_throws TimeoutError next(heartbeat_sub.sub; timeout=0.35)
+            finally
+                close(heartbeat_sub)
+            end
+
+            flow_subject = "$subject_root.flow"
+            flow_sub = push_subscribe(js, flow_subject; stream=stream,
+                                      config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW,
+                                                            ack_policy=AckPolicy.EXPLICIT,
+                                                            flow_control=true,
+                                                            idle_heartbeat=0.1))
+            try
+                js_publish(js, flow_subject, "flow-control"; stream=stream)
+                msg = next(flow_sub.sub; timeout=2.0)
+                @test msg.subject == flow_subject
+                @test String(msg) == "flow-control"
+                ack(msg)
+            finally
+                close(flow_sub)
+            end
+
+            queue_subject = "$subject_root.queue"
+            queue_consumer = "QUEUE_$(randstring(6))"
+            queue_sub = push_subscribe(js, queue_subject; stream=stream,
+                                       config=ConsumerConfig(name=queue_consumer,
+                                                             durable_name=queue_consumer,
+                                                             deliver_group="workers",
+                                                             deliver_policy=DeliverPolicy.NEW,
+                                                             ack_policy=AckPolicy.EXPLICIT))
+            try
+                flush(client; timeout=2.0)
+                js_publish(js, queue_subject, "queue-config"; stream=stream)
+                msg = next(queue_sub.sub; timeout=2.0)
+                @test msg.subject == queue_subject
+                @test String(msg) == "queue-config"
+                ack(msg)
+            finally
+                close(queue_sub)
+            end
+
+            queue_only_subject = "$subject_root.queue-only"
+            queue_group = "QONLY_$(randstring(6))"
+            queue_only_sub1 = push_subscribe(js, queue_only_subject; stream=stream,
+                                             queue=queue_group,
+                                             config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW,
+                                                                   ack_policy=AckPolicy.EXPLICIT))
+            queue_only_sub2 = push_subscribe(js, queue_only_subject; stream=stream,
+                                             queue=queue_group,
+                                             config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW,
+                                                                   ack_policy=AckPolicy.EXPLICIT))
+            try
+                @test queue_only_sub1.consumer == queue_group
+                @test queue_only_sub2.consumer == queue_group
+                queue_only_info = consumer_info(js, stream, queue_group)
+                @test queue_only_info.config.durable_name == queue_group
+                @test queue_only_info.config.deliver_group == queue_group
+
+                flush(client; timeout=2.0)
+                payloads = ["queue-only-$i" for i in 1:4]
+                for payload in payloads
+                    js_publish(js, queue_only_subject, payload; stream=stream)
+                end
+
+                received = String[]
+                deadline = time() + 3.0
+                while length(received) < length(payloads) && time() < deadline
+                    for sub in (queue_only_sub1.sub, queue_only_sub2.sub)
+                        try
+                            msg = next(sub; timeout=0.05)
+                            push!(received, String(msg))
+                            ack(msg)
+                        catch err
+                            err isa TimeoutError || rethrow()
+                        end
+                    end
+                end
+                @test sort(received) == payloads
+                @test_throws TimeoutError next(queue_only_sub1.sub; timeout=0.1)
+                @test_throws TimeoutError next(queue_only_sub2.sub; timeout=0.1)
+            finally
+                close(queue_only_sub1)
+                close(queue_only_sub2)
+            end
 
             bucket = "NATTERKV_$(randstring(8))"
             kv[] = kv_create(js, bucket; storage="memory", direct=true)
@@ -136,6 +287,11 @@ end
                 @test String(kv_get(kv[], "alpha"; revision=pa2.seq)) == "one"
                 kv_update(kv[], "alpha", "two", pa2.seq)
                 @test String(kv_get(kv[], "alpha")) == "two"
+                pa3 = fetch(kv_put_async(kv[], "beta", "async-one"))
+                @test pa3.seq >= 1
+                @test String(fetch(kv_get_async(kv[], "beta"))) == "async-one"
+                fetch(kv_delete_async(kv[], "beta"))
+                @test_throws KeyError fetch(kv_get_async(kv[], "beta"))
                 kv_delete(kv[], "alpha")
                 @test_throws KeyError kv_get(kv[], "alpha")
                 @test !("alpha" in kv_keys(kv[]))

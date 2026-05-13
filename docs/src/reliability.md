@@ -1,6 +1,6 @@
 # Reliability And TLS
 
-Natter.jl is synchronous at the public API boundary and task-based internally. Connection readers, ping timers, reconnects, and subscription callbacks run in background tasks owned by the client.
+Natter.jl uses Julia tasks for connection readers, ping timers, reconnects, subscription callbacks, and explicit async handles. Application code can usually call Natter directly inside web handlers, workers, and other Julia tasks; use `@sync` and `@async` when independent work should run concurrently.
 
 ## Automatic Reconnect
 
@@ -22,9 +22,15 @@ client = connect([
     reconnect_jitter=0.2,
     max_reconnect_attempts=-1,
     pending_size=8 * 1024 * 1024,
-    disconnected_cb=() -> @warn("NATS disconnected"),
-    reconnected_cb=() -> @info("NATS reconnected"),
-    error_cb=err -> @error("NATS client error" exception=err),
+    disconnected_cb=() -> begin
+        @warn "NATS disconnected"
+    end,
+    reconnected_cb=() -> begin
+        @info "NATS reconnected"
+    end,
+    error_cb=err -> begin
+        @error "NATS client error" exception=err
+    end,
 )
 ```
 

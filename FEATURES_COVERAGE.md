@@ -23,7 +23,8 @@ executes JetStream and KeyValue tests.
 | PUB / HPUB / SUB / UNSUB | Supported | Headers and queue groups included. |
 | Wildcard subscriptions | Supported | `*` and terminal `>` subscriptions are validated. Publish subjects reject wildcards. |
 | MSG / HMSG parser | Supported | Streaming line/payload parser written from scratch. |
-| Request/reply | Supported | Uses per-request inboxes; multiplexed request inbox optimization is planned. |
+| Request/reply | Supported | Uses a shared request inbox mux with per-request waiters. |
+| Direct public API and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code and `fetch(handle)` returns the sync result or rethrows the original operation error. |
 | No responders | Supported | Status `503` replies become `NoRespondersError`. |
 | Flush | Supported | Implemented as a ping/pong round trip. |
 | Drain | Supported | Subscription and client drain are implemented with timeout and covered by real-server tests. |
@@ -33,7 +34,7 @@ executes JetStream and KeyValue tests.
 | Max payload enforcement | Supported | Uses server `max_payload` from INFO. |
 | Slow consumer handling | Supported | Per-subscription pending message/byte limits raise `SlowConsumerError` through `error_cb`. |
 | Typed errors | Supported | Common connection, protocol, auth, buffer, timeout, slow consumer, and JetStream errors. |
-| Optimized request inbox multiplexing | Planned | Current requests use one inbox subscription per request. |
+| Optimized request inbox multiplexing | Supported | Requests share one wildcard inbox subscription per client and clean waiters on timeout, reconnect, and close. |
 
 ## Auth And Security
 
@@ -53,18 +54,18 @@ executes JetStream and KeyValue tests.
 |---|---:|---|
 | JetStream context | Supported | `jetstream(client)` creates a context. |
 | Publish with ack | Supported | Parses `PubAck` and API errors. |
-| Async publish | Partial | Returns Julia `Task`; pending-window management is basic. |
+| Task handle helpers | Supported | JetStream management, publish, message get/delete, consumers, fetch, close, and ack operations have `_async` helpers returning `NatterTask`. |
 | Typed stream configs | Supported | `StreamConfig` covers current stream schema fields with typed nested structs, enums, duration conversion, and raw `Dict` escape hatch. |
 | Stream create/update/info/list/names/purge/delete | Supported | Common management APIs, including list pagination. Stream info returns typed config plus raw response. |
 | Message get/delete | Supported | Common API path. |
 | Typed consumer configs | Supported | `ConsumerConfig` covers current consumer schema fields with typed enums, duration conversion, local validation, and raw `Dict` escape hatch. |
-| Consumer create/update/info/list/delete | Supported | Common management APIs, including newer named consumer subjects and legacy durable subjects. Consumer info returns typed config plus raw response. |
-| Pull subscribe/fetch | Partial | Common batch fetch works; fetches on one pull subscription are serialized and ephemeral consumers are deleted on close. |
-| Push subscribe | Partial | Common durable/ephemeral delivery works; returned subscriptions are closable and ephemeral consumers are deleted on close. Ordered reset/flow-control coverage is still limited. |
+| Consumer create/update/info/list/delete | Supported | Common management APIs, including newer named consumer subjects and legacy durable subjects. `consumer_create` and `consumer_update` use strict server actions when supported; `consumer_create_or_update` is the explicit upsert API. Consumer info returns typed config plus raw response. |
+| Pull subscribe/fetch | Partial | Common batch fetch works; fetches on one pull subscription are serialized. Durable and named consumers bind without mutation and validate supplied config fields; random ephemeral consumers are strictly created and deleted on close. |
+| Push subscribe | Partial | Common durable/ephemeral delivery works; durable and named consumers bind without mutation and validate supplied config fields. Queue groups can be supplied through `queue` or `deliver_group`. Returned subscriptions are closable and random ephemeral consumers are deleted on close. |
 | Manual ack APIs | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, and `term`. |
 | JetStream message metadata | Supported | V1 and domain-aware V2 ack metadata parsing. |
-| Ordered consumers | Partial | Common setup exists; automatic recovery needs more chaos testing. |
-| Flow control / heartbeats | Partial | Control messages are recognized in common paths; full push-consumer coverage is planned. |
+| Ordered consumers | Not implemented | Ordered consumer helpers and reset handling are intentionally absent for now. |
+| Flow control / heartbeats | Supported | Pull fetch consumes status messages; non-queue push consumers hide idle heartbeats and answer flow-control requests internally. |
 | Object Store | Planned | Not implemented in the first milestone. |
 | Direct get | Supported | `stream_message_get(...; direct=true)` supports sequence, last-by-subject, and next-by-subject direct reads. KeyValue stores remember `allow_direct` and use direct reads automatically. |
 | Stream templates | Ignored as esoteric | Legacy/rare API surface. |
@@ -79,6 +80,7 @@ executes JetStream and KeyValue tests.
 | Keys/history | Partial | Common paths implemented with temporary consumer cleanup and looped fetches. |
 | Watch/watchall | Partial | Callback watcher implemented with a closable push subscription; default watch delivers last value per subject plus updates. |
 | Direct get | Supported | `kv_create(...; direct=true)` enables direct reads, `kv_open` detects existing direct buckets, and `kv_get` uses direct access by default when available. |
+| Task handle helpers | Supported | Bucket, key, history, keys, and watch operations have `_async` helpers returning `NatterTask`. |
 
 ## Services / Micro
 
@@ -102,6 +104,5 @@ executes JetStream and KeyValue tests.
 - Object Store.
 - Services/micro framework.
 - Full ordered-consumer automatic reset behavior.
-- Full JetStream flow-control and heartbeat coverage for push consumers.
-- Publish-async pending windows and error aggregation comparable to mature clients.
+- Dedicated JetStream publish batching and pending-window APIs beyond `NatterTask` concurrency and reconnect buffering.
 - Cluster chaos tests covering server pool rotation, discovered routes, and failover under load.

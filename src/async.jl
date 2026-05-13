@@ -1,0 +1,200 @@
+"""
+    *_async(...)
+
+Run the matching synchronous operation in a Julia task and return a `NatterTask`.
+Use `fetch(handle)` to get the same return value as the synchronous operation, or
+to rethrow the original operation exception. These helpers intentionally share
+the synchronous implementation so reconnect, cleanup, validation, and timeout
+behavior stay identical across both API styles.
+"""
+struct NatterTask
+    task::Task
+end
+
+function _task_failure(task::Task)
+    exceptions = Base.current_exceptions(task)
+    isempty(exceptions) ? nothing : first(exceptions).exception
+end
+
+function _rethrow_task_failure(task::Task)
+    err = _task_failure(task)
+    isnothing(err) ? throw(TaskFailedException(task)) : throw(err)
+end
+
+function Base.wait(handle::NatterTask)
+    try
+        wait(handle.task)
+    catch err
+        err isa TaskFailedException || rethrow()
+        _rethrow_task_failure(handle.task)
+    end
+    handle
+end
+
+function Base.fetch(handle::NatterTask)
+    wait(handle)
+    fetch(handle.task)
+end
+
+Base.istaskdone(handle::NatterTask) = istaskdone(handle.task)
+Base.istaskfailed(handle::NatterTask) = istaskfailed(handle.task)
+Base.show(io::IO, handle::NatterTask) = print(io, "NatterTask(", handle.task, ")")
+
+function _natter_async(f::F, args...; kwargs...)::NatterTask where {F}
+    NatterTask(@async f(args...; kwargs...))
+end
+
+connect_async(url_or_urls=nothing; kwargs...)::NatterTask = _natter_async(connect, url_or_urls; kwargs...)
+
+publish_async(client::Client, subject::AbstractString, data=nothing; kwargs...)::NatterTask =
+    _natter_async(publish, client, subject, data; kwargs...)
+
+subscribe_async(client::Client, subject::AbstractString; kwargs...)::NatterTask =
+    _natter_async(subscribe, client, subject; kwargs...)
+
+subscribe_async(callback::Function, client::Client, subject::AbstractString; kwargs...)::NatterTask =
+    _natter_async(subscribe, callback, client, subject; kwargs...)
+
+unsubscribe_async(sub::Subscription; kwargs...)::NatterTask =
+    _natter_async(unsubscribe, sub; kwargs...)
+
+next_async(sub::Subscription; kwargs...)::NatterTask =
+    _natter_async(next, sub; kwargs...)
+
+request_async(client::Client, subject::AbstractString, data=nothing; kwargs...)::NatterTask =
+    _natter_async(request, client, subject, data; kwargs...)
+
+flush_async(client::Client; kwargs...)::NatterTask =
+    _natter_async(flush, client; kwargs...)
+
+ping_async(client::Client; kwargs...)::NatterTask =
+    _natter_async(ping, client; kwargs...)
+
+drain_async(client::Client; kwargs...)::NatterTask =
+    _natter_async(drain, client; kwargs...)
+
+drain_async(sub::Subscription; kwargs...)::NatterTask =
+    _natter_async(drain, sub; kwargs...)
+
+close_async(client::Client; kwargs...)::NatterTask =
+    _natter_async(close, client; kwargs...)
+
+close_async(sub::Subscription; kwargs...)::NatterTask =
+    _natter_async(close, sub; kwargs...)
+
+js_publish_async(js::JetStreamContext, subject::AbstractString, data=nothing; kwargs...)::NatterTask =
+    _natter_async(js_publish, js, subject, data; kwargs...)
+
+publish_async(js::JetStreamContext, subject::AbstractString, data=nothing; kwargs...)::NatterTask =
+    js_publish_async(js, subject, data; kwargs...)
+
+stream_create_async(js::JetStreamContext, config; kwargs...)::NatterTask =
+    _natter_async(stream_create, js, config; kwargs...)
+
+stream_update_async(js::JetStreamContext, config; kwargs...)::NatterTask =
+    _natter_async(stream_update, js, config; kwargs...)
+
+stream_info_async(js::JetStreamContext, name::AbstractString; kwargs...)::NatterTask =
+    _natter_async(stream_info, js, name; kwargs...)
+
+stream_list_async(js::JetStreamContext; kwargs...)::NatterTask =
+    _natter_async(stream_list, js; kwargs...)
+
+stream_names_async(js::JetStreamContext; kwargs...)::NatterTask =
+    _natter_async(stream_names, js; kwargs...)
+
+stream_purge_async(js::JetStreamContext, name::AbstractString; kwargs...)::NatterTask =
+    _natter_async(stream_purge, js, name; kwargs...)
+
+stream_delete_async(js::JetStreamContext, name::AbstractString; kwargs...)::NatterTask =
+    _natter_async(stream_delete, js, name; kwargs...)
+
+stream_message_get_async(js::JetStreamContext, stream::AbstractString; kwargs...)::NatterTask =
+    _natter_async(stream_message_get, js, stream; kwargs...)
+
+stream_message_delete_async(js::JetStreamContext, stream::AbstractString, seq::Int; kwargs...)::NatterTask =
+    _natter_async(stream_message_delete, js, stream, seq; kwargs...)
+
+consumer_create_async(js::JetStreamContext, stream::AbstractString, config; kwargs...)::NatterTask =
+    _natter_async(consumer_create, js, stream, config; kwargs...)
+
+consumer_create_or_update_async(js::JetStreamContext, stream::AbstractString, config; kwargs...)::NatterTask =
+    _natter_async(consumer_create_or_update, js, stream, config; kwargs...)
+
+consumer_update_async(js::JetStreamContext, stream::AbstractString, config; kwargs...)::NatterTask =
+    _natter_async(consumer_update, js, stream, config; kwargs...)
+
+consumer_info_async(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; kwargs...)::NatterTask =
+    _natter_async(consumer_info, js, stream, consumer; kwargs...)
+
+consumer_list_async(js::JetStreamContext, stream::AbstractString; kwargs...)::NatterTask =
+    _natter_async(consumer_list, js, stream; kwargs...)
+
+consumer_delete_async(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; kwargs...)::NatterTask =
+    _natter_async(consumer_delete, js, stream, consumer; kwargs...)
+
+pull_subscribe_async(js::JetStreamContext, subject::AbstractString; kwargs...)::NatterTask =
+    _natter_async(pull_subscribe, js, subject; kwargs...)
+
+push_subscribe_async(js::JetStreamContext, subject::AbstractString; kwargs...)::NatterTask =
+    _natter_async(push_subscribe, js, subject; kwargs...)
+
+fetch_async(psub::PullSubscription, batch::Int=1; kwargs...)::NatterTask =
+    _natter_async(fetch, psub, batch; kwargs...)
+
+close_async(psub::PullSubscription; kwargs...)::NatterTask =
+    _natter_async(close, psub; kwargs...)
+
+close_async(psub::PushSubscription; kwargs...)::NatterTask =
+    _natter_async(close, psub; kwargs...)
+
+ack_async(msg::Msg)::NatterTask =
+    _natter_async(ack, msg)
+
+ack_sync_async(msg::Msg; kwargs...)::NatterTask =
+    _natter_async(ack_sync, msg; kwargs...)
+
+nak_async(msg::Msg; kwargs...)::NatterTask =
+    _natter_async(nak, msg; kwargs...)
+
+in_progress_async(msg::Msg)::NatterTask =
+    _natter_async(in_progress, msg)
+
+term_async(msg::Msg)::NatterTask =
+    _natter_async(term, msg)
+
+kv_create_async(js::JetStreamContext, bucket::AbstractString; kwargs...)::NatterTask =
+    _natter_async(kv_create, js, bucket; kwargs...)
+
+kv_open_async(js::JetStreamContext, bucket::AbstractString; kwargs...)::NatterTask =
+    _natter_async(kv_open, js, bucket; kwargs...)
+
+kv_delete_bucket_async(kv::KeyValue; kwargs...)::NatterTask =
+    _natter_async(kv_delete_bucket, kv; kwargs...)
+
+kv_get_async(kv::KeyValue, key::AbstractString; kwargs...)::NatterTask =
+    _natter_async(kv_get, kv, key; kwargs...)
+
+kv_put_async(kv::KeyValue, key::AbstractString, value; kwargs...)::NatterTask =
+    _natter_async(kv_put, kv, key, value; kwargs...)
+
+kv_create_key_async(kv::KeyValue, key::AbstractString, value; kwargs...)::NatterTask =
+    _natter_async(kv_create_key, kv, key, value; kwargs...)
+
+kv_update_async(kv::KeyValue, key::AbstractString, value, revision::Int; kwargs...)::NatterTask =
+    _natter_async(kv_update, kv, key, value, revision; kwargs...)
+
+kv_delete_async(kv::KeyValue, key::AbstractString; kwargs...)::NatterTask =
+    _natter_async(kv_delete, kv, key; kwargs...)
+
+kv_purge_async(kv::KeyValue, key::AbstractString; kwargs...)::NatterTask =
+    _natter_async(kv_purge, kv, key; kwargs...)
+
+kv_history_async(kv::KeyValue, key::AbstractString; kwargs...)::NatterTask =
+    _natter_async(kv_history, kv, key; kwargs...)
+
+kv_keys_async(kv::KeyValue; kwargs...)::NatterTask =
+    _natter_async(kv_keys, kv; kwargs...)
+
+kv_watch_async(callback::Function, kv::KeyValue; kwargs...)::NatterTask =
+    _natter_async(kv_watch, callback, kv; kwargs...)

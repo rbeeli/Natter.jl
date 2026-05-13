@@ -69,6 +69,20 @@ for key in kv_keys(kv)
 end
 ```
 
+## Concurrent KeyValue Work
+
+Use Julia tasks for independent KeyValue operations:
+
+```julia
+profile = Ref{Msg}()
+settings = Ref{Msg}()
+
+@sync begin
+    @async profile[] = kv_get(kv, "users.42.profile")
+    @async settings[] = kv_get(kv, "users.42.settings")
+end
+```
+
 ## Watch
 
 `kv_watch` returns a push subscription. Close it when the watcher is no longer needed.

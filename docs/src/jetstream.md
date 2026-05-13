@@ -35,6 +35,8 @@ consumer_create(js, "ORDERS", ConsumerConfig(
 ))
 ```
 
+`consumer_create` is strict create-only and `consumer_update` is strict update-only on servers that support consumer actions. Use `consumer_create_or_update` only when create-or-update upsert behavior is intentional.
+
 Raw dictionaries are also accepted as an escape hatch for fields added by newer servers:
 
 ```julia
@@ -58,11 +60,15 @@ ack = js_publish(js, "orders.created", """{"id":1001}""";
 @info "stored" stream=ack.stream seq=ack.seq duplicate=ack.duplicate
 ```
 
-`publish_async` starts the publish in a Julia task and returns that task.
+Publish independent messages concurrently with Julia tasks:
 
 ```julia
-task = publish_async(js, "orders.created", "payload"; stream="ORDERS")
-ack = fetch(task)
+acks = Vector{PubAck}(undef, 2)
+
+@sync begin
+    @async acks[1] = js_publish(js, "orders.created", """{"id":1001}"""; stream="ORDERS")
+    @async acks[2] = js_publish(js, "orders.created", """{"id":1002}"""; stream="ORDERS")
+end
 ```
 
 ## Stream Management
@@ -102,9 +108,15 @@ msg = stream_message_get(js, "ORDERS";
 )
 ```
 
+Delete a stored message by stream sequence:
+
+```julia
+deleted = stream_message_delete(js, "ORDERS", 42)
+```
+
 ## Pull Consumers
 
-Pull subscriptions create or bind a consumer and fetch batches on demand.
+Pull subscriptions create or bind a consumer and fetch batches on demand. Durable or named consumers are bound when they already exist; any supplied config fields must match the existing consumer config. Missing durable or named consumers are created strictly, and random ephemeral consumers are created strictly and deleted on close.
 
 ```julia
 sub = pull_subscribe(js, "orders.created";
@@ -126,6 +138,23 @@ for msg in fetch(sub, 10; timeout=2.0)
 end
 ```
 
+To process a fetched batch concurrently, use a structured `@sync` boundary:
+
+```julia
+msgs = fetch(sub, 10; timeout=2.0)
+
+@sync for msg in msgs
+    @async begin
+        try
+            handle_order(String(msg.data))
+            ack(msg)
+        catch err
+            nak(msg; delay=1.0)
+        end
+    end
+end
+```
+
 Close ephemeral subscriptions when finished. Durable consumers remain on the server.
 
 ```julia
@@ -134,7 +163,7 @@ close(sub)
 
 ## Push Consumers
 
-Push subscriptions deliver messages to a normal NATS subscription. Set `manual_ack=true` when the callback will acknowledge messages itself.
+Push subscriptions deliver messages to a normal NATS subscription. Durable or named push consumers bind to existing consumers without updating server-side config; supplied config fields must match. Queue groups can be set with `queue` or `ConsumerConfig(deliver_group=...)`; when both are present, they must match. If no durable or name is supplied for a queue push subscription, the queue group is used as the durable consumer name so additional subscribers join the same server-side consumer. Set `manual_ack=true` when the callback will acknowledge messages itself.
 
 ```julia
 sub = push_subscribe(js, "orders.created";

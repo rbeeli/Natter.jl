@@ -26,10 +26,18 @@ function make_client()
         tls_ca_path="/etc/nats/ca.pem",
         tls_cert_path="/etc/nats/client.pem",
         tls_key_path="/etc/nats/client-key.pem",
-        disconnected_cb=() -> @warn("NATS disconnected"),
-        reconnected_cb=() -> @info("NATS reconnected"),
-        closed_cb=() -> @info("NATS connection closed"),
-        error_cb=err -> @error("NATS client error" exception=err),
+        disconnected_cb=() -> begin
+            @warn "NATS disconnected"
+        end,
+        reconnected_cb=() -> begin
+            @info "NATS reconnected"
+        end,
+        closed_cb=() -> begin
+            @info "NATS connection closed"
+        end,
+        error_cb=err -> begin
+            @error "NATS client error" exception=err
+        end,
     )
 end
 
@@ -73,3 +81,26 @@ end
 ```
 
 For exactly-once effects, combine JetStream message IDs with idempotent application storage. Reconnect publish replay protects availability, but duplicate delivery is still possible after ambiguous network failures.
+
+For CPU-light, I/O-heavy handlers, process a fetched batch concurrently with Julia tasks:
+
+```julia
+try
+    msgs = fetch(worker, 50; timeout=2.0)
+
+    @sync for msg in msgs
+        @async begin
+            try
+                handle_billing_event(String(msg.data))
+                ack(msg)
+            catch err
+                @error "billing event failed" exception=err
+                nak(msg; delay=5.0)
+            end
+        end
+    end
+finally
+    close(worker)
+    drain(client; timeout=10.0)
+end
+```

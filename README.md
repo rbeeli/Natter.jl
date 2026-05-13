@@ -16,7 +16,7 @@ See [`FEATURES_COVERAGE.md`](FEATURES_COVERAGE.md) for the current support matri
 
 Full package documentation lives in [`docs/src`](docs/src), is built with
 DocumenterVitepress, and is hosted at
-<https://rbeeli.github.io/Natter.jl/dev/> after the documentation workflow runs.
+<https://rbeeli.github.io/Natter.jl/> after the documentation workflow runs.
 
 ```bash
 julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
@@ -25,13 +25,19 @@ julia --project=docs docs/make.jl
 
 ## API Model
 
-The public API is synchronous/convenience-first: `connect`, `publish`, `request`,
-`next`, `flush`, `drain`, and JetStream management calls block until their operation
-completes or times out.
+Natter.jl uses Julia's task-based concurrency model. The normal public API is
+direct and ergonomic: call `connect`, `publish`, `request`, `next`, `flush`,
+`drain`, and JetStream management functions from your application task, web
+handler, or worker loop. When you need concurrency, use Julia's `@sync` and
+`@async` around those direct calls.
+
+The `_async` functions are explicit handle-returning helpers for cases where a
+library-owned `NatterTask` is useful. They are not required for ordinary task-based
+application code.
 
 Internally, each client uses Julia tasks for the reader loop, ping loop, reconnect
-loop, and subscription callbacks. Subscriptions can be consumed either by calling
-`next(sub; timeout=...)` or by passing a callback to `subscribe`.
+loop, subscription callbacks, and async API handles. Subscriptions can be consumed
+either by calling `next(sub; timeout=...)` or by passing a callback to `subscribe`.
 
 Automatic reconnect is enabled by default. After a transient disconnect, the client
 reconnects in the background, replays subscriptions, and flushes buffered publishes

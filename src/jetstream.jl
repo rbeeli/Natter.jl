@@ -64,10 +64,6 @@ function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing;
     _puback(_js_decode(msg))
 end
 
-function publish_async(js::JetStreamContext, subject::AbstractString, data=nothing; kwargs...)
-    @async js_publish(js, subject, data; kwargs...)
-end
-
 function _stream_config_name(config::StreamConfig)::String
     isnothing(config.name) && throw(ArgumentError("stream config name is required"))
     _validate_api_name("stream", config.name)
@@ -219,15 +215,18 @@ end
 stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Int; timeout::Real=js.timeout) =
     Bool(_api_request(js, "$(js.prefix).STREAM.MSG.DELETE.$(_validate_api_name("stream", stream))", JSON3.write(Dict("seq" => seq)); timeout)["success"])
 
-function _server_supports_consumer_name(client::Client)
-    version = @lock client.lock get(client.info, "version", nothing)
+function _server_version_at_least(client::Client, major::Int, minor::Int)
+    version = @lock client.lock client.info.version
     isnothing(version) && return true
-    m = match(r"^(\d+)\.(\d+)", String(version))
+    m = match(r"^(\d+)\.(\d+)", version)
     isnothing(m) && return true
-    major = parse(Int, m.captures[1])
-    minor = parse(Int, m.captures[2])
-    major > 2 || (major == 2 && minor >= 9)
+    server_major = parse(Int, m.captures[1])
+    server_minor = parse(Int, m.captures[2])
+    server_major > major || (server_major == major && server_minor >= minor)
 end
+
+_server_supports_consumer_name(client::Client) = _server_version_at_least(client, 2, 9)
+_server_supports_consumer_action(client::Client) = _server_version_at_least(client, 2, 10)
 
 function _consumer_create_subject(js::JetStreamContext, stream::AbstractString, config)
     stream = _validate_api_name("stream", stream)
@@ -247,23 +246,41 @@ function _consumer_create_subject(js::JetStreamContext, stream::AbstractString, 
     end
 end
 
-function consumer_create(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig; timeout::Real=js.timeout)
+function _consumer_request_payload(js::JetStreamContext, stream::AbstractString, config::Dict{String,Any}, action::Union{String,Nothing}=nothing)
+    request = Dict{String,Any}("stream_name" => stream, "config" => config)
+    if !isnothing(action)
+        action in ("create", "update") || throw(ArgumentError("invalid consumer action: $action"))
+        _server_supports_consumer_action(js.client) || throw(UnsupportedFeatureError("strict consumer $action requires nats-server 2.10+"))
+        request["action"] = action
+    end
+    request
+end
+
+function _consumer_create_request(js::JetStreamContext, stream::AbstractString, config; timeout::Real=js.timeout,
+                                  action::Union{String,Nothing}=nothing)
     stream = _validate_api_name("stream", stream)
     payload = _js_config_payload(config)
     subject = _consumer_create_subject(js, stream, payload)
-    _consumer_info(_api_request(js, subject, JSON3.write(Dict("stream_name" => stream, "config" => payload)); timeout))
+    _consumer_info(_api_request(js, subject, JSON3.write(_consumer_request_payload(js, stream, payload, action)); timeout))
 end
 
-function consumer_create(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout)
-    stream = _validate_api_name("stream", stream)
-    payload = _js_config_payload(config)
-    subject = _consumer_create_subject(js, stream, payload)
-    _consumer_info(_api_request(js, subject, JSON3.write(Dict("stream_name" => stream, "config" => payload)); timeout))
-end
+consumer_create(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig; timeout::Real=js.timeout) =
+    _consumer_create_request(js, stream, config; timeout, action="create")
 
-function consumer_update(js::JetStreamContext, stream::AbstractString, config::Union{ConsumerConfig,AbstractDict{String,<:Any}}; timeout::Real=js.timeout)
-    consumer_create(js, stream, config; timeout)
-end
+consumer_create(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout) =
+    _consumer_create_request(js, stream, config; timeout, action="create")
+
+consumer_create_or_update(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig; timeout::Real=js.timeout) =
+    _consumer_create_request(js, stream, config; timeout)
+
+consumer_create_or_update(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout) =
+    _consumer_create_request(js, stream, config; timeout)
+
+consumer_update(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig; timeout::Real=js.timeout) =
+    _consumer_create_request(js, stream, config; timeout, action="update")
+
+consumer_update(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout) =
+    _consumer_create_request(js, stream, config; timeout, action="update")
 
 consumer_info(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; timeout::Real=js.timeout) =
     _consumer_info(_api_request(js, "$(js.prefix).CONSUMER.INFO.$(_validate_api_name("stream", stream)).$(_validate_api_name("consumer", consumer))", ""; timeout))
@@ -292,6 +309,157 @@ function _consumer_info(obj::Dict{String,Any})
     ConsumerInfo(String(obj["stream_name"]), String(obj["name"]), cfg, obj)
 end
 
+_consumer_missing(err) = err isa JetStreamError && err.code == 404
+
+function _consumer_info_or_nothing(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; timeout::Real=js.timeout)
+    try
+        consumer_info(js, stream, consumer; timeout)
+    catch err
+        _consumer_missing(err) && return nothing
+        rethrow()
+    end
+end
+
+function _consumer_normalized_config_value(value)
+    if isnothing(value)
+        return nothing
+    elseif value isa AbstractString
+        return String(value)
+    elseif value isa AbstractDict
+        return Dict{String,Any}(String(k) => _consumer_normalized_config_value(v) for (k, v) in pairs(value))
+    elseif value isa JSON3.Object
+        return Dict{String,Any}(String(k) => _consumer_normalized_config_value(v) for (k, v) in pairs(value))
+    elseif value isa AbstractVector
+        return Any[_consumer_normalized_config_value(v) for v in value]
+    elseif value isa JSON3.Array
+        return Any[_consumer_normalized_config_value(v) for v in value]
+    else
+        return value
+    end
+end
+
+function _consumer_config_field(info::ConsumerInfo, config::Dict{String,Any}, field::String)
+    if haskey(config, field)
+        return config[field]
+    elseif field == "name"
+        return info.name
+    elseif field == "durable_name" && info.config.durable_name == info.name
+        return info.name
+    else
+        return nothing
+    end
+end
+
+function _validate_bound_consumer_config(info::ConsumerInfo, expected::Dict{String,Any}, fields)
+    current = _string_key_dict(info.raw["config"])
+    for field in fields
+        expected_value = _consumer_normalized_config_value(get(expected, field, nothing))
+        actual_value = _consumer_normalized_config_value(_consumer_config_field(info, current, field))
+        expected_value == actual_value && continue
+        throw(ArgumentError("existing consumer $(info.name) config field $field does not match requested value"))
+    end
+    info
+end
+
+function _set_config_default!(config::Dict{String,Any}, field::String, value)
+    if !haskey(config, field) || isnothing(config[field])
+        config[field] = value
+    end
+    config[field]
+end
+
+function _validate_push_consumer_control_config!(config::Dict{String,Any})
+    get(config, "flow_control", false) == true || return config
+    idle_heartbeat = get(config, "idle_heartbeat", nothing)
+    if !(idle_heartbeat isa Real) || idle_heartbeat isa Bool || idle_heartbeat <= 0
+        throw(ArgumentError("flow_control=true requires idle_heartbeat to be set to a positive value"))
+    end
+    config
+end
+
+function _push_config_deliver_group!(config::Dict{String,Any})
+    haskey(config, "deliver_group") || return nothing
+    value = config["deliver_group"]
+    isnothing(value) && return nothing
+    value isa AbstractString || throw(ArgumentError("deliver_group must be a string"))
+    group = _validate_queue(String(value))
+    config["deliver_group"] = group
+    group
+end
+
+function _resolve_push_queue!(config::Dict{String,Any}, queue::Union{String,Nothing})
+    local_queue = _validate_queue(queue)
+    config_queue = _push_config_deliver_group!(config)
+    if isnothing(local_queue)
+        return config_queue
+    elseif isnothing(config_queue)
+        config["deliver_group"] = local_queue
+        return local_queue
+    elseif local_queue == config_queue
+        return local_queue
+    else
+        throw(ArgumentError("queue $local_queue does not match deliver_group $config_queue"))
+    end
+end
+
+_push_config_has_idle_heartbeat(config::Dict{String,Any}) =
+    haskey(config, "idle_heartbeat") && !isnothing(config["idle_heartbeat"])
+
+_push_config_has_flow_control(config::Dict{String,Any}) =
+    get(config, "flow_control", false) == true
+
+function _validate_push_queue_control_config!(config::Dict{String,Any}, queue::Union{String,Nothing})
+    isnothing(queue) && return config
+    _push_config_has_flow_control(config) &&
+        throw(ArgumentError("queue push subscriptions do not support flow_control"))
+    _push_config_has_idle_heartbeat(config) &&
+        throw(ArgumentError("queue push subscriptions do not support idle_heartbeat"))
+    config
+end
+
+function _validate_existing_push_queue_control(info::ConsumerInfo, queue::Union{String,Nothing})
+    isnothing(queue) && return info
+    info.config.flow_control == true &&
+        throw(ArgumentError("existing queue push consumer $(info.name) uses flow_control"))
+    !isnothing(info.config.idle_heartbeat) &&
+        throw(ArgumentError("existing queue push consumer $(info.name) uses idle_heartbeat"))
+    info
+end
+
+_consumer_has_filter(config::Dict{String,Any}) =
+    (haskey(config, "filter_subject") && !isnothing(config["filter_subject"])) ||
+    (haskey(config, "filter_subjects") && !isnothing(config["filter_subjects"]))
+
+function _consumer_bind_name(config::Dict{String,Any})
+    if haskey(config, "name") && !isnothing(config["name"])
+        return _validate_api_name("consumer", config["name"])
+    elseif haskey(config, "durable_name") && !isnothing(config["durable_name"])
+        return _validate_api_name("consumer", config["durable_name"])
+    else
+        return nothing
+    end
+end
+
+function _default_push_queue_consumer!(config::Dict{String,Any}, bind_fields::Set{String}, queue::Union{String,Nothing})
+    isnothing(queue) && return config
+    !isnothing(_consumer_bind_name(config)) && return config
+
+    consumer = _validate_api_name("consumer", queue)
+    _set_config_default!(config, "name", consumer)
+    _set_config_default!(config, "durable_name", consumer)
+    push!(bind_fields, "durable_name")
+    config
+end
+
+function _bind_or_create_consumer(js::JetStreamContext, stream::AbstractString, name::AbstractString,
+                                  config::Dict{String,Any}, bind_fields; timeout::Real=js.timeout)
+    existing = _consumer_info_or_nothing(js, stream, name; timeout)
+    if !isnothing(existing)
+        return _validate_bound_consumer_config(existing, config, bind_fields), false
+    end
+    consumer_create(js, stream, config; timeout), true
+end
+
 mutable struct PullSubscription
     js::JetStreamContext
     sub::Subscription
@@ -299,7 +467,9 @@ mutable struct PullSubscription
     consumer::String
     deliver::String
     fetch_lock::ReentrantLock
+    close_lock::ReentrantLock
     delete_on_close::Bool
+    closed::Bool
 end
 
 mutable struct PushSubscription
@@ -307,7 +477,21 @@ mutable struct PushSubscription
     sub::Subscription
     stream::String
     consumer::String
+    close_lock::ReentrantLock
     delete_on_close::Bool
+    closed::Bool
+end
+
+function _handle_subscription_control(::_JetStreamPushControlHandler, sub::Subscription, msg::Msg)::Bool
+    _status_header(msg) == 100 || return false
+    if !isnothing(msg.reply)
+        try
+            publish(sub.client, msg.reply, EMPTY_BYTES)
+        catch err
+            _report_error(sub.client, err)
+        end
+    end
+    true
 end
 
 function _stream_by_subject(js::JetStreamContext, subject::AbstractString)
@@ -320,21 +504,35 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig())
     stream = isnothing(stream) ? _stream_by_subject(js, subject) : stream
     cfg = _js_config_payload(config)
-    delete_on_close = isnothing(durable) && !haskey(cfg, "durable_name")
-    if !haskey(cfg, "filter_subject") && !haskey(cfg, "filter_subjects")
+    bind_fields = Set{String}(keys(cfg))
+    if !_consumer_has_filter(cfg)
         cfg["filter_subject"] = String(subject)
+        push!(bind_fields, "filter_subject")
     end
     if !isnothing(durable)
-        cfg["name"] = get(cfg, "name", durable)
-        cfg["durable_name"] = get(cfg, "durable_name", durable)
-    else
-        cfg["name"] = get(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
+        _set_config_default!(cfg, "name", durable)
+        _set_config_default!(cfg, "durable_name", durable)
+        push!(bind_fields, "durable_name")
     end
-    info = consumer_create(js, stream, cfg)
+    bind_name = _consumer_bind_name(cfg)
+    delete_on_close = isnothing(bind_name)
+    info =
+        if isnothing(bind_name)
+            _set_config_default!(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
+            consumer_create(js, stream, cfg)
+        else
+            consumer, _created = _bind_or_create_consumer(js, stream, bind_name, cfg, bind_fields)
+            isnothing(consumer.config.deliver_subject) ||
+                throw(ArgumentError("existing consumer $(consumer.name) is configured for push delivery"))
+            consumer
+        end
+    if !haskey(cfg, "name") || isnothing(cfg["name"])
+        cfg["name"] = info.name
+    end
     try
         deliver = new_inbox(js.client)
         sub = subscribe(js.client, deliver)
-        PullSubscription(js, sub, stream, info.name, deliver, ReentrantLock(), delete_on_close)
+        PullSubscription(js, sub, stream, info.name, deliver, ReentrantLock(), ReentrantLock(), delete_on_close, false)
     catch err
         if delete_on_close
             try
@@ -347,8 +545,18 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     end
 end
 
-function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeout, expires::Real=timeout)
+function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real, expires::Real)
+    batch > 0 || throw(ArgumentError("fetch batch must be greater than zero"))
+    timeout > 0 || throw(ArgumentError("fetch timeout must be greater than zero"))
+    expires > 0 || throw(ArgumentError("fetch expires must be greater than zero"))
     timeout >= expires || throw(ArgumentError("fetch timeout must be greater than or equal to expires"))
+    (@lock psub.close_lock psub.closed) && throw(ConnectionClosedError("pull subscription is closed"))
+    (@lock psub.sub.client.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
+    nothing
+end
+
+function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeout, expires::Real=timeout)
+    _validate_pull_fetch(psub, batch, timeout, expires)
     @lock psub.fetch_lock begin
         req = Dict{String,Any}("batch" => batch, "expires" => round(Int, expires * 1_000_000_000))
         publish(psub.js.client, "$(psub.js.prefix).CONSUMER.MSG.NEXT.$(psub.stream).$(psub.consumer)", JSON3.write(req); reply=psub.deliver)
@@ -384,25 +592,57 @@ end
 function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{String,Nothing}=nothing, durable::Union{String,Nothing}=nothing,
                         queue::Union{String,Nothing}=nothing, callback::Union{Function,Nothing}=nothing, manual_ack::Bool=false,
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig())
+    cfg = _js_config_payload(config)
+    bind_fields = Set{String}(keys(cfg))
+    local_queue = _resolve_push_queue!(cfg, queue)
+    !isnothing(queue) && push!(bind_fields, "deliver_group")
+    _validate_push_queue_control_config!(cfg, local_queue)
+    _validate_push_consumer_control_config!(cfg)
+
     stream = isnothing(stream) ? _stream_by_subject(js, subject) : stream
     deliver = new_inbox(js.client)
-    cfg = _js_config_payload(config)
-    delete_on_close = isnothing(durable) && !haskey(cfg, "durable_name")
-    if !haskey(cfg, "filter_subject") && !haskey(cfg, "filter_subjects")
+    if !_consumer_has_filter(cfg)
         cfg["filter_subject"] = String(subject)
+        push!(bind_fields, "filter_subject")
     end
-    cfg["deliver_subject"] = get(cfg, "deliver_subject", deliver)
-    isnothing(queue) || (cfg["deliver_group"] = queue)
     if !isnothing(durable)
-        cfg["name"] = get(cfg, "name", durable)
-        cfg["durable_name"] = get(cfg, "durable_name", durable)
-    else
-        cfg["name"] = get(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
+        _set_config_default!(cfg, "name", durable)
+        _set_config_default!(cfg, "durable_name", durable)
+        push!(bind_fields, "durable_name")
     end
-    info = consumer_create(js, stream, cfg)
+    _default_push_queue_consumer!(cfg, bind_fields, local_queue)
+    bind_name = _consumer_bind_name(cfg)
+    delete_on_close = isnothing(bind_name)
+    info =
+        if isnothing(bind_name)
+            _set_config_default!(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
+            _set_config_default!(cfg, "deliver_subject", deliver)
+            consumer_create(js, stream, cfg)
+        else
+            existing = _consumer_info_or_nothing(js, stream, bind_name)
+            if isnothing(existing)
+                _set_config_default!(cfg, "deliver_subject", deliver)
+                consumer_create(js, stream, cfg)
+            else
+                _validate_bound_consumer_config(existing, cfg, bind_fields)
+                isnothing(existing.config.deliver_subject) &&
+                    throw(ArgumentError("existing consumer $(existing.name) is configured for pull delivery"))
+                cfg["deliver_subject"] = existing.config.deliver_subject
+                if isnothing(local_queue) && !isnothing(existing.config.deliver_group)
+                    local_queue = _validate_queue(existing.config.deliver_group)
+                end
+                _validate_existing_push_queue_control(existing, local_queue)
+                existing
+            end
+        end
+    if !haskey(cfg, "name") || isnothing(cfg["name"])
+        cfg["name"] = info.name
+    end
     try
-        sub = subscribe(js.client, String(cfg["deliver_subject"]); queue, callback, auto_ack=!manual_ack && !isnothing(callback))
-        PushSubscription(js, sub, stream, info.name, delete_on_close)
+        sub = subscribe(js.client, String(cfg["deliver_subject"]); queue=local_queue, callback,
+                        auto_ack=!manual_ack && !isnothing(callback),
+                        _control_handler=_JetStreamPushControlHandler())
+        PushSubscription(js, sub, stream, info.name, ReentrantLock(), delete_on_close, false)
     catch err
         if delete_on_close
             try
@@ -416,6 +656,12 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
 end
 
 function close(psub::PullSubscription)
+    already_closed = @lock psub.close_lock begin
+        was_closed = psub.closed
+        psub.closed = true
+        was_closed
+    end
+    already_closed && return nothing
     errors = Any[]
     try
         close(psub.sub)
@@ -434,6 +680,12 @@ function close(psub::PullSubscription)
 end
 
 function close(psub::PushSubscription)
+    already_closed = @lock psub.close_lock begin
+        was_closed = psub.closed
+        psub.closed = true
+        was_closed
+    end
+    already_closed && return nothing
     errors = Any[]
     try
         close(psub.sub)

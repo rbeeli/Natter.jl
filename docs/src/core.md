@@ -7,18 +7,50 @@ Core messaging covers the NATS protocol without JetStream persistence.
 `connect(url_or_urls; kwargs...)` builds a client and performs the server handshake. Common options are:
 
 | Option | Default | Purpose |
-| --- | --- | --- |
+| :--- | :--- | :--- |
 | `name` | `nothing` | Human-readable connection name sent to the server. |
 | `token`, `user`, `password` | `nothing` | Authentication credentials. |
 | `no_echo` | `false` | Prevent this connection from receiving its own publishes. |
 | `connect_timeout` | `2.0` | Socket and handshake timeout in seconds. |
 | `allow_reconnect` | `true` | Enable automatic reconnect after transient failures. |
 | `pending_size` | `2 MiB` | Maximum buffered outbound publish data while reconnecting. |
+| `max_control_line` | `16 KiB` | Maximum inbound protocol control line length. |
+| `max_inbound_payload` | `64 MiB` | Maximum inbound message payload allocation. |
+| `max_header_bytes` | `64 KiB` | Maximum inbound header block size. |
+| `max_stale_pong_waiters` | `1024` | Maximum timed-out flush waiters retained to preserve PING/PONG ordering. |
 | `sub_pending_msgs_limit` | `1024` | Default per-subscription queued message limit. |
 | `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit. |
 | `error_cb` | warning callback | Receives asynchronous callback, cleanup, and background task errors. |
 
 Use `status(client)`, `stats(client)`, and `connected_url(client)` for runtime inspection.
+
+## Julia Task Concurrency
+
+Julia does not require `async`/`await` syntax for normal task-based application code. A web handler or service task can call Natter directly:
+
+```julia
+function lookup_user(client, body)
+    response = request(client, "users.lookup", body; timeout=0.2)
+    publish(client, "audit.users.lookup", body)
+    response
+end
+```
+
+Use `@sync` and `@async` when independent NATS work should run concurrently:
+
+```julia
+user = Ref{Msg}()
+permissions = Ref{Msg}()
+
+@sync begin
+    @async user[] = request(client, "users.lookup", user_id; timeout=0.2)
+    @async permissions[] = request(client, "permissions.lookup", user_id; timeout=0.2)
+end
+
+build_response(user[], permissions[])
+```
+
+The `_async` APIs return `NatterTask` handles for explicit handle-oriented code. They are not needed just because code runs in a task.
 
 ## Publish
 
@@ -60,7 +92,7 @@ msg = next(one; timeout=5.0)
 
 ## Request Reply
 
-`request` creates a temporary inbox, publishes with a reply subject, waits for one response, and cleans up the inbox subscription.
+`request` uses a shared inbox subscription, publishes with a unique reply subject, waits for one response, and cleans up the request waiter.
 
 ```julia
 response = request(client, "time.now", ""; timeout=1.0)
@@ -100,3 +132,7 @@ drain(client; timeout=10.0)
 ```
 
 `close(client)` stops background tasks, closes subscriptions and transports, and invokes the close callback. Use `close(client; throw_errors=true)` if cleanup failures must be surfaced to the caller.
+
+```julia
+close(client; throw_errors=true)
+```

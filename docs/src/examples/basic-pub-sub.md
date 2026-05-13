@@ -26,4 +26,4 @@ drain(callback_sub)
 close(client)
 ```
 
-Use `flush` when the example or test needs to know that commands sent before it reached the server.
+Use `flush` when the example or test needs to know that commands sent before it reached the server. Use Julia `@sync` and `@async` when multiple independent publishes or requests should run concurrently.

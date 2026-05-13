@@ -189,6 +189,253 @@ end
     @test_throws ArgumentError N._js_field_value(:metadata, Dict{String,Any}("ok" => 1))
 end
 
+@testitem "JetStream push flow control requires positive heartbeat" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client()
+    js = jetstream(client)
+
+    @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS",
+                                              config=ConsumerConfig(flow_control=true))
+    @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS",
+                                              config=ConsumerConfig(flow_control=true, idle_heartbeat=0.0))
+    @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS",
+                                              config=Dict("flow_control" => true))
+
+    cfg = Dict{String,Any}("flow_control" => true, "idle_heartbeat" => 1)
+    @test N._validate_push_consumer_control_config!(cfg) === cfg
+end
+
+@testitem "JetStream push queue configuration is resolved before create" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    cfg = Dict{String,Any}("deliver_group" => "workers")
+    @test N._resolve_push_queue!(cfg, nothing) == "workers"
+    @test cfg["deliver_group"] == "workers"
+
+    cfg = Dict{String,Any}()
+    @test N._resolve_push_queue!(cfg, "workers") == "workers"
+    @test cfg["deliver_group"] == "workers"
+
+    cfg = Dict{String,Any}("deliver_group" => "workers")
+    @test N._resolve_push_queue!(cfg, "workers") == "workers"
+    @test_throws ArgumentError N._resolve_push_queue!(Dict{String,Any}("deliver_group" => "other"), "workers")
+    @test_throws ArgumentError N._resolve_push_queue!(Dict{String,Any}("deliver_group" => 1), nothing)
+    @test_throws ArgumentError N._resolve_push_queue!(Dict{String,Any}("deliver_group" => ""), nothing)
+
+    cfg = Dict{String,Any}()
+    bind_fields = Set{String}(keys(cfg))
+    queue = N._resolve_push_queue!(cfg, "workers")
+    @test N._default_push_queue_consumer!(cfg, bind_fields, queue) === cfg
+    @test cfg["name"] == "workers"
+    @test cfg["durable_name"] == "workers"
+    @test "durable_name" in bind_fields
+
+    cfg = Dict{String,Any}("deliver_group" => "workers")
+    bind_fields = Set{String}(keys(cfg))
+    queue = N._resolve_push_queue!(cfg, nothing)
+    @test N._default_push_queue_consumer!(cfg, bind_fields, queue) === cfg
+    @test cfg["name"] == "workers"
+    @test cfg["durable_name"] == "workers"
+    @test "durable_name" in bind_fields
+
+    cfg = Dict{String,Any}("name" => "custom", "deliver_group" => "workers")
+    bind_fields = Set{String}(keys(cfg))
+    @test N._default_push_queue_consumer!(cfg, bind_fields, "workers") === cfg
+    @test cfg["name"] == "custom"
+    @test !haskey(cfg, "durable_name")
+    @test !("durable_name" in bind_fields)
+
+    cfg = Dict{String,Any}()
+    bind_fields = Set{String}(keys(cfg))
+    @test_throws ArgumentError N._default_push_queue_consumer!(cfg, bind_fields, "workers.v1")
+end
+
+@testitem "JetStream queue push rejects heartbeat and flow control" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client()
+    js = jetstream(client)
+
+    @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS", queue="workers",
+                                              config=ConsumerConfig(idle_heartbeat=0.1))
+    @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS", queue="workers",
+                                              config=ConsumerConfig(flow_control=true, idle_heartbeat=0.1))
+    @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS",
+                                              config=ConsumerConfig(deliver_group="workers", idle_heartbeat=0.1))
+    @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS",
+                                              config=ConsumerConfig(deliver_group="workers", flow_control=true, idle_heartbeat=0.1))
+    @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS", queue="workers",
+                                              config=ConsumerConfig(deliver_group="other"))
+
+    cfg = Dict{String,Any}("flow_control" => true, "idle_heartbeat" => 1)
+    @test N._validate_push_queue_control_config!(cfg, nothing) === cfg
+    @test_throws ArgumentError N._validate_push_queue_control_config!(cfg, "workers")
+    @test_throws ArgumentError N._validate_push_queue_control_config!(Dict{String,Any}("idle_heartbeat" => 1), "workers")
+
+    flow_info = N._consumer_info(Dict{String,Any}(
+        "stream_name" => "ORDERS",
+        "name" => "worker",
+        "config" => Dict{String,Any}(
+            "deliver_subject" => "_INBOX.worker",
+            "deliver_group" => "workers",
+            "flow_control" => true,
+        ),
+    ))
+    heartbeat_info = N._consumer_info(Dict{String,Any}(
+        "stream_name" => "ORDERS",
+        "name" => "worker",
+        "config" => Dict{String,Any}(
+            "deliver_subject" => "_INBOX.worker",
+            "deliver_group" => "workers",
+            "idle_heartbeat" => 1_000_000_000,
+        ),
+    ))
+    @test_throws ArgumentError N._validate_existing_push_queue_control(flow_info, "workers")
+    @test_throws ArgumentError N._validate_existing_push_queue_control(heartbeat_info, "workers")
+end
+
+@testitem "JetStream push control dispatch filters heartbeats" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    push_sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+
+    heartbeat = Msg("_INBOX.push", nothing, UInt8[];
+                    headers=Headers("Status" => ["100"], "Description" => ["Idle Heartbeat"]),
+                    client, sid=push_sub.sid)
+    N._dispatch_msg(client, heartbeat)
+    @test !isready(push_sub.messages)
+    @test client.pending_bytes == 0
+
+    plain_sub = subscribe(client, "_INBOX.plain")
+    plain_heartbeat = Msg("_INBOX.plain", nothing, UInt8[];
+                          headers=Headers("Status" => ["100"], "Description" => ["Idle Heartbeat"]),
+                          client, sid=plain_sub.sid)
+    N._dispatch_msg(client, plain_heartbeat)
+    @test N._status_header(next(plain_sub; timeout=0.1)) == 100
+
+    close(push_sub)
+    close(plain_sub)
+end
+
+@testitem "JetStream push flow control replies internally" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+    flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
+                       headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
+                       client, sid=sub.sid)
+
+    N._dispatch_msg(client, flow_control)
+
+    expected = "PUB _INBOX.fc 0\r\n\r\n"
+    @test !isready(sub.messages)
+    @test client.pending_bytes == ncodeunits(expected)
+    @test String(take!(client.pending)) == expected
+    close(sub)
+end
+
+@testitem "JetStream push flow control reply failures use error callback" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    errors = Channel{Any}(1)
+    opts = ConnectOptions(error_cb=err -> put!(errors, err))
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+    @lock client.lock client.status = N.ConnectionStatus.DISCONNECTED
+
+    flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
+                       headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
+                       client, sid=sub.sid)
+    N._dispatch_msg(client, flow_control)
+
+    @test !isready(sub.messages)
+    @test timedwait(1.0; pollint=0.01) do
+        isready(errors)
+    end != :timed_out
+    @test take!(errors) isa ConnectionClosedError
+    close(sub)
+end
+
+@testitem "JetStream push control dispatch does not invoke callbacks" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    received = Channel{String}(1)
+    sub = subscribe(client, "_INBOX.callback";
+                    callback=msg -> put!(received, String(msg)),
+                    _control_handler=N._JetStreamPushControlHandler())
+
+    heartbeat = Msg("_INBOX.callback", nothing, UInt8[];
+                    headers=Headers("Status" => ["100"], "Description" => ["Idle Heartbeat"]),
+                    client, sid=sub.sid)
+    flow_control = Msg("_INBOX.callback", "_INBOX.fc", UInt8[];
+                       headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
+                       client, sid=sub.sid)
+    N._dispatch_msg(client, heartbeat)
+    N._dispatch_msg(client, flow_control)
+
+    @test timedwait(0.1; pollint=0.01) do
+        isready(received)
+    end == :timed_out
+
+    N._dispatch_msg(client, Msg("_INBOX.callback", nothing, TestHelpers.bytes("work"); client, sid=sub.sid))
+    @test timedwait(1.0; pollint=0.01) do
+        isready(received)
+    end != :timed_out
+    @test take!(received) == "work"
+    close(sub)
+end
+
+@testitem "JetStream consumer create update and upsert request actions" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client()
+    js = jetstream(client)
+    payload = N._js_config_payload(ConsumerConfig(name="worker", durable_name="worker", filter_subject="orders.created"))
+
+    create_request = N._consumer_request_payload(js, "ORDERS", payload, "create")
+    @test create_request["stream_name"] == "ORDERS"
+    @test create_request["config"] === payload
+    @test create_request["action"] == "create"
+
+    update_request = N._consumer_request_payload(js, "ORDERS", payload, "update")
+    @test update_request["stream_name"] == "ORDERS"
+    @test update_request["config"] === payload
+    @test update_request["action"] == "update"
+
+    upsert_request = N._consumer_request_payload(js, "ORDERS", payload)
+    @test upsert_request["stream_name"] == "ORDERS"
+    @test upsert_request["config"] === payload
+    @test !haskey(upsert_request, "action")
+
+    @test N._consumer_create_subject(js, "ORDERS", payload) == "\$JS.API.CONSUMER.CREATE.ORDERS.worker.orders.created"
+    @test_throws ArgumentError N._consumer_request_payload(js, "ORDERS", payload, "delete")
+
+    old_client = TestHelpers.fake_client()
+    old_client.info.version = "2.9.22"
+    @test_throws UnsupportedFeatureError N._consumer_request_payload(jetstream(old_client), "ORDERS", payload, "create")
+    @test_throws UnsupportedFeatureError N._consumer_request_payload(jetstream(old_client), "ORDERS", payload, "update")
+end
+
 @testitem "JetStream direct get request validation and response lifting" setup=[TestHelpers] begin
     using Natter
 
@@ -241,4 +488,63 @@ end
     meta2 = metadata(Msg("s", "\$JS.ACK._.acc.ORDERS.C1.3.11.5.987654321.8.rand", UInt8[]))
     @test meta2.domain == ""
     @test meta2.timestamp_ns == 987654321
+end
+
+@testitem "JetStream pull fetch validates inputs before publishing" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull")
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+
+    @test_throws ArgumentError fetch(psub, 0; timeout=1.0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, -1; timeout=1.0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=0.0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=-1.0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=0.0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=-1.0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=2.0)
+    @test client.pending_bytes == 0
+
+    close(psub)
+    @test_throws ConnectionClosedError fetch(psub, 1; timeout=1.0)
+    @test client.pending_bytes == 0
+
+    underlying = subscribe(client, "_INBOX.underlying")
+    underlying_psub = N.PullSubscription(js, underlying, "ORDERS", "WORKER", "_INBOX.underlying", ReentrantLock(), ReentrantLock(), false, false)
+    close(underlying)
+    @test_throws ConnectionClosedError fetch(underlying_psub, 1; timeout=1.0)
+    @test client.pending_bytes == 0
+end
+
+@testitem "JetStream subscription close is idempotent" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+
+    pull_core = subscribe(client, "_INBOX.pull")
+    pull = N.PullSubscription(js, pull_core, "S", "C", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+    close(pull)
+    close(pull)
+    @test pull.closed
+    @test pull_core.closed
+
+    push_core = subscribe(client, "_INBOX.push")
+    push = N.PushSubscription(js, push_core, "S", "C", ReentrantLock(), false, false)
+    close(push)
+    close(push)
+    @test push.closed
+    @test push_core.closed
 end

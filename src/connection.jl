@@ -21,7 +21,7 @@ function connect(url_or_urls=nothing; kwargs...)
         nothing,
         nothing,
         ConnectionStatus.DISCONNECTED,
-        Dict{String,Any}(),
+        ServerInfo(),
         nothing,
         nothing,
         nothing,
@@ -29,9 +29,11 @@ function connect(url_or_urls=nothing; kwargs...)
         ReentrantLock(),
         0,
         Dict{Int,Subscription}(),
+        nothing,
+        ReentrantLock(),
         IOBuffer(),
         0,
-        Channel{Bool}[],
+        PongWaiter[],
         nothing,
         nothing,
         nothing,
@@ -214,8 +216,10 @@ end
 
 function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}})
     @lock client.write_lock begin
-        write(client.write_io, data)
-        flush(client.write_io)
+        io = @lock client.lock client.write_io
+        isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
+        write(io, data)
+        flush(io)
     end
     nothing
 end
@@ -243,14 +247,17 @@ function _close_transport(read_io, write_io, sock)
 end
 
 function _take_transport!(client::Client)
-    @lock client.lock begin
-        read_io = client.read_io
-        write_io = client.write_io
-        sock = client.socket
-        client.read_io = nothing
-        client.write_io = nothing
-        client.socket = nothing
-        read_io, write_io, sock
+    @lock client.write_lock begin
+        @lock client.lock begin
+            read_io = client.read_io
+            write_io = client.write_io
+            sock = client.socket
+            client.read_io = nothing
+            client.reader = nothing
+            client.write_io = nothing
+            client.socket = nothing
+            read_io, write_io, sock
+        end
     end
 end
 
@@ -285,13 +292,15 @@ function _close_transport_report_errors!(client::Client, read_io, write_io, sock
 end
 
 function _notify_pong_waiters!(client::Client, value::Bool)
-    chans = @lock client.lock begin
-        chans = copy(client.pongs)
+    waiters = @lock client.lock begin
+        waiters = copy(client.pongs)
         empty!(client.pongs)
-        chans
+        waiters
     end
     errors = Any[]
-    for ch in chans
+    for waiter in waiters
+        ch = waiter.channel
+        isnothing(ch) && continue
         try
             isopen(ch) && put!(ch, value)
         catch err
@@ -299,6 +308,45 @@ function _notify_pong_waiters!(client::Client, value::Bool)
         end
     end
     errors
+end
+
+function _notify_request_waiters!(client::Client, err::Exception; clear_mux::Bool=false)
+    waiters = @lock client.lock begin
+        mux = client.request_mux
+        if isnothing(mux)
+            Channel{Any}[]
+        else
+            waiters = collect(values(mux.waiters))
+            empty!(mux.waiters)
+            clear_mux && (client.request_mux = nothing)
+            waiters
+        end
+    end
+    errors = Any[]
+    for ch in waiters
+        try
+            isopen(ch) && put!(ch, err)
+        catch notify_err
+            push!(errors, CleanupError("notify request waiter", notify_err))
+        end
+    end
+    errors
+end
+
+function _trim_stale_pong_waiters_locked!(client::Client)
+    limit = max(0, client.options.max_stale_pong_waiters)
+    stale = count(waiter -> isnothing(waiter.channel), client.pongs)
+    stale <= limit && return nothing
+
+    remove = stale - limit
+    filter!(client.pongs) do waiter
+        if remove > 0 && isnothing(waiter.channel)
+            remove -= 1
+            return false
+        end
+        true
+    end
+    nothing
 end
 
 function _wait_task!(errors::Vector, operation::String, task::Union{Task,Nothing}; timeout::Real=0.5)
@@ -333,7 +381,7 @@ function _stop_client_tasks!(client::Client; timeout::Real=0.5)
     errors
 end
 
-function _connect_command(client::Client, info::Dict{String,Any}, url_user, url_pass)
+function _connect_command(client::Client, info::ServerInfo, url_user, url_pass)
     opts = client.options
     body = Dict{String,Any}(
         "verbose" => opts.verbose,
@@ -363,6 +411,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     sock = _connect_tcp(host, port, _remaining_timeout(deadline))
     read_io = sock
     write_io = sock
+    reader = ProtocolReader{_read_transport_type(client)}(read_io)
     cleanup = () -> _close_transport(read_io, write_io, sock)
     try
         tls_active::Bool = false
@@ -372,22 +421,24 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             end
             read_io = tls
             write_io = tls
+            reader = ProtocolReader{_read_transport_type(client)}(read_io)
             tls_active = true
         end
         op, data = _run_with_timeout("connect INFO read", _remaining_timeout(deadline), cleanup) do
-            _read_control_or_msg(read_io)
+            _read_control_or_msg(reader, client.options)
         end
         op == :INFO || throw(ProtocolError("expected INFO during connect"))
-        info = data::Dict{String,Any}
-        wants_tls::Bool = !tls_active && (scheme == "tls" || client.options.tls_required || get(info, "tls_required", false) == true)
+        info = data::ServerInfo
+        wants_tls::Bool = !tls_active && (scheme == "tls" || client.options.tls_required || info.tls_required === true)
         if wants_tls
-            available = get(info, "tls_available", get(info, "tls_required", false))
+            available = something(info.tls_available, info.tls_required === true)
             available == true || throw(ProtocolError("TLS requested but server did not advertise TLS availability"))
             tls = _run_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup) do
                 _tls_wrap(sock, client.options, host)
             end
             read_io = tls
             write_io = tls
+            reader = ProtocolReader{_read_transport_type(client)}(read_io)
             tls_active = true
         end
         _run_with_timeout("connect command write", _remaining_timeout(deadline), cleanup) do
@@ -397,7 +448,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
         end
         while true
             op, data = _run_with_timeout("connect PONG read", _remaining_timeout(deadline), cleanup) do
-                _read_control_or_msg(read_io)
+                _read_control_or_msg(reader, client.options)
             end
             if op == :PONG
                 break
@@ -414,25 +465,29 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
                 throw(ProtocolError("unexpected $(op) during connect"))
             end
         end
-        accepted = @lock client.lock begin
-            if !isnothing(generation) && (client.generation != generation || client.status == ConnectionStatus.CLOSED)
-                false
-            else
-                client.current_server = server
-                client.connected_url = server.url
-                client.info = info
-                client.socket = sock
-                client.read_io = read_io
-                client.write_io = write_io
-                mark_connected && (client.status = ConnectionStatus.CONNECTED)
-                client.pings_out = 0
-                true
+        accepted = @lock client.write_lock begin
+            @lock client.lock begin
+                if !isnothing(generation) && (client.generation != generation || client.status == ConnectionStatus.CLOSED)
+                    false
+                else
+                    client.current_server = server
+                    client.connected_url = server.url
+                    client.info = info
+                    client.socket = sock
+                    client.read_io = read_io
+                    client.reader = reader
+                    client.write_io = write_io
+                    mark_connected && (client.status = ConnectionStatus.CONNECTED)
+                    client.pings_out = 0
+                    true
+                end
             end
         end
         if !accepted
             _close_transport_report_errors!(client, read_io, write_io, sock)
             read_io = nothing
             write_io = nothing
+            reader = nothing
             sock = nothing
             throw(ConnectionClosedError("connection state changed while connecting"))
         end
@@ -499,8 +554,8 @@ function _throw_server_err(message::AbstractString)
     end
 end
 
-function _merge_discovered_servers!(client::Client, info::Dict{String,Any})
-    urls = get(info, "connect_urls", nothing)
+function _merge_discovered_servers!(client::Client, info::ServerInfo)
+    urls = info.connect_urls
     isnothing(urls) && return
     added = false
     @lock client.lock begin
@@ -535,9 +590,16 @@ function _sleep_interruptibly(client::Client, generation::Int, seconds::Real)
 end
 
 function _reader_loop(client::Client, generation::Int)
+    reader = @lock client.lock client.reader
+    if isnothing(reader)
+        read_io = @lock client.lock client.read_io
+        isnothing(read_io) && return
+        reader = ProtocolReader{_read_transport_type(client)}(read_io)
+        @lock client.lock client.reader = reader
+    end
     while _generation_matches(client, generation) && status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
-            op, data = _read_control_or_msg(client.read_io)
+            op, data = _read_control_or_msg(reader, client.options)
             if op == :MSG
                 msg = data::Msg
                 msg.client = client
@@ -547,10 +609,10 @@ function _reader_loop(client::Client, generation::Int)
             elseif op == :PONG
                 _notify_pong(client)
             elseif op == :INFO
-                info = data::Dict{String,Any}
-                @lock client.lock merge!(client.info, info)
+                info = data::ServerInfo
+                @lock client.lock _merge_server_info!(client.info, info)
                 _merge_discovered_servers!(client, info)
-                if get(info, "ldm", false) == true
+                if info.ldm
                     _trigger_reconnect(client, ProtocolError("server entered lame duck mode"))
                     return
                 end
@@ -592,14 +654,20 @@ function _ping_loop(client::Client, generation::Int)
 end
 
 function _notify_pong(client::Client)
-    ch = nothing
+    waiter = nothing
     @lock client.lock begin
         client.pings_out = 0
         if !isempty(client.pongs)
-            ch = popfirst!(client.pongs)
+            waiter = popfirst!(client.pongs)
         end
     end
-    isnothing(ch) || put!(ch, true)
+    if !isnothing(waiter) && !isnothing(waiter.channel)
+        try
+            put!(waiter.channel, true)
+        catch err
+            _report_error(client, CleanupError("notify flush waiter", err))
+        end
+    end
     nothing
 end
 
@@ -619,6 +687,8 @@ function _trigger_reconnect(client::Client, reason)
         end
     end
     generation == 0 && return nothing
+    request_err = opts.allow_reconnect ? ConnectionReconnectingError() : ConnectionClosedError("connection is disconnected")
+    _report_cleanup_errors(client, _notify_request_waiters!(client, request_err))
     _report_cleanup_errors(client, _notify_pong_waiters!(client, false))
     _close_transport_report_errors!(client)
     if should_start
