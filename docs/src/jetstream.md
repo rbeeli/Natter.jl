@@ -110,7 +110,7 @@ msg = stream_message_get(js, "ORDERS";
 )
 ```
 
-Delete a stored message by stream sequence:
+Delete a stored message by positive stream sequence:
 
 ```julia
 deleted = stream_message_delete(js, "ORDERS", 42)

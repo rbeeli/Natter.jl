@@ -200,23 +200,35 @@ function _enqueue_pending(client::Client, data)
     end
 end
 
-function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{String,Nothing}=nothing,
-                  headers=nothing, buffer_on_reconnect::Bool=true)
-    _ensure_usable_for_publish(client)
+function _prepare_publish_frame(subject::AbstractString, data, reply::Union{String,Nothing}, headers)::PublishFrame
     subject = _validate_publish_subject(subject)
     !isnothing(reply) && _validate_publish_subject(reply)
     payload = _payload_bytes(data)
     hdr = isnothing(headers) ? EMPTY_BYTES : _headers_bytes(_headers_from_input(headers))
-    frame = PublishFrame(subject, reply, payload, hdr)
+    PublishFrame(subject, reply, payload, hdr)
+end
+
+function _validate_publish_frame_for_client(client::Client, frame::PublishFrame)
     total = _pub_payload_size(frame)
     max_payload, headers_supported = @lock client.lock begin
         something(client.info.max_payload, typemax(Int)), client.info.headers === true
     end
-    !isempty(hdr) && !headers_supported && throw(UnsupportedFeatureError("headers are not supported by the connected server"))
+    !isempty(frame.headers) && !headers_supported && throw(UnsupportedFeatureError("headers are not supported by the connected server"))
     total > max_payload && throw(MaxPayloadError(max_payload, total))
-    _send_publish(client, frame; buffer_on_reconnect)
-    _record_out!(client, length(payload))
     nothing
+end
+
+function _publish_prepared(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true)
+    _ensure_usable_for_publish(client)
+    _validate_publish_frame_for_client(client, frame)
+    _send_publish(client, frame; buffer_on_reconnect)
+    _record_out!(client, length(frame.payload))
+    nothing
+end
+
+function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{String,Nothing}=nothing,
+                  headers=nothing, buffer_on_reconnect::Bool=true)
+    _publish_prepared(client, _prepare_publish_frame(subject, data, reply, headers); buffer_on_reconnect)
 end
 
 function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{String,Nothing}=nothing, headers=nothing)
@@ -464,7 +476,12 @@ end
 
 close(sub::Subscription) = unsubscribe(sub)
 
-function drain(sub::Subscription; timeout::Real=sub.client.options.drain_timeout)
+_drain_deadline(timeout::Real)::Float64 = time() + Float64(timeout)
+_drain_timed_out(err)::Bool =
+    err isa TimeoutError || (err isa Base.CompositeException && any(_drain_timed_out, err.exceptions))
+_drain_timed_out(errors::Vector)::Bool = any(_drain_timed_out, errors)
+
+function _drain(sub::Subscription, deadline::Float64)
     closed, active = @lock sub.client.lock (sub.closed, sub.server_active)
     closed && return nothing
     status(sub.client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING) || throw(ConnectionReconnectingError())
@@ -476,8 +493,8 @@ function drain(sub::Subscription; timeout::Real=sub.client.options.drain_timeout
             throw(ConnectionReconnectingError())
         end
     end
-    flush(sub.client; timeout)
-    result = timedwait(timeout; pollint=0.01) do
+    flush(sub.client; timeout=_remaining_timeout(deadline))
+    result = timedwait(_remaining_timeout(deadline); pollint=0.01) do
         !isready(sub.messages) && (@lock sub.client.lock sub.processing == 0)
     end
     result == :timed_out && throw(TimeoutError("subscription drain timed out"))
@@ -489,6 +506,10 @@ function drain(sub::Subscription; timeout::Real=sub.client.options.drain_timeout
     _close_subscription_channel!(errors, sub)
     _throw_errors(errors)
     nothing
+end
+
+function drain(sub::Subscription; timeout::Real=sub.client.options.drain_timeout)
+    _drain(sub, _drain_deadline(timeout))
 end
 
 function flush(client::Client; timeout::Real=10.0)
@@ -523,6 +544,7 @@ end
 ping(client::Client; timeout::Real=10.0) = flush(client; timeout)
 
 function drain(client::Client; timeout::Real=client.options.drain_timeout)
+    deadline = _drain_deadline(timeout)
     @lock client.lock begin
         client.status == ConnectionStatus.CLOSED && return nothing
         client.status == ConnectionStatus.CONNECTED || throw(ConnectionReconnectingError())
@@ -532,17 +554,20 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout)
     subs = @lock client.lock collect(values(client.subscriptions))
     for sub in subs
         try
-            drain(sub; timeout)
+            _drain(sub, deadline)
+        catch err
+            push!(errors, err)
+            _report_error(client, err)
+            _drain_timed_out(err) && break
+        end
+    end
+    if !_drain_timed_out(errors)
+        try
+            flush(client; timeout=_remaining_timeout(deadline))
         catch err
             push!(errors, err)
             _report_error(client, err)
         end
-    end
-    try
-        flush(client; timeout)
-    catch err
-        push!(errors, err)
-        _report_error(client, err)
     end
     try
         close(client; throw_errors=true)
@@ -694,11 +719,16 @@ function _wait_request_reply(ch::Channel{Any}, timeout::Real)
 end
 
 function _request_raw(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0, headers=nothing)
+    request_frame = _prepare_publish_frame(subject, data, nothing, headers)
+    _ensure_connected_for_request(client)
+    _validate_publish_frame_for_client(client, request_frame)
     mux = _ensure_request_mux(client)
     token, ch = _register_request_waiter!(client, mux)
     reply = "$(mux.prefix).$token"
     try
-        _publish(client, subject, data; reply, headers, buffer_on_reconnect=false)
+        _validate_publish_subject(reply)
+        frame = PublishFrame(request_frame.subject, reply, request_frame.payload, request_frame.headers)
+        _publish_prepared(client, frame; buffer_on_reconnect=false)
         return _wait_request_reply(ch, timeout)
     finally
         _remove_request_waiter!(client, mux, token, ch)

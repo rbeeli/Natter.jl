@@ -45,6 +45,42 @@ function _ascii_startswith_ci(value::AbstractString, expected::AbstractString)::
     true
 end
 
+@inline _is_hspace(byte::UInt8)::Bool = byte == UInt8(' ') || byte == UInt8('\t')
+
+function _ascii_eq_ci(bytes::AbstractVector{UInt8}, first::Int, last::Int, expected::AbstractString)::Bool
+    last - first + 1 == ncodeunits(expected) || return false
+    @inbounds for i in 1:ncodeunits(expected)
+        _ascii_upper(bytes[first + i - 1]) == codeunit(expected, i) || return false
+    end
+    true
+end
+
+function _ascii_startswith_ci(bytes::AbstractVector{UInt8}, first::Int, last::Int, expected::AbstractString)::Bool
+    last - first + 1 >= ncodeunits(expected) || return false
+    @inbounds for i in 1:ncodeunits(expected)
+        _ascii_upper(bytes[first + i - 1]) == codeunit(expected, i) || return false
+    end
+    true
+end
+
+function _ascii_startswith(bytes::AbstractVector{UInt8}, first::Int, last::Int, expected::AbstractString)::Bool
+    last - first + 1 >= ncodeunits(expected) || return false
+    @inbounds for i in 1:ncodeunits(expected)
+        bytes[first + i - 1] == codeunit(expected, i) || return false
+    end
+    true
+end
+
+function _bytes_string(bytes::Vector{UInt8}, first::Int, last::Int)::String
+    last >= first || return ""
+    unsafe_string(pointer(bytes, first), last - first + 1)
+end
+
+function _bytes_string(bytes::AbstractVector{UInt8}, first::Int, last::Int)::String
+    last >= first || return ""
+    String(@view bytes[first:last])
+end
+
 _reader_available(reader::ProtocolReader)::Int = reader.last - reader.first + 1
 
 function _drop_consumed!(reader::ProtocolReader)
@@ -100,7 +136,9 @@ function _read_exact_bytes(io, n::Int)::Vector{UInt8}
     data
 end
 
-function _read_exact_bytes(reader::ProtocolReader, n::Int)::Vector{UInt8}
+_read_exact_bytes_no_drop(io, n::Int) = _read_exact_bytes(io, n)
+
+function _read_exact_bytes_no_drop(reader::ProtocolReader, n::Int)::Vector{UInt8}
     n == 0 && return UInt8[]
     data = Vector{UInt8}(undef, n)
     offset = 1
@@ -113,7 +151,6 @@ function _read_exact_bytes(reader::ProtocolReader, n::Int)::Vector{UInt8}
             reader.first += take
             offset += take
             remaining -= take
-            _drop_consumed!(reader)
         else
             unsafe_read(reader.io, pointer(data, offset), UInt(remaining))
             remaining = 0
@@ -122,20 +159,25 @@ function _read_exact_bytes(reader::ProtocolReader, n::Int)::Vector{UInt8}
     data
 end
 
-function _readline_crlf(reader::ProtocolReader, max_control_line::Int)
+function _read_exact_bytes(reader::ProtocolReader, n::Int)::Vector{UInt8}
+    data = _read_exact_bytes_no_drop(reader, n)
+    _drop_consumed!(reader)
+    data
+end
+
+function _readline_crlf_range(reader::ProtocolReader, max_control_line::Int)::UnitRange{Int}
     while true
-        newline = findnext(==(UInt8('\n')), reader.buffer, reader.first)
+        newline = _find_byte(reader.buffer, UInt8('\n'), reader.first, reader.last)
         if !isnothing(newline)
             line_bytes = newline - reader.first + 1
             line_bytes > max_control_line && throw(ProtocolError("protocol line exceeds configured limit of $max_control_line bytes"))
+            line_first = reader.first
             data_end = newline - 1
             if data_end >= reader.first && reader.buffer[data_end] == UInt8('\r')
                 data_end -= 1
             end
-            line = data_end >= reader.first ? String(@view reader.buffer[reader.first:data_end]) : ""
             reader.first = newline + 1
-            _drop_consumed!(reader)
-            return line
+            return line_first:data_end
         end
         _reader_available(reader) > max_control_line && throw(ProtocolError("protocol line exceeds configured limit of $max_control_line bytes"))
         try
@@ -146,6 +188,13 @@ function _readline_crlf(reader::ProtocolReader, max_control_line::Int)
             throw(ProtocolError("protocol line missing LF"))
         end
     end
+end
+
+function _readline_crlf(reader::ProtocolReader, max_control_line::Int)
+    range = _readline_crlf_range(reader, max_control_line)
+    line = _bytes_string(reader.buffer, first(range), last(range))
+    _drop_consumed!(reader)
+    line
 end
 
 _readline_crlf(io, max_control_line::Int) =
@@ -163,65 +212,211 @@ function _validate_header_size(size::Int, max_header_bytes::Int)
     size
 end
 
+_drop_payload_consumed!(io) = nothing
+_drop_payload_consumed!(reader::ProtocolReader) = _drop_consumed!(reader)
+
+function _read_byte_no_drop(io)::UInt8
+    read(io, UInt8)
+end
+
+function _read_byte_no_drop(reader::ProtocolReader)::UInt8
+    if _reader_available(reader) > 0
+        byte = reader.buffer[reader.first]
+        reader.first += 1
+        return byte
+    end
+    unsafe_read(reader.io, pointer(reader.scratch), UInt(1))
+    reader.scratch[1]
+end
+
+function _read_payload_trailer_no_drop!(io)
+    b1 = _read_byte_no_drop(io)
+    b2 = _read_byte_no_drop(io)
+    b1 == CRLF_BYTES[1] && b2 == CRLF_BYTES[2] || throw(ProtocolError("message payload missing CRLF trailer"))
+    nothing
+end
+
 function _read_exact_payload(io, n::Int)
     data = try
-        _read_exact_bytes(io, n)
+        _read_exact_bytes_no_drop(io, n)
     catch err
         err isa EOFError || rethrow()
         throw(ProtocolError("unexpected EOF while reading payload"))
     end
-    trailer = try
-        _read_exact_bytes(io, 2)
+    try
+        _read_payload_trailer_no_drop!(io)
     catch err
         err isa EOFError || rethrow()
         throw(ProtocolError("message payload missing CRLF trailer"))
     end
-    trailer == CRLF_BYTES || throw(ProtocolError("message payload missing CRLF trailer"))
+    _drop_payload_consumed!(io)
     data
+end
+
+function _read_exact_header_payload(io, hsize::Int, total::Int)
+    hsize <= total || throw(ProtocolError("header size exceeds message size"))
+    header = try
+        _read_exact_bytes_no_drop(io, hsize)
+    catch err
+        err isa EOFError || rethrow()
+        throw(ProtocolError("unexpected EOF while reading payload"))
+    end
+    data = try
+        _read_exact_bytes_no_drop(io, total - hsize)
+    catch err
+        err isa EOFError || rethrow()
+        throw(ProtocolError("unexpected EOF while reading payload"))
+    end
+    try
+        _read_payload_trailer_no_drop!(io)
+    catch err
+        err isa EOFError || rethrow()
+        throw(ProtocolError("message payload missing CRLF trailer"))
+    end
+    _drop_payload_consumed!(io)
+    header, data
+end
+
+function _skip_hspace(bytes::AbstractVector{UInt8}, pos::Int, stop::Int)::Int
+    @inbounds while pos <= stop && _is_hspace(bytes[pos])
+        pos += 1
+    end
+    pos
+end
+
+function _next_token(bytes::AbstractVector{UInt8}, pos::Int, stop::Int)::Tuple{Int,Int,Int}
+    pos = _skip_hspace(bytes, pos, stop)
+    pos > stop && return (0, -1, pos)
+    token_start = pos
+    @inbounds while pos <= stop && !_is_hspace(bytes[pos])
+        pos += 1
+    end
+    token_start, pos - 1, pos
+end
+
+function _has_more_tokens(bytes::AbstractVector{UInt8}, pos::Int, stop::Int)::Bool
+    _skip_hspace(bytes, pos, stop) <= stop
+end
+
+function _parse_int_token(bytes::AbstractVector{UInt8}, first::Int, last::Int)::Int
+    first <= last || throw(ProtocolError("malformed integer field in protocol line"))
+    negative = false
+    pos = first
+    @inbounds begin
+        if bytes[pos] == UInt8('-')
+            negative = true
+            pos += 1
+        elseif bytes[pos] == UInt8('+')
+            pos += 1
+        end
+        pos <= last || throw(ProtocolError("malformed integer field in protocol line"))
+        value = 0
+        while pos <= last
+            byte = bytes[pos]
+            UInt8('0') <= byte <= UInt8('9') || throw(ProtocolError("malformed integer field in protocol line"))
+            digit = Int(byte - UInt8('0'))
+            value <= (typemax(Int) - digit) ÷ 10 || throw(ProtocolError("integer field exceeds Int range"))
+            value = value * 10 + digit
+            pos += 1
+        end
+    end
+    negative ? -value : value
+end
+
+function _malformed_control_line(kind::AbstractString, bytes::AbstractVector{UInt8}, first::Int, last::Int)
+    throw(ProtocolError("malformed $kind control line: $(_bytes_string(bytes, first, last))"))
+end
+
+function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int, max_payload::Int)
+    bytes = reader.buffer
+    subject_start, subject_end, pos = _next_token(bytes, line_first + 4, line_last)
+    subject_start == 0 && _malformed_control_line("MSG", bytes, line_first, line_last)
+    sid_start, sid_end, pos = _next_token(bytes, pos, line_last)
+    sid_start == 0 && _malformed_control_line("MSG", bytes, line_first, line_last)
+    third_start, third_end, pos = _next_token(bytes, pos, line_last)
+    third_start == 0 && _malformed_control_line("MSG", bytes, line_first, line_last)
+    fourth_start, fourth_end, pos = _next_token(bytes, pos, line_last)
+    _has_more_tokens(bytes, pos, line_last) && _malformed_control_line("MSG", bytes, line_first, line_last)
+
+    subject = _bytes_string(bytes, subject_start, subject_end)
+    sid = _parse_int_token(bytes, sid_start, sid_end)
+    reply = fourth_start == 0 ? nothing : _bytes_string(bytes, third_start, third_end)
+    size_start, size_end = fourth_start == 0 ? (third_start, third_end) : (fourth_start, fourth_end)
+    size = _validate_payload_size(_parse_int_token(bytes, size_start, size_end), max_payload)
+    payload = _read_exact_payload(reader, size)
+    :MSG, Msg(subject, reply, payload, Headers(), nothing, sid, false)
+end
+
+function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
+                         max_payload::Int, max_header_bytes::Int)
+    bytes = reader.buffer
+    subject_start, subject_end, pos = _next_token(bytes, line_first + 5, line_last)
+    subject_start == 0 && _malformed_control_line("HMSG", bytes, line_first, line_last)
+    sid_start, sid_end, pos = _next_token(bytes, pos, line_last)
+    sid_start == 0 && _malformed_control_line("HMSG", bytes, line_first, line_last)
+    third_start, third_end, pos = _next_token(bytes, pos, line_last)
+    third_start == 0 && _malformed_control_line("HMSG", bytes, line_first, line_last)
+    fourth_start, fourth_end, pos = _next_token(bytes, pos, line_last)
+    fourth_start == 0 && _malformed_control_line("HMSG", bytes, line_first, line_last)
+    fifth_start, fifth_end, pos = _next_token(bytes, pos, line_last)
+    _has_more_tokens(bytes, pos, line_last) && _malformed_control_line("HMSG", bytes, line_first, line_last)
+
+    subject = _bytes_string(bytes, subject_start, subject_end)
+    sid = _parse_int_token(bytes, sid_start, sid_end)
+    has_reply = fifth_start != 0
+    reply = has_reply ? _bytes_string(bytes, third_start, third_end) : nothing
+    hsize_start, hsize_end = has_reply ? (fourth_start, fourth_end) : (third_start, third_end)
+    total_start, total_end = has_reply ? (fifth_start, fifth_end) : (fourth_start, fourth_end)
+    hsize = _validate_header_size(_parse_int_token(bytes, hsize_start, hsize_end), max_header_bytes)
+    total = _validate_payload_size(_parse_int_token(bytes, total_start, total_end), max_payload)
+    header_bytes, payload = _read_exact_header_payload(reader, hsize, total)
+    hdrs = _parse_headers(header_bytes)
+    :MSG, Msg(subject, reply, payload, hdrs, nothing, sid, false)
+end
+
+function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
+                              max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
+                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)
+    line_range = _readline_crlf_range(reader, max_control_line)
+    line_first = first(line_range)
+    line_last = last(line_range)
+    line_last >= line_first || throw(ProtocolError("empty protocol line"))
+    bytes = reader.buffer
+    if _ascii_startswith_ci(bytes, line_first, line_last, "INFO ")
+        info = _server_info(@view bytes[line_first + 5:line_last])
+        _drop_consumed!(reader)
+        return (:INFO, info)
+    elseif _ascii_eq_ci(bytes, line_first, line_last, "PING")
+        _drop_consumed!(reader)
+        return (:PING, nothing)
+    elseif _ascii_eq_ci(bytes, line_first, line_last, "PONG")
+        _drop_consumed!(reader)
+        return (:PONG, nothing)
+    elseif _ascii_eq_ci(bytes, line_first, line_last, "+OK")
+        _drop_consumed!(reader)
+        return (:OK, nothing)
+    elseif _ascii_startswith_ci(bytes, line_first, line_last, "-ERR")
+        msg = line_last - line_first + 1 >= 6 ? strip(_bytes_string(bytes, line_first + 5, line_last)) : ""
+        msg = strip(String(msg), ['\'', ' '])
+        _drop_consumed!(reader)
+        return (:ERR, msg)
+    elseif _ascii_startswith_ci(bytes, line_first, line_last, "MSG ")
+        return _read_msg_line(reader, line_first, line_last, max_payload)
+    elseif _ascii_startswith_ci(bytes, line_first, line_last, "HMSG ")
+        return _read_hmsg_line(reader, line_first, line_last, max_payload, max_header_bytes)
+    else
+        line = _bytes_string(bytes, line_first, line_last)
+        throw(ProtocolError("unknown protocol line: $line"))
+    end
 end
 
 function _read_control_or_msg(io; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
                               max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
                               max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)
-    line = _readline_crlf(io, max_control_line)
-    isempty(line) && throw(ProtocolError("empty protocol line"))
-    if _ascii_startswith_ci(line, "INFO ")
-        return (:INFO, _server_info(SubString(line, 6)))
-    elseif _ascii_eq_ci(line, "PING")
-        return (:PING, nothing)
-    elseif _ascii_eq_ci(line, "PONG")
-        return (:PONG, nothing)
-    elseif _ascii_eq_ci(line, "+OK")
-        return (:OK, nothing)
-    elseif _ascii_startswith_ci(line, "-ERR")
-        msg = lastindex(line) >= 6 ? strip(SubString(line, 6:lastindex(line))) : ""
-        msg = strip(String(msg), ['\'', ' '])
-        return (:ERR, msg)
-    elseif _ascii_startswith_ci(line, "MSG ")
-        parts = split(line)
-        length(parts) in (4, 5) || throw(ProtocolError("malformed MSG control line: $line"))
-        subject = String(parts[2])
-        sid = parse(Int, parts[3])
-        reply = length(parts) == 5 ? String(parts[4]) : nothing
-        size = _validate_payload_size(parse(Int, parts[end]), max_payload)
-        payload = _read_exact_payload(io, size)
-        return (:MSG, Msg(subject, reply, payload; client=nothing, sid=sid))
-    elseif _ascii_startswith_ci(line, "HMSG ")
-        parts = split(line)
-        length(parts) in (5, 6) || throw(ProtocolError("malformed HMSG control line: $line"))
-        subject = String(parts[2])
-        sid = parse(Int, parts[3])
-        reply = length(parts) == 6 ? String(parts[4]) : nothing
-        hsize = _validate_header_size(parse(Int, parts[end - 1]), max_header_bytes)
-        total = _validate_payload_size(parse(Int, parts[end]), max_payload)
-        payload = _read_exact_payload(io, total)
-        hsize <= total || throw(ProtocolError("header size exceeds message size"))
-        hdrs = _parse_headers(@view payload[1:hsize])
-        hsize == 0 || deleteat!(payload, 1:hsize)
-        return (:MSG, Msg(subject, reply, payload; headers=hdrs, client=nothing, sid=sid))
-    else
-        throw(ProtocolError("unknown protocol line: $line"))
-    end
+    _read_control_or_msg(ProtocolReader(io; read_size=1);
+                         max_control_line,
+                         max_payload,
+                         max_header_bytes)
 end
 
 function _read_control_or_msg(io, opts::ConnectOptions)
@@ -231,34 +426,80 @@ function _read_control_or_msg(io, opts::ConnectOptions)
                          max_header_bytes=opts.max_header_bytes)
 end
 
+function _find_byte(bytes::AbstractVector{UInt8}, byte::UInt8, pos::Int, stop::Int)
+    @inbounds while pos <= stop
+        bytes[pos] == byte && return pos
+        pos += 1
+    end
+    nothing
+end
+
+function _has_header_terminator(raw::AbstractVector{UInt8}, first::Int, last::Int)::Bool
+    pos = first
+    @inbounds while pos + 3 <= last
+        raw[pos] == UInt8('\r') && raw[pos + 1] == UInt8('\n') &&
+            raw[pos + 2] == UInt8('\r') && raw[pos + 3] == UInt8('\n') && return true
+        pos += 1
+    end
+    false
+end
+
+function _all_digits(bytes::AbstractVector{UInt8}, first::Int, last::Int)::Bool
+    first <= last || return false
+    @inbounds for pos in first:last
+        UInt8('0') <= bytes[pos] <= UInt8('9') || return false
+    end
+    true
+end
+
+function _parse_header_protocol_line!(headers::Headers, raw::AbstractVector{UInt8}, line_first::Int, line_last::Int)
+    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || throw(ProtocolError("invalid NATS header block"))
+    pos = _skip_hspace(raw, line_first + ncodeunits("NATS/1.0"), line_last)
+    pos > line_last && return headers
+    status_start, status_end, pos = _next_token(raw, pos, line_last)
+    if _all_digits(raw, status_start, status_end)
+        headers["Status"] = [_bytes_string(raw, status_start, status_end)]
+        description_start = _skip_hspace(raw, pos, line_last)
+        description_start <= line_last && (headers["Description"] = [_bytes_string(raw, description_start, line_last)])
+    end
+    headers
+end
+
 function _parse_headers(raw::AbstractVector{UInt8})
     h = Headers()
     isempty(raw) && return h
-    text = String(raw)
-    occursin("\r\n\r\n", text) || throw(ProtocolError("NATS header block missing terminator"))
-    lines = split(text, CRLF; keepempty=true)
-    isempty(lines) && return h
-    protocol_line = first(lines)
-    startswith(protocol_line, "NATS/1.0") || throw(ProtocolError("invalid NATS header block"))
-    status_parts = split(protocol_line; limit=3)
-    if length(status_parts) >= 2 && all(isdigit, String(status_parts[2]))
-        h["Status"] = [String(status_parts[2])]
-        length(status_parts) >= 3 && (h["Description"] = [String(status_parts[3])])
-    end
-    for line in Iterators.drop(lines, 1)
-        isempty(line) && break
-        idx = findfirst(==(':'), line)
-        if isnothing(idx)
+    raw_first = firstindex(raw)
+    raw_last = lastindex(raw)
+    _has_header_terminator(raw, raw_first, raw_last) || throw(ProtocolError("NATS header block missing terminator"))
+
+    newline = _find_byte(raw, UInt8('\n'), raw_first, raw_last)
+    isnothing(newline) && throw(ProtocolError("NATS header block missing terminator"))
+    protocol_end = newline - 1
+    protocol_end >= raw_first && raw[protocol_end] == UInt8('\r') && (protocol_end -= 1)
+    _parse_header_protocol_line!(h, raw, raw_first, protocol_end)
+
+    pos = newline + 1
+    while pos <= raw_last
+        newline = _find_byte(raw, UInt8('\n'), pos, raw_last)
+        isnothing(newline) && throw(ProtocolError("NATS header block missing terminator"))
+        line_end = newline - 1
+        line_end >= pos && raw[line_end] == UInt8('\r') && (line_end -= 1)
+        line_end < pos && return h
+
+        colon = _find_byte(raw, UInt8(':'), pos, line_end)
+        if isnothing(colon)
             throw(ProtocolError("malformed NATS header line"))
         end
-        idx == firstindex(line) && continue
-        value_start = nextind(line, idx)
-        while value_start <= lastindex(line) && line[value_start] in (' ', '\t')
-            value_start = nextind(line, value_start)
+        if colon == pos
+            pos = newline + 1
+            continue
         end
-        key = String(line[firstindex(line):prevind(line, idx)])
-        value = value_start <= lastindex(line) ? String(line[value_start:lastindex(line)]) : ""
+        value_start = colon + 1
+        value_start = _skip_hspace(raw, value_start, line_end)
+        key = _bytes_string(raw, pos, colon - 1)
+        value = value_start <= line_end ? _bytes_string(raw, value_start, line_end) : ""
         push!(get!(h, key, String[]), value)
+        pos = newline + 1
     end
     h
 end
@@ -274,11 +515,22 @@ function _status_description(msg::Msg)
     isnothing(value) ? "" : value
 end
 
+function _valid_header_field_name_char(byte::UInt8)::Bool
+    UInt8('A') <= byte <= UInt8('Z') && return true
+    UInt8('a') <= byte <= UInt8('z') && return true
+    UInt8('0') <= byte <= UInt8('9') && return true
+    byte == UInt8('!') || byte == UInt8('#') || byte == UInt8('$') ||
+        byte == UInt8('%') || byte == UInt8('&') || byte == UInt8('\'') ||
+        byte == UInt8('*') || byte == UInt8('+') || byte == UInt8('-') ||
+        byte == UInt8('.') || byte == UInt8('^') || byte == UInt8('_') ||
+        byte == UInt8('`') || byte == UInt8('|') || byte == UInt8('~')
+end
+
 function _validate_header_pair(key::AbstractString, value::AbstractString)
-    k = strip(String(key))
+    k = String(key)
     isempty(k) && throw(ArgumentError("header key cannot be empty"))
-    if occursin('\r', k) || occursin('\n', k) || occursin(':', k)
-        throw(ArgumentError("header key contains an invalid character"))
+    for byte in codeunits(k)
+        _valid_header_field_name_char(byte) || throw(ArgumentError("header key contains an invalid character"))
     end
     v = String(value)
     if occursin('\r', v) || occursin('\n', v)

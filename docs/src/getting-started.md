@@ -82,7 +82,7 @@ flush(client)
 
 ## Close Cleanly
 
-Use `drain` when a service is shutting down and should finish in-flight messages first. Use `close` for immediate teardown.
+Use `drain` when a service is shutting down and should finish in-flight messages first. The timeout is one overall deadline for draining work. Use `close` for immediate teardown.
 
 ```julia
 drain(client; timeout=10.0)

@@ -104,7 +104,7 @@ When negotiated with a server that supports header status messages, no responder
 
 ## Headers
 
-Received headers are represented as `Dict{String,Vector{String}}` through the `Headers` alias. Publish and request calls accept `Headers`, dictionaries with string or vector values, or pair iterators.
+Received headers are represented as `Dict{String,Vector{String}}` through the `Headers` alias. Publish and request calls accept `Headers`, dictionaries with string or vector values, or pair iterators. Header names must be valid NATS/HTTP token field names.
 Header publish and request calls require server header support advertised in INFO; older servers that do not advertise it raise `UnsupportedFeatureError` before Natter writes an `HPUB`.
 
 ```julia
@@ -128,7 +128,7 @@ publish(client, "events.created", "payload")
 flush(client; timeout=2.0)
 ```
 
-`drain(sub)` unsubscribes and waits for queued callback work to finish. `drain(client)` drains all subscriptions, flushes, and closes the client.
+`drain(sub)` unsubscribes and waits for queued callback work to finish. Its `timeout` is one overall deadline for the unsubscribe flush and callback work. `drain(client)` shares the same deadline across all subscriptions and the final flush, then closes the client.
 
 ```julia
 drain(client; timeout=10.0)

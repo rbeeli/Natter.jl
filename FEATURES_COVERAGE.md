@@ -27,9 +27,9 @@ executes JetStream and KeyValue tests.
 | Direct public API and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code and `fetch(handle)` returns the sync result or rethrows the original operation error. |
 | No responders | Supported | Advertised only when server INFO reports header support; status `503` replies become `NoRespondersError`. |
 | Flush | Supported | Implemented as a ping/pong round trip. |
-| Drain | Supported | Subscription and client drain are implemented with timeout and covered by real-server tests. |
+| Drain | Supported | Subscription and client drain are implemented with one overall timeout deadline and covered by unit and real-server tests. |
 | Close | Supported | Closes tasks and transport without further reconnects. |
-| Reconnect | Partial | Automatic reconnect is enabled by default with server pool, discovered URLs, backoff, subscription replay, pending buffer restore-on-failure, and generation-bound background tasks. Core publishes are replayed after reconnect; duplicate delivery is possible if a transport fails after partial server acceptance. Real-server tests cover same-server reconnect and multi-URL failover through a local proxy; multi-node cluster chaos, discovered-route churn, and auth failover coverage still need expansion. |
+| Reconnect | Partial | Automatic reconnect is enabled by default with server pool, discovered URLs with stale-route pruning, backoff, subscription replay, pending buffer restore-on-failure, and generation-bound background tasks. Core publishes are replayed after reconnect; duplicate delivery is possible if a transport fails after partial server acceptance. Real-server tests cover same-server reconnect and multi-URL failover through a local proxy; multi-node cluster chaos and auth failover coverage still need expansion. |
 | Lame Duck Mode | Supported | Async INFO with `ldm=true` triggers reconnect. |
 | Max payload enforcement | Supported | Uses server `max_payload` from INFO. |
 | Slow consumer handling | Supported | Per-subscription pending message/byte limits raise `SlowConsumerError` through `error_cb`. |

@@ -12,8 +12,8 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | Direct APIs and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code. |
 | Flush and ping | Supported | Drains buffered outbound writes and uses PING/PONG synchronization. |
 | Drain and close | Supported | Drains subscriptions and reports cleanup failures. |
-| Automatic reconnect | Partial | Reconnects in the background, replays subscriptions, and flushes bounded pending publishes. Real-server coverage includes same-server reconnect and multi-URL failover; multi-node cluster chaos, discovered-route churn, and auth failover need more coverage before treating this as fully hardened cluster behavior. |
-| Discovered servers | Partial | Server-discovered URLs are retained for reconnects; discovered-route churn under cluster changes still needs real-server hardening. |
+| Automatic reconnect | Partial | Reconnects in the background, replays subscriptions, and flushes bounded pending publishes. Real-server coverage includes same-server reconnect and multi-URL failover; multi-node cluster chaos and auth failover need more coverage before treating this as fully hardened cluster behavior. |
+| Discovered servers | Supported | Server-discovered URLs are retained for reconnects, and stale discovered routes are pruned on subsequent INFO updates. |
 | Server errors | Supported | Permission violations are reported without reconnecting; repeated auth failures abort reconnect with auth-specific errors. |
 | Slow consumer handling | Supported | Drops over-limit messages and reports `SlowConsumerError`. |
 | WebSocket transport | Not implemented | Planned only if there is clear demand. |

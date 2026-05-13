@@ -825,6 +825,12 @@ end
     @test_throws ArgumentError N._stream_message_get_request(0, "orders.created", true)
     @test_throws ArgumentError N._stream_message_get_request(1, "orders.*", true)
 
+    delete_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    delete_js = jetstream(delete_client)
+    @test_throws ArgumentError stream_message_delete(delete_js, "ORDERS", 0)
+    @test String(take!(delete_client.write_io)) == ""
+    @test isempty(delete_client.subscriptions)
+
     client = TestHelpers.fake_client()
     js = jetstream(client)
     api_msg, api_seq, api_created = N._stream_message_from_api_payload(js, Dict{String,Any}(

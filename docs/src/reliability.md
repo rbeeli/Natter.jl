@@ -36,7 +36,7 @@ client = connect([
 
 `max_reconnect_attempts=-1` means unlimited reconnect attempts.
 
-Reconnect coverage currently includes same-server reconnect and multi-URL failover in real-server tests. Multi-node cluster churn, discovered-route changes, and auth failover are still tracked as partial hardening work in the feature coverage matrix.
+Reconnect coverage currently includes same-server reconnect and multi-URL failover in real-server tests. `INFO` `connect_urls` updates add new discovered routes and prune stale discovered routes from the reconnect pool. Multi-node cluster chaos and auth failover are still tracked as partial hardening work in the feature coverage matrix.
 
 ## Publish Buffering
 

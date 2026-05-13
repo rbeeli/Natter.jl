@@ -37,6 +37,7 @@ end
     kv = KeyValue(js, "bucket", "KV_bucket", "\$KV.bucket.")
 
     @test_throws ArgumentError fetch(stream_message_get_async(js, "ORDERS"; seq=0))
+    @test_throws ArgumentError fetch(stream_message_delete_async(js, "ORDERS", 0))
     @test_throws JetStreamError fetch(ack_async(Msg("s", nothing, UInt8[]; client)))
     @test_throws ArgumentError fetch(kv_put_async(kv, "bad.*", "value"))
 end

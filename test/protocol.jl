@@ -35,6 +35,20 @@ using TestItems
     @test header(msg, "TRACE") == "abc"
     @test String(msg) == "body"
 
+    hdr = N._headers_bytes(Headers("Trace" => ["abc", "def"]))
+    payload = vcat(hdr, TestHelpers.bytes("work"))
+    raw = vcat(TestHelpers.bytes("HMSG jobs 10 _INBOX.2 $(length(hdr)) $(length(payload))\r\n"),
+               payload, N.CRLF_BYTES, TestHelpers.bytes("PING\r\n"))
+    reader = N.ProtocolReader(IOBuffer(raw))
+    op, msg = N._read_control_or_msg(reader)
+    @test op == :MSG
+    @test msg.subject == "jobs"
+    @test msg.sid == 10
+    @test msg.reply == "_INBOX.2"
+    @test msg.headers["Trace"] == ["abc", "def"]
+    @test String(msg) == "work"
+    @test first(N._read_control_or_msg(reader)) == :PING
+
     status_headers = N._parse_headers(TestHelpers.bytes("NATS/1.0 503 No Responders\r\n\r\n"))
     status_msg = Msg("reply", nothing, UInt8[]; headers=status_headers)
     @test N._status_header(status_msg) == 503
@@ -93,7 +107,10 @@ end
     cmd = String(N._pub_cmd("foo", nothing, TestHelpers.bytes("hi"), Headers("A" => ["b"])))
     @test startswith(cmd, "HPUB foo ")
     @test occursin("NATS/1.0\r\nA: b\r\n\r\nhi\r\n", cmd)
-    @test_throws ArgumentError N._headers_bytes(Headers("Bad\r\nKey" => ["x"]))
+    @test occursin("Trace-Id_1: ok\r\n", String(N._headers_bytes(Headers("Trace-Id_1" => ["ok"]))))
+    for bad_key in ("", "Bad Key", " Bad", "Bad ", "Bad\tKey", "Bad:Key", "Bad/Key", "Bad(Key)", "Bad\r\nKey", "Badé")
+        @test_throws ArgumentError N._headers_bytes(Headers(bad_key => ["x"]))
+    end
     @test_throws ArgumentError N._headers_bytes(Headers("Good" => ["bad\r\nvalue"]))
 
     client = TestHelpers.fake_client()

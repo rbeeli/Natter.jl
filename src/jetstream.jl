@@ -351,8 +351,11 @@ function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::U
     msg
 end
 
-stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Int; timeout::Real=js.timeout) =
-    Bool(_api_request(js, "$(js.prefix).STREAM.MSG.DELETE.$(_validate_api_name("stream", stream))", JSON3.write(Dict("seq" => seq)); timeout)["success"])
+function stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Int; timeout::Real=js.timeout)
+    stream = _validate_api_name("stream", stream)
+    seq = _validate_stream_sequence(seq)
+    Bool(_api_request(js, "$(js.prefix).STREAM.MSG.DELETE.$stream", JSON3.write(Dict("seq" => seq)); timeout)["success"])
+end
 
 function _server_version_at_least(client::Client, major::Int, minor::Int)
     version = @lock client.lock client.info.version

@@ -819,10 +819,23 @@ function _merge_discovered_servers!(client::Client, info::ServerInfo)
     isnothing(urls) && return
     added = false
     @lock client.lock begin
-        existing = Set(s.url for s in client.servers)
         base_url = client.connected_url
+        current_server = client.current_server
+        discovered_urls = Set{String}()
+        normalized_urls = String[]
         for raw in urls
             url = _normalize_discovered_url(raw, base_url)
+            if !(url in discovered_urls)
+                push!(discovered_urls, url)
+                push!(normalized_urls, url)
+            end
+        end
+        # Configured seed servers are sticky; discovered routes track the latest INFO snapshot.
+        filter!(client.servers) do server
+            !server.discovered || server === current_server || server.url in discovered_urls
+        end
+        existing = Set(s.url for s in client.servers)
+        for url in normalized_urls
             if !(url in existing)
                 push!(client.servers, Server(url; discovered=true))
                 push!(existing, url)

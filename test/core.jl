@@ -38,6 +38,17 @@ using TestItems
     @test String(take!(unsupported_headers.write_io)) == ""
     @test unsupported_headers.pending_bytes == 0
 
+    invalid_publish_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    @test_throws ArgumentError publish(invalid_publish_headers, "foo", "bar"; headers=Dict("Bad Key" => "abc"))
+    @test String(take!(invalid_publish_headers.write_io)) == ""
+    @test invalid_publish_headers.pending_bytes == 0
+
+    invalid_request_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    @test_throws ArgumentError request(invalid_request_headers, "svc", "body"; timeout=0.001, headers=Dict("Bad Key" => "abc"))
+    @test String(take!(invalid_request_headers.write_io)) == ""
+    @test isempty(invalid_request_headers.subscriptions)
+    @test invalid_request_headers.pending_bytes == 0
+
     headers = Headers("Trace" => [repeat("x", 16)])
     payload = TestHelpers.bytes("body")
     total = N._pub_payload_size(payload, N._headers_bytes(headers))
@@ -940,6 +951,106 @@ end
     @test count(waiter -> isnothing(waiter.channel), client.pongs) == 2
 end
 
+@testitem "drain uses one timeout budget" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct CoordinatedPongTransport <: IO
+        client::Base.RefValue{Any}
+        sub::Base.RefValue{Any}
+        pong_delay::Float64
+        release_delay::Float64
+        released::Channel{Bool}
+    end
+    Base.write(::CoordinatedPongTransport, data::Vector{UInt8}) = length(data)
+    Base.write(::CoordinatedPongTransport, data::String) = ncodeunits(data)
+    Base.flush(t::CoordinatedPongTransport) = begin
+        client = t.client[]
+        sub = t.sub[]
+        @async begin
+            sleep(t.pong_delay)
+            N._notify_pong(client)
+            if !isnothing(sub)
+                sleep(t.release_delay)
+                isready(sub.messages) && take!(sub.messages)
+                put!(t.released, true)
+            end
+        end
+        nothing
+    end
+    Base.close(::CoordinatedPongTransport) = nothing
+
+    warm_client_ref = Ref{Any}(nothing)
+    warm_sub_ref = Ref{Any}(nothing)
+    warm_released = Channel{Bool}(1)
+    warm_transport = CoordinatedPongTransport(warm_client_ref, warm_sub_ref, 0.0, 0.01, warm_released)
+    warm_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=warm_transport)
+    warm_client_ref[] = warm_client
+    warm_sub = subscribe(warm_client, "warmup")
+    warm_sub_ref[] = warm_sub
+    put!(warm_sub.messages, N.Msg("warmup", nothing, UInt8[]; client=warm_client, sid=warm_sub.sid))
+    @test_throws TimeoutError drain(warm_sub; timeout=0.001)
+    warm_release_result = timedwait(1.0; pollint=0.01) do
+        isready(warm_released)
+    end
+    @test warm_release_result != :timed_out
+    close(warm_client)
+
+    client_ref = Ref{Any}(nothing)
+    sub_ref = Ref{Any}(nothing)
+    released = Channel{Bool}(1)
+    transport = CoordinatedPongTransport(client_ref, sub_ref, 0.12, 0.14, released)
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    client_ref[] = client
+
+    sub = subscribe(client, "foo")
+    sub_ref[] = sub
+    put!(sub.messages, N.Msg("foo", nothing, UInt8[]; client, sid=sub.sid))
+
+    @test_throws TimeoutError drain(sub; timeout=0.2)
+    release_result = timedwait(1.0; pollint=0.01) do
+        isready(released)
+    end
+    @test release_result != :timed_out
+
+    close(client)
+end
+
+@testitem "client drain shares timeout across subscriptions" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct ImmediatePongTransport <: IO
+        client::Base.RefValue{Any}
+        writes::Vector{String}
+    end
+    Base.write(t::ImmediatePongTransport, data::Vector{UInt8}) = (push!(t.writes, String(data)); length(data))
+    Base.write(t::ImmediatePongTransport, data::String) = (push!(t.writes, data); ncodeunits(data))
+    Base.flush(t::ImmediatePongTransport) = (N._notify_pong(t.client[]); nothing)
+    Base.close(::ImmediatePongTransport) = nothing
+
+    reported = Any[]
+    opts = N.ConnectOptions(error_cb=err -> push!(reported, err))
+    client_ref = Ref{Any}(nothing)
+    transport = ImmediatePongTransport(client_ref, String[])
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    client_ref[] = client
+
+    sub1 = subscribe(client, "foo.1")
+    sub2 = subscribe(client, "foo.2")
+    put!(sub1.messages, N.Msg("foo.1", nothing, UInt8[]; client, sid=sub1.sid))
+    put!(sub2.messages, N.Msg("foo.2", nothing, UInt8[]; client, sid=sub2.sid))
+    empty!(transport.writes)
+
+    @test_throws TimeoutError drain(client; timeout=0.12)
+    @test count(startswith("UNSUB "), transport.writes) == 1
+    @test count(==("PING\r\n"), transport.writes) == 1
+    @test length(reported) == 1
+    @test status(client) == N.ConnectionStatus.CLOSED
+end
+
 @testitem "transport close waits for in-flight writes" setup=[TestHelpers] begin
     using Natter
 
@@ -1017,6 +1128,40 @@ end
     urls = [server.url for server in client.servers]
     @test "tls://user:pass@10.0.0.2:4222" in urls
     @test "nats://plain.test:4222" in urls
+end
+
+@testitem "discovered server merge prunes stale routes" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    callbacks = Ref(0)
+    opts = N.ConnectOptions(; discovered_server_cb=() -> (callbacks[] += 1))
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED)
+
+    seed = N.Server("nats://seed.test:4222")
+    current = N.Server("nats://current.test:4222"; discovered=true)
+    kept = N.Server("nats://kept.test:4222"; discovered=true)
+    stale = N.Server("nats://stale.test:4222"; discovered=true)
+    append!(client.servers, [seed, current, kept, stale])
+    client.current_server = current
+    client.connected_url = current.url
+
+    N._merge_discovered_servers!(client, N.ServerInfo(; connect_urls=["kept.test:4222", "new.test:4222", "new.test:4222"]))
+    @test [server.url for server in client.servers] == [
+        "nats://seed.test:4222",
+        "nats://current.test:4222",
+        "nats://kept.test:4222",
+        "nats://new.test:4222",
+    ]
+    @test callbacks[] == 1
+
+    N._merge_discovered_servers!(client, N.ServerInfo(; connect_urls=String[]))
+    @test [server.url for server in client.servers] == [
+        "nats://seed.test:4222",
+        "nats://current.test:4222",
+    ]
+    @test callbacks[] == 1
 end
 
 @testitem "TLS first handshake mode is explicit and overridable" begin

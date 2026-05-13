@@ -11,7 +11,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
 | `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. |
 | `Msg` | Received message with `subject`, `reply`, `data`, `headers`, and acknowledgement state. |
-| `Headers` | Alias for received headers, `Dict{String,Vector{String}}`; publish and request APIs also accept dictionaries with string or vector values and pair iterators. Header keys preserve source casing, while `header(msg, key)` lookup is case-insensitive. |
+| `Headers` | Alias for received headers, `Dict{String,Vector{String}}`; publish and request APIs also accept dictionaries with string or vector values and pair iterators. Outbound header names must be valid NATS/HTTP token field names. Header keys preserve source casing, while `header(msg, key)` lookup is case-insensitive. |
 | `Subscription` | Core subscription handle. |
 | `Stats` | Snapshot of message, byte, reconnect, error, and drop counters. |
 
@@ -27,8 +27,8 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `flush(client; timeout=10.0)` | Wait until the server has processed previous commands. |
 | `ping(client; timeout=10.0)` | Alias for `flush`. |
 | `unsubscribe(sub; max_msgs=0)` | Unsubscribe immediately or after `max_msgs` additional messages. |
-| `drain(sub; timeout=...)` | Unsubscribe and wait for queued callback work. |
-| `drain(client; timeout=...)` | Drain subscriptions, flush, and close the client. |
+| `drain(sub; timeout=...)` | Unsubscribe and wait for queued callback work within one deadline. |
+| `drain(client; timeout=...)` | Drain subscriptions and flush within one shared deadline, then close the client. |
 | `close(client; throw_errors=false)` | Close transports, tasks, subscriptions, and callbacks. |
 | `new_inbox(client; prefix=...)` | Generate a reply inbox subject. |
 | `header(msg, key)` | Return the first header value by case-insensitive key lookup or `nothing`. |
@@ -94,8 +94,8 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `stream_names(js; subject=nothing)` | List stream names, optionally filtered by subject. |
 | `stream_purge(js, name; filter_subject=nothing)` | Purge a stream or subject subset. |
 | `stream_delete(js, name)` | Delete a stream. |
-| `stream_message_get(js, stream; seq=nothing, subject=nothing, direct=false, next_by_subject=false)` | Read a stored message. |
-| `stream_message_delete(js, stream, seq)` | Delete one stored message. |
+| `stream_message_get(js, stream; seq=nothing, subject=nothing, direct=false, next_by_subject=false)` | Read a stored message. Sequence lookups require a positive sequence. |
+| `stream_message_delete(js, stream, seq)` | Delete one stored message by positive sequence. |
 | `consumer_create(js, stream, config)` | Strictly create a consumer from `ConsumerConfig` or `Dict`. |
 | `consumer_create_or_update(js, stream, config)` | Explicitly create or update a consumer. |
 | `consumer_update(js, stream, config)` | Strictly update an existing consumer. |
