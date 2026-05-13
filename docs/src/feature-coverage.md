@@ -39,8 +39,8 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | Consumer CRUD and list APIs | Supported | Includes server-version-aware create subjects, strict create/update actions, and explicit create-or-update upsert. |
 | Publish acknowledgements | Supported | `js_publish` returns `PubAck`. |
 | Task handle helpers | Supported | Management, publish, message get/delete, consumer, fetch, close, and ack operations have `_async` helpers. |
-| Pull consumers | Supported | Durable and named consumers bind without mutation; missing consumers and random ephemerals are strictly created. Batch fetch, expiration handling, idle heartbeat monitoring, reconnect-disconnect reporting, and JetStream status/control error mapping are covered. |
-| Push consumers | Supported | Durable and named consumers bind without mutation; queue groups, callbacks, and manual or automatic acknowledgement are supported. Non-queue push consumers also support idle heartbeat filtering, missed-heartbeat reporting, flow-control replies, and lifecycle status reporting. |
+| Pull consumers | Supported | Durable and named consumers bind without mutation; missing consumers and random ephemerals are strictly created. Batch fetch, per-request reply correlation, expiration handling, idle heartbeat monitoring, reconnect-disconnect reporting, and JetStream status/control error mapping are covered. |
+| Push consumers | Supported | Durable and named consumers bind without mutation; active non-queue push consumers reject a second bind; queue groups, callbacks, and manual or automatic acknowledgement are supported. Non-queue push consumers also support idle heartbeat filtering, missed-heartbeat reporting, flow-control replies, and lifecycle status reporting. |
 | Message acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, and `term`. |
 | Message get | Supported | Sequence, last by subject, next by subject, and direct get. |
 | Ordered consumers | Not implemented | Can be added later if needed. |

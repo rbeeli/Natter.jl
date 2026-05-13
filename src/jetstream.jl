@@ -22,8 +22,18 @@ struct ConsumerInfo
     stream_name::String
     name::String
     config::ConsumerConfig
+    push_bound::Bool
     raw::Dict{String,Any}
 end
+
+function _consumer_info_push_bound(raw::Dict{String,Any})::Bool
+    value = get(raw, "push_bound", false)
+    isnothing(value) && return false
+    Bool(value)
+end
+
+ConsumerInfo(stream_name::AbstractString, name::AbstractString, config::ConsumerConfig, raw::Dict{String,Any}) =
+    ConsumerInfo(String(stream_name), String(name), config, _consumer_info_push_bound(raw), raw)
 
 jetstream(client::Client; prefix::String="\$JS.API", timeout::Real=5.0) = JetStreamContext(client, prefix, Float64(timeout))
 
@@ -559,6 +569,15 @@ function _validate_existing_push_queue_control(info::ConsumerInfo, queue::Union{
     info
 end
 
+function _validate_existing_push_bind(info::ConsumerInfo, queue::Union{String,Nothing})
+    isnothing(info.config.deliver_group) || return info
+    isnothing(queue) ||
+        throw(ArgumentError("existing non-queue push consumer $(info.name) cannot be joined with queue $queue"))
+    info.push_bound &&
+        throw(ArgumentError("existing non-queue push consumer $(info.name) is already bound to a subscription"))
+    info
+end
+
 _consumer_has_filter(config::Dict{String,Any}) =
     (haskey(config, "filter_subject") && !isnothing(config["filter_subject"])) ||
     (haskey(config, "filter_subjects") && !isnothing(config["filter_subjects"]))
@@ -728,6 +747,19 @@ function _push_idle_heartbeat_seconds(info::ConsumerInfo)::Float64
     isnothing(heartbeat) ? 0.0 : Float64(heartbeat)
 end
 
+function _push_idle_heartbeat_seconds(config::Dict{String,Any})::Float64
+    heartbeat = get(config, "idle_heartbeat", nothing)
+    heartbeat isa Real && !(heartbeat isa Bool) ? Float64(heartbeat) / 1_000_000_000 : 0.0
+end
+
+function _push_callback_auto_ack(manual_ack::Bool, callback, info::ConsumerInfo)::Bool
+    !manual_ack && !isnothing(callback) && info.config.ack_policy != AckPolicy.NONE
+end
+
+function _push_callback_auto_ack(manual_ack::Bool, callback, config::Dict{String,Any})::Bool
+    !manual_ack && !isnothing(callback) && get(config, "ack_policy", nothing) != "none"
+end
+
 function _publish_flow_control_reply(sub::Subscription, reply::String)
     try
         publish(sub.client, reply, EMPTY_BYTES)
@@ -795,7 +827,7 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         cfg["name"] = info.name
     end
     try
-        deliver = new_inbox(js.client)
+        deliver = "$(new_inbox(js.client)).*"
         sub = subscribe(js.client, deliver)
         PullSubscription(js, sub, stream, info.name, deliver, ReentrantLock(), ReentrantLock(), delete_on_close, false)
     catch err
@@ -858,9 +890,10 @@ function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
     _throw_pull_fetch_wait_interrupted(closed, st)
 end
 
-function _publish_pull_fetch_request(psub::PullSubscription, request_subject::String, payload::AbstractString)
+function _publish_pull_fetch_request(psub::PullSubscription, request_subject::String, payload::AbstractString,
+                                     reply::String)
     try
-        _publish(psub.js.client, request_subject, payload; reply=psub.deliver, buffer_on_reconnect=false)
+        _publish(psub.js.client, request_subject, payload; reply, buffer_on_reconnect=false)
     catch err
         if err isa ConnectionReconnectingError ||
            (err isa ConnectionClosedError && status(psub.js.client) == ConnectionStatus.DISCONNECTED)
@@ -871,6 +904,25 @@ function _publish_pull_fetch_request(psub::PullSubscription, request_subject::St
     nothing
 end
 
+function _pull_fetch_reply(psub::PullSubscription)::Tuple{String,Union{String,Nothing}}
+    endswith(psub.deliver, ".*") || return psub.deliver, nothing
+    token = @lock psub.js.client.lock randstring(psub.js.client.rng, NUID_ALPHABET, 22)
+    string(chop(psub.deliver; tail=1), token), token
+end
+
+function _pull_fetch_status_matches_request(subject::AbstractString, token::Union{String,Nothing})::Bool
+    isnothing(token) && return true
+    subject = String(subject)
+    subject_len = ncodeunits(subject)
+    token_len = ncodeunits(token)
+    subject_len > token_len || return false
+    codeunit(subject, subject_len - token_len) == UInt8('.') || return false
+    @inbounds for i in 1:token_len
+        codeunit(subject, subject_len - token_len + i) == codeunit(token, i) || return false
+    end
+    true
+end
+
 function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeout, expires::Real=timeout,
                heartbeat::Union{Nothing,Real}=nothing)
     heartbeat_seconds = _validate_pull_fetch(psub, batch, timeout, expires, heartbeat)
@@ -879,7 +931,8 @@ function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeo
         heartbeat_seconds > 0 && (req["idle_heartbeat"] = round(Int, heartbeat_seconds * 1_000_000_000))
         !isnothing(psub.pin_id) && (req["pin_id"] = psub.pin_id)
         request_subject = "$(psub.js.prefix).CONSUMER.MSG.NEXT.$(psub.stream).$(psub.consumer)"
-        _publish_pull_fetch_request(psub, request_subject, JSON3.write(req))
+        reply, reply_token = _pull_fetch_reply(psub)
+        _publish_pull_fetch_request(psub, request_subject, JSON3.write(req), reply)
         msgs = Msg[]
         deadline = time() + timeout
         heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
@@ -888,10 +941,11 @@ function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeo
             remaining = max(0.001, wait_deadline - time())
             try
                 msg = _next_pull_fetch_msg(psub, remaining)
+                action, err = _jetstream_status_action(msg; request_subject)
+                action != :message && !_pull_fetch_status_matches_request(msg.subject, reply_token) && continue
                 heartbeat_seconds > 0 && (heartbeat_deadline = time() + 2 * heartbeat_seconds)
                 pin_id = header(msg, "Nats-Pin-Id")
                 !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
-                action, err = _jetstream_status_action(msg; request_subject)
                 if action in (:idle_heartbeat, :flow_control, :control)
                     continue
                 elseif action in (:no_messages, :timeout, :batch_completed)
@@ -943,49 +997,68 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     _default_push_queue_consumer!(cfg, bind_fields, local_queue)
     bind_name = _consumer_bind_name(cfg)
     delete_on_close = isnothing(bind_name)
-    info =
-        if isnothing(bind_name)
-            _set_config_default!(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
+    info::Union{ConsumerInfo,Nothing} = nothing
+    create_consumer = false
+    if isnothing(bind_name)
+        _set_config_default!(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
+        _set_config_default!(cfg, "deliver_subject", deliver)
+        create_consumer = true
+    else
+        existing = _consumer_info_or_nothing(js, stream, bind_name)
+        if isnothing(existing)
             _set_config_default!(cfg, "deliver_subject", deliver)
-            _consumer_create_payload_request(js, stream, cfg; action="create")
+            create_consumer = true
         else
-            existing = _consumer_info_or_nothing(js, stream, bind_name)
-            if isnothing(existing)
-                _set_config_default!(cfg, "deliver_subject", deliver)
-                _consumer_create_payload_request(js, stream, cfg; action="create")
-            else
-                _validate_bound_consumer_config(existing, cfg, bind_fields)
-                isnothing(existing.config.deliver_subject) &&
-                    throw(ArgumentError("existing consumer $(existing.name) is configured for pull delivery"))
-                cfg["deliver_subject"] = existing.config.deliver_subject
-                if isnothing(local_queue) && !isnothing(existing.config.deliver_group)
-                    local_queue = _validate_queue(existing.config.deliver_group)
-                end
-                _validate_existing_push_queue_control(existing, local_queue)
-                existing
+            _validate_bound_consumer_config(existing, cfg, bind_fields)
+            isnothing(existing.config.deliver_subject) &&
+                throw(ArgumentError("existing consumer $(existing.name) is configured for pull delivery"))
+            cfg["deliver_subject"] = existing.config.deliver_subject
+            if isnothing(local_queue) && !isnothing(existing.config.deliver_group)
+                local_queue = _validate_queue(existing.config.deliver_group)
             end
+            _validate_existing_push_bind(existing, local_queue)
+            _validate_existing_push_queue_control(existing, local_queue)
+            info = existing
         end
-    if !haskey(cfg, "name") || isnothing(cfg["name"])
-        cfg["name"] = info.name
     end
-    try
-        control_handler = _JetStreamPushControlHandler(_push_idle_heartbeat_seconds(info))
-        sub = subscribe(js.client, String(cfg["deliver_subject"]); queue=local_queue, callback,
-                        auto_ack=!manual_ack && !isnothing(callback),
+    control_handler = _JetStreamPushControlHandler(isnothing(info) ? _push_idle_heartbeat_seconds(cfg) : _push_idle_heartbeat_seconds(info))
+    deliver_subject = String(cfg["deliver_subject"])
+    auto_ack = isnothing(info) ? _push_callback_auto_ack(manual_ack, callback, cfg) :
+               _push_callback_auto_ack(manual_ack, callback, info)
+    sub = subscribe(js.client, deliver_subject; queue=local_queue, callback,
+                        auto_ack,
                         _control_handler=control_handler)
+    consumer_created = false
+    try
+        if create_consumer
+            info = _consumer_create_payload_request(js, stream, cfg; action="create")
+            consumer_created = true
+        end
+        info = info::ConsumerInfo
+        if !haskey(cfg, "name") || isnothing(cfg["name"])
+            cfg["name"] = info.name
+        end
+        @lock control_handler.lock control_handler.idle_heartbeat = _push_idle_heartbeat_seconds(info)
+        sub.auto_ack = _push_callback_auto_ack(manual_ack, callback, info)
         psub = PushSubscription(js, sub, String(stream), String(info.name), ReentrantLock(), delete_on_close, false,
                                 nothing, control_handler)
         psub.heartbeat_task = _start_push_heartbeat_monitor(psub, control_handler)
         psub
     catch err
-        if delete_on_close
+        cleanup_errors = Any[]
+        try
+            close(sub)
+        catch cleanup_err
+            push!(cleanup_errors, CleanupError("close push subscription $deliver_subject", cleanup_err))
+        end
+        if delete_on_close && consumer_created
             try
-                consumer_delete(js, stream, info.name)
+                consumer_delete(js, stream, (info::ConsumerInfo).name)
             catch cleanup_err
-                throw(Base.CompositeException([err, CleanupError("delete push consumer $(info.name)", cleanup_err)]))
+                push!(cleanup_errors, CleanupError("delete push consumer $((info::ConsumerInfo).name)", cleanup_err))
             end
         end
-        rethrow()
+        isempty(cleanup_errors) ? rethrow() : throw(Base.CompositeException(vcat(Any[err], cleanup_errors)))
     end
 end
 

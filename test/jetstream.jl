@@ -250,6 +250,14 @@ end
     @test consumer.idle_heartbeat == 0.25
     @test consumer.priority_policy == PriorityPolicy.OVERFLOW
     @test consumer.priority_timeout == 6.0
+
+    info = N._consumer_info(Dict{String,Any}(
+        "stream_name" => "ORDERS",
+        "name" => "worker",
+        "push_bound" => true,
+        "config" => Dict{String,Any}("deliver_subject" => "_INBOX.worker"),
+    ))
+    @test info.push_bound
 end
 
 @testitem "JetStream typed config rejects invalid local metadata" begin
@@ -259,6 +267,25 @@ end
 
     @test_throws MethodError StreamConfig(name="S", metadata=Dict{String,Any}("ok" => 1))
     @test_throws ArgumentError N._js_field_value(:metadata, Dict{String,Any}("ok" => 1))
+end
+
+@testitem "JetStream push callback auto ack respects ack none policy" begin
+    using Natter
+
+    const N = Natter
+
+    info(policy) = N.ConsumerInfo("ORDERS", "worker", ConsumerConfig(ack_policy=policy), Dict{String,Any}())
+    callback = _ -> nothing
+
+    @test !N._push_callback_auto_ack(true, callback, info(AckPolicy.EXPLICIT))
+    @test !N._push_callback_auto_ack(false, nothing, info(AckPolicy.EXPLICIT))
+    @test !N._push_callback_auto_ack(false, callback, info(AckPolicy.NONE))
+    @test N._push_callback_auto_ack(false, callback, info(AckPolicy.EXPLICIT))
+    @test N._push_callback_auto_ack(false, callback, info(AckPolicy.ALL))
+    @test N._push_callback_auto_ack(false, callback, info(nothing))
+    @test !N._push_callback_auto_ack(false, callback, Dict{String,Any}("ack_policy" => "none"))
+    @test N._push_callback_auto_ack(false, callback, Dict{String,Any}("ack_policy" => "explicit"))
+    @test N._push_callback_auto_ack(false, callback, Dict{String,Any}())
 end
 
 @testitem "JetStream push flow control requires positive heartbeat" setup=[TestHelpers] begin
@@ -371,6 +398,64 @@ end
     ))
     @test_throws ArgumentError N._validate_existing_push_queue_control(flow_info, "workers")
     @test_throws ArgumentError N._validate_existing_push_queue_control(heartbeat_info, "workers")
+end
+
+@testitem "JetStream push rejects binding active non-queue consumer" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    inactive = N._consumer_info(Dict{String,Any}(
+        "stream_name" => "ORDERS",
+        "name" => "worker",
+        "push_bound" => false,
+        "config" => Dict{String,Any}(
+            "deliver_subject" => "_INBOX.worker",
+        ),
+    ))
+    active = N._consumer_info(Dict{String,Any}(
+        "stream_name" => "ORDERS",
+        "name" => "worker",
+        "push_bound" => true,
+        "config" => Dict{String,Any}(
+            "deliver_subject" => "_INBOX.worker",
+        ),
+    ))
+    active_queue = N._consumer_info(Dict{String,Any}(
+        "stream_name" => "ORDERS",
+        "name" => "workers",
+        "push_bound" => true,
+        "config" => Dict{String,Any}(
+            "deliver_subject" => "_INBOX.workers",
+            "deliver_group" => "workers",
+        ),
+    ))
+
+    @test N._validate_existing_push_bind(inactive, nothing) === inactive
+    @test_throws ArgumentError N._validate_existing_push_bind(active, nothing)
+    @test N._validate_existing_push_bind(active_queue, "workers") === active_queue
+end
+
+@testitem "JetStream push subscribe installs core subscription before creating consumer" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client; timeout=0.001)
+
+    @test_throws TimeoutError push_subscribe(js, "orders.created"; stream="ORDERS",
+                                             config=Dict("deliver_subject" => "deliver.test",
+                                                         "ack_policy" => AckPolicy.NONE))
+
+    written = TestHelpers.capture_text(capture)
+    sub_range = findfirst("SUB deliver.test ", written)
+    create_range = findfirst("PUB \$JS.API.CONSUMER.CREATE.ORDERS", written)
+    @test sub_range !== nothing
+    @test create_range !== nothing
+    @test first(sub_range) < first(create_range)
+    @test occursin("UNSUB ", written)
 end
 
 @testitem "JetStream push control dispatch filters heartbeats" setup=[TestHelpers] begin
@@ -840,6 +925,72 @@ end
     @test length(msgs) == 1
     @test String(first(msgs)) == "payload"
     close(partial_psub)
+end
+
+@testitem "JetStream pull fetch correlates statuses to the active request" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function fetch_reply(capture)
+        line = first(split(TestHelpers.capture_text(capture), "\r\n"))
+        parts = split(line)
+        @test parts[1] == "PUB"
+        String(parts[3])
+    end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull.*")
+    TestHelpers.clear_capture!(capture)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+
+    try
+        N._dispatch_msg(client, Msg("_INBOX.pull.old404", nothing, UInt8[];
+                                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
+                                    client, sid=core_sub.sid))
+        N._dispatch_msg(client, Msg("_INBOX.pull.old408", nothing, UInt8[];
+                                    headers=Headers("Status" => ["408"], "Description" => ["Request Timeout"]),
+                                    client, sid=core_sub.sid))
+        N._dispatch_msg(client, Msg("_INBOX.pull.old409", nothing, UInt8[];
+                                    headers=Headers("Status" => ["409"], "Description" => ["Batch Completed"]),
+                                    client, sid=core_sub.sid))
+        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("payload");
+                                    client, sid=core_sub.sid))
+
+        msgs = fetch(psub, 1; timeout=0.2, expires=0.2, heartbeat=0)
+        @test length(msgs) == 1
+        @test String(first(msgs)) == "payload"
+
+        reply = fetch_reply(capture)
+        @test startswith(reply, "_INBOX.pull.")
+        @test reply != psub.deliver
+        @test !endswith(reply, ".*")
+    finally
+        close(psub)
+    end
+
+    active_capture = TestHelpers.WriteCapture()
+    active_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=active_capture)
+    active_js = jetstream(active_client)
+    active_core_sub = subscribe(active_client, "_INBOX.active.*")
+    TestHelpers.clear_capture!(active_capture)
+    active_psub = N.PullSubscription(active_js, active_core_sub, "ORDERS", "WORKER", "_INBOX.active.*", ReentrantLock(), ReentrantLock(), false, false)
+
+    try
+        fetch_task = @async fetch(active_psub, 1; timeout=1.0, expires=1.0, heartbeat=0)
+        @test timedwait(1.0; pollint=0.001) do
+            occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(active_capture))
+        end != :timed_out
+        reply = fetch_reply(active_capture)
+        N._dispatch_msg(active_client, Msg(reply, nothing, UInt8[];
+                                          headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
+                                          client=active_client, sid=active_core_sub.sid))
+        @test isempty(fetch(fetch_task))
+    finally
+        close(active_psub)
+    end
 end
 
 @testitem "JetStream pull fetch maps status controls" setup=[TestHelpers] begin

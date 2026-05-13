@@ -60,7 +60,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `StreamConfig` | Typed stream configuration. Raw `Dict` configs use the same seconds-based duration conversion for known stream fields. |
 | `ConsumerConfig` | Typed consumer configuration. Raw `Dict` configs use the same seconds-based duration conversion for known consumer fields. |
 | `StreamInfo` | Stream info response with typed config, state, and raw data. |
-| `ConsumerInfo` | Consumer info response with typed config and raw data. |
+| `ConsumerInfo` | Consumer info response with typed config, push-bound state, and raw data. |
 | `PubAck` | Publish acknowledgement with stream, sequence, duplicate, and domain. |
 | `PullSubscription` | Pull consumer handle. |
 | `PushSubscription` | Push consumer handle. |
@@ -103,8 +103,8 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `consumer_list(js, stream; offset=0)` | List consumers for a stream. |
 | `consumer_delete(js, stream, consumer)` | Delete a consumer. |
 | `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig())` | Create or bind a pull subscription without mutating existing consumers. |
-| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. |
-| `fetch(psub, batch=1; timeout=..., expires=timeout, heartbeat=nothing)` | Fetch a batch from a pull subscription. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
+| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Callback subscriptions auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`. |
+| `fetch(psub, batch=1; timeout=..., expires=timeout, heartbeat=nothing)` | Fetch a batch from a pull subscription. Each request uses a unique reply subject and ignores stale terminal statuses from older requests. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
 | `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for JetStream messages. |
 | `metadata(msg)` | Parse JetStream delivery metadata. |
 

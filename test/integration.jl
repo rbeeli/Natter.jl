@@ -341,6 +341,7 @@ end
                 ack_policy=AckPolicy.EXPLICIT,
             ))
             @test_throws ArgumentError fetch(psub, 1; timeout=0.0)
+            @test endswith(psub.deliver, ".*")
             msgs = fetch(psub, 1; timeout=2.0)
             @test length(msgs) == 1
             @test String(first(msgs)) == "payload"
@@ -360,6 +361,34 @@ end
             @test length(async_msgs) == 1
             fetch(ack_async(first(async_msgs)))
             fetch(close_async(async_psub))
+
+            ack_none_subject = "$subject_root.ack-none"
+            ack_none_errors = Channel{Any}(4)
+            ack_none_client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
+                                      error_cb=err -> put!(ack_none_errors, err))
+            try
+                ack_none_js = jetstream(ack_none_client)
+                received = Channel{String}(1)
+                ack_none_sub = push_subscribe(ack_none_js, ack_none_subject; stream=stream,
+                                              callback=msg -> put!(received, String(msg)),
+                                              config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW,
+                                                                    ack_policy=AckPolicy.NONE))
+                try
+                    flush(ack_none_client; timeout=2.0)
+                    js_publish(js, ack_none_subject, "ack-none"; stream=stream)
+                    @test timedwait(2.0; pollint=0.01) do
+                        isready(received)
+                    end != :timed_out
+                    @test take!(received) == "ack-none"
+                    @test timedwait(0.2; pollint=0.01) do
+                        isready(ack_none_errors)
+                    end == :timed_out
+                finally
+                    close(ack_none_sub)
+                end
+            finally
+                close(ack_none_client)
+            end
 
             heartbeat_subject = "$subject_root.heartbeat"
             heartbeat_sub = push_subscribe(js, heartbeat_subject; stream=stream,
@@ -386,6 +415,21 @@ end
                 ack(msg)
             finally
                 close(flow_sub)
+            end
+
+            bound_push_subject = "$subject_root.bound-push"
+            bound_push_consumer = "PUSHBOUND_$(randstring(6))"
+            bound_push_sub = push_subscribe(js, bound_push_subject; stream=stream, durable=bound_push_consumer,
+                                            config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW,
+                                                                  ack_policy=AckPolicy.EXPLICIT))
+            try
+                flush(client; timeout=2.0)
+                @test timedwait(2.0; pollint=0.01) do
+                    consumer_info(js, stream, bound_push_consumer).push_bound
+                end != :timed_out
+                @test_throws ArgumentError push_subscribe(js, bound_push_subject; stream=stream, durable=bound_push_consumer)
+            finally
+                close(bound_push_sub)
             end
 
             queue_subject = "$subject_root.queue"
@@ -487,6 +531,22 @@ end
                 @test length(alpha_history) >= 2
                 @test all(entry -> entry isa KeyValueEntry && entry.key == "alpha", alpha_history)
                 @test alpha_history[end].revision == updated_alpha.revision
+                kv_put(kv[], "watch-initial", "ready")
+                initial_updates = Channel{KeyValueEntry}(1)
+                initial_watcher = kv_watch(kv[]; key="watch-initial") do entry
+                    put!(initial_updates, entry)
+                end
+                try
+                    @test timedwait(2.0; pollint=0.01) do
+                        isready(initial_updates)
+                    end != :timed_out
+                    initial = take!(initial_updates)
+                    @test initial.key == "watch-initial"
+                    @test initial.operation == KeyValueOperation.PUT
+                    @test String(initial) == "ready"
+                finally
+                    close(initial_watcher)
+                end
                 pa3 = fetch(kv_put_async(kv[], "beta", "async-one"))
                 @test pa3.seq >= 1
                 @test String(fetch(kv_get_async(kv[], "beta"))) == "async-one"
