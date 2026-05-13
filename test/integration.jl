@@ -628,7 +628,7 @@ end
             psub[] = pull_subscribe(js, subject; stream, durable)
 
             before_out = stats(client).out_msgs
-            fetch_task = @async fetch(psub[], 1; timeout=5.0, expires=5.0, heartbeat=0)
+            fetch_task = @async fetch(psub[], 1; timeout=5.0, heartbeat=0)
             @test timedwait(2.0; pollint=0.01) do
                 stats(client).out_msgs > before_out
             end != :timed_out

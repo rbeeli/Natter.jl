@@ -901,11 +901,13 @@ end
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=-1.0)
     @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=1.0)
+    @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=2.0)
     @test client.pending_bytes == 0
-    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=1.0, heartbeat=-0.1)
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=0.9, heartbeat=-0.1)
     @test client.pending_bytes == 0
-    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=1.0, heartbeat=0.6)
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=0.9, heartbeat=0.6)
     @test client.pending_bytes == 0
 
     close(psub)
@@ -919,6 +921,50 @@ end
     @test client.pending_bytes == 0
 end
 
+@testitem "JetStream pull fetch expires server request before local timeout" setup=[TestHelpers] begin
+    using Natter
+    using JSON3
+
+    const N = Natter
+
+    function pull_request_payload(frame::AbstractString)
+        header, rest = split(frame, "\r\n"; limit=2)
+        parts = split(header)
+        @test parts[1] == "PUB"
+        len = parse(Int, parts[end])
+        payload, trailer = split(rest, "\r\n"; limit=2)
+        @test ncodeunits(payload) == len
+        @test trailer == ""
+        JSON3.read(payload)
+    end
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull")
+    take!(client.write_io)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+
+    try
+        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+                                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
+                                    client, sid=core_sub.sid))
+        @test isempty(fetch(psub, 1; timeout=10.0, heartbeat=0))
+        default_payload = pull_request_payload(String(take!(client.write_io)))
+        @test default_payload["batch"] == 1
+        @test default_payload["expires"] == 9_000_000_000
+        @test !haskey(default_payload, "idle_heartbeat")
+
+        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+                                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
+                                    client, sid=core_sub.sid))
+        @test isempty(fetch(psub, 1; timeout=10.0, expires=2.5, heartbeat=0))
+        explicit_payload = pull_request_payload(String(take!(client.write_io)))
+        @test explicit_payload["expires"] == 2_500_000_000
+    finally
+        close(psub)
+    end
+end
+
 @testitem "JetStream pull fetch is reconnect-aware" setup=[TestHelpers] begin
     using Natter
 
@@ -929,7 +975,7 @@ end
     reconnecting_sub = subscribe(reconnecting_client, "_INBOX.reconnecting")
     reconnecting_psub = N.PullSubscription(reconnecting_js, reconnecting_sub, "ORDERS", "WORKER", "_INBOX.reconnecting", ReentrantLock(), ReentrantLock(), false, false)
 
-    @test_throws FetchDisconnectedError fetch(reconnecting_psub, 1; timeout=0.1, expires=0.1, heartbeat=0)
+    @test_throws FetchDisconnectedError fetch(reconnecting_psub, 1; timeout=0.1, heartbeat=0)
     @test reconnecting_client.pending_bytes == 0
     @test isempty(take!(reconnecting_client.pending))
     close(reconnecting_psub)
@@ -950,7 +996,7 @@ end
     TestHelpers.clear_capture!(capture)
     psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
 
-    fetch_task = @async fetch(psub, 1; timeout=5.0, expires=5.0, heartbeat=0)
+    fetch_task = @async fetch(psub, 1; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))
     end != :timed_out
@@ -965,7 +1011,7 @@ end
     TestHelpers.clear_capture!(terminal_capture)
     terminal_psub = N.PullSubscription(terminal_js, terminal_core_sub, "ORDERS", "WORKER", "_INBOX.terminal", ReentrantLock(), ReentrantLock(), false, false)
 
-    terminal_task = @async fetch(terminal_psub, 1; timeout=5.0, expires=5.0, heartbeat=0)
+    terminal_task = @async fetch(terminal_psub, 1; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(terminal_capture))
     end != :timed_out
@@ -984,7 +1030,7 @@ end
     partial_psub = N.PullSubscription(partial_js, partial_core_sub, "ORDERS", "WORKER", "_INBOX.partial", ReentrantLock(), ReentrantLock(), false, false)
     N._dispatch_msg(partial_client, Msg("_INBOX.partial", nothing, TestHelpers.bytes("payload"); client=partial_client, sid=partial_core_sub.sid))
 
-    partial_task = @async fetch(partial_psub, 2; timeout=5.0, expires=5.0, heartbeat=0)
+    partial_task = @async fetch(partial_psub, 2; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(partial_capture))
     end != :timed_out
@@ -1027,7 +1073,7 @@ end
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("payload");
                                     client, sid=core_sub.sid))
 
-        msgs = fetch(psub, 1; timeout=0.2, expires=0.2, heartbeat=0)
+        msgs = fetch(psub, 1; timeout=0.2, heartbeat=0)
         @test length(msgs) == 1
         @test String(first(msgs)) == "payload"
 
@@ -1047,7 +1093,7 @@ end
     active_psub = N.PullSubscription(active_js, active_core_sub, "ORDERS", "WORKER", "_INBOX.active.*", ReentrantLock(), ReentrantLock(), false, false)
 
     try
-        fetch_task = @async fetch(active_psub, 1; timeout=1.0, expires=1.0, heartbeat=0)
+        fetch_task = @async fetch(active_psub, 1; timeout=1.0, heartbeat=0)
         @test timedwait(1.0; pollint=0.001) do
             occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(active_capture))
         end != :timed_out
@@ -1074,7 +1120,7 @@ end
         psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, data; headers, client, sid=core_sub.sid))
         try
-            fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0)
+            fetch(psub, 1; timeout=0.1, heartbeat=0)
         finally
             close(psub)
         end
@@ -1110,7 +1156,7 @@ end
     N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                 headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
                                 client, sid=core_sub.sid))
-    @test isempty(fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0.02))
+    @test isempty(fetch(psub, 1; timeout=0.1, heartbeat=0.02))
     @test occursin("\"idle_heartbeat\":20000000", String(take!(client.write_io)))
     close(psub)
 
@@ -1120,7 +1166,7 @@ end
     take!(timeout_client.write_io)
     timeout_psub = N.PullSubscription(timeout_js, timeout_sub, "ORDERS", "WORKER", "_INBOX.timeout", ReentrantLock(), ReentrantLock(), false, false)
     try
-        @test_throws JetStreamError fetch(timeout_psub, 1; timeout=0.12, expires=0.12, heartbeat=0.02)
+        @test_throws JetStreamError fetch(timeout_psub, 1; timeout=0.12, heartbeat=0.02)
     finally
         close(timeout_psub)
     end
@@ -1141,20 +1187,20 @@ end
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, TestHelpers.bytes("payload");
                                     headers=Headers("Nats-Pin-Id" => ["pin-a"]),
                                     client, sid=core_sub.sid))
-        @test String(first(fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0))) == "payload"
+        @test String(first(fetch(psub, 1; timeout=0.1, heartbeat=0))) == "payload"
         @test psub.pin_id == "pin-a"
         take!(client.write_io)
 
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
                                     client, sid=core_sub.sid))
-        @test isempty(fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0))
+        @test isempty(fetch(psub, 1; timeout=0.1, heartbeat=0))
         @test occursin("\"pin_id\":\"pin-a\"", String(take!(client.write_io)))
 
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["423"], "Description" => ["Pin ID Mismatch"]),
                                     client, sid=core_sub.sid))
-        @test_throws JetStreamError fetch(psub, 1; timeout=0.1, expires=0.1, heartbeat=0)
+        @test_throws JetStreamError fetch(psub, 1; timeout=0.1, heartbeat=0)
         @test isnothing(psub.pin_id)
     finally
         close(psub)

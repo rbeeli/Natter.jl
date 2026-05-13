@@ -883,12 +883,17 @@ function _pull_fetch_heartbeat(expires::Real, heartbeat::Union{Nothing,Real})::F
     hb
 end
 
+function _pull_fetch_default_expires(timeout::Real)::Float64
+    ttl = Float64(timeout)
+    ttl - min(ttl * 0.1, 5.0)
+end
+
 function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real, expires::Real,
                               heartbeat::Union{Nothing,Real})
     batch > 0 || throw(ArgumentError("fetch batch must be greater than zero"))
     timeout > 0 || throw(ArgumentError("fetch timeout must be greater than zero"))
     expires > 0 || throw(ArgumentError("fetch expires must be greater than zero"))
-    timeout >= expires || throw(ArgumentError("fetch timeout must be greater than or equal to expires"))
+    timeout > expires || throw(ArgumentError("fetch timeout must be greater than expires"))
     (@lock psub.close_lock psub.closed) && throw(ConnectionClosedError("pull subscription is closed"))
     (@lock psub.sub.client.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
     _pull_fetch_heartbeat(expires, heartbeat)
@@ -950,12 +955,13 @@ function _pull_fetch_status_matches_request(subject::AbstractString, token::Unio
     true
 end
 
-function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeout, expires::Real=timeout,
+function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeout,
+               expires::Real=_pull_fetch_default_expires(timeout),
                heartbeat::Union{Nothing,Real}=nothing)
     heartbeat_seconds = _validate_pull_fetch(psub, batch, timeout, expires, heartbeat)
     @lock psub.fetch_lock begin
-        req = Dict{String,Any}("batch" => batch, "expires" => round(Int, expires * 1_000_000_000))
-        heartbeat_seconds > 0 && (req["idle_heartbeat"] = round(Int, heartbeat_seconds * 1_000_000_000))
+        req = Dict{String,Any}("batch" => batch, "expires" => _seconds_to_nanoseconds(expires))
+        heartbeat_seconds > 0 && (req["idle_heartbeat"] = _seconds_to_nanoseconds(heartbeat_seconds))
         !isnothing(psub.pin_id) && (req["pin_id"] = psub.pin_id)
         request_subject = "$(psub.js.prefix).CONSUMER.MSG.NEXT.$(psub.stream).$(psub.consumer)"
         reply, reply_token = _pull_fetch_reply(psub)

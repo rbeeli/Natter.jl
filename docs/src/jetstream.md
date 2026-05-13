@@ -140,7 +140,7 @@ for msg in fetch(sub, 10; timeout=2.0)
 end
 ```
 
-Fetch requests use a unique reply subject under the pull subscription inbox, so late terminal status messages from an older request are ignored by the next request. Fetch requests are not replayed after reconnect. If the connection is lost before any messages arrive, `fetch` throws `FetchDisconnectedError` so callers can retry after reconnect without leaving a stale pull request behind. For fetches with `expires >= 10`, Natter requests JetStream idle heartbeats and reports missed heartbeats as `JetStreamError`. Use `heartbeat=0` to disable heartbeat monitoring or set a shorter positive heartbeat explicitly; `expires` must be at least twice the heartbeat.
+Fetch requests use a unique reply subject under the pull subscription inbox, so late terminal status messages from an older request are ignored by the next request. The server-side request expiration defaults to a value shorter than the caller `timeout` (10% shorter, capped at a 5 second margin), so a timed-out local wait does not leave a live server request that can deliver data into a later fetch. Fetch requests are not replayed after reconnect. If the connection is lost before any messages arrive, `fetch` throws `FetchDisconnectedError` so callers can retry after reconnect without leaving a stale pull request behind. For fetches with effective `expires >= 10`, Natter requests JetStream idle heartbeats and reports missed heartbeats as `JetStreamError`. Use `heartbeat=0` to disable heartbeat monitoring or set a shorter positive heartbeat explicitly; `expires` must be shorter than `timeout` and at least twice the heartbeat.
 
 To process a fetched batch concurrently, use a structured `@sync` boundary:
 
