@@ -6,7 +6,8 @@ The client is intended for long-running services:
 
 - Core publish, subscribe, queue groups, headers, request/reply, flush, drain, and close.
 - Background reconnect with subscription replay and bounded publish buffering.
-- TLS, including TLS-first servers and optional certificate verification control.
+- Token, user/password, NKEY/JWT, `.creds`, TLS, and client certificate connection modes.
+- TLS-first servers, INFO-first TLS upgrade, and optional certificate verification control.
 - JetStream stream and consumer management with typed Julia configuration structs.
 - Pull and push consumers, explicit acknowledgements, publish acknowledgements, message lookup, and direct get.
 - KeyValue buckets with direct reads, history, keys, optimistic writes, deletes, purges, and watches.
@@ -47,4 +48,4 @@ flush(client)
 - [JetStream](jetstream.md) covers streams, consumers, typed configs, direct get, and acknowledgements.
 - [KeyValue](keyvalue.md) documents buckets, reads, writes, watches, and direct access.
 - [Reliability And TLS](reliability.md) describes reconnect behavior, buffering, callbacks, and TLS options.
-- [Examples](examples/basic-pub-sub.md) provide complete patterns for common application code.
+- [Examples](examples/connection-auth-tls.md) provide complete patterns for common application code.

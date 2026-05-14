@@ -76,6 +76,7 @@ makedocs(;
             "Reliability And TLS" => "reliability.md",
         ],
         "Examples" => [
+            "Connection Auth And TLS" => "examples/connection-auth-tls.md",
             "Basic Publish And Subscribe" => "examples/basic-pub-sub.md",
             "Request Reply Service" => "examples/request-reply.md",
             "JetStream Work Queue" => "examples/jetstream-work-queue.md",

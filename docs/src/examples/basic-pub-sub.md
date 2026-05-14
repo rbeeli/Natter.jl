@@ -27,3 +27,23 @@ close(client)
 ```
 
 Use `flush` when the example or test needs to know that commands sent before it reached the server. Use Julia `@sync` and `@async` when multiple independent publishes or requests should run concurrently.
+
+With an active client, queue groups distribute matching messages across workers:
+
+```julia
+worker = subscribe(client, "jobs.ready"; queue="workers") do msg
+    @info "job" id=String(msg.data)
+end
+
+publish(client, "jobs.ready", "job-1001")
+flush(client)
+close(worker)
+```
+
+Headers are accepted on publish and request calls when the server supports NATS headers:
+
+```julia
+publish(client, "events.created", "payload";
+    headers=Dict("trace-id" => "abc-123", "source" => "example"),
+)
+```

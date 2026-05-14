@@ -19,8 +19,14 @@ stream_create(js, StreamConfig(
 ))
 
 for id in 1:100
-    js_publish(js, "jobs.ready", string(id); stream="JOBS")
+    js_publish(js, "jobs.ready", string(id);
+        stream="JOBS",
+        msg_id="job-$id",
+    )
 end
+
+stored = stream_message_get(js, "JOBS"; seq=1)
+@info "first stored job" data=String(stored.data)
 
 worker = pull_subscribe(js, "jobs.ready";
     stream="JOBS",
@@ -45,6 +51,8 @@ end
 close(worker)
 close(client)
 ```
+
+`msg_id` lets the server suppress duplicate publishes within the stream duplicate window. `stream_message_get` reads stored data by sequence when an application needs to inspect or replay messages before they are removed.
 
 For long-running workers, fetch in a loop and stop on your service shutdown signal. Use `in_progress(msg)` for jobs that need longer than `ack_wait`.
 

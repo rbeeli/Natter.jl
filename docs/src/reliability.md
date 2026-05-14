@@ -59,6 +59,8 @@ For high-volume services, prefer bounded work queues in the callback or pull-bas
 
 ## TLS
 
+For authentication and TLS connection snippets, see [Connection Auth And TLS](examples/connection-auth-tls.md).
+
 Use `tls://` URLs for TLS-first servers:
 
 ```julia

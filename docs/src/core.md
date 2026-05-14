@@ -39,6 +39,8 @@ Authentication must use one scheme: token, complete `user`/`password`, NKEY, or 
 
 For NKEY auth, pass `nkey_seed` or `nkey_seed_path` to derive the public key, or pass `nkey` with `signature_cb` when signing is managed externally. For user JWT auth, pass a `.creds` file with `credentials_path`, inline `.creds` content with `credentials`, or pair `jwt`/`jwt_path` with a seed or signing callback. NKEY/JWT auth requires a server nonce, which nats-server 2.x provides.
 
+For short connection security snippets, see [Connection Auth And TLS](examples/connection-auth-tls.md).
+
 `ConnectOptions` is immutable. Connection settings are frozen when options are built and the client reads them concurrently from background tasks; create a new client to change connection behavior.
 
 Use `status(client)`, `stats(client)`, and `connected_url(client)` for runtime inspection.

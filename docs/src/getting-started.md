@@ -49,6 +49,8 @@ client = connect([
 ])
 ```
 
+See [Connection Auth And TLS](examples/connection-auth-tls.md) for token, user/password, NKEY/JWT, `.creds`, TLS, and client certificate examples.
+
 ## Publish And Subscribe
 
 ```julia
