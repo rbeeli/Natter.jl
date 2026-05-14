@@ -5,9 +5,9 @@ using TestItems
 
     const N = Natter
 
-    op, data = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("INFO {\"server_id\":\"srv\",\"max_payload\":64,\"headers\":true}\r\n")))
-    @test op == :INFO
-    @test data isa N.ServerInfo
+    frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("INFO {\"server_id\":\"srv\",\"max_payload\":64,\"headers\":true}\r\n")))
+    @test frame.op == :INFO
+    data = N._protocol_info(frame)
     @test data.max_payload == 64
     @test data.headers == true
 
@@ -17,8 +17,9 @@ using TestItems
     N._merge_server_info!(info, N.ServerInfo(; headers=false))
     @test info.headers == false
 
-    op, msg = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\n")))
-    @test op == :MSG
+    frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\n")))
+    @test frame.op == :MSG
+    msg = N._protocol_msg(frame)
     @test msg.subject == "foo"
     @test msg.sid == 2
     @test msg.reply == "_INBOX.1"
@@ -27,8 +28,9 @@ using TestItems
     hdr = N._headers_bytes(Headers("Trace" => ["abc"]))
     payload = vcat(hdr, TestHelpers.bytes("body"))
     raw = vcat(TestHelpers.bytes("HMSG events 9 $(length(hdr)) $(length(payload))\r\n"), payload, N.CRLF_BYTES)
-    op, msg = N._read_control_or_msg(IOBuffer(raw))
-    @test op == :MSG
+    frame = N._read_control_or_msg(IOBuffer(raw))
+    @test frame.op == :MSG
+    msg = N._protocol_msg(frame)
     @test msg.subject == "events"
     @test header(msg, "Trace") == "abc"
     @test header(msg, "trace") == "abc"
@@ -42,14 +44,15 @@ using TestItems
     raw = vcat(TestHelpers.bytes("HMSG jobs 10 _INBOX.2 $(length(hdr)) $(length(payload))\r\n"),
                payload, N.CRLF_BYTES, TestHelpers.bytes("PING\r\n"))
     reader = N.ProtocolReader(IOBuffer(raw))
-    op, msg = N._read_control_or_msg(reader)
-    @test op == :MSG
+    frame = N._read_control_or_msg(reader)
+    @test frame.op == :MSG
+    msg = N._protocol_msg(frame)
     @test msg.subject == "jobs"
     @test msg.sid == 10
     @test msg.reply == "_INBOX.2"
     @test msg.headers["Trace"] == ["abc", "def"]
     @test String(msg) == "work"
-    @test first(N._read_control_or_msg(reader)) == :PING
+    @test N._read_control_or_msg(reader).op == :PING
 
     status_headers = N._parse_headers(TestHelpers.bytes("NATS/1.0 503 No Responders\r\n\r\n"))
     status_msg = Msg("reply", nothing, UInt8[]; headers=status_headers)
@@ -74,13 +77,36 @@ using TestItems
     malformed_raw = vcat(TestHelpers.bytes("HMSG events 9 $(length(malformed_hdr)) $(length(malformed_payload))\r\n"), malformed_payload, N.CRLF_BYTES)
     @test_throws ProtocolError N._read_control_or_msg(IOBuffer(malformed_raw))
 
-    op, err = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("-ERR 'Authorization Violation'\r\n")))
-    @test op == :ERR
+    frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("-ERR 'Authorization Violation'\r\n")))
+    @test frame.op == :ERR
+    err = N._protocol_err(frame)
     @test err == "Authorization Violation"
 
     reader = N.ProtocolReader(IOBuffer(TestHelpers.bytes("PING\r\nPONG\r\n")))
-    @test first(N._read_control_or_msg(reader)) == :PING
-    @test first(N._read_control_or_msg(reader)) == :PONG
+    @test N._read_control_or_msg(reader).op == :PING
+    @test N._read_control_or_msg(reader).op == :PONG
+end
+
+@testitem "protocol parser boundary is inferred" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    ping = @inferred N._read_control_or_msg(IOBuffer(TestHelpers.bytes("PING\r\n")))
+    @test typeof(ping) === N._ProtocolFrame
+    @test ping.op == :PING
+
+    frame = @inferred N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\n")))
+    @test typeof(frame) === N._ProtocolFrame
+    @test frame.op == :MSG
+    msg = @inferred N._protocol_msg(frame)
+    @test msg.subject == "foo"
+    @test msg.reply == "_INBOX.1"
+    @test String(msg) == "hello"
+
+    err = @inferred N._read_control_or_msg(IOBuffer(TestHelpers.bytes("-ERR 'Authorization Violation'\r\n")))
+    @test err.op == :ERR
+    @test (@inferred N._protocol_err(err)) == "Authorization Violation"
 end
 
 @testitem "protocol parser enforces configured resource limits" setup=[TestHelpers] begin

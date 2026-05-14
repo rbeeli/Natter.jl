@@ -10,6 +10,7 @@ js = jetstream(client; timeout=5.0)
 ## Typed Configuration
 
 Streams and consumers use typed Julia config structs. Optional fields default to `nothing`, so only explicitly set fields are sent to the server.
+Typed configs validate known subject, name, queue, and numeric bounds locally before sending management requests.
 
 ```julia
 stream_create(js, StreamConfig(
@@ -56,11 +57,15 @@ Known typed fields in raw dictionaries use the same Julia-side units as typed co
 ```julia
 ack = js_publish(js, "orders.created", """{"id":1001}""";
     stream="ORDERS",
-    headers=Dict("Nats-Msg-Id" => "order-1001"),
+    msg_id="order-1001",
+    expected_last_subject_sequence=42,
+    ttl=300.0,
 )
 
 @info "stored" stream=ack.stream seq=ack.seq duplicate=ack.duplicate
 ```
+
+Publish options map to JetStream headers for deduplication, optimistic concurrency, per-message TTL, and message schedules. TTL values are seconds and must be at least `1.0`. Use `expected_last_sequence`, `expected_last_subject_sequence`, `expected_last_subject`, `expected_last_msg_id`, `schedule_at`, `schedule_every`, `schedule`, `schedule_target`, `schedule_source`, `schedule_ttl`, and `schedule_timezone` as needed. `retry_attempts` and `retry_wait` retry publish requests that receive a no-responders status.
 
 Publish independent messages concurrently with Julia tasks:
 

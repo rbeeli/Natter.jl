@@ -502,7 +502,7 @@ end
             end
 
             bucket = "NATTERKV_$(randstring(8))"
-            kv[] = kv_create(js, bucket; history=5, storage="memory", direct=true)
+            kv[] = kv_create(js, bucket; history=5, storage="memory", direct=true, limit_marker_ttl=2.0)
             try
                 @test kv[].direct
                 empty_status = kv_status(kv[])
@@ -553,6 +553,46 @@ end
                 finally
                     close(initial_watcher)
                 end
+                object_watcher = kv_watch(kv[]; key="watch-initial", meta_only=true)
+                try
+                    object_initial = take!(object_watcher)
+                    @test object_initial isa KeyValueEntry
+                    @test object_initial.key == "watch-initial"
+                    @test object_initial.operation == KeyValueOperation.PUT
+                    @test take!(object_watcher) isa KeyValueWatchInitialDone
+                finally
+                    close(object_watcher)
+                end
+                kv_put(kv[], "filter.one", "one")
+                kv_put(kv[], "filter.two", "two")
+                filtered_watcher = kv_watch(kv[]; keys=["filter.one", "filter.two"], meta_only=true)
+                try
+                    filtered_keys = String[]
+                    while true
+                        update = take!(filtered_watcher)
+                        update isa KeyValueWatchInitialDone && break
+                        push!(filtered_keys, (update::KeyValueEntry).key)
+                    end
+                    @test sort(filtered_keys) == ["filter.one", "filter.two"]
+                finally
+                    close(filtered_watcher)
+                end
+                updates_only_watcher = kv_watch(kv[]; key="watch-initial", updates_only=true)
+                try
+                    @test timedwait(0.2; pollint=0.01) do
+                        isready(updates_only_watcher.updates)
+                    end == :timed_out
+                    kv_put(kv[], "watch-initial", "changed")
+                    @test timedwait(2.0; pollint=0.01) do
+                        isready(updates_only_watcher.updates)
+                    end != :timed_out
+                    update = take!(updates_only_watcher)
+                    @test update isa KeyValueEntry
+                    @test update.key == "watch-initial"
+                    @test String(update) == "changed"
+                finally
+                    close(updates_only_watcher)
+                end
                 pa3 = fetch(kv_put_async(kv[], "beta", "async-one"))
                 @test pa3.seq >= 1
                 @test String(fetch(kv_get_async(kv[], "beta"))) == "async-one"
@@ -575,6 +615,50 @@ end
                 finally
                     close(watcher)
                 end
+                ignore_delete_watcher = kv_watch(kv[]; key="ignore-delete", updates_only=true, ignore_deletes=true)
+                try
+                    kv_put(kv[], "ignore-delete", "live")
+                    @test timedwait(2.0; pollint=0.01) do
+                        isready(ignore_delete_watcher.updates)
+                    end != :timed_out
+                    @test (take!(ignore_delete_watcher)::KeyValueEntry).operation == KeyValueOperation.PUT
+                    kv_delete(kv[], "ignore-delete")
+                    flush(client)
+                    @test timedwait(0.2; pollint=0.01) do
+                        isready(ignore_delete_watcher.updates)
+                    end == :timed_out
+                finally
+                    close(ignore_delete_watcher)
+                end
+                resume_first = kv_put(kv[], "resume", "one")
+                resume_second = kv_put(kv[], "resume", "two")
+                resume_watcher = kv_watch(kv[]; key="resume", resume_revision=resume_second.seq, meta_only=true)
+                try
+                    resumed = take!(resume_watcher)
+                    @test resumed isa KeyValueEntry
+                    @test resumed.revision == resume_second.seq
+                    @test resumed.key == "resume"
+                    @test take!(resume_watcher) isa KeyValueWatchInitialDone
+                finally
+                    close(resume_watcher)
+                end
+                ttl_watcher = kv_watch(kv[]; key="ttl-key", updates_only=true)
+                try
+                    kv_create_key(kv[], "ttl-key", "short"; ttl=1.0)
+                    @test timedwait(2.0; pollint=0.01) do
+                        isready(ttl_watcher.updates)
+                    end != :timed_out
+                    @test (take!(ttl_watcher)::KeyValueEntry).operation == KeyValueOperation.PUT
+                    @test timedwait(3.0; pollint=0.01) do
+                        isready(ttl_watcher.updates)
+                    end != :timed_out
+                    expired = take!(ttl_watcher)
+                    @test expired isa KeyValueEntry
+                    @test expired.key == "ttl-key"
+                    @test expired.operation == KeyValueOperation.PURGE
+                finally
+                    close(ttl_watcher)
+                end
                 fetch(kv_delete_async(kv[], "beta"; revision=pa3.seq))
                 async_deleted = TestHelpers.thrown_exception() do
                     fetch(kv_get_async(kv[], "beta"))
@@ -588,6 +672,7 @@ end
                 kv_delete(kv[], "alpha")
                 @test_throws KeyValueKeyDeletedError kv_get(kv[], "alpha")
                 @test !("alpha" in kv_keys(kv[]))
+                kv_purge_deletes(kv[]; older_than=-1)
                 recreated = kv_create_key(kv[], "alpha", "three")
                 @test recreated.seq > pa2.seq
                 @test String(kv_get(kv[], "alpha")) == "three"

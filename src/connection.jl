@@ -141,20 +141,45 @@ function _connect_tcp(host::String, port::Int, timeout::Real)
     value
 end
 
-function _schedule_timeout_cleanup(operation::String, cleanup::Function)
-    @async begin
-        try
-            cleanup()
-        catch err
-            @debug "Natter timeout cleanup failed" operation exception=(err, catch_backtrace())
+function _warn_timeout_cleanup_errors(operation::String, errors::Vector)
+    for err in errors
+        if err isa CleanupError
+            @warn "Natter timeout cleanup failed" operation=err.operation cause=err.cause
+        else
+            @warn "Natter timeout cleanup failed" operation exception=err
         end
     end
     nothing
 end
 
-function _run_with_timeout(f::Function, operation::String, timeout::Real, cleanup::Function)
+_cleanup_errors(result::Nothing) = Any[]
+_cleanup_errors(result::AbstractVector) = Any[result...]
+_cleanup_errors(result) = Any[result]
+
+function _schedule_timeout_cleanup(operation::String, cleanup::Function,
+                                   report_cleanup_errors::Function=errors -> _warn_timeout_cleanup_errors(operation, errors))
+    @async begin
+        errors = Any[]
+        try
+            append!(errors, _cleanup_errors(cleanup()))
+        catch err
+            push!(errors, CleanupError("timeout cleanup after $operation", err))
+        end
+        if !isempty(errors)
+            try
+                report_cleanup_errors(errors)
+            catch err
+                @warn "Natter timeout cleanup error reporter failed" operation exception=(err, catch_backtrace())
+            end
+        end
+    end
+    nothing
+end
+
+function _run_with_timeout(f::Function, operation::String, timeout::Real, cleanup::Function,
+                           report_cleanup_errors::Function=errors -> _warn_timeout_cleanup_errors(operation, errors))
     if timeout <= 0
-        _schedule_timeout_cleanup(operation, cleanup)
+        _schedule_timeout_cleanup(operation, cleanup, report_cleanup_errors)
         throw(TimeoutError("$operation timed out"))
     end
     ch = Channel{Tuple{Bool,Any}}(1)
@@ -169,7 +194,7 @@ function _run_with_timeout(f::Function, operation::String, timeout::Real, cleanu
         isready(ch)
     end
     if result == :timed_out
-        _schedule_timeout_cleanup(operation, cleanup)
+        _schedule_timeout_cleanup(operation, cleanup, report_cleanup_errors)
         @async begin
             try
                 wait(task)
@@ -577,10 +602,11 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     write_io = sock
     reader = ProtocolReader{_read_transport_type(client)}(read_io)
     cleanup = () -> _close_transport(read_io, write_io, sock)
+    report_timeout_cleanup = errors -> _report_cleanup_errors(client, errors)
     try
         tls_active::Bool = false
         if _tls_first_for_connection(client.options, scheme)
-            tls = _run_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup) do
+            tls = _run_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                 _tls_wrap(sock, client.options, host)
             end
             read_io = tls
@@ -588,16 +614,16 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             reader = ProtocolReader{_read_transport_type(client)}(read_io)
             tls_active = true
         end
-        op, data = _run_with_timeout("connect INFO read", _remaining_timeout(deadline), cleanup) do
+        frame = _run_with_timeout("connect INFO read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
             _read_control_or_msg(reader, client.options)
         end
-        op == :INFO || throw(ProtocolError("expected INFO during connect"))
-        info = data::ServerInfo
+        frame.op == :INFO || throw(ProtocolError("expected INFO during connect"))
+        info = _protocol_info(frame)
         wants_tls::Bool = !tls_active && (scheme == "tls" || client.options.tls_required || info.tls_required === true)
         if wants_tls
             available = something(info.tls_available, info.tls_required === true)
             available == true || throw(ProtocolError("TLS requested but server did not advertise TLS availability"))
-            tls = _run_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup) do
+            tls = _run_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                 _tls_wrap(sock, client.options, host)
             end
             read_io = tls
@@ -605,24 +631,25 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             reader = ProtocolReader{_read_transport_type(client)}(read_io)
             tls_active = true
         end
-        _run_with_timeout("connect command write", _remaining_timeout(deadline), cleanup) do
+        _run_with_timeout("connect command write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
             write(write_io, _connect_command(client, info, url_user, url_pass))
             write(write_io, "PING$CRLF")
             flush(write_io)
         end
         while true
-            op, data = _run_with_timeout("connect PONG read", _remaining_timeout(deadline), cleanup) do
+            frame = _run_with_timeout("connect PONG read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                 _read_control_or_msg(reader, client.options)
             end
+            op = frame.op
             if op == :PONG
                 break
             elseif op == :PING
-                _run_with_timeout("connect PONG write", _remaining_timeout(deadline), cleanup) do
+                _run_with_timeout("connect PONG write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                     write(write_io, "PONG$CRLF")
                     flush(write_io)
                 end
             elseif op == :ERR
-                _throw_server_err(data)
+                _throw_server_err(_protocol_err(frame))
             elseif op == :OK
                 continue
             else
@@ -872,9 +899,10 @@ function _reader_loop(client::Client, generation::Int)
     end
     while _generation_matches(client, generation) && status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
-            op, data = _read_control_or_msg(reader, client.options)
+            frame = _read_control_or_msg(reader, client.options)
+            op = frame.op
             if op == :MSG
-                msg = data::Msg
+                msg = _protocol_msg(frame)
                 msg.client = client
                 _dispatch_msg(client, msg)
             elseif op == :PING
@@ -882,7 +910,7 @@ function _reader_loop(client::Client, generation::Int)
             elseif op == :PONG
                 _notify_pong(client)
             elseif op == :INFO
-                info = data::ServerInfo
+                info = _protocol_info(frame)
                 @lock client.lock _merge_server_info!(client.info, info)
                 _merge_discovered_servers!(client, info)
                 if info.ldm
@@ -890,7 +918,7 @@ function _reader_loop(client::Client, generation::Int)
                     return
                 end
             elseif op == :ERR
-                _handle_server_err!(client, generation, data) && return
+                _handle_server_err!(client, generation, _protocol_err(frame)) && return
             end
         catch err
             status(client) in (ConnectionStatus.CLOSED, ConnectionStatus.DRAINING) && return

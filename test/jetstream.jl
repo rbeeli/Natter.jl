@@ -140,6 +140,54 @@ end
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(filter_subjects=["orders.*", "orders.created"]))
 end
 
+@testitem "JetStream typed stream config validates local schema" begin
+    using Natter
+
+    const N = Natter
+
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="bad.name"))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", subjects=["orders..created"]))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", subjects=["orders.*", "orders.created"]))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", max_msgs=-2))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", max_msg_size=typemax(Int32) + 1))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", num_replicas=6))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", first_seq=-1))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", max_age=0.01))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", max_age=1.0, duplicate_window=2.0))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", subject_delete_marker_ttl=0.5))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(name="ORDERS", discard_new_per_subject=true))
+    @test_throws ArgumentError N._js_config_payload(StreamConfig(
+        name="ORDERS",
+        sources=[StreamSource(name="SOURCE", filter_subject="orders.created",
+                              subject_transforms=[SubjectTransform(src="orders.*", dest="archive.*")])],
+    ))
+end
+
+@testitem "JetStream typed consumer config validates local schema" begin
+    using Natter
+
+    const N = Natter
+
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(name="bad.name"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(name="a", durable_name="b"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(deliver_subject="deliver.*"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(deliver_subject="deliver..worker"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(deliver_group=""))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(deliver_group="bad group"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(max_deliver=-2))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(max_ack_pending=-2))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(max_waiting=-1))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(rate_limit_bps=-1))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(num_replicas=6))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(max_batch=-1))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(max_bytes=-1))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(max_expires=0.0005))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(idle_heartbeat=0.01))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(backoff=[0.1, -0.2]))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(sample_freq="-1%"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_groups=["bad group"]))
+end
+
 @testitem "JetStream raw dict config serialization matches typed config units" begin
     using Dates
     using Natter
@@ -210,6 +258,63 @@ end
     config = N._consumer_normalized_config_value(request["config"])
     @test config["ack_wait"] == 500_000_000
     @test config["backoff"] == [100_000_000, 200_000_000]
+end
+
+@testitem "JetStream publish options serialize supported headers" setup=[TestHelpers] begin
+    using Dates
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    @test_throws TimeoutError js_publish(
+        js,
+        "orders.created",
+        "payload";
+        timeout=0.001,
+        stream="ORDERS",
+        msg_id="msg-1",
+        expected_last_sequence=10,
+        expected_last_subject_sequence=3,
+        expected_last_subject="orders.created",
+        expected_last_msg_id="msg-0",
+        ttl=1.5,
+        schedule_every=5.0,
+        schedule_target="orders.scheduled",
+        schedule_source="orders.source",
+        schedule_ttl=:never,
+        schedule_timezone="UTC",
+    )
+
+    written = TestHelpers.capture_text(capture)
+    @test occursin("HPUB orders.created ", written)
+    @test occursin("Nats-Expected-Stream: ORDERS\r\n", written)
+    @test occursin("Nats-Msg-Id: msg-1\r\n", written)
+    @test occursin("Nats-Expected-Last-Sequence: 10\r\n", written)
+    @test occursin("Nats-Expected-Last-Subject-Sequence: 3\r\n", written)
+    @test occursin("Nats-Expected-Last-Subject-Sequence-Subject: orders.created\r\n", written)
+    @test occursin("Nats-Expected-Last-Msg-Id: msg-0\r\n", written)
+    @test occursin("Nats-TTL: 1.5s\r\n", written)
+    @test occursin("Nats-Schedule: @every 5s\r\n", written)
+    @test occursin("Nats-Schedule-Target: orders.scheduled\r\n", written)
+    @test occursin("Nats-Schedule-Source: orders.source\r\n", written)
+    @test occursin("Nats-Schedule-TTL: never\r\n", written)
+    @test occursin("Nats-Schedule-Time-Zone: UTC\r\n", written)
+
+    hdrs = N._js_publish_headers(nothing; schedule_at=DateTime(2026, 1, 2, 3, 4, 5))
+    @test hdrs["Nats-Schedule"] == ["@at 2026-01-02T03:04:05.000Z"]
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws ArgumentError js_publish(js, "orders.created", "payload"; stream="A", expected_stream="B")
+    @test_throws ArgumentError js_publish(js, "orders.created", "payload"; expected_last_subject="orders.created")
+    @test_throws ArgumentError js_publish(js, "orders.created", "payload"; ttl=0)
+    @test_throws ArgumentError js_publish(js, "orders.created", "payload"; ttl=0.5)
+    @test_throws ArgumentError js_publish(js, "orders.created", "payload"; schedule="x", schedule_every=1.0)
+    @test_throws ArgumentError js_publish(js, "orders.created", "payload"; retry_attempts=-1)
+    @test TestHelpers.capture_text(capture) == ""
 end
 
 @testitem "JetStream typed config response parsing" begin
@@ -327,6 +432,31 @@ end
     @test TestHelpers.capture_text(capture) == ""
 end
 
+@testitem "JetStream typed config validation happens before request" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    @test_throws ArgumentError stream_create(
+        js,
+        StreamConfig(name="ORDERS", subjects=["orders..created"]);
+        timeout=0.001,
+    )
+    @test TestHelpers.capture_text(capture) == ""
+
+    @test_throws ArgumentError consumer_create(
+        js,
+        "ORDERS",
+        ConsumerConfig(name="worker", deliver_subject="deliver.*");
+        timeout=0.001,
+    )
+    @test TestHelpers.capture_text(capture) == ""
+end
+
 @testitem "JetStream stream purge validates filter locally" setup=[TestHelpers] begin
     using Natter
 
@@ -338,6 +468,17 @@ end
 
     @test_throws ArgumentError stream_purge(js, "ORDERS"; filter_subject="orders..created", timeout=0.001)
     @test TestHelpers.capture_text(capture) == ""
+
+    @test_throws ArgumentError stream_purge(js, "ORDERS"; keep=-1, timeout=0.001)
+    @test TestHelpers.capture_text(capture) == ""
+
+    @test_throws TimeoutError stream_purge(js, "ORDERS"; filter_subject="orders.created", keep=1, timeout=0.001)
+    written = TestHelpers.capture_text(capture)
+    json_match = match(r"\{.*\}", written)
+    @test !isnothing(json_match)
+    request = N._json_dict(json_match.match)
+    @test request["filter"] == "orders.created"
+    @test request["keep"] == 1
 end
 
 @testitem "JetStream push callback auto ack respects ack none policy" begin

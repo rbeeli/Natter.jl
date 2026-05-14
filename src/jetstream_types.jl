@@ -50,6 +50,18 @@ EnumX.@enumx PriorityPolicy begin
     PINNED_CLIENT
 end
 
+const _JS_MAX_REPLICAS = 5
+const _JS_MAX_NAME_LEN = 255
+const _JS_MAX_DESCRIPTION_LEN = 4 * 1024
+const _JS_MAX_METADATA_LEN = 128 * 1024
+const _JS_MIN_DUPLICATE_WINDOW_NS = 100_000_000
+const _JS_MIN_MAX_AGE_NS = 100_000_000
+const _JS_MIN_HEARTBEAT_NS = 100_000_000
+const _JS_MIN_MAX_EXPIRES_NS = 1_000_000
+const _JS_MIN_SUBJECT_DELETE_MARKER_TTL_NS = 1_000_000_000
+const _JS_MAX_INT32 = Int(typemax(Int32))
+const _JS_PRIORITY_GROUP_RE = r"^[A-Za-z0-9/_=-]{1,16}$"
+
 Base.@kwdef struct Placement
     cluster::Union{String,Nothing} = nothing
     preferred::Union{String,Nothing} = nothing
@@ -188,7 +200,14 @@ const _JS_DURATION_FIELDS = Set{Symbol}((
 
 const _JS_TIMESTAMP_FIELDS = Set{Symbol}((:opt_start_time, :pause_until))
 
-_seconds_to_nanoseconds(value::Real)::Int = round(Int, Float64(value) * 1_000_000_000)
+function _seconds_to_nanoseconds(value::Real)::Int
+    seconds = Float64(value)
+    isfinite(seconds) || throw(ArgumentError("duration values must be finite"))
+    nanoseconds = seconds * 1_000_000_000
+    typemin(Int) <= nanoseconds <= typemax(Int) ||
+        throw(ArgumentError("duration value is outside Int range after nanosecond conversion"))
+    round(Int, nanoseconds)
+end
 _nanoseconds_to_seconds(value)::Float64 = Float64(value) / 1_000_000_000
 
 function _timestamp_to_rfc3339(value::DateTime)::String
@@ -208,6 +227,56 @@ function _string_dict(value, field::AbstractString)::Dict{String,String}
         result[String(k)] = String(v)
     end
     result
+end
+
+function _validate_api_name(kind::AbstractString, name)
+    n = String(name)
+    isempty(n) && throw(ArgumentError("$kind name cannot be empty"))
+    for c in n
+        if isspace(c) || c in ('.', '*', '>', '/', '\\') || !isprint(c)
+            throw(ArgumentError("$kind name contains an invalid character: $n"))
+        end
+    end
+    n
+end
+
+function _validate_js_name_field!(payload::Dict{String,Any}, field::AbstractString, kind::AbstractString)
+    haskey(payload, field) || return payload
+    value = payload[field]
+    isnothing(value) && return payload
+    value isa AbstractString || throw(ArgumentError("$field must be a string"))
+    name = _validate_api_name(kind, value)
+    ncodeunits(name) <= _JS_MAX_NAME_LEN ||
+        throw(ArgumentError("$kind name is too long; maximum is $_JS_MAX_NAME_LEN bytes"))
+    payload[field] = name
+    payload
+end
+
+function _validate_js_description!(payload::Dict{String,Any})
+    haskey(payload, "description") || return payload
+    value = payload["description"]
+    isnothing(value) && return payload
+    value isa AbstractString || throw(ArgumentError("description must be a string"))
+    ncodeunits(value) <= _JS_MAX_DESCRIPTION_LEN ||
+        throw(ArgumentError("description is too long; maximum is $_JS_MAX_DESCRIPTION_LEN bytes"))
+    payload["description"] = String(value)
+    payload
+end
+
+function _validate_js_metadata!(payload::Dict{String,Any})
+    haskey(payload, "metadata") || return payload
+    value = payload["metadata"]
+    isnothing(value) && return payload
+    value isa AbstractDict || throw(ArgumentError("metadata must be a dictionary"))
+    total = 0
+    for (k, v) in pairs(value)
+        k isa AbstractString || throw(ArgumentError("metadata keys must be strings"))
+        v isa AbstractString || throw(ArgumentError("metadata values must be strings"))
+        total += ncodeunits(k) + ncodeunits(v)
+    end
+    total <= _JS_MAX_METADATA_LEN ||
+        throw(ArgumentError("metadata exceeds maximum size of $_JS_MAX_METADATA_LEN bytes"))
+    payload
 end
 
 _js_enum_value(value::RetentionPolicy.T)::String =
@@ -301,12 +370,167 @@ function _js_config_payload(config::_JSConfigObject)::Dict{String,Any}
         isnothing(value) && continue
         payload[String(field)] = _js_field_value(field, value)
     end
-    config isa ConsumerConfig && _validate_consumer_config_payload!(payload)
+    _validate_js_config_payload!(payload, config)
     payload
 end
 
 function _js_config_payload(config::AbstractDict)::Dict{String,Any}
     Dict{String,Any}(String(k) => _js_field_value(Symbol(String(k)), v) for (k, v) in pairs(config))
+end
+
+_validate_js_config_payload!(payload::Dict{String,Any}, ::_JSConfigObject) = payload
+_validate_js_config_payload!(payload::Dict{String,Any}, ::ExternalStreamSource) =
+    _validate_js_external_stream_source_payload!(payload)
+_validate_js_config_payload!(payload::Dict{String,Any}, ::SubjectTransform) =
+    _validate_js_subject_transform_payload!(payload)
+_validate_js_config_payload!(payload::Dict{String,Any}, ::StreamSource) =
+    _validate_js_stream_source_payload!(payload)
+_validate_js_config_payload!(payload::Dict{String,Any}, ::StreamConsumerLimits) =
+    _validate_js_stream_consumer_limits_payload!(payload)
+_validate_js_config_payload!(payload::Dict{String,Any}, ::RePublish) =
+    _validate_js_republish_payload!(payload)
+_validate_js_config_payload!(payload::Dict{String,Any}, ::StreamConfig) =
+    _validate_stream_config_payload!(payload)
+_validate_js_config_payload!(payload::Dict{String,Any}, ::ConsumerConfig) =
+    _validate_consumer_config_payload!(payload)
+
+function _validate_js_integer!(payload::Dict{String,Any}, field::AbstractString; min::Union{Integer,Nothing}=nothing,
+                               max::Union{Integer,Nothing}=nothing)
+    haskey(payload, field) || return payload
+    value = payload[field]
+    isnothing(value) && return payload
+    value isa Integer && !(value isa Bool) || throw(ArgumentError("$field must be an integer"))
+    if !isnothing(min) && value < min
+        throw(ArgumentError("$field must be at least $min"))
+    elseif !isnothing(max) && value > max
+        throw(ArgumentError("$field must be at most $max"))
+    end
+    payload[field] = Int(value)
+    payload
+end
+
+function _validate_js_number!(payload::Dict{String,Any}, field::AbstractString; min::Union{Real,Nothing}=nothing,
+                              max::Union{Real,Nothing}=nothing, min_positive::Union{Real,Nothing}=nothing)
+    haskey(payload, field) || return payload
+    value = payload[field]
+    isnothing(value) && return payload
+    value isa Real && !(value isa Bool) || throw(ArgumentError("$field must be numeric"))
+    isfinite(Float64(value)) || throw(ArgumentError("$field must be finite"))
+    if !isnothing(min) && value < min
+        throw(ArgumentError("$field must be at least $min"))
+    elseif !isnothing(max) && value > max
+        throw(ArgumentError("$field must be at most $max"))
+    elseif !isnothing(min_positive) && value > 0 && value < min_positive
+        throw(ArgumentError("$field must be 0 or at least $min_positive"))
+    end
+    payload
+end
+
+function _validate_subject_field!(payload::Dict{String,Any}, field::AbstractString; allow_wildcards::Bool=true)
+    haskey(payload, field) || return payload
+    value = payload[field]
+    isnothing(value) && return payload
+    value isa AbstractString || throw(ArgumentError("$field must be a string"))
+    payload[field] = _validate_subject(value; allow_wildcards)
+    payload
+end
+
+function _validate_subject_vector_field!(payload::Dict{String,Any}, field::AbstractString; allow_wildcards::Bool=true,
+                                         allow_empty::Bool=true)
+    haskey(payload, field) || return String[]
+    value = payload[field]
+    isnothing(value) && return String[]
+    value isa AbstractVector || throw(ArgumentError("$field must be a vector of subjects"))
+    subjects = String[]
+    sizehint!(subjects, length(value))
+    for subject in value
+        subject isa AbstractString || throw(ArgumentError("$field entries must be strings"))
+        push!(subjects, _validate_subject(subject; allow_wildcards))
+    end
+    if isempty(subjects)
+        allow_empty || throw(ArgumentError("$field cannot be empty"))
+        return subjects
+    end
+    payload[field] = subjects
+    subjects
+end
+
+function _validate_non_overlapping_subjects(subjects::Vector{String}, field::AbstractString)
+    for i in eachindex(subjects)
+        for j in (i + 1):lastindex(subjects)
+            _subjects_overlap(subjects[i], subjects[j]) &&
+                throw(ArgumentError("$field entries cannot overlap"))
+        end
+    end
+    subjects
+end
+
+function _validate_js_subject_transform_payload!(payload::Dict{String,Any})::Dict{String,Any}
+    _validate_subject_field!(payload, "src")
+    _validate_subject_field!(payload, "dest")
+    payload
+end
+
+function _validate_js_external_stream_source_payload!(payload::Dict{String,Any})::Dict{String,Any}
+    _validate_subject_field!(payload, "api"; allow_wildcards=false)
+    _validate_subject_field!(payload, "deliver"; allow_wildcards=false)
+    payload
+end
+
+function _validate_js_stream_source_payload!(payload::Dict{String,Any})::Dict{String,Any}
+    _validate_js_name_field!(payload, "name", "stream")
+    _validate_js_integer!(payload, "opt_start_seq"; min=0)
+    _validate_subject_field!(payload, "filter_subject")
+    if haskey(payload, "filter_subject") && !isnothing(payload["filter_subject"]) &&
+       haskey(payload, "subject_transforms") && !isnothing(payload["subject_transforms"]) &&
+       !isempty(payload["subject_transforms"])
+        throw(ArgumentError("stream source cannot have both filter_subject and subject_transforms specified"))
+    end
+    payload
+end
+
+function _validate_js_stream_consumer_limits_payload!(payload::Dict{String,Any})::Dict{String,Any}
+    _validate_js_number!(payload, "inactive_threshold"; min=0)
+    _validate_js_integer!(payload, "max_ack_pending"; min=-1)
+    payload
+end
+
+function _validate_js_republish_payload!(payload::Dict{String,Any})::Dict{String,Any}
+    _validate_subject_field!(payload, "src")
+    _validate_subject_field!(payload, "dest")
+    payload
+end
+
+function _validate_stream_config_payload!(payload::Dict{String,Any})::Dict{String,Any}
+    _validate_js_name_field!(payload, "name", "stream")
+    _validate_js_description!(payload)
+    _validate_js_metadata!(payload)
+
+    subjects = _validate_subject_vector_field!(payload, "subjects"; allow_wildcards=true)
+    _validate_non_overlapping_subjects(subjects, "stream subjects")
+
+    _validate_js_integer!(payload, "max_consumers"; min=-1)
+    _validate_js_integer!(payload, "max_msgs"; min=-1)
+    _validate_js_integer!(payload, "max_bytes"; min=-1)
+    _validate_js_integer!(payload, "max_msgs_per_subject"; min=-1)
+    _validate_js_integer!(payload, "max_msg_size"; min=-1, max=_JS_MAX_INT32)
+    _validate_js_integer!(payload, "num_replicas"; min=0, max=_JS_MAX_REPLICAS)
+    _validate_js_integer!(payload, "first_seq"; min=0)
+
+    _validate_js_number!(payload, "max_age"; min=0, min_positive=_JS_MIN_MAX_AGE_NS)
+    _validate_js_number!(payload, "duplicate_window"; min=0, min_positive=_JS_MIN_DUPLICATE_WINDOW_NS)
+    if haskey(payload, "max_age") && !isnothing(payload["max_age"]) && payload["max_age"] > 0 &&
+       haskey(payload, "duplicate_window") && !isnothing(payload["duplicate_window"]) &&
+       payload["duplicate_window"] > payload["max_age"]
+        throw(ArgumentError("duplicate_window cannot be larger than max_age"))
+    end
+    _validate_js_number!(payload, "subject_delete_marker_ttl"; min=0,
+                         min_positive=_JS_MIN_SUBJECT_DELETE_MARKER_TTL_NS)
+    if get(payload, "discard_new_per_subject", false) == true &&
+       get(payload, "max_msgs_per_subject", 0) <= 0
+        throw(ArgumentError("discard_new_per_subject requires max_msgs_per_subject > 0"))
+    end
+    payload
 end
 
 function _validate_filter_subjects_value(value)::Vector{String}
@@ -349,9 +573,17 @@ function _validate_filter_subjects_do_not_overlap(subjects::Vector{String})
 end
 
 function _validate_consumer_config_payload!(payload::Dict{String,Any})::Dict{String,Any}
-    if haskey(payload, "filter_subject") && !isnothing(payload["filter_subject"])
-        payload["filter_subject"] = _validate_subject(payload["filter_subject"])
+    _validate_js_name_field!(payload, "name", "consumer")
+    _validate_js_name_field!(payload, "durable_name", "consumer")
+    _validate_js_description!(payload)
+    _validate_js_metadata!(payload)
+    if haskey(payload, "name") && !isnothing(payload["name"]) &&
+       haskey(payload, "durable_name") && !isnothing(payload["durable_name"]) &&
+       payload["name"] != payload["durable_name"]
+        throw(ArgumentError("consumer name and durable_name must match when both are specified"))
     end
+
+    _validate_subject_field!(payload, "filter_subject")
 
     has_filter_subjects = false
     if haskey(payload, "filter_subjects") && !isnothing(payload["filter_subjects"])
@@ -368,6 +600,60 @@ function _validate_consumer_config_payload!(payload::Dict{String,Any})::Dict{Str
         throw(ArgumentError("consumer cannot have both filter_subject and filter_subjects specified"))
     end
     has_filter_subjects && _validate_filter_subjects_do_not_overlap(payload["filter_subjects"])
+
+    _validate_subject_field!(payload, "deliver_subject"; allow_wildcards=false)
+    if haskey(payload, "deliver_group") && !isnothing(payload["deliver_group"])
+        payload["deliver_group"] isa AbstractString || throw(ArgumentError("deliver_group must be a string"))
+        payload["deliver_group"] = _validate_queue(String(payload["deliver_group"]))
+    end
+
+    _validate_js_integer!(payload, "opt_start_seq"; min=0)
+    _validate_js_integer!(payload, "max_deliver"; min=-1)
+    _validate_js_integer!(payload, "rate_limit_bps"; min=0)
+    _validate_js_integer!(payload, "max_waiting"; min=0)
+    _validate_js_integer!(payload, "max_ack_pending"; min=-1)
+    _validate_js_integer!(payload, "num_replicas"; min=0, max=_JS_MAX_REPLICAS)
+    _validate_js_integer!(payload, "max_batch"; min=0)
+    _validate_js_integer!(payload, "max_bytes"; min=0)
+
+    _validate_js_number!(payload, "ack_wait"; min=0)
+    _validate_js_number!(payload, "idle_heartbeat"; min=0, min_positive=_JS_MIN_HEARTBEAT_NS)
+    _validate_js_number!(payload, "inactive_threshold"; min=0)
+    _validate_js_number!(payload, "max_expires"; min=0, min_positive=_JS_MIN_MAX_EXPIRES_NS)
+    _validate_js_number!(payload, "priority_timeout"; min=0)
+
+    if haskey(payload, "backoff") && !isnothing(payload["backoff"])
+        backoff = payload["backoff"]
+        backoff isa AbstractVector || throw(ArgumentError("backoff must be a vector of durations"))
+        for value in backoff
+            value isa Real && !(value isa Bool) || throw(ArgumentError("backoff entries must be numeric"))
+            isfinite(Float64(value)) || throw(ArgumentError("backoff entries must be finite"))
+            value >= 0 || throw(ArgumentError("backoff entries must be non-negative"))
+        end
+    end
+
+    if haskey(payload, "sample_freq") && !isnothing(payload["sample_freq"])
+        payload["sample_freq"] isa AbstractString || throw(ArgumentError("sample_freq must be a string"))
+        raw = String(payload["sample_freq"])
+        freq = endswith(raw, "%") ? chop(raw; tail=1) : raw
+        !isempty(freq) && all(isdigit, freq) || throw(ArgumentError("sample_freq must be a non-negative integer percentage"))
+        payload["sample_freq"] = raw
+    end
+
+    if haskey(payload, "priority_groups") && !isnothing(payload["priority_groups"])
+        groups = payload["priority_groups"]
+        groups isa AbstractVector || throw(ArgumentError("priority_groups must be a vector of strings"))
+        validated = String[]
+        sizehint!(validated, length(groups))
+        for group in groups
+            group isa AbstractString || throw(ArgumentError("priority_groups entries must be strings"))
+            s = String(group)
+            occursin(_JS_PRIORITY_GROUP_RE, s) ||
+                throw(ArgumentError("priority_groups entries must match [A-Za-z0-9/_=-]{1,16}"))
+            push!(validated, s)
+        end
+        payload["priority_groups"] = validated
+    end
     payload
 end
 

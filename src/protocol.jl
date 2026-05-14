@@ -327,7 +327,7 @@ function _malformed_control_line(kind::AbstractString, bytes::AbstractVector{UIn
     throw(ProtocolError("malformed $kind control line: $(_bytes_string(bytes, first, last))"))
 end
 
-function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int, max_payload::Int)
+function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int, max_payload::Int)::_ProtocolFrame
     bytes = reader.buffer
     subject_start, subject_end, pos = _next_token(bytes, line_first + 4, line_last)
     subject_start == 0 && _malformed_control_line("MSG", bytes, line_first, line_last)
@@ -344,11 +344,11 @@ function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
     size_start, size_end = fourth_start == 0 ? (third_start, third_end) : (fourth_start, fourth_end)
     size = _validate_payload_size(_parse_int_token(bytes, size_start, size_end), max_payload)
     payload = _read_exact_payload(reader, size)
-    :MSG, Msg(subject, reply, payload, Headers(), nothing, sid, false)
+    _protocol_msg_frame(Msg(subject, reply, payload, Headers(), nothing, sid, false))
 end
 
 function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
-                         max_payload::Int, max_header_bytes::Int)
+                         max_payload::Int, max_header_bytes::Int)::_ProtocolFrame
     bytes = reader.buffer
     subject_start, subject_end, pos = _next_token(bytes, line_first + 5, line_last)
     subject_start == 0 && _malformed_control_line("HMSG", bytes, line_first, line_last)
@@ -371,12 +371,12 @@ function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int
     total = _validate_payload_size(_parse_int_token(bytes, total_start, total_end), max_payload)
     header_bytes, payload = _read_exact_header_payload(reader, hsize, total)
     hdrs = _parse_headers(header_bytes)
-    :MSG, Msg(subject, reply, payload, hdrs, nothing, sid, false, hsize)
+    _protocol_msg_frame(Msg(subject, reply, payload, hdrs, nothing, sid, false, hsize))
 end
 
 function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
                               max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
-                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)
+                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)::_ProtocolFrame
     line_range = _readline_crlf_range(reader, max_control_line)
     line_first = first(line_range)
     line_last = last(line_range)
@@ -385,21 +385,21 @@ function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFA
     if _ascii_startswith_ci(bytes, line_first, line_last, "INFO ")
         info = _server_info(@view bytes[line_first + 5:line_last])
         _drop_consumed!(reader)
-        return (:INFO, info)
+        return _protocol_info_frame(info)
     elseif _ascii_eq_ci(bytes, line_first, line_last, "PING")
         _drop_consumed!(reader)
-        return (:PING, nothing)
+        return _protocol_control_frame(:PING)
     elseif _ascii_eq_ci(bytes, line_first, line_last, "PONG")
         _drop_consumed!(reader)
-        return (:PONG, nothing)
+        return _protocol_control_frame(:PONG)
     elseif _ascii_eq_ci(bytes, line_first, line_last, "+OK")
         _drop_consumed!(reader)
-        return (:OK, nothing)
+        return _protocol_control_frame(:OK)
     elseif _ascii_startswith_ci(bytes, line_first, line_last, "-ERR")
         msg = line_last - line_first + 1 >= 6 ? strip(_bytes_string(bytes, line_first + 5, line_last)) : ""
-        msg = strip(String(msg), ['\'', ' '])
+        msg = String(strip(String(msg), ['\'', ' ']))
         _drop_consumed!(reader)
-        return (:ERR, msg)
+        return _protocol_err_frame(msg)
     elseif _ascii_startswith_ci(bytes, line_first, line_last, "MSG ")
         return _read_msg_line(reader, line_first, line_last, max_payload)
     elseif _ascii_startswith_ci(bytes, line_first, line_last, "HMSG ")
@@ -412,14 +412,14 @@ end
 
 function _read_control_or_msg(io; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
                               max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
-                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)
+                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)::_ProtocolFrame
     _read_control_or_msg(ProtocolReader(io; read_size=1);
                          max_control_line,
                          max_payload,
                          max_header_bytes)
 end
 
-function _read_control_or_msg(io, opts::ConnectOptions)
+function _read_control_or_msg(io, opts::ConnectOptions)::_ProtocolFrame
     _read_control_or_msg(io;
                          max_control_line=opts.max_control_line,
                          max_payload=opts.max_inbound_payload,

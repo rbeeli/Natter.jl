@@ -201,5 +201,11 @@ kv_history_async(kv::KeyValue, key::AbstractString; kwargs...)::NatterTask =
 kv_keys_async(kv::KeyValue; kwargs...)::NatterTask =
     _natter_async(kv_keys, kv; kwargs...)
 
+kv_watch_async(kv::KeyValue; kwargs...)::NatterTask =
+    _natter_async(kv_watch, kv; kwargs...)
+
 kv_watch_async(callback::Function, kv::KeyValue; kwargs...)::NatterTask =
     _natter_async(kv_watch, callback, kv; kwargs...)
+
+kv_purge_deletes_async(kv::KeyValue; kwargs...)::NatterTask =
+    _natter_async(kv_purge_deletes, kv; kwargs...)

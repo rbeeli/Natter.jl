@@ -32,12 +32,12 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
-| Typed stream configs | Supported | Mirrors known stream schema fields with Julia structs and EnumX enums. |
-| Typed consumer configs | Supported | Mirrors known consumer schema fields with Julia structs and EnumX enums. |
+| Typed stream configs | Supported | Mirrors known stream schema fields with Julia structs and EnumX enums, plus local subject/name/numeric validation. |
+| Typed consumer configs | Supported | Mirrors known consumer schema fields with Julia structs and EnumX enums, plus local subject/name/queue/numeric validation. |
 | Raw config dictionaries | Supported | Escape hatch for newer server fields. |
 | Stream CRUD and list APIs | Supported | Includes pagination. |
 | Consumer CRUD and list APIs | Supported | Includes server-version-aware create subjects, strict create/update actions, and explicit create-or-update upsert. |
-| Publish acknowledgements | Supported | `js_publish` returns `PubAck`. |
+| Publish acknowledgements | Supported | `js_publish` returns `PubAck` and exposes first-class headers for msg-id, expected stream/sequence/msg-id/subject, per-message TTL, schedules, and no-responders retry. |
 | Task handle helpers | Supported | Management, publish, message get/delete, consumer, fetch, close, and ack operations have `_async` helpers. |
 | Pull consumers | Supported | Durable and named consumers bind without mutation and recover from concurrent matching strict-create conflicts; missing consumers and random ephemerals are strictly created. Batch fetch, per-request reply correlation, expiration handling, idle heartbeat monitoring, reconnect-disconnect reporting, and JetStream status/control error mapping are covered. |
 | Push consumers | Supported | Durable and named consumers bind without mutation and recover from concurrent matching strict-create conflicts by rebinding to the existing deliver subject; active non-queue push consumers reject a second bind, and existing queue consumers require an explicit matching queue. Queue groups, callbacks, and manual or automatic acknowledgement are supported. Non-queue push consumers also support idle heartbeat filtering, missed-heartbeat reporting, flow-control replies, and lifecycle status reporting. |
@@ -51,9 +51,9 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
 | Bucket create/open/delete/status | Supported | Backed by JetStream streams; `kv_create` exposes history, bucket TTL, max bucket bytes, max value size, storage, replicas, direct reads, compression, metadata, and delete-marker TTL. History is locally limited to 1 through 64. |
-| Put/create/update | Supported | Includes optimistic revision checks, create after delete/purge markers, and KV-specific conflict errors. |
+| Put/create/update | Supported | Includes optimistic revision checks, create after delete/purge markers, per-key TTL headers, and KV-specific conflict errors. |
 | Get by latest or revision | Supported | Returns typed entries with key, value, revision, created timestamp, delta, and operation. Direct reads are used when bucket direct access is enabled; missing and deleted keys raise KV-specific errors. |
-| Delete and purge | Supported | Uses KeyValue operation headers and optional expected-revision checks. |
+| Delete and purge | Supported | Uses KeyValue operation headers, optional expected-revision checks, purge marker TTL, and delete-marker cleanup. |
 | History and keys | Supported | Implemented through pull consumers; history returns typed entries. |
-| Watch | Supported | Implemented through push consumers and typed entry callbacks. |
+| Watch | Supported | Implemented through push consumers with callback or `KeyValueWatcher` channel APIs. Supports multiple filters, updates-only, history, ignore-deletes, metadata-only delivery, resume revision, and an initial-done sentinel. |
 | Task handle helpers | Supported | Bucket, status, key, history, keys, and watch operations have `_async` helpers. |

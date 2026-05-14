@@ -11,6 +11,19 @@ struct PubAck
     domain::Union{String,Nothing}
 end
 
+const _JS_MSG_ID_HEADER = "Nats-Msg-Id"
+const _JS_EXPECTED_STREAM_HEADER = "Nats-Expected-Stream"
+const _JS_EXPECTED_LAST_SEQUENCE_HEADER = "Nats-Expected-Last-Sequence"
+const _JS_EXPECTED_LAST_SUBJECT_SEQUENCE_HEADER = "Nats-Expected-Last-Subject-Sequence"
+const _JS_EXPECTED_LAST_SUBJECT_SEQUENCE_SUBJECT_HEADER = "Nats-Expected-Last-Subject-Sequence-Subject"
+const _JS_EXPECTED_LAST_MSG_ID_HEADER = "Nats-Expected-Last-Msg-Id"
+const _JS_MSG_TTL_HEADER = "Nats-TTL"
+const _JS_SCHEDULE_HEADER = "Nats-Schedule"
+const _JS_SCHEDULE_TARGET_HEADER = "Nats-Schedule-Target"
+const _JS_SCHEDULE_SOURCE_HEADER = "Nats-Schedule-Source"
+const _JS_SCHEDULE_TTL_HEADER = "Nats-Schedule-TTL"
+const _JS_SCHEDULE_TIMEZONE_HEADER = "Nats-Schedule-Time-Zone"
+
 struct StreamInfo
     name::String
     config::StreamConfig
@@ -131,27 +144,154 @@ function _api_request(js::JetStreamContext, subject::String, payload=nothing; ti
     _js_decode(msg)
 end
 
-function _validate_api_name(kind::AbstractString, name)
-    n = String(name)
-    isempty(n) && throw(ArgumentError("$kind name cannot be empty"))
-    for c in n
-        if isspace(c) || c in ('.', '*', '>', '/', '\\') || !isprint(c)
-            throw(ArgumentError("$kind name contains an invalid character: $n"))
-        end
-    end
-    n
-end
-
 function _puback(obj)
     PubAck(String(obj["stream"]), Int(obj["seq"]), Bool(get(obj, "duplicate", false)), haskey(obj, "domain") ? String(obj["domain"]) : nothing)
 end
 
-function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing; timeout::Real=js.timeout, stream::Union{String,Nothing}=nothing,
-                    headers=nothing)
+function _js_header_nonempty(name::AbstractString, value)::String
+    s = String(value)
+    isempty(s) && throw(ArgumentError("$name cannot be empty"))
+    s
+end
+
+function _js_header_sequence(name::AbstractString, value)::String
+    value isa Integer && !(value isa Bool) ||
+        throw(ArgumentError("$name must be a non-negative integer"))
+    value >= 0 || throw(ArgumentError("$name must be a non-negative integer"))
+    string(Int(value))
+end
+
+function _js_duration_header(name::AbstractString, value; allow_never::Bool=false, min_seconds::Real=0.0)::String
+    if allow_never && value isa AbstractString && lowercase(String(value)) == "never"
+        return "never"
+    elseif allow_never && value === :never
+        return "never"
+    end
+    value isa Real && !(value isa Bool) ||
+        throw(ArgumentError("$name must be a positive number of seconds"))
+    seconds = Float64(value)
+    isfinite(seconds) && seconds > 0 ||
+        throw(ArgumentError("$name must be a positive number of seconds"))
+    seconds >= Float64(min_seconds) ||
+        throw(ArgumentError("$name must be at least $(Float64(min_seconds)) seconds"))
+    isinteger(seconds) ? "$(Int(seconds))s" : "$(seconds)s"
+end
+
+function _js_publish_schedule(schedule, schedule_at, schedule_every)
+    provided = count(!isnothing, (schedule, schedule_at, schedule_every))
+    provided <= 1 || throw(ArgumentError("provide at most one of schedule, schedule_at, or schedule_every"))
+    if !isnothing(schedule)
+        return _js_header_nonempty("schedule", schedule)
+    elseif !isnothing(schedule_at)
+        return "@at $(_timestamp_to_rfc3339(schedule_at))"
+    elseif !isnothing(schedule_every)
+        seconds = Float64(schedule_every)
+        isfinite(seconds) && seconds >= 1 ||
+            throw(ArgumentError("schedule_every must be at least 1 second"))
+        return "@every $(_js_duration_header("schedule_every", seconds))"
+    end
+    nothing
+end
+
+function _push_header!(headers::Headers, name::String, value::String)
+    push!(get!(headers, name, String[]), value)
+    headers
+end
+
+function _js_publish_headers(headers; stream::Union{String,Nothing}=nothing,
+                             expected_stream::Union{String,Nothing}=nothing,
+                             msg_id=nothing, expected_last_sequence=nothing,
+                             expected_last_subject_sequence=nothing,
+                             expected_last_subject=nothing,
+                             expected_last_msg_id=nothing, ttl=nothing,
+                             schedule=nothing, schedule_at=nothing, schedule_every=nothing,
+                             schedule_target=nothing, schedule_source=nothing,
+                             schedule_ttl=nothing, schedule_timezone=nothing)::Headers
     hdrs = isnothing(headers) ? Headers() : _headers_copy(headers)
-    isnothing(stream) || push!(get!(hdrs, "Nats-Expected-Stream", String[]), stream)
-    msg = request(js.client, subject, data; timeout, headers=hdrs)
-    _puback(_js_decode(msg))
+    if !isnothing(stream) && !isnothing(expected_stream) && String(stream) != String(expected_stream)
+        throw(ArgumentError("stream and expected_stream must match when both are provided"))
+    end
+    expected = isnothing(expected_stream) ? stream : expected_stream
+
+    isnothing(msg_id) || _push_header!(hdrs, _JS_MSG_ID_HEADER, _js_header_nonempty("msg_id", msg_id))
+    isnothing(expected) ||
+        _push_header!(hdrs, _JS_EXPECTED_STREAM_HEADER, _validate_api_name("stream", expected))
+    isnothing(expected_last_sequence) ||
+        _push_header!(hdrs, _JS_EXPECTED_LAST_SEQUENCE_HEADER,
+                      _js_header_sequence("expected_last_sequence", expected_last_sequence))
+    isnothing(expected_last_subject_sequence) ||
+        _push_header!(hdrs, _JS_EXPECTED_LAST_SUBJECT_SEQUENCE_HEADER,
+                      _js_header_sequence("expected_last_subject_sequence", expected_last_subject_sequence))
+    if !isnothing(expected_last_subject)
+        isnothing(expected_last_subject_sequence) &&
+            throw(ArgumentError("expected_last_subject requires expected_last_subject_sequence"))
+        _push_header!(hdrs, _JS_EXPECTED_LAST_SUBJECT_SEQUENCE_SUBJECT_HEADER,
+                      _validate_publish_subject(expected_last_subject))
+    end
+    isnothing(expected_last_msg_id) ||
+        _push_header!(hdrs, _JS_EXPECTED_LAST_MSG_ID_HEADER,
+                      _js_header_nonempty("expected_last_msg_id", expected_last_msg_id))
+    isnothing(ttl) || _push_header!(hdrs, _JS_MSG_TTL_HEADER, _js_duration_header("ttl", ttl; min_seconds=1.0))
+
+    publish_schedule = _js_publish_schedule(schedule, schedule_at, schedule_every)
+    isnothing(publish_schedule) || _push_header!(hdrs, _JS_SCHEDULE_HEADER, publish_schedule)
+    isnothing(schedule_target) ||
+        _push_header!(hdrs, _JS_SCHEDULE_TARGET_HEADER, _validate_publish_subject(schedule_target))
+    isnothing(schedule_source) ||
+        _push_header!(hdrs, _JS_SCHEDULE_SOURCE_HEADER, _validate_publish_subject(schedule_source))
+    isnothing(schedule_ttl) ||
+        _push_header!(hdrs, _JS_SCHEDULE_TTL_HEADER,
+                      _js_duration_header("schedule_ttl", schedule_ttl; allow_never=true))
+    isnothing(schedule_timezone) ||
+        _push_header!(hdrs, _JS_SCHEDULE_TIMEZONE_HEADER,
+                      _js_header_nonempty("schedule_timezone", schedule_timezone))
+    hdrs
+end
+
+function _js_publish_retry_attempts(value)::Int
+    value isa Integer && !(value isa Bool) ||
+        throw(ArgumentError("retry_attempts must be a non-negative integer"))
+    value >= 0 || throw(ArgumentError("retry_attempts must be a non-negative integer"))
+    Int(value)
+end
+
+function _js_publish_retry_wait(value)::Float64
+    value isa Real && !(value isa Bool) ||
+        throw(ArgumentError("retry_wait must be a positive number of seconds"))
+    wait = Float64(value)
+    isfinite(wait) && wait > 0 ||
+        throw(ArgumentError("retry_wait must be a positive number of seconds"))
+    wait
+end
+
+function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing; timeout::Real=js.timeout,
+                    stream::Union{String,Nothing}=nothing, headers=nothing,
+                    expected_stream::Union{String,Nothing}=nothing, msg_id=nothing,
+                    expected_last_sequence=nothing, expected_last_subject_sequence=nothing,
+                    expected_last_subject=nothing, expected_last_msg_id=nothing, ttl=nothing,
+                    schedule=nothing, schedule_at=nothing, schedule_every=nothing,
+                    schedule_target=nothing, schedule_source=nothing, schedule_ttl=nothing,
+                    schedule_timezone=nothing, retry_attempts::Integer=0, retry_wait::Real=0.25)
+    hdrs = _js_publish_headers(headers; stream, expected_stream, msg_id, expected_last_sequence,
+                               expected_last_subject_sequence, expected_last_subject,
+                               expected_last_msg_id, ttl, schedule, schedule_at, schedule_every,
+                               schedule_target, schedule_source, schedule_ttl, schedule_timezone)
+    attempts = _js_publish_retry_attempts(retry_attempts)
+    wait_seconds = _js_publish_retry_wait(retry_wait)
+    deadline = time() + Float64(timeout)
+    attempt = 0
+    while true
+        remaining = deadline - time()
+        remaining > 0 || throw(TimeoutError("request timed out"))
+        try
+            msg = request(js.client, subject, data; timeout=remaining, headers=hdrs)
+            return _puback(_js_decode(msg))
+        catch err
+            err isa NoRespondersError && attempt < attempts || rethrow()
+            attempt += 1
+            sleep(min(wait_seconds, max(0.0, deadline - time())))
+        end
+    end
 end
 
 function _stream_config_name(config::StreamConfig)::String
@@ -225,9 +365,20 @@ end
 stream_delete(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout) =
     Bool(_api_request(js, "$(js.prefix).STREAM.DELETE.$(_validate_api_name("stream", name))", ""; timeout)["success"])
 
-stream_purge(js::JetStreamContext, name::AbstractString; filter_subject::Union{String,Nothing}=nothing, timeout::Real=js.timeout) = begin
+function _validate_stream_purge_keep(keep::Union{Integer,Nothing})
+    isnothing(keep) && return nothing
+    keep isa Bool && throw(ArgumentError("keep must be non-negative"))
+    keep >= 0 || throw(ArgumentError("keep must be non-negative"))
+    Int(keep)
+end
+
+stream_purge(js::JetStreamContext, name::AbstractString; filter_subject::Union{String,Nothing}=nothing,
+             keep::Union{Integer,Nothing}=nothing, timeout::Real=js.timeout) = begin
     filter = isnothing(filter_subject) ? nothing : _validate_subject(filter_subject)
-    req = isnothing(filter) ? Dict{String,Any}() : Dict{String,Any}("filter" => filter)
+    req = Dict{String,Any}()
+    isnothing(filter) || (req["filter"] = filter)
+    keep = _validate_stream_purge_keep(keep)
+    isnothing(keep) || (req["keep"] = keep)
     Bool(_api_request(js, "$(js.prefix).STREAM.PURGE.$(_validate_api_name("stream", name))", JSON3.write(req); timeout)["success"])
 end
 
@@ -692,7 +843,15 @@ mutable struct PushSubscription
     closed::Bool
     heartbeat_task::Union{Task,Nothing}
     control_handler::Union{_JetStreamPushControlHandler,Nothing}
+    info::Union{ConsumerInfo,Nothing}
 end
+
+PushSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
+                 close_lock::ReentrantLock, delete_on_close::Bool, closed::Bool,
+                 heartbeat_task::Union{Task,Nothing},
+                 control_handler::Union{_JetStreamPushControlHandler,Nothing}) =
+    PushSubscription(js, sub, String(stream), String(consumer), close_lock, delete_on_close, closed,
+                     heartbeat_task, control_handler, nothing)
 
 PushSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
                  close_lock::ReentrantLock, delete_on_close::Bool, closed::Bool) =
@@ -1107,7 +1266,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         @lock control_handler.lock control_handler.idle_heartbeat = _push_idle_heartbeat_seconds(info)
         sub.auto_ack = _push_callback_auto_ack(manual_ack, callback, info)
         psub = PushSubscription(js, sub, String(stream), String(info.name), ReentrantLock(), delete_on_close, false,
-                                nothing, control_handler)
+                                nothing, control_handler, info)
         psub.heartbeat_task = _start_push_heartbeat_monitor(psub, control_handler)
         psub
     catch err

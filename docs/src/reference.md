@@ -57,8 +57,8 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | Type | Purpose |
 | :--- | :--- |
 | `JetStreamContext` | JetStream API context for a client. |
-| `StreamConfig` | Typed stream configuration. Raw `Dict` configs use the same seconds-based duration conversion for known stream fields. |
-| `ConsumerConfig` | Typed consumer configuration. Raw `Dict` configs use the same seconds-based duration conversion for known consumer fields. |
+| `StreamConfig` | Typed stream configuration with local subject, name, and numeric validation. Raw `Dict` configs use the same seconds-based duration conversion for known stream fields. |
+| `ConsumerConfig` | Typed consumer configuration with local subject, name, queue, and numeric validation. Raw `Dict` configs use the same seconds-based duration conversion for known consumer fields. |
 | `StreamInfo` | Stream info response with typed config, state, and raw data. |
 | `ConsumerInfo` | Consumer info response with typed config, push-bound state, and raw data. |
 | `PubAck` | Publish acknowledgement with stream, sequence, duplicate, and domain. |
@@ -84,7 +84,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | Function | Purpose |
 | :--- | :--- |
 | `jetstream(client; prefix="$JS.API", timeout=5.0)` | Create a JetStream context. |
-| `js_publish(js, subject, data=nothing; timeout=..., stream=nothing, headers=nothing)` | Publish and wait for a `PubAck`. |
+| `js_publish(js, subject, data=nothing; timeout=..., stream=nothing, headers=nothing, msg_id=nothing, expected_last_sequence=nothing, expected_last_subject_sequence=nothing, expected_last_subject=nothing, expected_last_msg_id=nothing, ttl=nothing, schedule=nothing, schedule_at=nothing, schedule_every=nothing, retry_attempts=0, retry_wait=0.25)` | Publish and wait for a `PubAck`; first-class options map to JetStream publish headers. |
 | `js_publish_async(js, subject, data=nothing; kwargs...)` | Start `js_publish` and return `NatterTask`. |
 | `publish_async(js, subject, data=nothing; kwargs...)` | Alias for `js_publish_async`. |
 | `stream_create(js, config)` | Create a stream from `StreamConfig` or `Dict`. |
@@ -92,7 +92,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `stream_info(js, name)` | Fetch stream info. |
 | `stream_list(js; offset=0)` | List streams, following pagination. |
 | `stream_names(js; subject=nothing)` | List stream names, optionally filtered by subject. |
-| `stream_purge(js, name; filter_subject=nothing)` | Purge a stream or subject subset. |
+| `stream_purge(js, name; filter_subject=nothing, keep=nothing)` | Purge a stream or subject subset, optionally keeping recent messages. |
 | `stream_delete(js, name)` | Delete a stream. |
 | `stream_message_get(js, stream; seq=nothing, subject=nothing, direct=false, next_by_subject=false)` | Read a stored message. Sequence lookups require a positive sequence. |
 | `stream_message_delete(js, stream, seq)` | Delete one stored message by positive sequence. |
@@ -137,6 +137,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 `KeyValueEntry` contains `bucket`, `key`, `value`, `revision`, `created`, `delta`, `operation`, and the underlying `msg`.
 `operation` uses the `KeyValueOperation` enum namespace: `PUT`, `DELETE`, and `PURGE`.
 `KeyValueStatus` contains `bucket`, `stream`, `values`, `history`, `ttl`, `bytes`, `storage`, `replicas`, `direct`, and the backing `stream_info`.
+`KeyValueWatcher` wraps a push subscription. Channel-backed watchers yield `KeyValueEntry` values and the `KV_WATCH_INITIAL_DONE` sentinel.
 
 | Function | Purpose |
 | :--- | :--- |
@@ -145,14 +146,16 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `kv_delete_bucket(kv)` | Delete a bucket. |
 | `kv_status(kv)` | Return bucket status and stream-backed configuration. |
 | `kv_get(kv, key; revision=nothing, direct=nothing)` | Get the latest value or a revision as `KeyValueEntry`. |
-| `kv_put(kv, key, value; revision=nothing)` | Put a value, optionally expecting a revision. |
-| `kv_create_key(kv, key, value)` | Put a value only if the key is absent or currently deleted. |
-| `kv_update(kv, key, value, revision)` | Put a value only if the key is at `revision`. |
+| `kv_put(kv, key, value; revision=nothing, ttl=nothing)` | Put a value, optionally expecting a revision or setting a per-key TTL. |
+| `kv_create_key(kv, key, value; ttl=nothing)` | Put a value only if the key is absent or currently deleted. |
+| `kv_update(kv, key, value, revision; ttl=nothing)` | Put a value only if the key is at `revision`. |
 | `kv_delete(kv, key; revision=nothing)` | Mark a key deleted, optionally only if the key is at `revision`. |
-| `kv_purge(kv, key; revision=nothing)` | Purge a key with rollup, optionally only if the key is at `revision`. |
+| `kv_purge(kv, key; revision=nothing, ttl=nothing)` | Purge a key with rollup, optionally only if the key is at `revision`; `ttl` expires the purge marker. |
+| `kv_purge_deletes(kv; older_than=1800.0)` | Remove delete and purge markers, keeping recent markers when `older_than` is positive. |
 | `kv_history(kv, key; batch=256)` | Return historical `KeyValueEntry` values for a key. |
 | `kv_keys(kv)` | Return active keys. |
-| `kv_watch(callback, kv; key=">", history=false)` | Watch bucket updates as `KeyValueEntry` values with a push subscription. |
+| `kv_watch(kv; key=">", keys=nothing, history=false, updates_only=false, ignore_deletes=false, meta_only=false, resume_revision=nothing)` | Watch bucket updates with a `KeyValueWatcher` and sentinel channel. |
+| `kv_watch(callback, kv; kwargs...)` | Watch bucket updates with a callback. |
 
 ## KeyValue Task Handle Helpers
 
@@ -168,9 +171,10 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `kv_update_async(kv, key, value, revision)` | Start `kv_update` and return `NatterTask`. |
 | `kv_delete_async(kv, key; kwargs...)` | Start `kv_delete` and return `NatterTask`. |
 | `kv_purge_async(kv, key; kwargs...)` | Start `kv_purge` and return `NatterTask`. |
+| `kv_purge_deletes_async(kv; kwargs...)` | Start `kv_purge_deletes` and return `NatterTask`. |
 | `kv_history_async(kv, key; batch=256)` | Start `kv_history` and return `NatterTask`. |
 | `kv_keys_async(kv)` | Start `kv_keys` and return `NatterTask`. |
-| `kv_watch_async(callback, kv; kwargs...)` | Start `kv_watch` and return `NatterTask`. |
+| `kv_watch_async(kv; kwargs...)`, `kv_watch_async(callback, kv; kwargs...)` | Start `kv_watch` and return `NatterTask`. |
 
 ## Errors
 

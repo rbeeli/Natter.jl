@@ -32,10 +32,10 @@ export pull_subscribe, push_subscribe, fetch
 export pull_subscribe_async, push_subscribe_async, fetch_async
 export ack, ack_sync, nak, in_progress, term, metadata
 export ack_async, ack_sync_async, nak_async, in_progress_async, term_async
-export KeyValue, KeyValueEntry, KeyValueOperation, KeyValueStatus
-export kv_create, kv_open, kv_delete_bucket, kv_status, kv_get, kv_put, kv_create_key, kv_update, kv_delete, kv_purge, kv_history, kv_keys, kv_watch
+export KeyValue, KeyValueEntry, KeyValueOperation, KeyValueStatus, KeyValueWatcher, KeyValueWatchInitialDone, KV_WATCH_INITIAL_DONE
+export kv_create, kv_open, kv_delete_bucket, kv_status, kv_get, kv_put, kv_create_key, kv_update, kv_delete, kv_purge, kv_purge_deletes, kv_history, kv_keys, kv_watch
 export kv_create_async, kv_open_async, kv_delete_bucket_async, kv_status_async, kv_get_async, kv_put_async, kv_create_key_async, kv_update_async
-export kv_delete_async, kv_purge_async, kv_history_async, kv_keys_async, kv_watch_async
+export kv_delete_async, kv_purge_async, kv_purge_deletes_async, kv_history_async, kv_keys_async, kv_watch_async
 export NatterError, TimeoutError, NoRespondersError, ConnectionClosedError, ConnectionReconnectingError
 export ConnectionDrainingError, ProtocolError, AuthenticationError, AuthorizationError
 export AuthenticationExpiredError, AuthenticationRevokedError, AccountAuthenticationExpiredError, PermissionViolationError

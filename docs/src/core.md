@@ -12,7 +12,11 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `token`, `user`, `password` | `nothing` | Authentication credentials. |
 | `no_echo` | `false` | Prevent this connection from receiving its own publishes. |
 | `connect_timeout` | `2.0` | Socket and handshake timeout in seconds. |
+| `ping_interval` | `120.0` | Background keepalive interval in seconds. |
+| `max_outstanding_pings` | `2` | Missed keepalive PINGs allowed before reconnecting. |
 | `allow_reconnect` | `true` | Enable automatic reconnect after transient failures. |
+| `reconnect_wait`, `reconnect_max_wait`, `reconnect_jitter` | `0.5`, `5.0`, `0.1` | Reconnect backoff timing in seconds. |
+| `max_reconnect_attempts` | `-1` | Maximum reconnect loop attempts; `-1` means unlimited. |
 | `pending_size` | `2 MiB` | Maximum outbound publish data retained for reconnect replay, including unflushed connected publishes. |
 | `write_buffer_size` | `32 KiB` | Outbound write buffer size for coalescing small writes. Set to `0` to disable it; publish frames at or above this size bypass the buffer. |
 | `max_control_line` | `16 KiB` | Maximum inbound protocol control line length. |
@@ -22,6 +26,8 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `sub_pending_msgs_limit` | `1024` | Default per-subscription queued message limit. |
 | `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit, including NATS header blocks. |
 | `error_cb` | warning callback | Receives asynchronous callback, cleanup, and background task errors. |
+
+Durations and production limits are validated when `ConnectOptions` is built. Timeouts, keepalive intervals, pending limits, parser limits, stale waiter limits, and subscription pending limits must be positive. `reconnect_jitter` can be zero, `write_buffer_size` can be zero to disable buffering, and `max_reconnect_attempts` must be `-1` or non-negative.
 
 Use `status(client)`, `stats(client)`, and `connected_url(client)` for runtime inspection.
 

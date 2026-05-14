@@ -163,44 +163,185 @@ _msg_pending_bytes(msg::Msg)::Int = msg.header_bytes + length(msg.data)
 
 Base.String(msg::Msg) = String(msg.data)
 
-Base.@kwdef mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
-    servers::Vector{String} = [DEFAULT_URL]
-    name::Union{String,Nothing} = nothing
-    verbose::Bool = false
-    pedantic::Bool = false
-    token::Union{String,Nothing} = nothing
-    user::Union{String,Nothing} = nothing
-    password::Union{String,Nothing} = nothing
-    no_echo::Bool = false
-    tls_required::Bool = false
-    tls_first::Union{Bool,Nothing} = nothing
-    tls_verify::Bool = true
-    tls_ca_path::Union{String,Nothing} = nothing
-    tls_cert_path::Union{String,Nothing} = nothing
-    tls_key_path::Union{String,Nothing} = nothing
-    connect_timeout::Float64 = 2.0
-    ping_interval::Float64 = 120.0
-    max_outstanding_pings::Int = 2
-    allow_reconnect::Bool = true
-    reconnect_wait::Float64 = 0.5
-    reconnect_max_wait::Float64 = 5.0
-    reconnect_jitter::Float64 = 0.1
-    max_reconnect_attempts::Int = -1
-    pending_size::Int = 2 * 1024 * 1024
-    write_buffer_size::Int = DEFAULT_WRITE_BUFFER_SIZE
-    max_control_line::Int = DEFAULT_MAX_CONTROL_LINE
-    max_inbound_payload::Int = DEFAULT_MAX_INBOUND_PAYLOAD
-    max_header_bytes::Int = DEFAULT_MAX_HEADER_BYTES
-    max_stale_pong_waiters::Int = 1024
-    sub_pending_msgs_limit::Int = 1024
-    sub_pending_bytes_limit::Int = 128 * 1024 * 1024
-    drain_timeout::Float64 = 30.0
-    inbox_prefix::String = DEFAULT_INBOX_PREFIX
-    error_cb::ErrorCallback = _default_error_cb
-    disconnected_cb::DisconnectedCallback = _default_noop_cb
-    reconnected_cb::ReconnectedCallback = _default_noop_cb
-    closed_cb::ClosedCallback = _default_noop_cb
-    discovered_server_cb::DiscoveredServerCallback = _default_noop_cb
+function _connect_option_servers(servers)::Vector{String}
+    servers isa AbstractVector || throw(ArgumentError("servers must be a vector of strings"))
+    result = String.(servers)
+    isempty(result) && throw(ArgumentError("at least one server URL is required"))
+    any(isempty, result) && throw(ArgumentError("server URL cannot be empty"))
+    result
+end
+
+function _connect_option_float(name::String, value)::Float64
+    value isa Real && !(value isa Bool) ||
+        throw(ArgumentError("$name must be a finite number"))
+    result = Float64(value)
+    isfinite(result) || throw(ArgumentError("$name must be a finite number"))
+    result
+end
+
+function _connect_option_positive_float(name::String, value)::Float64
+    result = _connect_option_float(name, value)
+    result > 0 || throw(ArgumentError("$name must be positive"))
+    result
+end
+
+function _connect_option_nonnegative_float(name::String, value)::Float64
+    result = _connect_option_float(name, value)
+    result >= 0 || throw(ArgumentError("$name must be non-negative"))
+    result
+end
+
+function _connect_option_int(name::String, value)::Int
+    value isa Integer && !(value isa Bool) ||
+        throw(ArgumentError("$name must be an integer"))
+    try
+        return Int(value)
+    catch
+        throw(ArgumentError("$name must fit in Int"))
+    end
+end
+
+function _connect_option_positive_int(name::String, value)::Int
+    result = _connect_option_int(name, value)
+    result > 0 || throw(ArgumentError("$name must be positive"))
+    result
+end
+
+function _connect_option_nonnegative_int(name::String, value)::Int
+    result = _connect_option_int(name, value)
+    result >= 0 || throw(ArgumentError("$name must be non-negative"))
+    result
+end
+
+function _connect_option_reconnect_attempts(value)::Int
+    result = _connect_option_int("max_reconnect_attempts", value)
+    (result == -1 || result >= 0) ||
+        throw(ArgumentError("max_reconnect_attempts must be -1 or non-negative"))
+    result
+end
+
+mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
+    servers::Vector{String}
+    name::Union{String,Nothing}
+    verbose::Bool
+    pedantic::Bool
+    token::Union{String,Nothing}
+    user::Union{String,Nothing}
+    password::Union{String,Nothing}
+    no_echo::Bool
+    tls_required::Bool
+    tls_first::Union{Bool,Nothing}
+    tls_verify::Bool
+    tls_ca_path::Union{String,Nothing}
+    tls_cert_path::Union{String,Nothing}
+    tls_key_path::Union{String,Nothing}
+    connect_timeout::Float64
+    ping_interval::Float64
+    max_outstanding_pings::Int
+    allow_reconnect::Bool
+    reconnect_wait::Float64
+    reconnect_max_wait::Float64
+    reconnect_jitter::Float64
+    max_reconnect_attempts::Int
+    pending_size::Int
+    write_buffer_size::Int
+    max_control_line::Int
+    max_inbound_payload::Int
+    max_header_bytes::Int
+    max_stale_pong_waiters::Int
+    sub_pending_msgs_limit::Int
+    sub_pending_bytes_limit::Int
+    drain_timeout::Float64
+    inbox_prefix::String
+    error_cb::ErrorCallback
+    disconnected_cb::DisconnectedCallback
+    reconnected_cb::ReconnectedCallback
+    closed_cb::ClosedCallback
+    discovered_server_cb::DiscoveredServerCallback
+
+    function ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}(
+        servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
+        tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
+        max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
+        max_reconnect_attempts, pending_size, write_buffer_size, max_control_line, max_inbound_payload,
+        max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
+        drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb, closed_cb,
+        discovered_server_cb,
+    ) where {ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
+        servers = _connect_option_servers(servers)
+        connect_timeout = _connect_option_positive_float("connect_timeout", connect_timeout)
+        ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
+        max_outstanding_pings = _connect_option_positive_int("max_outstanding_pings", max_outstanding_pings)
+        reconnect_wait = _connect_option_positive_float("reconnect_wait", reconnect_wait)
+        reconnect_max_wait = _connect_option_positive_float("reconnect_max_wait", reconnect_max_wait)
+        reconnect_max_wait >= reconnect_wait ||
+            throw(ArgumentError("reconnect_max_wait must be greater than or equal to reconnect_wait"))
+        reconnect_jitter = _connect_option_nonnegative_float("reconnect_jitter", reconnect_jitter)
+        max_reconnect_attempts = _connect_option_reconnect_attempts(max_reconnect_attempts)
+        pending_size = _connect_option_positive_int("pending_size", pending_size)
+        write_buffer_size = _connect_option_nonnegative_int("write_buffer_size", write_buffer_size)
+        max_control_line = _connect_option_positive_int("max_control_line", max_control_line)
+        max_inbound_payload = _connect_option_positive_int("max_inbound_payload", max_inbound_payload)
+        max_header_bytes = _connect_option_positive_int("max_header_bytes", max_header_bytes)
+        max_stale_pong_waiters = _connect_option_positive_int("max_stale_pong_waiters", max_stale_pong_waiters)
+        sub_pending_msgs_limit = _connect_option_positive_int("sub_pending_msgs_limit", sub_pending_msgs_limit)
+        sub_pending_bytes_limit = _connect_option_positive_int("sub_pending_bytes_limit", sub_pending_bytes_limit)
+        drain_timeout = _connect_option_positive_float("drain_timeout", drain_timeout)
+
+        new{ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}(
+            servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
+            tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
+            max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
+            max_reconnect_attempts, pending_size, write_buffer_size, max_control_line, max_inbound_payload,
+            max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
+            drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb, closed_cb,
+            discovered_server_cb)
+    end
+end
+
+function ConnectOptions(servers, name, verbose, pedantic, token, user, password, no_echo, tls_required,
+                        tls_first, tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout,
+                        ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
+                        reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
+                        write_buffer_size, max_control_line, max_inbound_payload, max_header_bytes,
+                        max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
+                        drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb,
+                        closed_cb, discovered_server_cb)
+    ConnectOptions{typeof(error_cb),typeof(disconnected_cb),typeof(reconnected_cb),typeof(closed_cb),
+                   typeof(discovered_server_cb)}(
+        servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
+        tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
+        max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
+        max_reconnect_attempts, pending_size, write_buffer_size, max_control_line, max_inbound_payload,
+        max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
+        drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb, closed_cb,
+        discovered_server_cb)
+end
+
+function ConnectOptions(; servers=[DEFAULT_URL], name=nothing, verbose=false, pedantic=false,
+                        token=nothing, user=nothing, password=nothing, no_echo=false,
+                        tls_required=false, tls_first=nothing, tls_verify=true,
+                        tls_ca_path=nothing, tls_cert_path=nothing, tls_key_path=nothing,
+                        connect_timeout=2.0, ping_interval=120.0, max_outstanding_pings=2,
+                        allow_reconnect=true, reconnect_wait=0.5, reconnect_max_wait=5.0,
+                        reconnect_jitter=0.1, max_reconnect_attempts=-1,
+                        pending_size=2 * 1024 * 1024, write_buffer_size=DEFAULT_WRITE_BUFFER_SIZE,
+                        max_control_line=DEFAULT_MAX_CONTROL_LINE,
+                        max_inbound_payload=DEFAULT_MAX_INBOUND_PAYLOAD,
+                        max_header_bytes=DEFAULT_MAX_HEADER_BYTES,
+                        max_stale_pong_waiters=1024, sub_pending_msgs_limit=1024,
+                        sub_pending_bytes_limit=128 * 1024 * 1024, drain_timeout=30.0,
+                        inbox_prefix=DEFAULT_INBOX_PREFIX, error_cb=_default_error_cb,
+                        disconnected_cb=_default_noop_cb, reconnected_cb=_default_noop_cb,
+                        closed_cb=_default_noop_cb, discovered_server_cb=_default_noop_cb)
+    ConnectOptions(servers, name, verbose, pedantic, token, user, password, no_echo, tls_required,
+                   tls_first, tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout,
+                   ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
+                   reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
+                   write_buffer_size, max_control_line, max_inbound_payload, max_header_bytes,
+                   max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
+                   drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb,
+                   closed_cb, discovered_server_cb)
 end
 
 mutable struct Server
@@ -246,6 +387,22 @@ ProtocolReader(io::I; read_size::Int=4096) where {I} =
 
 ProtocolReader{I}(io; read_size::Int=4096) where {I} =
     ProtocolReader{I}(io, UInt8[], 1, 0, Vector{UInt8}(undef, read_size))
+
+struct _ProtocolFrame
+    op::Symbol
+    msg::Union{Msg,Nothing}
+    info::Union{ServerInfo,Nothing}
+    err::Union{String,Nothing}
+end
+
+@inline _protocol_msg_frame(msg::Msg) = _ProtocolFrame(:MSG, msg, nothing, nothing)
+@inline _protocol_info_frame(info::ServerInfo) = _ProtocolFrame(:INFO, nothing, info, nothing)
+@inline _protocol_err_frame(err::AbstractString) = _ProtocolFrame(:ERR, nothing, nothing, String(err))
+@inline _protocol_control_frame(op::Symbol) = _ProtocolFrame(op, nothing, nothing, nothing)
+
+@inline _protocol_msg(frame::_ProtocolFrame)::Msg = something(frame.msg)
+@inline _protocol_info(frame::_ProtocolFrame)::ServerInfo = something(frame.info)
+@inline _protocol_err(frame::_ProtocolFrame)::String = something(frame.err)
 
 mutable struct BufferedWriteIO{I} <: IO
     io::I

@@ -45,7 +45,7 @@ st = kv_status(kv)
 ## Put And Get
 
 ```julia
-ack = kv_put(kv, "theme", "dark")
+ack = kv_put(kv, "theme", "dark"; ttl=3600.0)
 entry = kv_get(kv, "theme")
 
 @assert entry.key == "theme"
@@ -54,10 +54,10 @@ entry = kv_get(kv, "theme")
 @assert String(entry.value) == "dark"
 ```
 
-Create only if the key does not currently exist. A deleted key can be created again:
+Create only if the key does not currently exist. A deleted key can be created again. Per-key TTL uses JetStream message TTL, must be at least `1.0` second, and requires the bucket to have `limit_marker_ttl` enabled.
 
 ```julia
-kv_create_key(kv, "first-run", "complete")
+kv_create_key(kv, "first-run", "complete"; ttl=3600.0)
 ```
 
 Update only if the key is still at a known revision:
@@ -72,7 +72,7 @@ kv_update(kv, "theme", "light", ack.seq)
 ```julia
 latest = kv_get(kv, "theme")
 kv_delete(kv, "theme"; revision=latest.revision)
-kv_purge(kv, "theme")
+kv_purge(kv, "theme"; ttl=60.0)
 ```
 
 Absent keys raise `KeyValueKeyNotFoundError` from `kv_get`. Deleted and purged keys raise `KeyValueKeyDeletedError` with the tombstone entry attached.
@@ -105,9 +105,27 @@ settings = Ref{KeyValueEntry}()
 end
 ```
 
+`kv_purge_deletes(kv; older_than=1800.0)` removes current delete and purge markers. Negative `older_than` removes markers regardless of age; recent markers are kept when `older_than` is positive so watchers can still observe them.
+
 ## Watch
 
-`kv_watch` returns a push subscription. Close it when the watcher is no longer needed.
+`kv_watch(kv)` returns a `KeyValueWatcher` with an `updates` channel. The channel yields `KeyValueEntry` values and then `KV_WATCH_INITIAL_DONE` after the initial snapshot has been delivered. Close the watcher when it is no longer needed.
+
+```julia
+watcher = kv_watch(kv; keys=["users.*.name", "system.theme"], meta_only=true)
+
+while true
+    update = take!(watcher)
+    update === KV_WATCH_INITIAL_DONE && break
+    @info "initial key" key=update.key revision=update.revision
+end
+
+close(watcher)
+```
+
+Use `updates_only=true` for changes after watcher creation, `history=true` to include historical revisions, `ignore_deletes=true` to skip delete and purge markers, and `resume_revision=rev` to resume from a stream revision.
+
+The callback form is available when you do not need a buffered updates channel:
 
 ```julia
 watcher = kv_watch(kv; key=">", history=false) do entry

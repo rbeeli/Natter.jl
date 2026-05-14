@@ -247,6 +247,73 @@ end
     @test_throws ArgumentError kv_purge(kv, "alpha"; revision=-1)
 end
 
+@testitem "KeyValue writes expose per-key TTL headers" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    kv = KeyValue(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
+
+    @test_throws TimeoutError kv_put(kv, "alpha", "value"; ttl=2)
+    written = TestHelpers.capture_text(capture)
+    @test occursin("HPUB \$KV.bucket.alpha ", written)
+    @test occursin("Nats-TTL: 2s\r\n", written)
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws TimeoutError kv_create_key(kv, "beta", "value"; ttl=1.5)
+    written = TestHelpers.capture_text(capture)
+    @test occursin("HPUB \$KV.bucket.beta ", written)
+    @test occursin("Nats-Expected-Last-Subject-Sequence: 0\r\n", written)
+    @test occursin("Nats-TTL: 1.5s\r\n", written)
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws TimeoutError kv_purge(kv, "gamma"; revision=9, ttl=3)
+    written = TestHelpers.capture_text(capture)
+    @test occursin("KV-Operation: PURGE\r\n", written)
+    @test occursin("Nats-Rollup: sub\r\n", written)
+    @test occursin("Nats-Expected-Last-Subject-Sequence: 9\r\n", written)
+    @test occursin("Nats-TTL: 3s\r\n", written)
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws ArgumentError kv_put(kv, "alpha", "value"; ttl=0)
+    @test_throws ArgumentError kv_put(kv, "alpha", "value"; ttl=0.5)
+    @test TestHelpers.capture_text(capture) == ""
+end
+
+@testitem "KeyValue watcher options map to consumer config" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    kv = KeyValue(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.")
+    filters = N._kv_watch_filters(">", ["alpha", "beta.*"])
+    cfg = N._kv_watch_consumer_config(kv, filters; meta_only=true)
+    @test cfg["deliver_policy"] == "last_per_subject"
+    @test cfg["ack_policy"] == "none"
+    @test cfg["headers_only"] == true
+    @test cfg["filter_subjects"] == ["\$KV.bucket.alpha", "\$KV.bucket.beta.*"]
+
+    history_cfg = N._kv_watch_consumer_config(kv, [">"]; history=true)
+    @test history_cfg["deliver_policy"] == "all"
+    @test history_cfg["filter_subject"] == "\$KV.bucket.>"
+
+    updates_cfg = N._kv_watch_consumer_config(kv, [">"]; updates_only=true)
+    @test updates_cfg["deliver_policy"] == "new"
+
+    resume_cfg = N._kv_watch_consumer_config(kv, [">"]; resume_revision=7)
+    @test resume_cfg["deliver_policy"] == "by_start_sequence"
+    @test resume_cfg["opt_start_seq"] == 7
+
+    @test N._kv_watch_filters(">", String[]) == [">"]
+    @test_throws ArgumentError N._kv_watch_filters("alpha", ["beta"])
+    @test_throws ArgumentError N._kv_watch_consumer_config(kv, [">"]; history=true, updates_only=true)
+    @test_throws ArgumentError N._kv_watch_consumer_config(kv, [">"]; updates_only=true, resume_revision=1)
+    @test_throws ArgumentError N._kv_watch_consumer_config(kv, [">"]; resume_revision=0)
+    @test_throws ArgumentError N._kv_watch_channel_size(0)
+end
+
 @testitem "KeyValue entries expose typed metadata" setup=[TestHelpers] begin
     using Natter
     using Dates
@@ -280,6 +347,14 @@ end
     unknown = Msg("\$KV.bucket.path.to.key", nothing, UInt8[]; headers=Headers("KV-Operation" => ["UNKNOWN"]))
     @test_throws ProtocolError N._kv_entry_from_stored_msg(kv, unknown, 15, created)
     @test_throws ProtocolError N._kv_entry_from_stored_msg(kv, Msg("other.subject", nothing, UInt8[]), 16, created)
+
+    max_age = Msg("\$KV.bucket.path.to.key", nothing, UInt8[]; headers=Headers("Nats-Marker-Reason" => ["MaxAge"]))
+    max_age_entry = N._kv_entry_from_stored_msg(kv, max_age, 17, created)
+    @test max_age_entry.operation == KeyValueOperation.PURGE
+    @test !N._kv_key_active(max_age)
+
+    removed = Msg("\$KV.bucket.path.to.key", nothing, UInt8[]; headers=Headers("Nats-Marker-Reason" => ["Remove"]))
+    @test N._kv_entry_from_stored_msg(kv, removed, 18, created).operation == KeyValueOperation.DELETE
 
     consumer_msg = Msg("\$KV.bucket.path.to.key", "\$JS.ACK.KV_bucket.C1.1.17.2.123456789.4", TestHelpers.bytes("older"))
     consumer_entry = N._kv_entry_from_consumer_msg(kv, consumer_msg)

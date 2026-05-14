@@ -73,6 +73,45 @@ using TestItems
     @test_throws ConnectionClosedError subscribe(closed, "foo")
 end
 
+@testitem "ConnectOptions validates safety limits" begin
+    using Natter
+
+    const N = Natter
+
+    opts = N.ConnectOptions(connect_timeout=1, ping_interval=2, max_outstanding_pings=1,
+                            reconnect_jitter=0, write_buffer_size=0)
+    @test opts.connect_timeout == 1.0
+    @test opts.ping_interval == 2.0
+    @test opts.write_buffer_size == 0
+
+    function rejects(; kwargs...)
+        @test_throws ArgumentError N.ConnectOptions(; kwargs...)
+    end
+
+    rejects(servers=String[])
+    rejects(servers=[""])
+    rejects(connect_timeout=0)
+    rejects(connect_timeout=Inf)
+    rejects(ping_interval=0)
+    rejects(ping_interval=true)
+    rejects(max_outstanding_pings=0)
+    rejects(max_outstanding_pings=true)
+    rejects(reconnect_wait=0)
+    rejects(reconnect_max_wait=0)
+    rejects(reconnect_wait=2.0, reconnect_max_wait=1.0)
+    rejects(reconnect_jitter=-0.1)
+    rejects(max_reconnect_attempts=-2)
+    rejects(pending_size=0)
+    rejects(write_buffer_size=-1)
+    rejects(max_control_line=0)
+    rejects(max_inbound_payload=0)
+    rejects(max_header_bytes=0)
+    rejects(max_stale_pong_waiters=0)
+    rejects(sub_pending_msgs_limit=0)
+    rejects(sub_pending_bytes_limit=0)
+    rejects(drain_timeout=0)
+end
+
 @testitem "reconnect local state does not enqueue subscription protocol" setup=[TestHelpers] begin
     using Natter
 
@@ -94,9 +133,9 @@ end
         raw = vcat(TestHelpers.bytes("HMSG events $sid $(length(hdr)) $(length(hdr))\r\n"),
                    hdr,
                    N.CRLF_BYTES)
-        op, msg = N._read_control_or_msg(IOBuffer(raw))
-        @test op == :MSG
-        msg
+        frame = N._read_control_or_msg(IOBuffer(raw))
+        @test frame.op == :MSG
+        N._protocol_msg(frame)
     end
 
     hdr = N._headers_bytes(Headers("Trace" => [repeat("x", 64)]))
@@ -929,6 +968,59 @@ end
         end
         done == :timed_out || wait(server_task)
     end
+end
+
+@testitem "timeout cleanup reports returned and thrown cleanup failures" begin
+    using Natter
+
+    const N = Natter
+
+    returned_reported = Channel{Any}(1)
+    returned_done = Channel{Bool}(1)
+    returned_release = Channel{Bool}(1)
+    returned_error = CleanupError("close timed-out transport", ErrorException("close failed"))
+    returned_cleanup = () -> begin
+        put!(returned_release, true)
+        [returned_error]
+    end
+    returned_reporter = errors -> begin
+        foreach(err -> put!(returned_reported, err), errors)
+        put!(returned_done, true)
+    end
+
+    @test_throws TimeoutError N._run_with_timeout("returned cleanup", 0.01, returned_cleanup, returned_reporter) do
+        take!(returned_release)
+        nothing
+    end
+    @test timedwait(0.5; pollint=0.01) do
+        isready(returned_done)
+    end != :timed_out
+    @test take!(returned_reported) === returned_error
+
+    thrown_reported = Channel{Any}(1)
+    thrown_done = Channel{Bool}(1)
+    thrown_release = Channel{Bool}(1)
+    cleanup_exception = ErrorException("cleanup failed")
+    thrown_cleanup = () -> begin
+        put!(thrown_release, true)
+        throw(cleanup_exception)
+    end
+    thrown_reporter = errors -> begin
+        foreach(err -> put!(thrown_reported, err), errors)
+        put!(thrown_done, true)
+    end
+
+    @test_throws TimeoutError N._run_with_timeout("thrown cleanup", 0.01, thrown_cleanup, thrown_reporter) do
+        take!(thrown_release)
+        nothing
+    end
+    @test timedwait(0.5; pollint=0.01) do
+        isready(thrown_done)
+    end != :timed_out
+    thrown_error = take!(thrown_reported)
+    @test thrown_error isa CleanupError
+    @test thrown_error.operation == "timeout cleanup after thrown cleanup"
+    @test thrown_error.cause === cleanup_exception
 end
 
 @testitem "close notifies pending flush waiters" setup=[TestHelpers] begin
