@@ -82,6 +82,8 @@ sub = subscribe(client, "events.*";
 msg = next(sub; timeout=1.0)
 ```
 
+Callback subscriptions are callback-only; use `next` with subscriptions created without a callback.
+
 Use queue groups for load-balanced subscribers:
 
 ```julia

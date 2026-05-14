@@ -172,6 +172,57 @@ end
     @test only(reported) isa SlowConsumerError
 end
 
+@testitem "next rejects callback subscriptions" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "events") do _
+        nothing
+    end
+    try
+        err = TestHelpers.thrown_exception(() -> next(sub; timeout=0.1))
+        @test err isa ArgumentError
+        @test occursin("callback", err.msg)
+    finally
+        close(sub)
+    end
+end
+
+@testitem "next timeout survives concurrent direct channel consumption" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "events")
+    put!(sub.messages, Msg("events", nothing, TestHelpers.bytes("stolen"); sid=sub.sid))
+
+    lock(sub.messages)
+    task = @async next(sub; timeout=0.05)
+    try
+        sleep(0.01)
+        stolen = take!(sub.messages)
+        @test String(stolen) == "stolen"
+    finally
+        unlock(sub.messages)
+    end
+
+    result = timedwait(1.0; pollint=0.001) do
+        istaskdone(task)
+    end
+    @test result != :timed_out
+    err = try
+        fetch(task)
+        nothing
+    catch caught
+        caught isa TaskFailedException ? first(Base.current_exceptions(task)).exception : caught
+    end
+    @test err isa TimeoutError
+    close(sub)
+end
+
 @testitem "publish writes use buffered flusher" setup=[TestHelpers] begin
     using Natter
 
@@ -1224,6 +1275,26 @@ end
     wait(close_task)
     @test closes[] == 1
     @test isnothing(client.write_io)
+end
+
+@testitem "default clients retain concrete protocol readers" setup=[TestHelpers] begin
+    using Natter
+    using Sockets
+
+    const N = Natter
+
+    client = TestHelpers.fake_client()
+    sock = Sockets.TCPSocket()
+    try
+        reader = N.ProtocolReader(sock)
+        client.read_io = sock
+        client.reader = reader
+
+        @test client.reader === reader
+        @test typeof(client.reader) === N.ProtocolReader{Sockets.TCPSocket}
+    finally
+        close(sock)
+    end
 end
 
 @testitem "cleanup errors are reported and optionally thrown" setup=[TestHelpers] begin

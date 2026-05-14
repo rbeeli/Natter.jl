@@ -580,6 +580,41 @@ end
     @test N._push_callback_auto_ack(false, callback, Dict{String,Any}())
 end
 
+@testitem "JetStream in-progress ack is allowed only before terminal ack" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function fresh_msg()
+        capture = TestHelpers.WriteCapture()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+        msg = JetStreamMsg(Msg("orders.created", "ACK.REPLY", TestHelpers.bytes("work")), client)
+        msg, capture
+    end
+
+    progress_msg, progress_capture = fresh_msg()
+    in_progress(progress_msg)
+    in_progress(progress_msg)
+    @test !progress_msg._acked
+    @test TestHelpers.capture_text(progress_capture) ==
+          "PUB ACK.REPLY 4\r\n+WPI\r\nPUB ACK.REPLY 4\r\n+WPI\r\n"
+
+    for terminal_ack in (ack, msg -> nak(msg), term)
+        terminal_msg, terminal_capture = fresh_msg()
+        in_progress(terminal_msg)
+        @test !terminal_msg._acked
+
+        terminal_ack(terminal_msg)
+        @test terminal_msg._acked
+        written = TestHelpers.capture_text(terminal_capture)
+
+        @test_throws JetStreamError in_progress(terminal_msg)
+        @test TestHelpers.capture_text(terminal_capture) == written
+        @test_throws JetStreamError terminal_ack(terminal_msg)
+        @test TestHelpers.capture_text(terminal_capture) == written
+    end
+end
+
 @testitem "JetStream push flow control requires positive heartbeat" setup=[TestHelpers] begin
     using Natter
 
@@ -924,6 +959,29 @@ end
         @test msg isa JetStreamMsg
         @test fieldtype(typeof(msg), :_client) === typeof(client)
         @test String(msg) == "work"
+    finally
+        close(psub)
+    end
+end
+
+@testitem "JetStream push next rejects callback subscriptions" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    sub = subscribe(client, "_INBOX.push"; callback=_ -> nothing,
+                    _control_handler=N._JetStreamPushControlHandler())
+    psub = N.PushSubscription(js, sub, "S", "C", ReentrantLock(), false, false)
+
+    try
+        err = TestHelpers.thrown_exception(() -> next(psub; timeout=0.1))
+        @test err isa ArgumentError
+        @test occursin("callback", err.msg)
+        async_err = TestHelpers.thrown_exception(() -> fetch(next_async(psub; timeout=0.1)))
+        @test async_err isa CapturedException
+        @test async_err.ex isa ArgumentError
     finally
         close(psub)
     end

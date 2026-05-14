@@ -231,9 +231,44 @@ end
 _drop_payload_consumed!(io) = nothing
 _drop_payload_consumed!(reader::ProtocolReader) = _drop_consumed!(reader)
 
+function _read_payload_trailer_byte!(reader::ProtocolReader)::UInt8
+    if isempty(reader.scratch)
+        return read(reader.io, UInt8)
+    end
+    unsafe_read(reader.io, pointer(reader.scratch), UInt(1))
+    @inbounds reader.scratch[1]
+end
+
 function _read_payload_trailer_no_drop!(io)
-    trailer = _read_exact_bytes_no_drop(io, 2)
-    trailer[1] == CRLF_BYTES[1] && trailer[2] == CRLF_BYTES[2] || throw(ProtocolError("message payload missing CRLF trailer"))
+    first = read(io, UInt8)
+    second = read(io, UInt8)
+    first == CRLF_BYTES[1] && second == CRLF_BYTES[2] || throw(ProtocolError("message payload missing CRLF trailer"))
+    nothing
+end
+
+function _read_payload_trailer_no_drop!(reader::ProtocolReader)
+    available = _reader_available(reader)
+    if available >= 2
+        @inbounds begin
+            first = reader.buffer[reader.first]
+            second = reader.buffer[reader.first + 1]
+        end
+        reader.first += 2
+    elseif available == 1
+        @inbounds first = reader.buffer[reader.first]
+        reader.first += 1
+        second = _read_payload_trailer_byte!(reader)
+    elseif length(reader.scratch) >= 2
+        unsafe_read(reader.io, pointer(reader.scratch), UInt(2))
+        @inbounds begin
+            first = reader.scratch[1]
+            second = reader.scratch[2]
+        end
+    else
+        first = _read_payload_trailer_byte!(reader)
+        second = _read_payload_trailer_byte!(reader)
+    end
+    first == CRLF_BYTES[1] && second == CRLF_BYTES[2] || throw(ProtocolError("message payload missing CRLF trailer"))
     nothing
 end
 

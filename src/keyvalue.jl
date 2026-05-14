@@ -13,7 +13,7 @@ struct KeyValue{J<:JetStreamContext}
 end
 KeyValue(js::JetStreamContext, bucket::String, stream::String, prefix::String) = KeyValue(js, bucket, stream, prefix, false)
 
-struct KeyValueEntry{M<:AbstractMsg}
+struct KeyValueEntry
     bucket::String
     key::String
     value::Vector{UInt8}
@@ -21,7 +21,6 @@ struct KeyValueEntry{M<:AbstractMsg}
     created::DateTime
     delta::Int
     operation::KeyValueOperation.T
-    msg::M
 end
 
 Base.String(entry::KeyValueEntry) = String(entry.value)
@@ -151,11 +150,11 @@ _kv_is_delete_marker(operation::KeyValueOperation.T)::Bool =
 
 _kv_key_active(msg::AbstractMsg)::Bool = !_kv_is_delete_marker(_kv_operation(msg))
 
-function _kv_entry(kv::KeyValue, msg::M, revision::Int, created::DateTime, delta::Int)::KeyValueEntry{M} where {M<:AbstractMsg}
-    KeyValueEntry(kv.bucket, _kv_key_from_subject(kv, msg.subject), msg.data, revision, created, delta, _kv_operation(msg), msg)
+function _kv_entry(kv::KeyValue, msg::AbstractMsg, revision::Int, created::DateTime, delta::Int)::KeyValueEntry
+    KeyValueEntry(kv.bucket, _kv_key_from_subject(kv, msg.subject), msg.data, revision, created, delta, _kv_operation(msg))
 end
 
-function _kv_entry_from_stored_msg(kv::KeyValue, msg::M, revision::Int, created::Union{DateTime,Nothing})::KeyValueEntry{M} where {M<:AbstractMsg}
+function _kv_entry_from_stored_msg(kv::KeyValue, msg::AbstractMsg, revision::Int, created::Union{DateTime,Nothing})::KeyValueEntry
     isnothing(created) && throw(ProtocolError("key-value message is missing created timestamp"))
     _kv_entry(kv, msg, revision, created, 0)
 end
@@ -166,7 +165,7 @@ _kv_created_from_timestamp_ns(timestamp_ns::Int)::DateTime =
 _kv_created_from_metadata(meta::MsgMetadata)::DateTime =
     _kv_created_from_timestamp_ns(meta.timestamp_ns)
 
-function _kv_entry_from_consumer_msg(kv::KeyValue, msg::M)::KeyValueEntry{M} where {M<:AbstractMsg}
+function _kv_entry_from_consumer_msg(kv::KeyValue, msg::AbstractMsg)::KeyValueEntry
     meta = _parse_msg_metadata(msg)
     _kv_entry(kv, msg, meta.stream_sequence, _kv_created_from_timestamp_ns(meta.timestamp_ns), meta.pending)
 end

@@ -22,7 +22,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `connect(url_or_urls=nothing; kwargs...)` | Connect to one or more servers. |
 | `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | Publish a core message; header publishes require server INFO header support. |
 | `subscribe(client, subject; queue=nothing, callback=nothing, max_msgs=0, ...)` | Create a core subscription. |
-| `next(sub; timeout=1.0)` | Wait for the next message from a subscription. |
+| `next(sub; timeout=1.0)` | Wait for the next message from a non-callback subscription. |
 | `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | Send a request and wait for one response; request headers require server INFO header support. |
 | `flush(client; timeout=10.0)` | Wait until the server has processed previous commands. |
 | `ping(client; timeout=10.0)` | Alias for `flush`. |
@@ -104,7 +104,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `consumer_list(js, stream; offset=0)` | List consumers for a stream. |
 | `consumer_delete(js, stream, consumer)` | Delete a consumer. |
 | `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig())` | Create or bind a pull subscription without mutating existing consumers. Configs with `deliver_subject` or `deliver_group` are rejected because they describe push delivery. |
-| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions receive `JetStreamMsg` and auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`; channel-backed use calls `next(psub)` for `JetStreamMsg` delivery. |
+| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions receive `JetStreamMsg` and auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`; channel-backed subscriptions use `next(psub)` for `JetStreamMsg` delivery. |
 | `fetch(psub, batch=1; timeout=..., expires=<shorter than timeout>, heartbeat=nothing)` | Fetch a batch of `JetStreamMsg` values from a pull subscription. Each request uses a unique reply subject and ignores stale terminal statuses from older requests. The default server expiration is shorter than the local timeout; explicit `expires` values must also be shorter than `timeout`. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
 | `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for `JetStreamMsg` values. |
 | `metadata(msg)` | Parse JetStream delivery metadata. |
@@ -135,7 +135,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 
 ## KeyValue Functions
 
-`KeyValueEntry` contains `bucket`, `key`, `value`, `revision`, `created`, `delta`, `operation`, and the underlying `msg`.
+`KeyValueEntry` contains `bucket`, `key`, `value`, `revision`, `created`, `delta`, and `operation`.
 `operation` uses the `KeyValueOperation` enum namespace: `PUT`, `DELETE`, and `PURGE`.
 `KeyValueStatus` contains `bucket`, `stream`, `values`, `history`, `ttl`, `bytes`, `storage`, `replicas`, `direct`, and the backing `stream_info`.
 `KeyValueWatcher` wraps a push subscription. Channel-backed watchers yield `KeyValueEntry` values and the `KV_WATCH_INITIAL_DONE` sentinel.

@@ -326,6 +326,9 @@ end
     entry = N._kv_entry_from_stored_msg(kv, msg, 12, created)
 
     @test entry isa KeyValueEntry
+    @test KeyValueEntry isa DataType
+    @test !hasfield(KeyValueEntry, :msg)
+    @test typeof(KeyValueEntry[]) == Vector{KeyValueEntry}
     @test entry.bucket == "bucket"
     @test entry.key == "path.to.key"
     @test entry.value == TestHelpers.bytes("value")
@@ -334,7 +337,6 @@ end
     @test entry.created == created
     @test entry.delta == 0
     @test entry.operation == KeyValueOperation.PUT
-    @test entry.msg === msg
 
     deleted = Msg("\$KV.bucket.path.to.key", nothing, UInt8[]; headers=Headers("KV-Operation" => ["DEL"]))
     deleted_entry = N._kv_entry_from_stored_msg(kv, deleted, 13, created)

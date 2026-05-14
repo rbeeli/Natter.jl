@@ -20,6 +20,9 @@ using TestItems
 
     callback_sub = fetch(subscribe_async(_ -> nothing, client, "foo.callback"))
     @test callback_sub.has_callback
+    next_err = TestHelpers.thrown_exception(() -> fetch(next_async(callback_sub; timeout=0.1)))
+    @test next_err isa CapturedException
+    @test next_err.ex isa ArgumentError
     @test isnothing(fetch(close_async(callback_sub)))
 
     closed = TestHelpers.fake_client(; status=N.ConnectionStatus.DISCONNECTED)

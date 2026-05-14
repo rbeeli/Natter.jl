@@ -282,9 +282,14 @@ function _flush_buffered_writes(client::Client; allow_missing::Bool=false)
             allow_missing && return false
             throw(ConnectionClosedError("connection transport is closed"))
         end
-        _flush_write_io(client, io)
+        _flush_buffered_writes_to_io(client, io)
     end
     true
+end
+
+function _flush_buffered_writes_to_io(client::Client, io::WriteIO) where {WriteIO<:IO}
+    _flush_write_io(client, io)
+    nothing
 end
 
 function _reserve_pending_bytes_locked!(client::Client, bytes::Int)
@@ -349,9 +354,15 @@ function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; f
     @lock client.write_lock begin
         io = @lock client.lock client.write_io
         isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
-        write(io, data)
-        _flush_or_signal_locked(client, io; force_flush)
+        _write_raw_to_io(client, io, data; force_flush)
     end
+    nothing
+end
+
+function _write_raw_to_io(client::Client, io::WriteIO, data::Union{AbstractString,Vector{UInt8}};
+                          force_flush::Bool=false) where {WriteIO<:IO}
+    write(io, data)
+    _flush_or_signal_locked(client, io; force_flush)
     nothing
 end
 
@@ -609,7 +620,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     sock = _connect_tcp(host, port, _remaining_timeout(deadline))
     read_io = sock
     write_io = sock
-    reader = ProtocolReader{_read_transport_type(client)}(read_io)
+    reader = ProtocolReader(read_io)
     cleanup = () -> _close_transport(read_io, write_io, sock)
     report_timeout_cleanup = errors -> _report_cleanup_errors(client, errors)
     try
@@ -620,7 +631,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             end
             read_io = tls
             write_io = tls
-            reader = ProtocolReader{_read_transport_type(client)}(read_io)
+            reader = ProtocolReader(read_io)
             tls_active = true
         end
         frame = _run_with_timeout("connect INFO read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
@@ -637,7 +648,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             end
             read_io = tls
             write_io = tls
-            reader = ProtocolReader{_read_transport_type(client)}(read_io)
+            reader = ProtocolReader(read_io)
             tls_active = true
         end
         _run_with_timeout("connect command write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
@@ -903,9 +914,15 @@ function _reader_loop(client::Client, generation::Int)
     if isnothing(reader)
         read_io = @lock client.lock client.read_io
         isnothing(read_io) && return
-        reader = ProtocolReader{_read_transport_type(client)}(read_io)
+        reader = ProtocolReader(read_io)
         @lock client.lock client.reader = reader
     end
+    _reader_loop_with_reader(client, generation, reader)
+    nothing
+end
+
+function _reader_loop_with_reader(client::Client, generation::Int,
+                                  reader::ProtocolReader{ReadIO}) where {ReadIO}
     while _generation_matches(client, generation) && status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
             frame = _read_control_or_msg(reader, client.options)
@@ -935,6 +952,7 @@ function _reader_loop(client::Client, generation::Int)
             return
         end
     end
+    nothing
 end
 
 function _ping_loop(client::Client, generation::Int)

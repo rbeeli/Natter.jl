@@ -837,11 +837,31 @@ function _bind_or_create_consumer(js::JetStreamContext, stream::AbstractString, 
     end
 end
 
+_pull_fetch_next_subject(js::JetStreamContext, stream::AbstractString, consumer::AbstractString)::String =
+    string(js.prefix, ".CONSUMER.MSG.NEXT.", stream, ".", consumer)
+
+function _pull_fetch_request_payload(batch::Int, expires_ns::Int, heartbeat_ns::Int,
+                                     pin_id::Union{String,Nothing})::String
+    if heartbeat_ns > 0
+        if isnothing(pin_id)
+            return JSON3.write((batch=batch, expires=expires_ns, idle_heartbeat=heartbeat_ns))
+        else
+            return JSON3.write((batch=batch, expires=expires_ns,
+                                idle_heartbeat=heartbeat_ns, pin_id=pin_id))
+        end
+    elseif isnothing(pin_id)
+        return JSON3.write((batch=batch, expires=expires_ns))
+    else
+        return JSON3.write((batch=batch, expires=expires_ns, pin_id=pin_id))
+    end
+end
+
 mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
     js::J
     sub::S
     stream::String
     consumer::String
+    next_subject::String
     deliver::String
     fetch_lock::ReentrantLock
     close_lock::ReentrantLock
@@ -854,7 +874,10 @@ end
 function PullSubscription(js::J, sub::S, stream::AbstractString, consumer::AbstractString,
                           deliver::AbstractString, fetch_lock::ReentrantLock, close_lock::ReentrantLock,
                           delete_on_close::Bool, closed::Bool) where {C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
-    PullSubscription{C,J,S}(js, sub, String(stream), String(consumer), String(deliver), fetch_lock, close_lock,
+    stream = String(stream)
+    consumer = String(consumer)
+    PullSubscription{C,J,S}(js, sub, stream, consumer, _pull_fetch_next_subject(js, stream, consumer),
+                            String(deliver), fetch_lock, close_lock,
                             delete_on_close, closed, false, nothing)
 end
 
@@ -1137,17 +1160,24 @@ end
 function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
     sub = psub.sub
     client = sub.client
-    closed, st = @lock client.lock (sub.closed, client.status)
-    closed && !isready(sub.messages) && _throw_pull_fetch_wait_interrupted(closed, st)
-    ready = @lock client.lock begin
-        _wait_until_condition_locked(sub.condition, timeout) do
-            isready(sub.messages) || sub.closed || client.status != ConnectionStatus.CONNECTED
+    deadline = time() + Float64(timeout)
+    while true
+        msg = _take_subscription_msg_if_ready!(sub)
+        !isnothing(msg) && return msg
+
+        closed, st = @lock client.lock (sub.closed, client.status)
+        closed && !isready(sub.messages) && _throw_pull_fetch_wait_interrupted(closed, st)
+        ready = @lock client.lock begin
+            _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
+                isready(sub.messages) || sub.closed || client.status != ConnectionStatus.CONNECTED
+            end
         end
+        ready || throw(TimeoutError("next message timed out"))
+        msg = _take_subscription_msg_if_ready!(sub)
+        !isnothing(msg) && return msg
+        closed, st = @lock client.lock (sub.closed, client.status)
+        (closed || st != ConnectionStatus.CONNECTED) && _throw_pull_fetch_wait_interrupted(closed, st)
     end
-    ready || throw(TimeoutError("next message timed out"))
-    isready(sub.messages) && return _take_subscription_msg!(sub)
-    closed, st = @lock client.lock (sub.closed, client.status)
-    _throw_pull_fetch_wait_interrupted(closed, st)
 end
 
 function _publish_pull_fetch_request(psub::PullSubscription, request_subject::String, payload::AbstractString,
@@ -1188,13 +1218,14 @@ function fetch(psub::PullSubscription{C}, batch::Int=1; timeout::Real=psub.js.ti
                heartbeat::Union{Nothing,Real}=nothing) where {C}
     heartbeat_seconds = _validate_pull_fetch(psub, batch, timeout, expires, heartbeat)
     @lock psub.fetch_lock begin
-        req = Dict{String,Any}("batch" => batch, "expires" => _seconds_to_nanoseconds(expires))
-        heartbeat_seconds > 0 && (req["idle_heartbeat"] = _seconds_to_nanoseconds(heartbeat_seconds))
-        !isnothing(psub.pin_id) && (req["pin_id"] = psub.pin_id)
-        request_subject = "$(psub.js.prefix).CONSUMER.MSG.NEXT.$(psub.stream).$(psub.consumer)"
+        request_subject = psub.next_subject
+        heartbeat_ns = heartbeat_seconds > 0 ? _seconds_to_nanoseconds(heartbeat_seconds) : 0
+        payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(expires),
+                                              heartbeat_ns, psub.pin_id)
         reply, reply_token = _pull_fetch_reply(psub)
-        _publish_pull_fetch_request(psub, request_subject, JSON3.write(req), reply)
+        _publish_pull_fetch_request(psub, request_subject, payload, reply)
         msgs = JetStreamMsg{C}[]
+        sizehint!(msgs, batch)
         deadline = time() + timeout
         heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
         while length(msgs) < batch && time() < deadline
@@ -1598,21 +1629,23 @@ function _ack_reply_subject(msg::JetStreamMsg)::String
     msg.reply
 end
 
+_ack_terminal(kind::Symbol)::Bool = kind != :progress
+
 function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing)::Nothing
     reply = _ack_reply_subject(msg)
-    kind != :progress && msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
+    msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
     payload = _ack_payload(kind; delay)
     publish(msg._client, reply, payload)
-    kind == :progress || (msg._acked = true)
+    _ack_terminal(kind) && (msg._acked = true)
     nothing
 end
 
 function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::Real=1.0)::Msg
     reply = _ack_reply_subject(msg)
-    kind != :progress && msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
+    msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
     payload = _ack_payload(kind; delay)
     response = request(msg._client, reply, payload; timeout)
-    msg._acked = true
+    _ack_terminal(kind) && (msg._acked = true)
     response
 end
 

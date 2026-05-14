@@ -682,7 +682,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     info::ServerInfo
     socket::Union{Sockets.TCPSocket,Nothing}
     read_io::Union{ReadIO,Nothing}
-    reader::Union{ProtocolReader{ReadIO},Nothing}
+    reader::Union{ProtocolReader{<:ReadIO},Nothing}
     write_io::Union{WriteIO,Nothing}
     lock::ReentrantLock
     write_lock::ReentrantLock
@@ -737,7 +737,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
         end
         RequestMux{client_type}(request_mux.prefix, sub, waiters)
     end
-    reader = isnothing(read_io) ? nothing : ProtocolReader{ReadIO}(read_io)
+    reader = isnothing(read_io) ? nothing : ProtocolReader(read_io)
     Client{Options,ReadIO,WriteIO}(options, servers, current_server, connected_url, status,
                                    info, socket, read_io, reader, write_io, lock, write_lock,
                                    flush_signal, flusher_task,
@@ -808,8 +808,6 @@ function _resolve_request_waiter_locked!(waiter::RequestWaiter{C},
     notify(waiter.condition)
     true
 end
-
-_read_transport_type(::Client{Options,ReadIO,WriteIO}) where {Options,ReadIO,WriteIO} = ReadIO
 
 status(client::Client) = (@lock client.lock client.status)
 stats(client::Client) = @lock client.lock Stats(; in_msgs=client.stats.in_msgs, out_msgs=client.stats.out_msgs,

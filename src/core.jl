@@ -89,13 +89,20 @@ function _write_publish(client::Client, frame::PublishFrame; force_flush::Bool=f
     @lock client.write_lock begin
         io = @lock client.lock client.write_io
         isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
-        threshold = max(0, client.options.write_buffer_size)
-        captured = _write_publish_frame(client, io, frame; replayable, threshold)
-        if !isnothing(replayable_captured)
-            replayable_captured[] = captured
-        end
-        _flush_or_signal_locked(client, io; force_flush)
+        _write_publish_to_io(client, io, frame, force_flush, replayable, replayable_captured)
     end
+    nothing
+end
+
+function _write_publish_to_io(client::Client, io::WriteIO, frame::PublishFrame, force_flush::Bool,
+                              replayable::Bool,
+                              replayable_captured::Union{Nothing,Base.RefValue{Bool}}) where {WriteIO<:IO}
+    threshold = max(0, client.options.write_buffer_size)
+    captured = _write_publish_frame(client, io, frame; replayable, threshold)
+    if !isnothing(replayable_captured)
+        replayable_captured[] = captured
+    end
+    _flush_or_signal_locked(client, io; force_flush)
     nothing
 end
 
@@ -438,8 +445,19 @@ function _dispatch_msg(client::Client, msg::Msg)
     end
 end
 
-function _take_subscription_msg!(sub::Subscription)
-    msg = take!(sub.messages)
+function _take_subscription_channel_msg_if_ready!(sub::Subscription)::Union{Msg,Nothing}
+    lock(sub.messages)
+    try
+        isready(sub.messages) || return nothing
+        return take!(sub.messages)
+    finally
+        unlock(sub.messages)
+    end
+end
+
+function _take_subscription_msg_if_ready!(sub::Subscription)::Union{Msg,Nothing}
+    msg = _take_subscription_channel_msg_if_ready!(sub)
+    isnothing(msg) && return nothing
     msg_bytes = _msg_pending_bytes(msg)
     control_handler = @lock sub.client.lock begin
         sub.pending_bytes = max(0, sub.pending_bytes - msg_bytes)
@@ -450,16 +468,31 @@ function _take_subscription_msg!(sub::Subscription)
     msg
 end
 
+function _ensure_sync_subscription(sub::Subscription)
+    sub.has_callback && throw(ArgumentError("next requires a subscription without a callback"))
+    nothing
+end
+
 function next(sub::Subscription; timeout::Real=1.0)
-    ready = @lock sub.client.lock begin
-        sub.closed && !isready(sub.messages) && throw(ConnectionClosedError("subscription is closed"))
-        _wait_until_condition_locked(sub.condition, timeout) do
-            isready(sub.messages) || sub.closed
+    _ensure_sync_subscription(sub)
+    deadline = time() + Float64(timeout)
+    while true
+        msg = _take_subscription_msg_if_ready!(sub)
+        !isnothing(msg) && return msg
+
+        wait_result = @lock sub.client.lock begin
+            if sub.closed && !isready(sub.messages)
+                :closed
+            else
+                ready = _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
+                    isready(sub.messages) || sub.closed
+                end
+                ready ? :retry : :timeout
+            end
         end
+        wait_result === :closed && throw(ConnectionClosedError("subscription is closed"))
+        wait_result === :timeout && throw(TimeoutError("next message timed out"))
     end
-    ready || throw(TimeoutError("next message timed out"))
-    isready(sub.messages) || throw(ConnectionClosedError("subscription is closed"))
-    _take_subscription_msg!(sub)
 end
 
 function unsubscribe(sub::Subscription; max_msgs::Int=0)

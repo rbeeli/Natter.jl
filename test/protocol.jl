@@ -191,6 +191,31 @@ end
     @test io.reads == [2, 2]
 end
 
+@testitem "protocol payload trailer consumes buffered bytes without allocation" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function buffered_trailer_reader(raw)
+        reader = N.ProtocolReader(IOBuffer(UInt8[]))
+        reader.buffer = copy(raw)
+        reader.first = 1
+        reader.last = length(raw)
+        reader
+    end
+
+    consume_buffered_trailer!(reader) = N._read_payload_trailer_no_drop!(reader)
+
+    raw = TestHelpers.bytes("\r\nPING\r\n")
+    consume_buffered_trailer!(buffered_trailer_reader(raw))
+
+    reader = buffered_trailer_reader(raw)
+    @test (@allocated consume_buffered_trailer!(reader)) == 0
+    @test reader.first == 3
+    @test reader.last == length(raw)
+    @test N._read_control_or_msg(reader).op == :PING
+end
+
 @testitem "protocol writer" setup=[TestHelpers] begin
     using JSON3
     using Natter
