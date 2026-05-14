@@ -1,4 +1,4 @@
-# Natter.jl - Native Julia NATS client
+# Natter.jl - Pure Julia NATS client
 
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/rbeeli/Natter.jl/blob/main/LICENSE)
 ![Maintenance](https://img.shields.io/maintenance/yes/2026)
