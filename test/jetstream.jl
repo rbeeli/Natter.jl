@@ -163,6 +163,39 @@ end
     ))
 end
 
+@testitem "JetStream raw stream config validates local schema" begin
+    using Natter
+
+    const N = Natter
+
+    payload = N._stream_config_payload(Dict{String,Any}(
+        "name" => "ORDERS",
+        "subjects" => ["orders.*"],
+        "mirror" => Dict("name" => "UPSTREAM", "external" => Dict("api" => "\$JS.domain.API")),
+        "republish" => Dict("src" => "orders.>", "dest" => "audit.>"),
+        "consumer_limits" => Dict("max_ack_pending" => 10),
+    ))
+
+    @test payload["subjects"] == ["orders.*"]
+    @test payload["mirror"]["external"]["api"] == "\$JS.domain.API"
+
+    @test_throws ArgumentError N._stream_config_payload(Dict{String,Any}("name" => "bad.name"))
+    @test_throws ArgumentError N._stream_config_payload(Dict{String,Any}("name" => "ORDERS", "subjects" => ["orders..created"]))
+    @test_throws ArgumentError N._stream_config_payload(Dict{String,Any}("name" => "ORDERS", "max_msgs" => -2))
+    @test_throws ArgumentError N._stream_config_payload(Dict{String,Any}("name" => "ORDERS", "num_replicas" => 99))
+    @test_throws ArgumentError N._stream_config_payload(Dict{String,Any}(
+        "name" => "ORDERS",
+        "mirror" => Dict("name" => "UPSTREAM", "filter_subject" => "orders..created"),
+    ))
+    @test_throws ArgumentError N._stream_config_payload(Dict{String,Any}(
+        "name" => "ORDERS",
+        "sources" => [
+            Dict("name" => "SOURCE", "filter_subject" => "orders.created",
+                 "subject_transforms" => [Dict("src" => "orders.*", "dest" => "archive.*")]),
+        ],
+    ))
+end
+
 @testitem "JetStream typed consumer config validates local schema" begin
     using Natter
 
@@ -432,7 +465,7 @@ end
     @test TestHelpers.capture_text(capture) == ""
 end
 
-@testitem "JetStream typed config validation happens before request" setup=[TestHelpers] begin
+@testitem "JetStream stream config validation happens before request" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -447,6 +480,53 @@ end
         timeout=0.001,
     )
     @test TestHelpers.capture_text(capture) == ""
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws ArgumentError stream_create(
+        js,
+        Dict{String,Any}("name" => "ORDERS", "subjects" => ["orders..created"]);
+        timeout=0.001,
+    )
+    @test TestHelpers.capture_text(capture) == ""
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws ArgumentError stream_update(
+        js,
+        Dict{String,Any}("name" => "ORDERS", "max_msgs" => -2);
+        timeout=0.001,
+    )
+    @test TestHelpers.capture_text(capture) == ""
+end
+
+@testitem "JetStream stream discovery validates subjects before request" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    @test_throws ArgumentError stream_names(js; subject="orders..created", timeout=0.001)
+    @test TestHelpers.capture_text(capture) == ""
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws ArgumentError pull_subscribe(js, "orders..created")
+    @test TestHelpers.capture_text(capture) == ""
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws ArgumentError push_subscribe(js, "orders..created")
+    @test TestHelpers.capture_text(capture) == ""
+end
+
+@testitem "JetStream consumer config validation happens before request" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
 
     @test_throws ArgumentError consumer_create(
         js,
@@ -721,7 +801,7 @@ end
 
     heartbeat = Msg("_INBOX.push", "_INBOX.hb", UInt8[];
                     headers=Headers("Status" => ["100"], "Description" => ["Idle Heartbeat"]),
-                    client, sid=push_sub.sid)
+                    sid=push_sub.sid)
     N._dispatch_msg(client, heartbeat)
     @test !isready(push_sub.messages)
     @test client.pending_bytes == 0
@@ -729,7 +809,7 @@ end
     plain_sub = subscribe(client, "_INBOX.plain")
     plain_heartbeat = Msg("_INBOX.plain", nothing, UInt8[];
                           headers=Headers("Status" => ["100"], "Description" => ["Idle Heartbeat"]),
-                          client, sid=plain_sub.sid)
+                          sid=plain_sub.sid)
     N._dispatch_msg(client, plain_heartbeat)
     @test N._status_header(next(plain_sub; timeout=0.1)) == 100
 
@@ -749,7 +829,7 @@ end
     deleted_sub = subscribe(client, "_INBOX.deleted"; _control_handler=N._JetStreamPushControlHandler())
     deleted = Msg("_INBOX.deleted", nothing, UInt8[];
                   headers=Headers("Status" => ["409"], "Description" => ["Consumer Deleted"]),
-                  client, sid=deleted_sub.sid)
+                  sid=deleted_sub.sid)
     N._dispatch_msg(client, deleted)
 
     @test !isready(deleted_sub.messages)
@@ -765,7 +845,7 @@ end
     leader_sub = subscribe(client, "_INBOX.leader"; _control_handler=N._JetStreamPushControlHandler())
     leadership = Msg("_INBOX.leader", nothing, UInt8[];
                      headers=Headers("Status" => ["409"], "Description" => ["Leadership Change"]),
-                     client, sid=leader_sub.sid)
+                     sid=leader_sub.sid)
     N._dispatch_msg(client, leadership)
 
     @test !isready(leader_sub.messages)
@@ -790,7 +870,7 @@ end
     sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
     flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
                        headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
-                       client, sid=sub.sid)
+                       sid=sub.sid)
 
     N._dispatch_msg(client, flow_control)
 
@@ -809,10 +889,10 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
     data = Msg("_INBOX.push", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("work");
-               client, sid=sub.sid)
+               sid=sub.sid)
     flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
                        headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
-                       client, sid=sub.sid)
+                       sid=sub.sid)
 
     N._dispatch_msg(client, data)
     N._dispatch_msg(client, flow_control)
@@ -825,6 +905,28 @@ end
     @test client.pending_bytes == ncodeunits(expected)
     @test String(take!(client.pending)) == expected
     close(sub)
+end
+
+@testitem "JetStream push next returns ackable messages" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+    psub = N.PushSubscription(js, sub, "S", "C", ReentrantLock(), false, false)
+
+    try
+        N._dispatch_msg(client, Msg("_INBOX.push", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("work");
+                                   sid=sub.sid))
+        msg = next(psub; timeout=0.1)
+        @test msg isa JetStreamMsg
+        @test fieldtype(typeof(msg), :_client) === typeof(client)
+        @test String(msg) == "work"
+    finally
+        close(psub)
+    end
 end
 
 @testitem "JetStream push flow control waits for callback delivery" setup=[TestHelpers] begin
@@ -844,12 +946,12 @@ end
 
     try
         busy = Msg("_INBOX.callback", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("busy");
-                   client, sid=sub.sid)
+                   sid=sub.sid)
         data = Msg("_INBOX.callback", "\$JS.ACK.S.C.1.2.2.0.0", TestHelpers.bytes("work");
-                   client, sid=sub.sid)
+                   sid=sub.sid)
         flow_control = Msg("_INBOX.callback", "_INBOX.fc", UInt8[];
                            headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
-                           client, sid=sub.sid)
+                           sid=sub.sid)
 
         N._dispatch_msg(client, busy)
         @test timedwait(1.0; pollint=0.01) do
@@ -891,7 +993,7 @@ end
 
     flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
                        headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
-                       client, sid=sub.sid)
+                       sid=sub.sid)
     N._dispatch_msg(client, flow_control)
 
     @test !isready(sub.messages)
@@ -942,10 +1044,10 @@ end
 
     heartbeat = Msg("_INBOX.callback", nothing, UInt8[];
                     headers=Headers("Status" => ["100"], "Description" => ["Idle Heartbeat"]),
-                    client, sid=sub.sid)
+                    sid=sub.sid)
     flow_control = Msg("_INBOX.callback", "_INBOX.fc", UInt8[];
                        headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
-                       client, sid=sub.sid)
+                       sid=sub.sid)
     N._dispatch_msg(client, heartbeat)
     N._dispatch_msg(client, flow_control)
 
@@ -953,7 +1055,7 @@ end
         isready(received)
     end == :timed_out
 
-    N._dispatch_msg(client, Msg("_INBOX.callback", nothing, TestHelpers.bytes("work"); client, sid=sub.sid))
+    N._dispatch_msg(client, Msg("_INBOX.callback", nothing, TestHelpers.bytes("work"); sid=sub.sid))
     @test timedwait(1.0; pollint=0.01) do
         isready(received)
     end != :timed_out
@@ -1013,7 +1115,7 @@ end
             token = first(keys(mux.waiters))
             "$(mux.prefix).$token", mux.sub.sid
         end
-        N._dispatch_msg(client, Msg(subject, nothing, TestHelpers.bytes(payload); client, sid))
+        N._dispatch_msg(client, Msg(subject, nothing, TestHelpers.bytes(payload); sid))
     end
 
     consumer_response(; deliver_subject=nothing) = begin
@@ -1122,7 +1224,10 @@ end
 @testitem "JetStream metadata" begin
     using Natter
 
-    meta = metadata(Msg("s", "\$JS.ACK.ORDERS.C1.2.10.4.123456789.7", UInt8[]))
+    const N = Natter
+
+    msg = Msg("s", "\$JS.ACK.ORDERS.C1.2.10.4.123456789.7", UInt8[])
+    meta = metadata(msg)
     @test meta.stream == "ORDERS"
     @test meta.consumer == "C1"
     @test meta.delivered == 2
@@ -1130,10 +1235,23 @@ end
     @test meta.consumer_sequence == 4
     @test meta.timestamp_ns == 123456789
     @test meta.pending == 7
+    @test isnothing(meta.domain)
+    @test N._parse_msg_metadata(msg).stream_sequence == 10
+    let local_msg = msg
+        @test (@allocated N._parse_msg_metadata(local_msg)) == 0
+    end
 
     meta2 = metadata(Msg("s", "\$JS.ACK._.acc.ORDERS.C1.3.11.5.987654321.8.rand", UInt8[]))
     @test meta2.domain == ""
+    @test meta2.stream == "ORDERS"
+    @test meta2.consumer == "C1"
     @test meta2.timestamp_ns == 987654321
+
+    meta3 = metadata(Msg("s", "\$JS.ACK.HUB.acc.EVENTS.C2.4.12.6.987654322.9.rand.extra", UInt8[]))
+    @test meta3.domain == "HUB"
+    @test meta3.stream == "EVENTS"
+    @test meta3.consumer == "C2"
+    @test meta3.pending == 9
 end
 
 @testitem "JetStream pull fetch validates inputs before publishing" setup=[TestHelpers] begin
@@ -1204,7 +1322,7 @@ end
     try
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    client, sid=core_sub.sid))
+                                    sid=core_sub.sid))
         @test isempty(fetch(psub, 1; timeout=10.0, heartbeat=0))
         default_payload = pull_request_payload(String(take!(client.write_io)))
         @test default_payload["batch"] == 1
@@ -1213,7 +1331,7 @@ end
 
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    client, sid=core_sub.sid))
+                                    sid=core_sub.sid))
         @test isempty(fetch(psub, 1; timeout=10.0, expires=2.5, heartbeat=0))
         explicit_payload = pull_request_payload(String(take!(client.write_io)))
         @test explicit_payload["expires"] == 2_500_000_000
@@ -1285,7 +1403,7 @@ end
     partial_core_sub = subscribe(partial_client, "_INBOX.partial")
     TestHelpers.clear_capture!(partial_capture)
     partial_psub = N.PullSubscription(partial_js, partial_core_sub, "ORDERS", "WORKER", "_INBOX.partial", ReentrantLock(), ReentrantLock(), false, false)
-    N._dispatch_msg(partial_client, Msg("_INBOX.partial", nothing, TestHelpers.bytes("payload"); client=partial_client, sid=partial_core_sub.sid))
+    N._dispatch_msg(partial_client, Msg("_INBOX.partial", nothing, TestHelpers.bytes("payload"); sid=partial_core_sub.sid))
 
     partial_task = @async fetch(partial_psub, 2; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
@@ -1320,15 +1438,15 @@ end
     try
         N._dispatch_msg(client, Msg("_INBOX.pull.old404", nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    client, sid=core_sub.sid))
+                                    sid=core_sub.sid))
         N._dispatch_msg(client, Msg("_INBOX.pull.old408", nothing, UInt8[];
                                     headers=Headers("Status" => ["408"], "Description" => ["Request Timeout"]),
-                                    client, sid=core_sub.sid))
+                                    sid=core_sub.sid))
         N._dispatch_msg(client, Msg("_INBOX.pull.old409", nothing, UInt8[];
                                     headers=Headers("Status" => ["409"], "Description" => ["Batch Completed"]),
-                                    client, sid=core_sub.sid))
+                                    sid=core_sub.sid))
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("payload");
-                                    client, sid=core_sub.sid))
+                                    sid=core_sub.sid))
 
         msgs = fetch(psub, 1; timeout=0.2, heartbeat=0)
         @test length(msgs) == 1
@@ -1357,7 +1475,7 @@ end
         reply = fetch_reply(active_capture)
         N._dispatch_msg(active_client, Msg(reply, nothing, UInt8[];
                                           headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                          client=active_client, sid=active_core_sub.sid))
+                                          sid=active_core_sub.sid))
         @test isempty(fetch(fetch_task))
     finally
         close(active_psub)
@@ -1375,7 +1493,7 @@ end
         core_sub = subscribe(client, "_INBOX.pull")
         take!(client.write_io)
         psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
-        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, data; headers, client, sid=core_sub.sid))
+        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, data; headers, sid=core_sub.sid))
         try
             fetch(psub, 1; timeout=0.1, heartbeat=0)
         finally
@@ -1412,7 +1530,7 @@ end
     psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
     N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                 headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                client, sid=core_sub.sid))
+                                sid=core_sub.sid))
     @test isempty(fetch(psub, 1; timeout=0.1, heartbeat=0.02))
     @test occursin("\"idle_heartbeat\":20000000", String(take!(client.write_io)))
     close(psub)
@@ -1443,20 +1561,20 @@ end
     try
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, TestHelpers.bytes("payload");
                                     headers=Headers("Nats-Pin-Id" => ["pin-a"]),
-                                    client, sid=core_sub.sid))
+                                    sid=core_sub.sid))
         @test String(first(fetch(psub, 1; timeout=0.1, heartbeat=0))) == "payload"
         @test psub.pin_id == "pin-a"
         take!(client.write_io)
 
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    client, sid=core_sub.sid))
+                                    sid=core_sub.sid))
         @test isempty(fetch(psub, 1; timeout=0.1, heartbeat=0))
         @test occursin("\"pin_id\":\"pin-a\"", String(take!(client.write_io)))
 
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["423"], "Description" => ["Pin ID Mismatch"]),
-                                    client, sid=core_sub.sid))
+                                    sid=core_sub.sid))
         @test_throws JetStreamError fetch(psub, 1; timeout=0.1, heartbeat=0)
         @test isnothing(psub.pin_id)
     finally
@@ -1485,4 +1603,24 @@ end
     close(push)
     @test push.closed
     @test push_core.closed
+end
+
+@testitem "JetStream hot handles carry concrete client and subscription types" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    sub = subscribe(client, "_INBOX.typed")
+    msg = JetStreamMsg(Msg("_INBOX.typed", "\$JS.ACK.S.C.1.1.1.0.0", UInt8[]; sid=sub.sid), client)
+    pull = N.PullSubscription(js, sub, "S", "C", "_INBOX.typed", ReentrantLock(), ReentrantLock(), false, false)
+    push = N.PushSubscription(js, sub, "S", "C", ReentrantLock(), false, false)
+
+    @test fieldtype(typeof(msg), :_client) === typeof(client)
+    @test fieldtype(typeof(js), :client) === typeof(client)
+    @test fieldtype(typeof(pull), :sub) === typeof(sub)
+    @test fieldtype(typeof(push), :sub) === typeof(sub)
+    @test only(Base.return_types(ack, Tuple{typeof(msg)})) === Nothing
+    @test only(Base.return_types(ack_sync, Tuple{typeof(msg)})) === Msg
 end

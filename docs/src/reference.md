@@ -10,7 +10,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `ConnectOptions` | Keyword-backed connection configuration. |
 | `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
 | `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. Failed handles throw `CapturedException`; inspect `err.ex` for the original operation error. |
-| `Msg` | Received message with `subject`, `reply`, `data`, `headers`, and acknowledgement state. |
+| `Msg` | Core received message data with `subject`, `reply`, `data`, and `headers`. |
 | `Headers` | Alias for received headers, `Dict{String,Vector{String}}`; publish and request APIs also accept dictionaries with string or vector values and pair iterators. Outbound header names must be valid NATS/HTTP token field names. Header keys preserve source casing, while `header(msg, key)` lookup is case-insensitive. |
 | `Subscription` | Core subscription handle. |
 | `Stats` | Snapshot of message, byte, reconnect, error, and drop counters. |
@@ -62,6 +62,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `StreamInfo` | Stream info response with typed config, state, and raw data. |
 | `ConsumerInfo` | Consumer info response with typed config, push-bound state, and raw data. |
 | `PubAck` | Publish acknowledgement with stream, sequence, duplicate, and domain. |
+| `JetStreamMsg` | JetStream consumer message data plus acknowledgement state for `ack`, `nak`, `in_progress`, and `term`. |
 | `PullSubscription` | Pull consumer handle. |
 | `PushSubscription` | Push consumer handle. |
 
@@ -103,9 +104,9 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `consumer_list(js, stream; offset=0)` | List consumers for a stream. |
 | `consumer_delete(js, stream, consumer)` | Delete a consumer. |
 | `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig())` | Create or bind a pull subscription without mutating existing consumers. Configs with `deliver_subject` or `deliver_group` are rejected because they describe push delivery. |
-| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`. |
-| `fetch(psub, batch=1; timeout=..., expires=<shorter than timeout>, heartbeat=nothing)` | Fetch a batch from a pull subscription. Each request uses a unique reply subject and ignores stale terminal statuses from older requests. The default server expiration is shorter than the local timeout; explicit `expires` values must also be shorter than `timeout`. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
-| `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for JetStream messages. |
+| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions receive `JetStreamMsg` and auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`; channel-backed use calls `next(psub)` for `JetStreamMsg` delivery. |
+| `fetch(psub, batch=1; timeout=..., expires=<shorter than timeout>, heartbeat=nothing)` | Fetch a batch of `JetStreamMsg` values from a pull subscription. Each request uses a unique reply subject and ignores stale terminal statuses from older requests. The default server expiration is shorter than the local timeout; explicit `expires` values must also be shorter than `timeout`. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
+| `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for `JetStreamMsg` values. |
 | `metadata(msg)` | Parse JetStream delivery metadata. |
 
 ## JetStream Task Handle Helpers
@@ -117,7 +118,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `stream_info_async(js, name)` | Start `stream_info` and return `NatterTask`. |
 | `stream_list_async(js; offset=0)` | Start `stream_list` and return `NatterTask`. |
 | `stream_names_async(js; subject=nothing)` | Start `stream_names` and return `NatterTask`. |
-| `stream_purge_async(js, name; filter_subject=nothing)` | Start `stream_purge` and return `NatterTask`. |
+| `stream_purge_async(js, name; filter_subject=nothing, keep=nothing)` | Start `stream_purge` and return `NatterTask`. |
 | `stream_delete_async(js, name)` | Start `stream_delete` and return `NatterTask`. |
 | `stream_message_get_async(js, stream; kwargs...)` | Start `stream_message_get` and return `NatterTask`. |
 | `stream_message_delete_async(js, stream, seq)` | Start `stream_message_delete` and return `NatterTask`. |
@@ -130,7 +131,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `pull_subscribe_async(js, subject; kwargs...)` | Start `pull_subscribe` and return `NatterTask`. |
 | `push_subscribe_async(js, subject; kwargs...)` | Start `push_subscribe` and return `NatterTask`. |
 | `fetch_async(psub, batch=1; kwargs...)` | Start pull `fetch` and return `NatterTask`. |
-| `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async` | Start acknowledgement operations and return `NatterTask`. |
+| `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async` | Start `JetStreamMsg` acknowledgement operations and return `NatterTask`. |
 
 ## KeyValue Functions
 

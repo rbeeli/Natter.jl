@@ -4,8 +4,8 @@ EnumX.@enumx KeyValueOperation begin
     PURGE
 end
 
-struct KeyValue
-    js::JetStreamContext
+struct KeyValue{J<:JetStreamContext}
+    js::J
     bucket::String
     stream::String
     prefix::String
@@ -13,7 +13,7 @@ struct KeyValue
 end
 KeyValue(js::JetStreamContext, bucket::String, stream::String, prefix::String) = KeyValue(js, bucket, stream, prefix, false)
 
-struct KeyValueEntry
+struct KeyValueEntry{M<:AbstractMsg}
     bucket::String
     key::String
     value::Vector{UInt8}
@@ -21,7 +21,7 @@ struct KeyValueEntry
     created::DateTime
     delta::Int
     operation::KeyValueOperation.T
-    msg::Msg
+    msg::M
 end
 
 Base.String(entry::KeyValueEntry) = String(entry.value)
@@ -55,8 +55,8 @@ mutable struct _KeyValueWatcherState
     initial_received::Int
 end
 
-mutable struct KeyValueWatcher
-    subscription::PushSubscription
+mutable struct KeyValueWatcher{S<:PushSubscription}
+    subscription::S
     updates::Union{Channel{_KeyValueWatchUpdate},Nothing}
     state::_KeyValueWatcherState
 end
@@ -126,7 +126,7 @@ function _kv_key_from_subject(kv::KeyValue, subject::AbstractString)::String
     String(chop(String(subject); head=length(kv.prefix), tail=0))
 end
 
-function _kv_marker_operation(msg::Msg)
+function _kv_marker_operation(msg::AbstractMsg)
     reason = header(msg, _KV_MARKER_REASON)
     isnothing(reason) && return nothing
     reason in ("MaxAge", "Purge") && return KeyValueOperation.PURGE
@@ -134,7 +134,7 @@ function _kv_marker_operation(msg::Msg)
     nothing
 end
 
-function _kv_operation(msg::Msg)::KeyValueOperation.T
+function _kv_operation(msg::AbstractMsg)::KeyValueOperation.T
     op = header(msg, "KV-Operation")
     if isnothing(op)
         marker_op = _kv_marker_operation(msg)
@@ -149,24 +149,26 @@ end
 _kv_is_delete_marker(operation::KeyValueOperation.T)::Bool =
     operation in (KeyValueOperation.DELETE, KeyValueOperation.PURGE)
 
-_kv_key_active(msg::Msg)::Bool = !_kv_is_delete_marker(_kv_operation(msg))
+_kv_key_active(msg::AbstractMsg)::Bool = !_kv_is_delete_marker(_kv_operation(msg))
 
-function _kv_entry(kv::KeyValue, msg::Msg, revision::Int, created::DateTime, delta::Int)::KeyValueEntry
+function _kv_entry(kv::KeyValue, msg::M, revision::Int, created::DateTime, delta::Int)::KeyValueEntry{M} where {M<:AbstractMsg}
     KeyValueEntry(kv.bucket, _kv_key_from_subject(kv, msg.subject), msg.data, revision, created, delta, _kv_operation(msg), msg)
 end
 
-function _kv_entry_from_stored_msg(kv::KeyValue, msg::Msg, revision::Int, created::Union{DateTime,Nothing})::KeyValueEntry
+function _kv_entry_from_stored_msg(kv::KeyValue, msg::M, revision::Int, created::Union{DateTime,Nothing})::KeyValueEntry{M} where {M<:AbstractMsg}
     isnothing(created) && throw(ProtocolError("key-value message is missing created timestamp"))
     _kv_entry(kv, msg, revision, created, 0)
 end
 
-function _kv_created_from_metadata(meta::MsgMetadata)::DateTime
-    DateTime(1970, 1, 1) + Millisecond(meta.timestamp_ns ÷ 1_000_000)
-end
+_kv_created_from_timestamp_ns(timestamp_ns::Int)::DateTime =
+    DateTime(1970, 1, 1) + Millisecond(timestamp_ns ÷ 1_000_000)
 
-function _kv_entry_from_consumer_msg(kv::KeyValue, msg::Msg)::KeyValueEntry
-    meta = metadata(msg)
-    _kv_entry(kv, msg, meta.stream_sequence, _kv_created_from_metadata(meta), meta.pending)
+_kv_created_from_metadata(meta::MsgMetadata)::DateTime =
+    _kv_created_from_timestamp_ns(meta.timestamp_ns)
+
+function _kv_entry_from_consumer_msg(kv::KeyValue, msg::M)::KeyValueEntry{M} where {M<:AbstractMsg}
+    meta = _parse_msg_metadata(msg)
+    _kv_entry(kv, msg, meta.stream_sequence, _kv_created_from_timestamp_ns(meta.timestamp_ns), meta.pending)
 end
 
 function _kv_watcher_state(callback::Union{Function,Nothing}, channel_size::Integer,
@@ -256,11 +258,11 @@ function Base.take!(watcher::KeyValueWatcher)
     take!(watcher.updates)
 end
 
-function _kv_record_key!(latest::Dict{String,Tuple{Int,Bool}}, prefix::String, msg::Msg)
+function _kv_record_key!(latest::Dict{String,Tuple{Int,Bool}}, prefix::String, msg::AbstractMsg)
     startswith(msg.subject, prefix) ||
         throw(ProtocolError("key-value keys consumer received subject outside bucket prefix"))
     key = String(chop(msg.subject; head=length(prefix), tail=0))
-    seq = metadata(msg).stream_sequence
+    seq = _parse_msg_metadata(msg).stream_sequence
     current_seq = get(latest, key, (0, false))[1]
     seq >= current_seq && (latest[key] = (seq, _kv_key_active(msg)))
     latest
@@ -384,7 +386,7 @@ function kv_put(kv::KeyValue, key::AbstractString, value; revision::Union{Nothin
 end
 
 _kv_wrong_last_sequence(err) = err isa JetStreamError && err.err_code == 10071
-_kv_delete_marker_revision(msg::Msg, sequence::Int) =
+_kv_delete_marker_revision(msg::AbstractMsg, sequence::Int) =
     _kv_is_delete_marker(_kv_operation(msg)) ? sequence : nothing
 
 function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String)

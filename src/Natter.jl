@@ -16,7 +16,7 @@ export Msg, Headers, Subscription, Stats
 export connect, close, drain, flush, ping, publish, subscribe, unsubscribe, request, next, new_inbox
 export connect_async, close_async, drain_async, flush_async, ping_async, publish_async, subscribe_async, unsubscribe_async, request_async, next_async
 export header, headers, status, stats, connected_url
-export JetStreamContext, StreamInfo, ConsumerInfo, PubAck, PullSubscription, PushSubscription
+export JetStreamContext, StreamInfo, ConsumerInfo, PubAck, JetStreamMsg, PullSubscription, PushSubscription
 export RetentionPolicy, StorageType, DiscardPolicy, StoreCompression, PersistMode
 export AckPolicy, DeliverPolicy, ReplayPolicy, PriorityPolicy
 export Placement, ExternalStreamSource, SubjectTransform, StreamSource, StreamConsumerLimits, RePublish

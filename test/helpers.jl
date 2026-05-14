@@ -57,7 +57,7 @@ using TestItems
             ReentrantLock(),
             IOBuffer(),
             0,
-            N.PongWaiter[],
+            N.PongWaiterQueue(),
             nothing,
             nothing,
             nothing,

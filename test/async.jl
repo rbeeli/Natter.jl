@@ -14,7 +14,7 @@ using TestItems
 
     sub = fetch(subscribe_async(client, "foo"))
     @test sub isa Subscription
-    put!(sub.messages, Msg("foo", nothing, TestHelpers.bytes("hello"); client, sid=sub.sid))
+    put!(sub.messages, Msg("foo", nothing, TestHelpers.bytes("hello"); sid=sub.sid))
     @test String(fetch(next_async(sub; timeout=0.1))) == "hello"
     @test isnothing(fetch(close_async(sub)))
 
@@ -49,7 +49,8 @@ end
     @test delete_err isa CapturedException
     @test delete_err.ex isa ArgumentError
 
-    ack_err = TestHelpers.thrown_exception(() -> fetch(ack_async(Msg("s", nothing, UInt8[]; client))))
+    ack_msg = JetStreamMsg(Msg("s", nothing, UInt8[]), client)
+    ack_err = TestHelpers.thrown_exception(() -> fetch(ack_async(ack_msg)))
     @test ack_err isa CapturedException
     @test ack_err.ex isa JetStreamError
 

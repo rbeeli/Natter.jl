@@ -1,8 +1,24 @@
-Base.@kwdef struct JetStreamContext
-    client::Client
+Base.@kwdef struct JetStreamContext{C<:Client}
+    client::C
     prefix::String = "\$JS.API"
     timeout::Float64 = 5.0
 end
+
+mutable struct JetStreamMsg{C<:Client} <: AbstractMsg
+    subject::String
+    reply::Union{String,Nothing}
+    data::Vector{UInt8}
+    headers::Headers
+    sid::Int
+    header_bytes::Int
+    _client::C
+    _acked::Bool
+end
+
+JetStreamMsg(msg::Msg, client::C) where {C<:Client} =
+    JetStreamMsg{C}(msg.subject, msg.reply, msg.data, msg.headers, msg.sid, msg.header_bytes, client, false)
+
+Base.String(msg::JetStreamMsg) = String(msg.data)
 
 struct PubAck
     stream::String
@@ -304,27 +320,34 @@ function _stream_config_name(config::AbstractDict)::String
     _validate_api_name("stream", config["name"])
 end
 
+_stream_config_payload(config::StreamConfig) = _js_config_payload(config)
+
+function _stream_config_payload(config::AbstractDict{String,<:Any})::Dict{String,Any}
+    payload = _js_config_payload(config)
+    _validate_stream_config_payload!(payload)
+end
+
 function stream_create(js::JetStreamContext, config::StreamConfig; timeout::Real=js.timeout)
     name = _stream_config_name(config)
-    payload = _js_config_payload(config)
+    payload = _stream_config_payload(config)
     _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload); timeout))
 end
 
 function stream_create(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout)
     name = _stream_config_name(config)
-    payload = _js_config_payload(config)
+    payload = _stream_config_payload(config)
     _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload); timeout))
 end
 
 function stream_update(js::JetStreamContext, config::StreamConfig; timeout::Real=js.timeout)
     name = _stream_config_name(config)
-    payload = _js_config_payload(config)
+    payload = _stream_config_payload(config)
     _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload); timeout))
 end
 
 function stream_update(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout)
     name = _stream_config_name(config)
-    payload = _js_config_payload(config)
+    payload = _stream_config_payload(config)
     _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload); timeout))
 end
 
@@ -346,7 +369,8 @@ function stream_list(js::JetStreamContext; offset::Int=0, timeout::Real=js.timeo
     streams
 end
 
-function stream_names(js::JetStreamContext; subject::Union{String,Nothing}=nothing, timeout::Real=js.timeout)
+function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothing}=nothing, timeout::Real=js.timeout)
+    subject = isnothing(subject) ? nothing : _validate_subject(subject)
     names = String[]
     next_offset = 0
     while true
@@ -451,7 +475,7 @@ function _direct_message_response_info(js::JetStreamContext, request_subject::St
     for name in _DIRECT_GET_METADATA_HEADERS
         _delete_header!(headers, name)
     end
-    Msg(subject, nothing, copy(response.data); headers, client=js.client), sequence, created
+    Msg(subject, nothing, copy(response.data); headers), sequence, created
 end
 
 function _direct_message_response(js::JetStreamContext, request_subject::String, response::Msg)::Msg
@@ -481,7 +505,7 @@ function _stream_message_from_api_payload(js::JetStreamContext, raw_msg)
     data = haskey(msg, "data") ? base64decode(String(msg["data"])) : UInt8[]
     hdrs = haskey(msg, "hdrs") ? _parse_headers(base64decode(String(msg["hdrs"]))) : Headers()
     created = haskey(msg, "time") ? _parse_rfc3339_datetime(String(msg["time"])) : nothing
-    Msg(String(msg["subject"]), nothing, data; headers=hdrs, client=js.client), Int(msg["seq"]), created
+    Msg(String(msg["subject"]), nothing, data; headers=hdrs), Int(msg["seq"]), created
 end
 
 function _stream_message_get_api(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any}; timeout::Real)
@@ -813,9 +837,9 @@ function _bind_or_create_consumer(js::JetStreamContext, stream::AbstractString, 
     end
 end
 
-mutable struct PullSubscription
-    js::JetStreamContext
-    sub::Subscription
+mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
+    js::J
+    sub::S
     stream::String
     consumer::String
     deliver::String
@@ -827,15 +851,16 @@ mutable struct PullSubscription
     pin_id::Union{String,Nothing}
 end
 
-PullSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
-                 deliver::AbstractString, fetch_lock::ReentrantLock, close_lock::ReentrantLock,
-                 delete_on_close::Bool, closed::Bool) =
-    PullSubscription(js, sub, String(stream), String(consumer), String(deliver), fetch_lock, close_lock,
-                     delete_on_close, closed, false, nothing)
+function PullSubscription(js::J, sub::S, stream::AbstractString, consumer::AbstractString,
+                          deliver::AbstractString, fetch_lock::ReentrantLock, close_lock::ReentrantLock,
+                          delete_on_close::Bool, closed::Bool) where {C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
+    PullSubscription{C,J,S}(js, sub, String(stream), String(consumer), String(deliver), fetch_lock, close_lock,
+                            delete_on_close, closed, false, nothing)
+end
 
-mutable struct PushSubscription
-    js::JetStreamContext
-    sub::Subscription
+mutable struct PushSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
+    js::J
+    sub::S
     stream::String
     consumer::String
     close_lock::ReentrantLock
@@ -846,12 +871,13 @@ mutable struct PushSubscription
     info::Union{ConsumerInfo,Nothing}
 end
 
-PushSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
-                 close_lock::ReentrantLock, delete_on_close::Bool, closed::Bool,
-                 heartbeat_task::Union{Task,Nothing},
-                 control_handler::Union{_JetStreamPushControlHandler,Nothing}) =
-    PushSubscription(js, sub, String(stream), String(consumer), close_lock, delete_on_close, closed,
-                     heartbeat_task, control_handler, nothing)
+function PushSubscription(js::J, sub::S, stream::AbstractString, consumer::AbstractString,
+                          close_lock::ReentrantLock, delete_on_close::Bool, closed::Bool,
+                          heartbeat_task::Union{Task,Nothing},
+                          control_handler::Union{_JetStreamPushControlHandler,Nothing}) where {C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
+    PushSubscription{C,J,S}(js, sub, String(stream), String(consumer), close_lock, delete_on_close, closed,
+                            heartbeat_task, control_handler, nothing)
+end
 
 PushSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
                  close_lock::ReentrantLock, delete_on_close::Bool, closed::Bool) =
@@ -951,6 +977,10 @@ function _start_push_heartbeat_monitor(psub::PushSubscription, handler::_JetStre
     @async _push_heartbeat_monitor(psub, handler)
 end
 
+function next(psub::PushSubscription{C}; timeout::Real=1.0)::JetStreamMsg{C} where {C<:Client}
+    JetStreamMsg(next(psub.sub; timeout), psub.js.client)
+end
+
 function _push_idle_heartbeat_seconds(info::ConsumerInfo)::Float64
     heartbeat = info.config.idle_heartbeat
     isnothing(heartbeat) ? 0.0 : Float64(heartbeat)
@@ -967,6 +997,17 @@ end
 
 function _push_callback_auto_ack(manual_ack::Bool, callback, config::Dict{String,Any})::Bool
     !manual_ack && !isnothing(callback) && get(config, "ack_policy", nothing) != "none"
+end
+
+function _jetstream_push_callback(js::JetStreamContext{C}, callback::Union{Function,Nothing},
+                                  auto_ack::Bool) where {C<:Client}
+    isnothing(callback) && return nothing
+    msg -> begin
+        jsmsg = JetStreamMsg(msg, js.client)
+        callback(jsmsg)
+        auto_ack && ack(jsmsg)
+        nothing
+    end
 end
 
 function _publish_flow_control_reply(sub::Subscription, reply::String)
@@ -1001,13 +1042,15 @@ function _schedule_or_reply_to_flow_control(sub::Subscription, handler::_JetStre
 end
 
 function _stream_by_subject(js::JetStreamContext, subject::AbstractString)
-    names = stream_names(js; subject=String(subject))
+    subject = _validate_subject(subject)
+    names = stream_names(js; subject)
     isempty(names) && throw(JetStreamError(404, nothing, "no stream found for subject $subject"))
     first(names)
 end
 
 function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{String,Nothing}=nothing, durable::Union{String,Nothing}=nothing,
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig())
+    subject = _validate_subject(subject)
     cfg = _js_config_payload(config)
     _validate_pull_consumer_config!(cfg)
     _validate_consumer_config_payload!(cfg)
@@ -1096,10 +1139,12 @@ function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
     client = sub.client
     closed, st = @lock client.lock (sub.closed, client.status)
     closed && !isready(sub.messages) && _throw_pull_fetch_wait_interrupted(closed, st)
-    result = timedwait(timeout; pollint=0.001) do
-        isready(sub.messages) || (@lock client.lock sub.closed || client.status != ConnectionStatus.CONNECTED)
+    ready = @lock client.lock begin
+        _wait_until_condition_locked(sub.condition, timeout) do
+            isready(sub.messages) || sub.closed || client.status != ConnectionStatus.CONNECTED
+        end
     end
-    result == :timed_out && throw(TimeoutError("next message timed out"))
+    ready || throw(TimeoutError("next message timed out"))
     isready(sub.messages) && return _take_subscription_msg!(sub)
     closed, st = @lock client.lock (sub.closed, client.status)
     _throw_pull_fetch_wait_interrupted(closed, st)
@@ -1138,9 +1183,9 @@ function _pull_fetch_status_matches_request(subject::AbstractString, token::Unio
     true
 end
 
-function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeout,
+function fetch(psub::PullSubscription{C}, batch::Int=1; timeout::Real=psub.js.timeout,
                expires::Real=_pull_fetch_default_expires(timeout),
-               heartbeat::Union{Nothing,Real}=nothing)
+               heartbeat::Union{Nothing,Real}=nothing) where {C}
     heartbeat_seconds = _validate_pull_fetch(psub, batch, timeout, expires, heartbeat)
     @lock psub.fetch_lock begin
         req = Dict{String,Any}("batch" => batch, "expires" => _seconds_to_nanoseconds(expires))
@@ -1149,7 +1194,7 @@ function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeo
         request_subject = "$(psub.js.prefix).CONSUMER.MSG.NEXT.$(psub.stream).$(psub.consumer)"
         reply, reply_token = _pull_fetch_reply(psub)
         _publish_pull_fetch_request(psub, request_subject, JSON3.write(req), reply)
-        msgs = Msg[]
+        msgs = JetStreamMsg{C}[]
         deadline = time() + timeout
         heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
         while length(msgs) < batch && time() < deadline
@@ -1167,7 +1212,7 @@ function fetch(psub::PullSubscription, batch::Int=1; timeout::Real=psub.js.timeo
                 elseif action in (:no_messages, :timeout, :batch_completed)
                     break
                 elseif action == :message
-                    push!(msgs, msg)
+                    push!(msgs, JetStreamMsg(msg, psub.js.client))
                 else
                     action == :consumer_deleted && (@lock psub.close_lock psub.server_deleted = true)
                     action == :pin_id_mismatch && (psub.pin_id = nothing)
@@ -1192,6 +1237,7 @@ end
 function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{String,Nothing}=nothing, durable::Union{String,Nothing}=nothing,
                         queue::Union{String,Nothing}=nothing, callback::Union{Function,Nothing}=nothing, manual_ack::Bool=false,
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig())
+    subject = _validate_subject(subject)
     cfg = _js_config_payload(config)
     queue_explicit = !isnothing(queue)
     local_queue = _resolve_push_queue!(cfg, queue)
@@ -1235,9 +1281,9 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     deliver_subject = String(cfg["deliver_subject"])
     auto_ack = isnothing(info) ? _push_callback_auto_ack(manual_ack, callback, cfg) :
                _push_callback_auto_ack(manual_ack, callback, info)
-    sub = subscribe(js.client, deliver_subject; queue=local_queue, callback,
-                        auto_ack,
-                        _control_handler=control_handler)
+    wrapped_callback = _jetstream_push_callback(js, callback, auto_ack)
+    sub = subscribe(js.client, deliver_subject; queue=local_queue, callback=wrapped_callback,
+                    _control_handler=control_handler)
     consumer_created = false
     try
         if create_consumer
@@ -1254,8 +1300,9 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
                 existing = consumer_info(js, stream, bind_name)
                 info = _bind_existing_push_consumer!(existing, cfg, bind_fields, local_queue, queue_explicit)
                 deliver_subject = String(cfg["deliver_subject"])
-                sub = subscribe(js.client, deliver_subject; queue=local_queue, callback,
-                                auto_ack=_push_callback_auto_ack(manual_ack, callback, info),
+                retry_auto_ack = _push_callback_auto_ack(manual_ack, callback, info)
+                wrapped_callback = _jetstream_push_callback(js, callback, retry_auto_ack)
+                sub = subscribe(js.client, deliver_subject; queue=local_queue, callback=wrapped_callback,
                                 _control_handler=control_handler)
             end
         end
@@ -1264,7 +1311,6 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
             cfg["name"] = info.name
         end
         @lock control_handler.lock control_handler.idle_heartbeat = _push_idle_heartbeat_seconds(info)
-        sub.auto_ack = _push_callback_auto_ack(manual_ack, callback, info)
         psub = PushSubscription(js, sub, String(stream), String(info.name), ReentrantLock(), delete_on_close, false,
                                 nothing, control_handler, info)
         psub.heartbeat_task = _start_push_heartbeat_monitor(psub, control_handler)
@@ -1339,17 +1385,191 @@ function close(psub::PushSubscription)
     nothing
 end
 
-function metadata(msg::Msg)
-    reply = msg.reply
-    isnothing(reply) && throw(JetStreamError(400, nothing, "message is not a JetStream message"))
-    parts = split(reply, ".")
-    if length(parts) == 9 && parts[1] == "\$JS" && parts[2] == "ACK"
-        return MsgMetadata(parts[3], parts[4], parse(Int, parts[5]), parse(Int, parts[6]), parse(Int, parts[7]), parse(Int, parts[8]), parse(Int, parts[9]), nothing)
-    elseif length(parts) >= 11 && parts[1] == "\$JS" && parts[2] == "ACK"
-        domain = parts[3] == "_" ? "" : parts[3]
-        return MsgMetadata(parts[5], parts[6], parse(Int, parts[7]), parse(Int, parts[8]), parse(Int, parts[9]), parse(Int, parts[10]), parse(Int, parts[11]), domain)
+const _JS_ACK_PREFIX = "\$JS.ACK."
+const _JS_ACK_NOT_MESSAGE = "message is not a JetStream message"
+
+struct _ParsedMsgMetadata
+    stream_first::Int
+    stream_last::Int
+    consumer_first::Int
+    consumer_last::Int
+    delivered::Int
+    stream_sequence::Int
+    consumer_sequence::Int
+    timestamp_ns::Int
+    pending::Int
+    domain_first::Int
+    domain_last::Int
+    has_domain::Bool
+end
+
+_ack_metadata_error() = throw(JetStreamError(400, nothing, _JS_ACK_NOT_MESSAGE))
+
+function _ack_token_count(reply::String)::Int
+    tokens = 1
+    @inbounds for i in 1:ncodeunits(reply)
+        codeunit(reply, i) == UInt8('.') && (tokens += 1)
     end
-    throw(JetStreamError(400, nothing, "message is not a JetStream message"))
+    tokens
+end
+
+function _ack_next_dot(reply::String, first::Int, last::Int)::Int
+    @inbounds for i in first:last
+        codeunit(reply, i) == UInt8('.') && return i
+    end
+    0
+end
+
+function _ack_required_dot(reply::String, first::Int, last::Int)::Int
+    dot = _ack_next_dot(reply, first, last)
+    dot == 0 && _ack_metadata_error()
+    dot
+end
+
+function _ack_parse_int(reply::String, first::Int, last::Int)::Int
+    first <= last || throw(ArgumentError("JetStream ack metadata integer field cannot be empty"))
+
+    negative = false
+    i = first
+    @inbounds sign = codeunit(reply, i)
+    if sign == UInt8('-') || sign == UInt8('+')
+        negative = sign == UInt8('-')
+        i += 1
+        i <= last || throw(ArgumentError("JetStream ack metadata integer field has no digits"))
+    end
+
+    limit = negative ? UInt64(typemax(Int)) + UInt64(1) : UInt64(typemax(Int))
+    value = UInt64(0)
+    @inbounds while i <= last
+        digit_byte = codeunit(reply, i)
+        UInt8('0') <= digit_byte <= UInt8('9') ||
+            throw(ArgumentError("JetStream ack metadata integer field contains a non-digit"))
+        digit = UInt64(digit_byte - UInt8('0'))
+        value <= (limit - digit) ÷ UInt64(10) ||
+            throw(OverflowError("JetStream ack metadata integer field overflows Int"))
+        value = value * UInt64(10) + digit
+        i += 1
+    end
+
+    if negative
+        value == limit && return typemin(Int)
+        return -Int(value)
+    end
+    Int(value)
+end
+
+function _ack_parse_int_token(reply::String, first::Int, last::Int, require_dot::Bool)::Tuple{Int,Int}
+    dot = _ack_next_dot(reply, first, last)
+    if dot == 0
+        require_dot && _ack_metadata_error()
+        return _ack_parse_int(reply, first, last), 0
+    end
+    _ack_parse_int(reply, first, dot - 1), dot + 1
+end
+
+function _ack_field_string(reply::String, first::Int, last::Int)::String
+    first <= last || return ""
+    String(SubString(reply, first, prevind(reply, last + 1)))
+end
+
+function _ack_field_equals(reply::String, first::Int, last::Int, value::String)::Bool
+    ncodeunits(value) == last - first + 1 || return false
+    @inbounds for i in 1:ncodeunits(value)
+        codeunit(reply, first + i - 1) == codeunit(value, i) || return false
+    end
+    true
+end
+
+function _parse_ack_metadata_no_domain(reply::String, first::Int, last::Int)::_ParsedMsgMetadata
+    dot = _ack_required_dot(reply, first, last)
+    stream_first, stream_last = first, dot - 1
+
+    first = dot + 1
+    dot = _ack_required_dot(reply, first, last)
+    consumer_first, consumer_last = first, dot - 1
+
+    delivered, first = _ack_parse_int_token(reply, dot + 1, last, true)
+    stream_sequence, first = _ack_parse_int_token(reply, first, last, true)
+    consumer_sequence, first = _ack_parse_int_token(reply, first, last, true)
+    timestamp_ns, first = _ack_parse_int_token(reply, first, last, true)
+    pending = _ack_parse_int(reply, first, last)
+
+    _ParsedMsgMetadata(stream_first, stream_last, consumer_first, consumer_last,
+                       delivered, stream_sequence, consumer_sequence, timestamp_ns,
+                       pending, 0, -1, false)
+end
+
+function _parse_ack_metadata_with_domain(reply::String, first::Int, last::Int)::_ParsedMsgMetadata
+    dot = _ack_required_dot(reply, first, last)
+    domain_first, domain_last = first, dot - 1
+
+    first = dot + 1
+    dot = _ack_required_dot(reply, first, last) # account hash
+
+    first = dot + 1
+    dot = _ack_required_dot(reply, first, last)
+    stream_first, stream_last = first, dot - 1
+
+    first = dot + 1
+    dot = _ack_required_dot(reply, first, last)
+    consumer_first, consumer_last = first, dot - 1
+
+    delivered, first = _ack_parse_int_token(reply, dot + 1, last, true)
+    stream_sequence, first = _ack_parse_int_token(reply, first, last, true)
+    consumer_sequence, first = _ack_parse_int_token(reply, first, last, true)
+    timestamp_ns, first = _ack_parse_int_token(reply, first, last, true)
+    pending, _ = _ack_parse_int_token(reply, first, last, false)
+
+    _ParsedMsgMetadata(stream_first, stream_last, consumer_first, consumer_last,
+                       delivered, stream_sequence, consumer_sequence, timestamp_ns,
+                       pending, domain_first, domain_last, true)
+end
+
+function _parse_msg_metadata(reply::String)::_ParsedMsgMetadata
+    startswith(reply, _JS_ACK_PREFIX) || _ack_metadata_error()
+    token_count = _ack_token_count(reply)
+    first = ncodeunits(_JS_ACK_PREFIX) + 1
+    last = ncodeunits(reply)
+    if token_count == 9
+        return _parse_ack_metadata_no_domain(reply, first, last)
+    elseif token_count >= 11
+        return _parse_ack_metadata_with_domain(reply, first, last)
+    end
+    _ack_metadata_error()
+end
+
+function _parse_msg_metadata(msg::Msg)::_ParsedMsgMetadata
+    reply = msg.reply
+    isnothing(reply) && _ack_metadata_error()
+    _parse_msg_metadata(reply::String)
+end
+
+function _parse_msg_metadata(msg::JetStreamMsg)::_ParsedMsgMetadata
+    reply = msg.reply
+    isnothing(reply) && _ack_metadata_error()
+    _parse_msg_metadata(reply::String)
+end
+
+function _parse_msg_metadata(msg::AbstractMsg)::_ParsedMsgMetadata
+    reply = msg.reply
+    isnothing(reply) && _ack_metadata_error()
+    _parse_msg_metadata(reply::String)
+end
+
+function metadata(msg::AbstractMsg)
+    reply = msg.reply
+    isnothing(reply) && _ack_metadata_error()
+    parsed = _parse_msg_metadata(reply::String)
+    domain = if parsed.has_domain
+        _ack_field_equals(reply, parsed.domain_first, parsed.domain_last, "_") ?
+            "" : _ack_field_string(reply, parsed.domain_first, parsed.domain_last)
+    else
+        nothing
+    end
+    MsgMetadata(_ack_field_string(reply, parsed.stream_first, parsed.stream_last),
+                _ack_field_string(reply, parsed.consumer_first, parsed.consumer_last),
+                parsed.delivered, parsed.stream_sequence, parsed.consumer_sequence,
+                parsed.timestamp_ns, parsed.pending, domain)
 end
 
 function _ack_payload(kind::Symbol; delay::Union{Nothing,Real}=nothing)
@@ -1373,23 +1593,31 @@ function _ack_payload(kind::Symbol; delay::Union{Nothing,Real}=nothing)
     end
 end
 
-function _ack(msg::Msg, kind::Symbol; delay=nothing, sync::Bool=false, timeout::Real=1.0)
+function _ack_reply_subject(msg::JetStreamMsg)::String
     isnothing(msg.reply) && throw(JetStreamError(400, nothing, "message has no ack reply subject"))
-    kind != :progress && msg.acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
-    payload = _ack_payload(kind; delay)
-    if sync
-        response = request(msg.client, msg.reply, payload; timeout)
-        msg.acked = true
-        response
-    else
-        publish(msg.client, msg.reply, payload)
-        kind == :progress || (msg.acked = true)
-        nothing
-    end
+    msg.reply
 end
 
-ack(msg::Msg) = _ack(msg, :ack)
-ack_sync(msg::Msg; timeout::Real=1.0) = _ack(msg, :ack; sync=true, timeout)
-nak(msg::Msg; delay=nothing) = _ack(msg, :nak; delay)
-in_progress(msg::Msg) = _ack(msg, :progress)
-term(msg::Msg) = _ack(msg, :term)
+function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing)::Nothing
+    reply = _ack_reply_subject(msg)
+    kind != :progress && msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
+    payload = _ack_payload(kind; delay)
+    publish(msg._client, reply, payload)
+    kind == :progress || (msg._acked = true)
+    nothing
+end
+
+function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::Real=1.0)::Msg
+    reply = _ack_reply_subject(msg)
+    kind != :progress && msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
+    payload = _ack_payload(kind; delay)
+    response = request(msg._client, reply, payload; timeout)
+    msg._acked = true
+    response
+end
+
+ack(msg::JetStreamMsg)::Nothing = _ack_publish(msg, :ack)
+ack_sync(msg::JetStreamMsg; timeout::Real=1.0)::Msg = _ack_request(msg, :ack; timeout)
+nak(msg::JetStreamMsg; delay=nothing)::Nothing = _ack_publish(msg, :nak; delay)
+in_progress(msg::JetStreamMsg)::Nothing = _ack_publish(msg, :progress)
+term(msg::JetStreamMsg)::Nothing = _ack_publish(msg, :term)

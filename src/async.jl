@@ -63,6 +63,9 @@ unsubscribe_async(sub::Subscription; kwargs...)::NatterTask =
 next_async(sub::Subscription; kwargs...)::NatterTask =
     _natter_async(next, sub; kwargs...)
 
+next_async(psub::PushSubscription; kwargs...)::NatterTask =
+    _natter_async(next, psub; kwargs...)
+
 request_async(client::Client, subject::AbstractString, data=nothing; kwargs...)::NatterTask =
     _natter_async(request, client, subject, data; kwargs...)
 
@@ -150,19 +153,19 @@ close_async(psub::PullSubscription; kwargs...)::NatterTask =
 close_async(psub::PushSubscription; kwargs...)::NatterTask =
     _natter_async(close, psub; kwargs...)
 
-ack_async(msg::Msg)::NatterTask =
+ack_async(msg::JetStreamMsg)::NatterTask =
     _natter_async(ack, msg)
 
-ack_sync_async(msg::Msg; kwargs...)::NatterTask =
+ack_sync_async(msg::JetStreamMsg; kwargs...)::NatterTask =
     _natter_async(ack_sync, msg; kwargs...)
 
-nak_async(msg::Msg; kwargs...)::NatterTask =
+nak_async(msg::JetStreamMsg; kwargs...)::NatterTask =
     _natter_async(nak, msg; kwargs...)
 
-in_progress_async(msg::Msg)::NatterTask =
+in_progress_async(msg::JetStreamMsg)::NatterTask =
     _natter_async(in_progress, msg)
 
-term_async(msg::Msg)::NatterTask =
+term_async(msg::JetStreamMsg)::NatterTask =
     _natter_async(term, msg)
 
 kv_create_async(js::JetStreamContext, bucket::AbstractString; kwargs...)::NatterTask =

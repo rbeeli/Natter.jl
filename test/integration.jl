@@ -400,7 +400,7 @@ end
                                                                  ack_policy=AckPolicy.EXPLICIT,
                                                                  idle_heartbeat=0.1))
             try
-                @test_throws TimeoutError next(heartbeat_sub.sub; timeout=0.35)
+                @test_throws TimeoutError next(heartbeat_sub; timeout=0.35)
             finally
                 close(heartbeat_sub)
             end
@@ -413,9 +413,10 @@ end
                                                             idle_heartbeat=0.1))
             try
                 js_publish(js, flow_subject, "flow-control"; stream=stream)
-                msg = next(flow_sub.sub; timeout=2.0)
+                msg = next(flow_sub; timeout=2.0)
                 @test msg.subject == flow_subject
                 @test String(msg) == "flow-control"
+                @test msg isa JetStreamMsg
                 ack(msg)
             finally
                 close(flow_sub)
@@ -447,9 +448,10 @@ end
             try
                 flush(client; timeout=2.0)
                 js_publish(js, queue_subject, "queue-config"; stream=stream)
-                msg = next(queue_sub.sub; timeout=2.0)
+                msg = next(queue_sub; timeout=2.0)
                 @test msg.subject == queue_subject
                 @test String(msg) == "queue-config"
+                @test msg isa JetStreamMsg
                 ack(msg)
             finally
                 close(queue_sub)
@@ -483,7 +485,7 @@ end
                 received = String[]
                 deadline = time() + 3.0
                 while length(received) < length(payloads) && time() < deadline
-                    for sub in (queue_only_sub1.sub, queue_only_sub2.sub)
+                    for sub in (queue_only_sub1, queue_only_sub2)
                         try
                             msg = next(sub; timeout=0.05)
                             push!(received, String(msg))
@@ -494,8 +496,8 @@ end
                     end
                 end
                 @test sort(received) == payloads
-                @test_throws TimeoutError next(queue_only_sub1.sub; timeout=0.1)
-                @test_throws TimeoutError next(queue_only_sub2.sub; timeout=0.1)
+                @test_throws TimeoutError next(queue_only_sub1; timeout=0.1)
+                @test_throws TimeoutError next(queue_only_sub2; timeout=0.1)
             finally
                 close(queue_only_sub1)
                 close(queue_only_sub2)

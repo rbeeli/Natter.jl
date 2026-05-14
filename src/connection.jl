@@ -1,15 +1,28 @@
+function _parse_server_urls(urls; drop_empty::Bool=false)::Vector{String}
+    servers = String[]
+    for raw in urls
+        url = strip(String(raw))
+        if isempty(url)
+            drop_empty && continue
+            throw(ArgumentError("server URL cannot be empty"))
+        end
+        push!(servers, url)
+    end
+    isempty(servers) && throw(ArgumentError("at least one server URL is required"))
+    servers
+end
+
 function _parse_options(url_or_urls; kwargs...)
     servers =
         if isnothing(url_or_urls)
             [DEFAULT_URL]
         elseif url_or_urls isa AbstractString
-            String.(split(String(url_or_urls), ","; keepempty=false))
+            _parse_server_urls(split(String(url_or_urls), ","; keepempty=false); drop_empty=true)
         elseif url_or_urls isa AbstractVector
-            String.(url_or_urls)
+            _parse_server_urls(url_or_urls)
         else
             throw(ArgumentError("servers must be a string or vector of strings"))
         end
-    isempty(servers) && throw(ArgumentError("at least one server URL is required"))
     ConnectOptions(; servers, kwargs...)
 end
 
@@ -38,7 +51,7 @@ function connect(url_or_urls=nothing; kwargs...)
         ReentrantLock(),
         IOBuffer(),
         0,
-        PongWaiter[],
+        PongWaiterQueue(),
         nothing,
         nothing,
         nothing,
@@ -111,7 +124,7 @@ function _tls_config(opts::ConnectOptions)
 end
 
 function _connect_tcp(host::String, port::Int, timeout::Real)
-    ch = Channel{Any}(1)
+    ch = Channel{Union{Sockets.TCPSocket,Exception}}(1)
     task = @async begin
         try
             put!(ch, Sockets.connect(host, port))
@@ -423,42 +436,35 @@ function _close_transport_report_errors!(client::Client, read_io, write_io, sock
 end
 
 function _notify_pong_waiters!(client::Client, value::Bool)
-    waiters = @lock client.lock begin
-        waiters = copy(client.pongs)
-        empty!(client.pongs)
-        waiters
-    end
     errors = Any[]
-    for waiter in waiters
-        ch = waiter.channel
-        isnothing(ch) && continue
-        try
-            isopen(ch) && put!(ch, value)
-        catch err
-            push!(errors, CleanupError("notify flush waiter", err))
+    @lock client.lock begin
+        for waiter in client.pongs
+            try
+                _resolve_pong_waiter_locked!(waiter, value)
+            catch err
+                push!(errors, CleanupError("notify flush waiter", err))
+            end
         end
+        empty!(client.pongs)
     end
     errors
 end
 
 function _notify_request_waiters!(client::Client, err::Exception; clear_mux::Bool=false)
-    waiters = @lock client.lock begin
+    errors = Any[]
+    @lock client.lock begin
         mux = client.request_mux
-        if isnothing(mux)
-            Channel{Any}[]
-        else
+        if !isnothing(mux)
             waiters = collect(values(mux.waiters))
             empty!(mux.waiters)
             clear_mux && (client.request_mux = nothing)
-            waiters
-        end
-    end
-    errors = Any[]
-    for ch in waiters
-        try
-            isopen(ch) && put!(ch, err)
-        catch notify_err
-            push!(errors, CleanupError("notify request waiter", notify_err))
+            for waiter in waiters
+                try
+                    _resolve_request_waiter_locked!(waiter, err)
+                catch notify_err
+                    push!(errors, CleanupError("notify request waiter", notify_err))
+                end
+            end
         end
     end
     errors
@@ -466,7 +472,7 @@ end
 
 function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     subs = Subscription[]
-    request_waiters = Channel{Any}[]
+    request_waiters = RequestWaiter[]
     terminal = @lock client.lock begin
         if client.generation == generation &&
            client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.RECONNECTING, ConnectionStatus.DISCONNECTED)
@@ -484,6 +490,7 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
             for sub in subs
                 sub.closed = true
                 sub.server_active = false
+                _notify_subscription_waiters_locked(sub; all=true)
             end
 
             mux = client.request_mux
@@ -502,11 +509,13 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     _wake_flusher(client)
     errors = Any[]
     append!(errors, _notify_pong_waiters!(client, false))
-    for ch in request_waiters
-        try
-            isopen(ch) && put!(ch, ConnectionClosedError("connection is disconnected"))
-        catch notify_err
-            push!(errors, CleanupError("notify request waiter", notify_err))
+    @lock client.lock begin
+        for waiter in request_waiters
+            try
+                _resolve_request_waiter_locked!(waiter, ConnectionClosedError("connection is disconnected"))
+            catch notify_err
+                push!(errors, CleanupError("notify request waiter", notify_err))
+            end
         end
     end
     for sub in subs
@@ -521,12 +530,12 @@ end
 
 function _trim_stale_pong_waiters_locked!(client::Client)
     limit = max(0, client.options.max_stale_pong_waiters)
-    stale = count(waiter -> isnothing(waiter.channel), client.pongs)
+    stale = count(waiter -> !waiter.active && !waiter.ready, client.pongs)
     stale <= limit && return nothing
 
     remove = stale - limit
-    filter!(client.pongs) do waiter
-        if remove > 0 && isnothing(waiter.channel)
+    _filter_pong_waiter_queue!(client.pongs) do waiter
+        if remove > 0 && !waiter.active && !waiter.ready
             remove -= 1
             return false
         end
@@ -903,7 +912,6 @@ function _reader_loop(client::Client, generation::Int)
             op = frame.op
             if op == :MSG
                 msg = _protocol_msg(frame)
-                msg.client = client
                 _dispatch_msg(client, msg)
             elseif op == :PING
                 _send_raw(client, "PONG$CRLF"; force_flush=true)
@@ -953,19 +961,21 @@ end
 
 function _notify_pong(client::Client)
     waiter = nothing
+    notify_err = nothing
     @lock client.lock begin
         client.pings_out = 0
         if !isempty(client.pongs)
             waiter = popfirst!(client.pongs)
         end
-    end
-    if !isnothing(waiter) && !isnothing(waiter.channel)
-        try
-            put!(waiter.channel, true)
-        catch err
-            _report_error(client, CleanupError("notify flush waiter", err))
+        if !isnothing(waiter)
+            try
+                _resolve_pong_waiter_locked!(waiter, true)
+            catch err
+                notify_err = err
+            end
         end
     end
+    isnothing(notify_err) || _report_error(client, CleanupError("notify flush waiter", notify_err))
     nothing
 end
 
@@ -983,6 +993,7 @@ function _trigger_reconnect(client::Client, reason)
             for sub in values(client.subscriptions)
                 sub.server_active = false
             end
+            _notify_all_subscription_waiters_locked(client; all=true)
         end
     end
     generation == 0 && return nothing
@@ -1086,6 +1097,7 @@ function _reconnect_loop(client::Client, generation::Int)
                         for sub in values(client.subscriptions)
                             sub.server_active = false
                         end
+                        _notify_all_subscription_waiters_locked(client; all=true)
                     end
                 end
                 _close_transport_report_errors!(client; preserve_replayable=true)

@@ -465,6 +465,27 @@ function _validate_non_overlapping_subjects(subjects::Vector{String}, field::Abs
     subjects
 end
 
+function _validate_js_object_field!(payload::Dict{String,Any}, field::AbstractString, validate!)
+    haskey(payload, field) || return payload
+    value = payload[field]
+    isnothing(value) && return payload
+    value isa Dict{String,Any} || throw(ArgumentError("$field must be an object"))
+    validate!(value)
+    payload
+end
+
+function _validate_js_object_vector_field!(payload::Dict{String,Any}, field::AbstractString, validate!)
+    haskey(payload, field) || return payload
+    value = payload[field]
+    isnothing(value) && return payload
+    value isa AbstractVector || throw(ArgumentError("$field must be a vector of objects"))
+    for item in value
+        item isa Dict{String,Any} || throw(ArgumentError("$field entries must be objects"))
+        validate!(item)
+    end
+    payload
+end
+
 function _validate_js_subject_transform_payload!(payload::Dict{String,Any})::Dict{String,Any}
     _validate_subject_field!(payload, "src")
     _validate_subject_field!(payload, "dest")
@@ -481,6 +502,8 @@ function _validate_js_stream_source_payload!(payload::Dict{String,Any})::Dict{St
     _validate_js_name_field!(payload, "name", "stream")
     _validate_js_integer!(payload, "opt_start_seq"; min=0)
     _validate_subject_field!(payload, "filter_subject")
+    _validate_js_object_field!(payload, "external", _validate_js_external_stream_source_payload!)
+    _validate_js_object_vector_field!(payload, "subject_transforms", _validate_js_subject_transform_payload!)
     if haskey(payload, "filter_subject") && !isnothing(payload["filter_subject"]) &&
        haskey(payload, "subject_transforms") && !isnothing(payload["subject_transforms"]) &&
        !isempty(payload["subject_transforms"])
@@ -530,6 +553,11 @@ function _validate_stream_config_payload!(payload::Dict{String,Any})::Dict{Strin
        get(payload, "max_msgs_per_subject", 0) <= 0
         throw(ArgumentError("discard_new_per_subject requires max_msgs_per_subject > 0"))
     end
+    _validate_js_object_field!(payload, "mirror", _validate_js_stream_source_payload!)
+    _validate_js_object_vector_field!(payload, "sources", _validate_js_stream_source_payload!)
+    _validate_js_object_field!(payload, "republish", _validate_js_republish_payload!)
+    _validate_js_object_field!(payload, "subject_transform", _validate_js_subject_transform_payload!)
+    _validate_js_object_field!(payload, "consumer_limits", _validate_js_stream_consumer_limits_payload!)
     payload
 end
 

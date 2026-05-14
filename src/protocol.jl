@@ -83,6 +83,8 @@ end
 
 _reader_available(reader::ProtocolReader)::Int = reader.last - reader.first + 1
 
+const _READER_COMPACT_MIN_PREFIX = 8192
+
 function _drop_consumed!(reader::ProtocolReader)
     reader.first == 1 && return nothing
     available = _reader_available(reader)
@@ -90,7 +92,7 @@ function _drop_consumed!(reader::ProtocolReader)
         empty!(reader.buffer)
         reader.first = 1
         reader.last = 0
-    else
+    elseif reader.first > _READER_COMPACT_MIN_PREFIX && reader.first > available
         copyto!(reader.buffer, 1, reader.buffer, reader.first, available)
         resize!(reader.buffer, available)
         reader.first = 1
@@ -99,34 +101,48 @@ function _drop_consumed!(reader::ProtocolReader)
     nothing
 end
 
+function _read_some!(io::IOStream, scratch::Vector{UInt8})::Int
+    readbytes!(io, scratch, length(scratch); all=false)
+end
+
+function _read_some!(io::MbedTLS.SSLContext, scratch::Vector{UInt8})::Int
+    readbytes!(io, scratch, length(scratch); all=false)
+end
+
+function _read_some!(io::Base.LibuvStream, scratch::Vector{UInt8})::Int
+    Base.wait_readnb(io, 1)
+    n = min(bytesavailable(io), length(scratch))
+    n == 0 && return 0
+    readbytes!(io, scratch, n)
+end
+
+function _read_some!(io::Base.GenericIOBuffer, scratch::Vector{UInt8})::Int
+    readbytes!(io, scratch, length(scratch))
+end
+
+function _read_some!(io, scratch::Vector{UInt8})::Int
+    try
+        readbytes!(io, scratch, length(scratch); all=false)
+    catch err
+        err isa MethodError || rethrow()
+        readbytes!(io, scratch, length(scratch))
+    end
+end
+
 function _fill_reader!(reader::ProtocolReader)
     _drop_consumed!(reader)
     n = try
-        readbytes!(reader.io, reader.scratch, 1)
+        _read_some!(reader.io, reader.scratch)
     catch err
         err isa EOFError || rethrow()
         throw(err)
     end
     n == 0 && throw(EOFError())
-    extra = min(_bytesavailable(reader.io), length(reader.scratch) - n)
-    if extra > 0
-        unsafe_read(reader.io, pointer(reader.scratch, n + 1), UInt(extra))
-        n += extra
-    end
     old = length(reader.buffer)
     resize!(reader.buffer, old + n)
     copyto!(reader.buffer, old + 1, reader.scratch, 1, n)
     reader.last = length(reader.buffer)
     nothing
-end
-
-function _bytesavailable(io)::Int
-    try
-        bytesavailable(io)
-    catch err
-        err isa MethodError || rethrow()
-        0
-    end
 end
 
 function _read_exact_bytes(io, n::Int)::Vector{UInt8}
@@ -215,24 +231,9 @@ end
 _drop_payload_consumed!(io) = nothing
 _drop_payload_consumed!(reader::ProtocolReader) = _drop_consumed!(reader)
 
-function _read_byte_no_drop(io)::UInt8
-    read(io, UInt8)
-end
-
-function _read_byte_no_drop(reader::ProtocolReader)::UInt8
-    if _reader_available(reader) > 0
-        byte = reader.buffer[reader.first]
-        reader.first += 1
-        return byte
-    end
-    unsafe_read(reader.io, pointer(reader.scratch), UInt(1))
-    reader.scratch[1]
-end
-
 function _read_payload_trailer_no_drop!(io)
-    b1 = _read_byte_no_drop(io)
-    b2 = _read_byte_no_drop(io)
-    b1 == CRLF_BYTES[1] && b2 == CRLF_BYTES[2] || throw(ProtocolError("message payload missing CRLF trailer"))
+    trailer = _read_exact_bytes_no_drop(io, 2)
+    trailer[1] == CRLF_BYTES[1] && trailer[2] == CRLF_BYTES[2] || throw(ProtocolError("message payload missing CRLF trailer"))
     nothing
 end
 
@@ -327,7 +328,8 @@ function _malformed_control_line(kind::AbstractString, bytes::AbstractVector{UIn
     throw(ProtocolError("malformed $kind control line: $(_bytes_string(bytes, first, last))"))
 end
 
-function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int, max_payload::Int)::_ProtocolFrame
+function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
+                        max_payload::Int)
     bytes = reader.buffer
     subject_start, subject_end, pos = _next_token(bytes, line_first + 4, line_last)
     subject_start == 0 && _malformed_control_line("MSG", bytes, line_first, line_last)
@@ -344,11 +346,11 @@ function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
     size_start, size_end = fourth_start == 0 ? (third_start, third_end) : (fourth_start, fourth_end)
     size = _validate_payload_size(_parse_int_token(bytes, size_start, size_end), max_payload)
     payload = _read_exact_payload(reader, size)
-    _protocol_msg_frame(Msg(subject, reply, payload, Headers(), nothing, sid, false))
+    _protocol_msg_frame(Msg(subject, reply, payload, Headers(), sid))
 end
 
 function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
-                         max_payload::Int, max_header_bytes::Int)::_ProtocolFrame
+                         max_payload::Int, max_header_bytes::Int)
     bytes = reader.buffer
     subject_start, subject_end, pos = _next_token(bytes, line_first + 5, line_last)
     subject_start == 0 && _malformed_control_line("HMSG", bytes, line_first, line_last)
@@ -371,55 +373,92 @@ function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int
     total = _validate_payload_size(_parse_int_token(bytes, total_start, total_end), max_payload)
     header_bytes, payload = _read_exact_header_payload(reader, hsize, total)
     hdrs = _parse_headers(header_bytes)
-    _protocol_msg_frame(Msg(subject, reply, payload, hdrs, nothing, sid, false, hsize))
+    _protocol_msg_frame(Msg(subject, reply, payload; headers=hdrs, sid, header_bytes=hsize))
 end
 
 function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
                               max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
-                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)::_ProtocolFrame
+                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)
     line_range = _readline_crlf_range(reader, max_control_line)
     line_first = first(line_range)
     line_last = last(line_range)
     line_last >= line_first || throw(ProtocolError("empty protocol line"))
     bytes = reader.buffer
-    if _ascii_startswith_ci(bytes, line_first, line_last, "INFO ")
-        info = _server_info(@view bytes[line_first + 5:line_last])
-        _drop_consumed!(reader)
-        return _protocol_info_frame(info)
-    elseif _ascii_eq_ci(bytes, line_first, line_last, "PING")
-        _drop_consumed!(reader)
-        return _protocol_control_frame(:PING)
-    elseif _ascii_eq_ci(bytes, line_first, line_last, "PONG")
-        _drop_consumed!(reader)
-        return _protocol_control_frame(:PONG)
-    elseif _ascii_eq_ci(bytes, line_first, line_last, "+OK")
-        _drop_consumed!(reader)
-        return _protocol_control_frame(:OK)
-    elseif _ascii_startswith_ci(bytes, line_first, line_last, "-ERR")
-        msg = line_last - line_first + 1 >= 6 ? strip(_bytes_string(bytes, line_first + 5, line_last)) : ""
-        msg = String(strip(String(msg), ['\'', ' ']))
-        _drop_consumed!(reader)
-        return _protocol_err_frame(msg)
-    elseif _ascii_startswith_ci(bytes, line_first, line_last, "MSG ")
-        return _read_msg_line(reader, line_first, line_last, max_payload)
-    elseif _ascii_startswith_ci(bytes, line_first, line_last, "HMSG ")
-        return _read_hmsg_line(reader, line_first, line_last, max_payload, max_header_bytes)
-    else
-        line = _bytes_string(bytes, line_first, line_last)
-        throw(ProtocolError("unknown protocol line: $line"))
+    line_len = line_last - line_first + 1
+    command = @inbounds bytes[line_first]
+    @inbounds begin
+        if command == UInt8('M')
+            if line_len >= 4 &&
+                    bytes[line_first + 1] == UInt8('S') &&
+                    bytes[line_first + 2] == UInt8('G') &&
+                    bytes[line_first + 3] == UInt8(' ')
+                return _read_msg_line(reader, line_first, line_last, max_payload)
+            end
+        elseif command == UInt8('H')
+            if line_len >= 5 &&
+                    bytes[line_first + 1] == UInt8('M') &&
+                    bytes[line_first + 2] == UInt8('S') &&
+                    bytes[line_first + 3] == UInt8('G') &&
+                    bytes[line_first + 4] == UInt8(' ')
+                return _read_hmsg_line(reader, line_first, line_last, max_payload, max_header_bytes)
+            end
+        elseif command == UInt8('I')
+            if line_len >= 5 &&
+                    bytes[line_first + 1] == UInt8('N') &&
+                    bytes[line_first + 2] == UInt8('F') &&
+                    bytes[line_first + 3] == UInt8('O') &&
+                    bytes[line_first + 4] == UInt8(' ')
+                info = _server_info(@view bytes[line_first + 5:line_last])
+                _drop_consumed!(reader)
+                return _protocol_info_frame(info)
+            end
+        elseif command == UInt8('P')
+            if line_len == 4 &&
+                    bytes[line_first + 1] == UInt8('I') &&
+                    bytes[line_first + 2] == UInt8('N') &&
+                    bytes[line_first + 3] == UInt8('G')
+                _drop_consumed!(reader)
+                return _protocol_control_frame(:PING)
+            elseif line_len == 4 &&
+                    bytes[line_first + 1] == UInt8('O') &&
+                    bytes[line_first + 2] == UInt8('N') &&
+                    bytes[line_first + 3] == UInt8('G')
+                _drop_consumed!(reader)
+                return _protocol_control_frame(:PONG)
+            end
+        elseif command == UInt8('+')
+            if line_len == 3 &&
+                    bytes[line_first + 1] == UInt8('O') &&
+                    bytes[line_first + 2] == UInt8('K')
+                _drop_consumed!(reader)
+                return _protocol_control_frame(:OK)
+            end
+        elseif command == UInt8('-')
+            if line_len >= 4 &&
+                    bytes[line_first + 1] == UInt8('E') &&
+                    bytes[line_first + 2] == UInt8('R') &&
+                    bytes[line_first + 3] == UInt8('R')
+                msg = line_len >= 6 ? strip(_bytes_string(bytes, line_first + 5, line_last)) : ""
+                msg = String(strip(String(msg), ['\'', ' ']))
+                _drop_consumed!(reader)
+                return _protocol_err_frame(msg)
+            end
+        end
     end
+    line = _bytes_string(bytes, line_first, line_last)
+    throw(ProtocolError("unknown protocol line: $line"))
 end
 
 function _read_control_or_msg(io; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
                               max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
-                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)::_ProtocolFrame
+                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)
     _read_control_or_msg(ProtocolReader(io; read_size=1);
                          max_control_line,
                          max_payload,
                          max_header_bytes)
 end
 
-function _read_control_or_msg(io, opts::ConnectOptions)::_ProtocolFrame
+function _read_control_or_msg(io, opts::ConnectOptions)
     _read_control_or_msg(io;
                          max_control_line=opts.max_control_line,
                          max_payload=opts.max_inbound_payload,
@@ -504,13 +543,13 @@ function _parse_headers(raw::AbstractVector{UInt8})
     h
 end
 
-function _status_header(msg::Msg)
+function _status_header(msg::AbstractMsg)
     value = header(msg, "Status")
     !isnothing(value) && !isempty(value) && all(isdigit, value) && return parse(Int, value)
     nothing
 end
 
-function _status_description(msg::Msg)
+function _status_description(msg::AbstractMsg)
     value = header(msg, "Description")
     isnothing(value) ? "" : value
 end
@@ -617,6 +656,21 @@ function _copy_decimal!(dest::Vector{UInt8}, pos::Int, value::Int)::Int
     pos + digits
 end
 
+function _write_decimal(io, value::Int)
+    digits = _decimal_digits(value)
+    divisor = 1
+    for _ in 2:digits
+        divisor *= 10
+    end
+    while divisor > 0
+        digit = div(value, divisor)
+        write(io, UInt8('0') + UInt8(digit))
+        value -= digit * divisor
+        divisor = div(divisor, 10)
+    end
+    nothing
+end
+
 function _copy_byte!(dest::Vector{UInt8}, pos::Int, byte::UInt8)::Int
     dest[pos] = byte
     pos + 1
@@ -659,18 +713,28 @@ end
 
 function _write_pub_frame(io, frame::PublishFrame)
     if isempty(frame.headers)
-        print(io, "PUB ", frame.subject, ' ')
+        write(io, "PUB ")
+        write(io, frame.subject)
+        write(io, UInt8(' '))
         if !isnothing(frame.reply)
-            print(io, frame.reply, ' ')
+            write(io, frame.reply)
+            write(io, UInt8(' '))
         end
-        print(io, length(frame.payload), CRLF)
+        _write_decimal(io, length(frame.payload))
+        write(io, CRLF_BYTES)
         write(io, frame.payload)
     else
-        print(io, "HPUB ", frame.subject, ' ')
+        write(io, "HPUB ")
+        write(io, frame.subject)
+        write(io, UInt8(' '))
         if !isnothing(frame.reply)
-            print(io, frame.reply, ' ')
+            write(io, frame.reply)
+            write(io, UInt8(' '))
         end
-        print(io, length(frame.headers), ' ', _pub_payload_size(frame), CRLF)
+        _write_decimal(io, length(frame.headers))
+        write(io, UInt8(' '))
+        _write_decimal(io, _pub_payload_size(frame))
+        write(io, CRLF_BYTES)
         write(io, frame.headers)
         write(io, frame.payload)
     end
@@ -692,24 +756,41 @@ end
 
 _unsub_cmd(sid::Int, max_msgs::Int=0) = max_msgs > 0 ? "UNSUB $sid $max_msgs$CRLF" : "UNSUB $sid$CRLF"
 
+function _validate_subject_token(wildcard::Char, token_chars::Int, allow_wildcards::Bool)
+    wildcard == '\0' && return nothing
+    token_chars == 1 || throw(ArgumentError("wildcards must occupy a complete subject token"))
+    allow_wildcards || throw(ArgumentError("publish subjects cannot contain wildcards"))
+    nothing
+end
+
 function _validate_subject(subject::AbstractString; allow_wildcards::Bool=true)
     s = String(subject)
     isempty(s) && throw(ArgumentError("subject cannot be empty"))
-    occursin(r"\s", s) && throw(ArgumentError("subject cannot contain whitespace"))
-    startswith(s, ".") && throw(ArgumentError("subject cannot start with '.'"))
-    endswith(s, ".") && throw(ArgumentError("subject cannot end with '.'"))
-    occursin("..", s) && throw(ArgumentError("subject cannot contain consecutive dots"))
-    tokens = split(s, ".")
-    for (i, token) in pairs(tokens)
-        if token == ">"
-            i == length(tokens) || throw(ArgumentError("subject wildcard '>' must be the final token"))
-            allow_wildcards || throw(ArgumentError("publish subjects cannot contain wildcards"))
-        elseif token == "*"
-            allow_wildcards || throw(ArgumentError("publish subjects cannot contain wildcards"))
-        elseif occursin(">", token) || occursin("*", token)
-            throw(ArgumentError("wildcards must occupy a complete subject token"))
+    token_chars = 0
+    token_wildcard = '\0'
+    previous_dot = false
+    for c in s
+        isspace(c) && throw(ArgumentError("subject cannot contain whitespace"))
+        if c == '.'
+            if token_chars == 0
+                msg = previous_dot ? "subject cannot contain consecutive dots" : "subject cannot start with '.'"
+                throw(ArgumentError(msg))
+            end
+            token_wildcard == '>' && throw(ArgumentError("subject wildcard '>' must be the final token"))
+            _validate_subject_token(token_wildcard, token_chars, allow_wildcards)
+            token_chars = 0
+            token_wildcard = '\0'
+            previous_dot = true
+        else
+            if c == '>' || c == '*'
+                token_wildcard = c
+            end
+            token_chars += 1
+            previous_dot = false
         end
     end
+    previous_dot && throw(ArgumentError("subject cannot end with '.'"))
+    _validate_subject_token(token_wildcard, token_chars, allow_wildcards)
     s
 end
 

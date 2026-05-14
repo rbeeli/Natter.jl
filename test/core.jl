@@ -11,6 +11,10 @@ using TestItems
 
     @test N._validate_subject("foo.*.bar") == "foo.*.bar"
     @test N._validate_subject("foo.>") == "foo.>"
+    @test_throws ArgumentError N._validate_subject(".foo")
+    @test_throws ArgumentError N._validate_subject("foo.")
+    @test_throws ArgumentError N._validate_subject("foo bar")
+    @test_throws ArgumentError N._validate_subject("foo\tbar")
     @test_throws ArgumentError N._validate_subject("foo.>.bar")
     @test_throws ArgumentError N._validate_subject("foo.bad*")
     @test_throws ArgumentError N._validate_subject("foo..bar")
@@ -83,6 +87,13 @@ end
     @test opts.connect_timeout == 1.0
     @test opts.ping_interval == 2.0
     @test opts.write_buffer_size == 0
+    @test N._parse_options(" nats://one.example:4222, nats://two.example:4223 , ").servers == [
+        "nats://one.example:4222",
+        "nats://two.example:4223",
+    ]
+    @test N._parse_options([" nats://one.example:4222 "]).servers == ["nats://one.example:4222"]
+    @test_throws ArgumentError N._parse_options(" , ")
+    @test_throws ArgumentError N._parse_options(["nats://one.example:4222", " "])
 
     function rejects(; kwargs...)
         @test_throws ArgumentError N.ConnectOptions(; kwargs...)
@@ -129,11 +140,11 @@ end
 
     const N = Natter
 
-    function parse_header_msg(sid, hdr)
+    function parse_header_msg(client, sid, hdr)
         raw = vcat(TestHelpers.bytes("HMSG events $sid $(length(hdr)) $(length(hdr))\r\n"),
                    hdr,
                    N.CRLF_BYTES)
-        frame = N._read_control_or_msg(IOBuffer(raw))
+        frame = N._read_control_or_msg(IOBuffer(raw), client.options)
         @test frame.op == :MSG
         N._protocol_msg(frame)
     end
@@ -142,7 +153,7 @@ end
 
     accepted = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     accepted_sub = subscribe(accepted, "events"; pending_bytes_limit=length(hdr))
-    accepted_msg = parse_header_msg(accepted_sub.sid, hdr)
+    accepted_msg = parse_header_msg(accepted, accepted_sub.sid, hdr)
     N._dispatch_msg(accepted, accepted_msg)
     @test isready(accepted_sub.messages)
     @test accepted_sub.pending_bytes == length(hdr)
@@ -153,7 +164,7 @@ end
     opts = N.ConnectOptions(error_cb=err -> push!(reported, err))
     rejected = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
     rejected_sub = subscribe(rejected, "events"; pending_bytes_limit=length(hdr) - 1)
-    rejected_msg = parse_header_msg(rejected_sub.sid, hdr)
+    rejected_msg = parse_header_msg(rejected, rejected_sub.sid, hdr)
     N._dispatch_msg(rejected, rejected_msg)
     @test !isready(rejected_sub.messages)
     @test rejected_sub.pending_bytes == 0
@@ -610,7 +621,7 @@ end
     @test !occursin("UNSUB", TestHelpers.capture_text(transport))
 
     for (reply, payload) in reverse(publishes)
-        N._dispatch_msg(client, Msg(reply, nothing, TestHelpers.bytes("resp-$payload"); client, sid=mux.sub.sid))
+        N._dispatch_msg(client, Msg(reply, nothing, TestHelpers.bytes("resp-$payload"); sid=mux.sub.sid))
     end
 
     responses = String[ String(fetch(task)) for task in tasks ]
@@ -656,7 +667,7 @@ end
     @test isempty(mux.waiters)
 
     before_drops = stats(client).dropped_msgs
-    N._dispatch_msg(client, Msg(first_reply, nothing, TestHelpers.bytes("late"); client, sid=mux.sub.sid))
+    N._dispatch_msg(client, Msg(first_reply, nothing, TestHelpers.bytes("late"); sid=mux.sub.sid))
     @test stats(client).dropped_msgs == before_drops + 1
 
     task = @async request(client, "svc", "second"; timeout=1.0)
@@ -664,10 +675,10 @@ end
     second_reply = publishes[2][1]
     @test second_reply != first_reply
 
-    N._dispatch_msg(client, Msg(first_reply, nothing, TestHelpers.bytes("still-late"); client, sid=mux.sub.sid))
+    N._dispatch_msg(client, Msg(first_reply, nothing, TestHelpers.bytes("still-late"); sid=mux.sub.sid))
     sleep(0.02)
     @test !istaskdone(task)
-    N._dispatch_msg(client, Msg(second_reply, nothing, TestHelpers.bytes("on-time"); client, sid=mux.sub.sid))
+    N._dispatch_msg(client, Msg(second_reply, nothing, TestHelpers.bytes("on-time"); sid=mux.sub.sid))
     @test String(fetch(task)) == "on-time"
     @test isempty(mux.waiters)
     close(client)
@@ -1029,11 +1040,11 @@ end
     const N = Natter
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED)
-    ch = Channel{Bool}(1)
-    push!(client.pongs, N.PongWaiter(ch))
+    waiter = N.PongWaiter(Base.Threads.Condition(client.lock))
+    push!(client.pongs, waiter)
     close(client)
-    @test isready(ch)
-    @test take!(ch) == false
+    @test waiter.ready
+    @test waiter.value == false
 end
 
 @testitem "timed out flush consumes its own late pong" setup=[TestHelpers] begin
@@ -1052,12 +1063,13 @@ end
     @test_throws TimeoutError flush(client; timeout=0.01)
     @test length(client.pongs) == 1
     timed_out_waiter = only(client.pongs)
-    later_waiter = Channel{Bool}(1)
-    push!(client.pongs, N.PongWaiter(later_waiter))
+    later_waiter = N.PongWaiter(Base.Threads.Condition(client.lock))
+    push!(client.pongs, later_waiter)
 
     N._notify_pong(client)
-    @test isnothing(timed_out_waiter.channel)
-    @test !isready(later_waiter)
+    @test !timed_out_waiter.active
+    @test !timed_out_waiter.ready
+    @test !later_waiter.ready
 end
 
 @testitem "stale flush waiters are bounded" setup=[TestHelpers] begin
@@ -1077,7 +1089,7 @@ end
     for _ in 1:4
         @test_throws TimeoutError flush(client; timeout=0.001)
     end
-    @test count(waiter -> isnothing(waiter.channel), client.pongs) == 2
+    @test count(waiter -> !waiter.active && !waiter.ready, client.pongs) == 2
 end
 
 @testitem "drain uses one timeout budget" setup=[TestHelpers] begin
@@ -1118,7 +1130,7 @@ end
     warm_client_ref[] = warm_client
     warm_sub = subscribe(warm_client, "warmup")
     warm_sub_ref[] = warm_sub
-    put!(warm_sub.messages, N.Msg("warmup", nothing, UInt8[]; client=warm_client, sid=warm_sub.sid))
+    put!(warm_sub.messages, N.Msg("warmup", nothing, UInt8[]; sid=warm_sub.sid))
     @test_throws TimeoutError drain(warm_sub; timeout=0.001)
     warm_release_result = timedwait(1.0; pollint=0.01) do
         isready(warm_released)
@@ -1135,7 +1147,7 @@ end
 
     sub = subscribe(client, "foo")
     sub_ref[] = sub
-    put!(sub.messages, N.Msg("foo", nothing, UInt8[]; client, sid=sub.sid))
+    put!(sub.messages, N.Msg("foo", nothing, UInt8[]; sid=sub.sid))
 
     @test_throws TimeoutError drain(sub; timeout=0.2)
     release_result = timedwait(1.0; pollint=0.01) do
@@ -1169,8 +1181,8 @@ end
 
     sub1 = subscribe(client, "foo.1")
     sub2 = subscribe(client, "foo.2")
-    put!(sub1.messages, N.Msg("foo.1", nothing, UInt8[]; client, sid=sub1.sid))
-    put!(sub2.messages, N.Msg("foo.2", nothing, UInt8[]; client, sid=sub2.sid))
+    put!(sub1.messages, N.Msg("foo.1", nothing, UInt8[]; sid=sub1.sid))
+    put!(sub2.messages, N.Msg("foo.2", nothing, UInt8[]; sid=sub2.sid))
     empty!(transport.writes)
 
     @test_throws TimeoutError drain(client; timeout=0.12)

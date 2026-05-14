@@ -27,6 +27,7 @@ _default_noop_cb() = nothing
 const Headers = Dict{String,Vector{String}}
 
 abstract type AbstractNatterClient end
+abstract type AbstractMsg end
 
 function _append_header_value!(values::Vector{String}, value)
     push!(values, String(value))
@@ -120,8 +121,8 @@ function _msg_header_bytes(headers::Headers, header_bytes::Union{Int,Nothing})::
     header_bytes
 end
 
-headers(msg) = _headers_copy(msg.headers)
-header(msg, key::AbstractString) = begin
+headers(msg::AbstractMsg) = _headers_copy(msg.headers)
+header(msg::AbstractMsg, key::AbstractString) = begin
     values = _header_values(msg.headers, key)
     isnothing(values) || isempty(values) ? nothing : first(values)
 end
@@ -137,29 +138,27 @@ struct MsgMetadata
     domain::Union{String,Nothing}
 end
 
-mutable struct Msg
+struct Msg <: AbstractMsg
     subject::String
     reply::Union{String,Nothing}
     data::Vector{UInt8}
     headers::Headers
-    client::Union{AbstractNatterClient,Nothing}
     sid::Int
-    acked::Bool
     header_bytes::Int
 end
 
 function Msg(subject::String, reply::Union{String,Nothing}, data::Vector{UInt8};
-             headers=Headers(), client=nothing, sid=0, header_bytes::Union{Int,Nothing}=nothing)
+             headers=Headers(), sid=0, header_bytes::Union{Int,Nothing}=nothing)
     hdrs = _headers_copy(headers)
-    Msg(subject, reply, data, hdrs, client, sid, false, _msg_header_bytes(hdrs, header_bytes))
+    Msg(subject, reply, data, hdrs, sid, _msg_header_bytes(hdrs, header_bytes))
 end
 
 function Msg(subject::String, reply::Union{String,Nothing}, data::Vector{UInt8},
-             headers::Headers, client::Union{AbstractNatterClient,Nothing}, sid::Int, acked::Bool)
-    Msg(subject, reply, data, headers, client, sid, acked, _headers_wire_size(headers))
+             headers::Headers, sid::Int)
+    Msg(subject, reply, data, headers, sid, _headers_wire_size(headers))
 end
 
-_msg_pending_bytes(msg::Msg)::Int = msg.header_bytes + length(msg.data)
+_msg_pending_bytes(msg::AbstractMsg)::Int = msg.header_bytes + length(msg.data)
 
 Base.String(msg::Msg) = String(msg.data)
 
@@ -400,7 +399,7 @@ end
 @inline _protocol_err_frame(err::AbstractString) = _ProtocolFrame(:ERR, nothing, nothing, String(err))
 @inline _protocol_control_frame(op::Symbol) = _ProtocolFrame(op, nothing, nothing, nothing)
 
-@inline _protocol_msg(frame::_ProtocolFrame)::Msg = something(frame.msg)
+@inline _protocol_msg(frame::_ProtocolFrame) = something(frame.msg)
 @inline _protocol_info(frame::_ProtocolFrame)::ServerInfo = something(frame.info)
 @inline _protocol_err(frame::_ProtocolFrame)::String = something(frame.err)
 
@@ -548,6 +547,7 @@ mutable struct Subscription{C<:AbstractNatterClient}
     queue::Union{String,Nothing}
     has_callback::Bool
     messages::Channel{Msg}
+    condition::Base.GenericCondition{ReentrantLock}
     control_handler::_SubscriptionControlHandler
     pending_msgs_limit::Int
     pending_bytes_limit::Int
@@ -556,29 +556,121 @@ mutable struct Subscription{C<:AbstractNatterClient}
     max_msgs::Int
     closed::Bool
     processor::Union{Task,Nothing}
-    auto_ack::Bool
     server_active::Bool
     processing::Int
 end
 
 function Subscription(client::C, sid::Int, subject::String, queue::Union{String,Nothing}, callback,
-                      messages::Channel{Msg}, control_handler::_SubscriptionControlHandler,
+                      messages::Channel{Msg}, condition::Base.GenericCondition{ReentrantLock},
+                      control_handler::_SubscriptionControlHandler,
                       pending_msgs_limit::Int, pending_bytes_limit::Int, pending_bytes::Int,
                       received::Int, max_msgs::Int, closed::Bool, processor::Union{Task,Nothing},
-                      auto_ack::Bool, server_active::Bool, processing::Int) where {C<:AbstractNatterClient}
-    Subscription{C}(client, sid, subject, queue, !isnothing(callback), messages,
+                      server_active::Bool, processing::Int) where {C<:AbstractNatterClient}
+    Subscription{C}(client, sid, subject, queue, !isnothing(callback), messages, condition,
                     control_handler, pending_msgs_limit, pending_bytes_limit, pending_bytes,
-                    received, max_msgs, closed, processor, auto_ack, server_active, processing)
+                    received, max_msgs, closed, processor, server_active, processing)
 end
 
 mutable struct PongWaiter
-    channel::Union{Channel{Bool},Nothing}
+    condition::Base.GenericCondition{ReentrantLock}
+    ready::Bool
+    value::Bool
+    active::Bool
 end
+
+PongWaiter(condition::Base.GenericCondition{ReentrantLock}) = PongWaiter(condition, false, false, true)
+
+mutable struct PongWaiterQueue
+    buffer::Vector{Union{PongWaiter,Nothing}}
+    head::Int
+    len::Int
+end
+
+PongWaiterQueue() = PongWaiterQueue(Union{PongWaiter,Nothing}[], 1, 0)
+
+Base.eltype(::Type{PongWaiterQueue}) = PongWaiter
+Base.length(q::PongWaiterQueue) = q.len
+Base.isempty(q::PongWaiterQueue) = q.len == 0
+Base.IteratorSize(::Type{PongWaiterQueue}) = Base.HasLength()
+Base.firstindex(::PongWaiterQueue) = 1
+Base.lastindex(q::PongWaiterQueue) = q.len
+
+function _resize_pong_waiter_queue!(q::PongWaiterQueue, capacity::Int)
+    capacity = max(capacity, q.len)
+    buffer = Vector{Union{PongWaiter,Nothing}}(undef, capacity)
+    fill!(buffer, nothing)
+    for i in 1:q.len
+        buffer[i] = q[i]
+    end
+    q.buffer = buffer
+    q.head = 1
+    q
+end
+
+function Base.getindex(q::PongWaiterQueue, i::Int)
+    1 <= i <= q.len || throw(BoundsError(q, i))
+    idx = mod1(q.head + i - 1, length(q.buffer))
+    q.buffer[idx]::PongWaiter
+end
+
+function Base.iterate(q::PongWaiterQueue, state::Int=1)
+    state > q.len && return nothing
+    q[state], state + 1
+end
+
+function Base.push!(q::PongWaiterQueue, waiter::PongWaiter)
+    if q.len == length(q.buffer)
+        _resize_pong_waiter_queue!(q, max(8, 2 * max(q.len, 1)))
+    end
+    idx = mod1(q.head + q.len, length(q.buffer))
+    q.buffer[idx] = waiter
+    q.len += 1
+    q
+end
+
+function Base.popfirst!(q::PongWaiterQueue)
+    isempty(q) && throw(ArgumentError("PONG waiter queue is empty"))
+    waiter = q.buffer[q.head]::PongWaiter
+    q.buffer[q.head] = nothing
+    q.len -= 1
+    q.head = q.len == 0 ? 1 : mod1(q.head + 1, length(q.buffer))
+    waiter
+end
+
+function Base.empty!(q::PongWaiterQueue)
+    fill!(q.buffer, nothing)
+    q.head = 1
+    q.len = 0
+    q
+end
+
+function _filter_pong_waiter_queue!(f::Function, q::PongWaiterQueue)
+    kept = PongWaiter[]
+    sizehint!(kept, q.len)
+    for waiter in q
+        f(waiter) && push!(kept, waiter)
+    end
+    empty!(q)
+    for waiter in kept
+        push!(q, waiter)
+    end
+    q
+end
+
+mutable struct RequestWaiter{C<:AbstractNatterClient}
+    condition::Base.GenericCondition{ReentrantLock}
+    ready::Bool
+    value::Union{Msg,Exception,Nothing}
+    active::Bool
+end
+
+RequestWaiter{C}(condition::Base.GenericCondition{ReentrantLock}) where {C<:AbstractNatterClient} =
+    RequestWaiter{C}(condition, false, nothing, true)
 
 mutable struct RequestMux{C<:AbstractNatterClient}
     prefix::String
     sub::Subscription{C}
-    waiters::Dict{String,Channel{Any}}
+    waiters::Dict{String,RequestWaiter{C}}
 end
 
 mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterClient
@@ -602,7 +694,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     request_mux_lock::ReentrantLock
     pending::IOBuffer
     pending_bytes::Int
-    pongs::Vector{PongWaiter}
+    pongs::PongWaiterQueue
     reader_task::Union{Task,Nothing}
     ping_task::Union{Task,Nothing}
     reconnect_task::Union{Task,Nothing}
@@ -618,7 +710,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                 lock::ReentrantLock, write_lock::ReentrantLock, flush_signal::Channel{Bool},
                 flusher_task::Union{Task,Nothing}, sid::Int, subscriptions,
                 request_mux::Union{RequestMux,Nothing}, request_mux_lock::ReentrantLock,
-                pending::IOBuffer, pending_bytes::Int, pongs::Vector{PongWaiter},
+                pending::IOBuffer, pending_bytes::Int, pongs::PongWaiterQueue,
                 reader_task::Union{Task,Nothing}, ping_task::Union{Task,Nothing},
                 reconnect_task::Union{Task,Nothing}, pings_out::Int, stats::Stats,
                 rng::MersenneTwister, generation::Int) where {Options<:ConnectOptions}
@@ -633,7 +725,17 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
         nothing
     else
         sub = typed_subscriptions[request_mux.sub.sid]
-        RequestMux{client_type}(request_mux.prefix, sub, request_mux.waiters)
+        waiters = Dict{String,RequestWaiter{client_type}}()
+        for (token, waiter) in request_mux.waiters
+            typed_waiter = RequestWaiter{client_type}(Base.Threads.Condition(lock))
+            typed_waiter.ready = waiter.ready
+            typed_waiter.active = waiter.active
+            if waiter.value isa Exception || isnothing(waiter.value)
+                typed_waiter.value = waiter.value
+            end
+            waiters[token] = typed_waiter
+        end
+        RequestMux{client_type}(request_mux.prefix, sub, waiters)
     end
     reader = isnothing(read_io) ? nothing : ProtocolReader{ReadIO}(read_io)
     Client{Options,ReadIO,WriteIO}(options, servers, current_server, connected_url, status,
@@ -643,6 +745,68 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                    pending, pending_bytes, pongs,
                                    reader_task, ping_task, reconnect_task, pings_out, stats,
                                    rng, generation)
+end
+
+function _wait_until_condition_locked(predicate::Function, condition::Base.GenericCondition{ReentrantLock},
+                                      timeout::Real)::Bool
+    predicate() && return true
+    seconds = Float64(timeout)
+    seconds > 0 || return false
+    timed_out = Ref(false)
+    timer = isfinite(seconds) ? Timer(seconds) do _
+        lock(condition)
+        try
+            timed_out[] = true
+            notify(condition; all=true)
+        finally
+            unlock(condition)
+        end
+    end : nothing
+    try
+        while !predicate()
+            timed_out[] && return false
+            wait(condition)
+        end
+        true
+    finally
+        isnothing(timer) || close(timer)
+    end
+end
+
+function _notify_subscription_waiters_locked(sub::Subscription; all::Bool=false)
+    notify(sub.condition; all)
+    nothing
+end
+
+function _notify_subscription_waiters!(sub::Subscription; all::Bool=false)
+    @lock sub.client.lock _notify_subscription_waiters_locked(sub; all)
+    nothing
+end
+
+function _notify_all_subscription_waiters_locked(client; all::Bool=true)
+    for sub in values(client.subscriptions)
+        _notify_subscription_waiters_locked(sub; all)
+    end
+    nothing
+end
+
+function _resolve_pong_waiter_locked!(waiter::PongWaiter, value::Bool)
+    waiter.active || return false
+    waiter.value = value
+    waiter.ready = true
+    waiter.active = false
+    notify(waiter.condition)
+    true
+end
+
+function _resolve_request_waiter_locked!(waiter::RequestWaiter{C},
+                                         value::Union{Msg,Exception}) where {C<:AbstractNatterClient}
+    waiter.active || return false
+    waiter.value = value
+    waiter.ready = true
+    waiter.active = false
+    notify(waiter.condition)
+    true
 end
 
 _read_transport_type(::Client{Options,ReadIO,WriteIO}) where {Options,ReadIO,WriteIO} = ReadIO

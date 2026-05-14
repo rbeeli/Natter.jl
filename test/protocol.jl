@@ -100,6 +100,7 @@ end
     @test typeof(frame) === N._ProtocolFrame
     @test frame.op == :MSG
     msg = @inferred N._protocol_msg(frame)
+    @test typeof(msg) === Msg
     @test msg.subject == "foo"
     @test msg.reply == "_INBOX.1"
     @test String(msg) == "hello"
@@ -123,6 +124,73 @@ end
     @test_throws ProtocolError N._read_control_or_msg(IOBuffer(raw); max_header_bytes=length(hdr) - 1)
 end
 
+@testitem "protocol reader uses lazy buffering" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct PartialReadIO <: IO
+        data::Vector{UInt8}
+        pos::Int
+        requests::Vector{Tuple{Int,Bool}}
+    end
+
+    function Base.readbytes!(io::PartialReadIO, b::Vector{UInt8}, nb::Integer=length(b); all::Bool=true)
+        push!(io.requests, (Int(nb), all))
+        io.pos > length(io.data) && return 0
+        n = min(Int(nb), length(io.data) - io.pos + 1)
+        copyto!(b, 1, io.data, io.pos, n)
+        io.pos += n
+        n
+    end
+
+    io = PartialReadIO(TestHelpers.bytes("PING\r\n"), 1, Tuple{Int,Bool}[])
+    reader = N.ProtocolReader(io; read_size=16)
+    @test N._read_control_or_msg(reader).op == :PING
+    @test io.requests == [(16, false)]
+
+    raw = TestHelpers.bytes(repeat("PING\r\n", 4))
+    reader = N.ProtocolReader(IOBuffer(raw); read_size=length(raw))
+    @test N._read_control_or_msg(reader).op == :PING
+    @test length(reader.buffer) == length(raw)
+    @test reader.first == ncodeunits("PING\r\n") + 1
+    @test reader.last == length(raw)
+
+    for _ in 2:4
+        @test N._read_control_or_msg(reader).op == :PING
+    end
+    @test isempty(reader.buffer)
+    @test reader.first == 1
+    @test reader.last == 0
+end
+
+@testitem "protocol payload trailer is read in one chunk" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct ExactReadIO <: IO
+        data::Vector{UInt8}
+        pos::Int
+        reads::Vector{Int}
+    end
+
+    function Base.unsafe_read(io::ExactReadIO, p::Ptr{UInt8}, n::UInt)
+        count = Int(n)
+        push!(io.reads, count)
+        length(io.data) - io.pos + 1 >= count || throw(EOFError())
+        data = io.data
+        GC.@preserve data unsafe_copyto!(p, pointer(data, io.pos), count)
+        io.pos += count
+        nothing
+    end
+
+    io = ExactReadIO(vcat(TestHelpers.bytes("hi"), N.CRLF_BYTES), 1, Int[])
+    reader = N.ProtocolReader(io)
+    @test String(N._read_exact_payload(reader, 2)) == "hi"
+    @test io.reads == [2, 2]
+end
+
 @testitem "protocol writer" setup=[TestHelpers] begin
     using JSON3
     using Natter
@@ -135,6 +203,33 @@ end
     cmd = String(N._pub_cmd("foo", nothing, TestHelpers.bytes("hi"), Headers("A" => ["b"])))
     @test startswith(cmd, "HPUB foo ")
     @test occursin("NATS/1.0\r\nA: b\r\n\r\nhi\r\n", cmd)
+
+    function write_frame(frame)
+        io = IOBuffer()
+        N._write_pub_frame(io, frame)
+        take!(io)
+    end
+    plain_frame = N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), UInt8[])
+    reply_frame = N.PublishFrame("foo", "bar", TestHelpers.bytes("hi"), UInt8[])
+    header_frame = N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), N._headers_bytes(Headers("A" => ["b"])))
+    @test write_frame(plain_frame) == N._pub_cmd(plain_frame)
+    @test write_frame(reply_frame) == N._pub_cmd(reply_frame)
+    @test write_frame(header_frame) == N._pub_cmd(header_frame)
+
+    io = IOBuffer()
+    for _ in 1:1000
+        truncate(io, 0)
+        seekstart(io)
+        N._write_pub_frame(io, plain_frame)
+        N._validate_publish_subject("foo.bar")
+    end
+    @test (@allocated begin
+        truncate(io, 0)
+        seekstart(io)
+        N._write_pub_frame(io, plain_frame)
+    end) == 0
+    @test (@allocated N._validate_publish_subject("foo.bar")) == 0
+
     @test occursin("Trace-Id_1: ok\r\n", String(N._headers_bytes(Headers("Trace-Id_1" => ["ok"]))))
     for bad_key in ("", "Bad Key", " Bad", "Bad ", "Bad\tKey", "Bad:Key", "Bad/Key", "Bad(Key)", "Bad\r\nKey", "Badé")
         @test_throws ArgumentError N._headers_bytes(Headers(bad_key => ["x"]))
