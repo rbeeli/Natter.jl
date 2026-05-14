@@ -77,6 +77,50 @@ using TestItems
     @test_throws ConnectionClosedError subscribe(closed, "foo")
 end
 
+@testitem "core APIs accept abstract strings and callable objects" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct CoreCallable
+        seen::Vector{String}
+    end
+    function (cb::CoreCallable)(msg)
+        push!(cb.seen, String(msg))
+        nothing
+    end
+
+    reply = SubString("reply.inbox.extra", 1, 11)
+    publish_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    publish(publish_client, "foo", "bar"; reply)
+    @test String(take!(publish_client.pending)) == "PUB foo reply.inbox 3\r\nbar\r\n"
+
+    queue = SubString("workers.extra", 1, 7)
+    callback = CoreCallable(String[])
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "events"; queue, callback)
+    @test sub.queue == "workers"
+    @test sub.has_callback
+
+    N._dispatch_msg(client, Msg("events", nothing, TestHelpers.bytes("payload"); sid=sub.sid))
+    for _ in 1:100
+        isempty(callback.seen) || break
+        yield()
+    end
+    @test callback.seen == ["payload"]
+    close(sub)
+    wait(sub.processor)
+
+    positional = CoreCallable(String[])
+    positional_sub = subscribe(positional, client, "events.positional")
+    @test positional_sub.has_callback
+    close(positional_sub)
+    wait(positional_sub.processor)
+
+    inbox = new_inbox(client; prefix=SubString("_INBOX.extra", 1, 6))
+    @test startswith(inbox, "_INBOX.")
+end
+
 @testitem "ConnectOptions validates safety limits" begin
     using Natter
 
@@ -87,11 +131,18 @@ end
     @test opts.connect_timeout == 1.0
     @test opts.ping_interval == 2.0
     @test opts.write_buffer_size == 0
-    @test N._parse_options(" nats://one.example:4222, nats://two.example:4223 , ").servers == [
+    @test !ismutable(opts)
+    @test opts.servers isa Tuple{Vararg{String}}
+    source_servers = ["nats://one.example:4222"]
+    frozen = N.ConnectOptions(; servers=source_servers)
+    source_servers[1] = "nats://two.example:4222"
+    push!(source_servers, "nats://three.example:4222")
+    @test frozen.servers == ("nats://one.example:4222",)
+    @test N._parse_options(" nats://one.example:4222, nats://two.example:4223 , ").servers == (
         "nats://one.example:4222",
         "nats://two.example:4223",
-    ]
-    @test N._parse_options([" nats://one.example:4222 "]).servers == ["nats://one.example:4222"]
+    )
+    @test N._parse_options([" nats://one.example:4222 "]).servers == ("nats://one.example:4222",)
     @test_throws ArgumentError N._parse_options(" , ")
     @test_throws ArgumentError N._parse_options(["nats://one.example:4222", " "])
 
@@ -99,8 +150,25 @@ end
         @test_throws ArgumentError N.ConnectOptions(; kwargs...)
     end
 
+    function rejects_with(message; kwargs...)
+        err = try
+            N.ConnectOptions(; kwargs...)
+            nothing
+        catch err
+            err
+        end
+        @test err isa ArgumentError
+        @test occursin(message, sprint(showerror, err))
+    end
+
     rejects(servers=String[])
     rejects(servers=[""])
+    rejects_with("tls_cert_path and tls_key_path must be provided together"; tls_cert_path="client.pem")
+    rejects_with("tls_cert_path and tls_key_path must be provided together"; tls_key_path="client-key.pem")
+    rejects_with("token authentication cannot be combined with user/password authentication";
+                 token="secret", user="user", password="pass")
+    rejects_with("user and password must be provided together"; user="user")
+    rejects_with("user and password must be provided together"; password="pass")
     rejects(connect_timeout=0)
     rejects(connect_timeout=Inf)
     rejects(ping_interval=0)
@@ -121,6 +189,20 @@ end
     rejects(sub_pending_msgs_limit=0)
     rejects(sub_pending_bytes_limit=0)
     rejects(drain_timeout=0)
+end
+
+@testitem "connect rejects mixed URL and option authentication before transport IO" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(token="secret"))
+    err = TestHelpers.thrown_exception() do
+        N._connect_once!(client, N.Server("nats://user:pass@example.invalid:4222"))
+    end
+    @test err isa ArgumentError
+    @test occursin("token authentication cannot be combined with user/password authentication",
+                   sprint(showerror, err))
 end
 
 @testitem "reconnect local state does not enqueue subscription protocol" setup=[TestHelpers] begin
@@ -273,16 +355,16 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     sub = subscribe(client, "events")
-    put!(sub.messages, Msg("events", nothing, TestHelpers.bytes("stolen"); sid=sub.sid))
+    @lock client.lock put!(sub.messages, Msg("events", nothing, TestHelpers.bytes("stolen"); sid=sub.sid))
 
-    lock(sub.messages)
+    lock(client.lock)
     task = @async next(sub; timeout=0.05)
     try
         sleep(0.01)
         stolen = take!(sub.messages)
         @test String(stolen) == "stolen"
     finally
-        unlock(sub.messages)
+        unlock(client.lock)
     end
 
     result = timedwait(1.0; pollint=0.001) do
@@ -362,6 +444,67 @@ end
     @test client.pending_bytes == 0
     @test isempty(N._take_replayable_writes!(write_io))
 
+    close(client)
+end
+
+@testitem "direct publish writes use coalesced frame chunks" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct ChunkCapture <: IO
+        chunks::Vector{String}
+    end
+    ChunkCapture() = ChunkCapture(String[])
+
+    Base.write(t::ChunkCapture, data::Vector{UInt8}) = (push!(t.chunks, String(copy(data))); length(data))
+    Base.write(t::ChunkCapture, data::Base.CodeUnits{UInt8}) = (push!(t.chunks, String(data)); length(data))
+    Base.write(t::ChunkCapture, data::Union{String,SubString{String}}) = (push!(t.chunks, String(data)); ncodeunits(data))
+    Base.write(t::ChunkCapture, byte::UInt8) = (push!(t.chunks, String([byte])); 1)
+    Base.flush(::ChunkCapture) = nothing
+    Base.close(::ChunkCapture) = nothing
+
+    transport = ChunkCapture()
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(write_buffer_size=0),
+                                     status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+
+    publish(client, "foo", "bar")
+
+    @test transport.chunks == ["PUB foo 3\r\n", "bar", "\r\n"]
+    close(client)
+end
+
+@testitem "request publish force flushes buffered writes" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct FlushCapture <: IO
+        bytes::Vector{UInt8}
+        flushes::Int
+    end
+    FlushCapture() = FlushCapture(UInt8[], 0)
+
+    Base.write(t::FlushCapture, data::Vector{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::FlushCapture, data::Base.CodeUnits{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::FlushCapture, data::AbstractString) = (append!(t.bytes, codeunits(data)); ncodeunits(data))
+    Base.flush(t::FlushCapture) = (t.flushes += 1; nothing)
+    Base.close(::FlushCapture) = nothing
+
+    transport = FlushCapture()
+    write_io = N.BufferedWriteIO(transport)
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(write_buffer_size=1024 * 1024),
+                                     status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io)
+
+    @test_throws TimeoutError request(client, "svc", "body"; timeout=0.001)
+    written = String(copy(transport.bytes))
+
+    @test transport.flushes >= 1
+    @test occursin("SUB _INBOX.", written)
+    @test occursin("PUB svc _INBOX.", written)
+    @test N._buffered_bytes(write_io) == 0
     close(client)
 end
 
@@ -480,6 +623,37 @@ end
     N._enqueue_pending(client, data)
     @test_throws ErrorException N._flush_pending_buffer(client)
     @test client.pending_bytes == length(data)
+end
+
+@testitem "pending replay writes bounded batches" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct ReplayBatchTransport <: IO
+        writes::Vector{String}
+        flushes::Int
+    end
+    ReplayBatchTransport() = ReplayBatchTransport(String[], 0)
+
+    Base.write(t::ReplayBatchTransport, data::Vector{UInt8}) = (push!(t.writes, String(copy(data))); length(data))
+    Base.flush(t::ReplayBatchTransport) = (t.flushes += 1; nothing)
+    Base.close(::ReplayBatchTransport) = nothing
+
+    transport = ReplayBatchTransport()
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(write_buffer_size=1024),
+                                     status=N.ConnectionStatus.RECONNECTING,
+                                     write_io=transport)
+    first = TestHelpers.bytes("PUB foo 3\r\none\r\n")
+    second = TestHelpers.bytes("PUB bar 3\r\ntwo\r\n")
+    N._enqueue_pending(client, first)
+    N._enqueue_pending(client, second)
+
+    N._flush_pending_buffer(client)
+
+    @test transport.writes == [String(copy(first)) * String(copy(second))]
+    @test transport.flushes == 1
+    @test client.pending_bytes == 0
 end
 
 @testitem "pending replay failure after close does not resurrect buffer" setup=[TestHelpers] begin
@@ -674,7 +848,12 @@ end
         startswith(s, "PUB ") && throw(ErrorException("write failed"))
         ncodeunits(s)
     end
-    Base.write(t::RequestPublishFailTransport, data::Vector{UInt8}) = (push!(t.writes, String(data)); length(data))
+    function Base.write(t::RequestPublishFailTransport, data::Vector{UInt8})
+        s = String(copy(data))
+        push!(t.writes, s)
+        startswith(s, "PUB ") && throw(ErrorException("write failed"))
+        length(data)
+    end
     Base.flush(::RequestPublishFailTransport) = nothing
     Base.close(t::RequestPublishFailTransport) = (t.closed = true; nothing)
 
@@ -1294,7 +1473,7 @@ end
         client::Base.RefValue{Any}
         writes::Vector{String}
     end
-    Base.write(t::ImmediatePongTransport, data::Vector{UInt8}) = (push!(t.writes, String(data)); length(data))
+    Base.write(t::ImmediatePongTransport, data::Vector{UInt8}) = (push!(t.writes, String(copy(data))); length(data))
     Base.write(t::ImmediatePongTransport, data::String) = (push!(t.writes, data); ncodeunits(data))
     Base.flush(t::ImmediatePongTransport) = (N._notify_pong(t.client[]); nothing)
     Base.close(::ImmediatePongTransport) = nothing

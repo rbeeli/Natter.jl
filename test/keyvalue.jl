@@ -314,6 +314,30 @@ end
     @test_throws ArgumentError N._kv_watch_channel_size(0)
 end
 
+@testitem "KeyValue watchers accept callable objects" setup=[TestHelpers] begin
+    using Dates
+    using Natter
+
+    const N = Natter
+
+    mutable struct KeyValueCallable
+        updates::Vector{Any}
+    end
+    function (cb::KeyValueCallable)(update)
+        push!(cb.updates, update)
+        nothing
+    end
+
+    callback = KeyValueCallable(Any[])
+    state = N._kv_watcher_state(callback, 1, true)
+    entry = KeyValueEntry("BUCKET", "key", TestHelpers.bytes("value"), 1, DateTime(2026), 0, KeyValueOperation.PUT)
+
+    N._kv_watcher_emit!(state, entry)
+    N._kv_watcher_emit!(state, KV_WATCH_INITIAL_DONE)
+
+    @test callback.updates == Any[entry, KV_WATCH_INITIAL_DONE]
+end
+
 @testitem "KeyValue entries expose typed metadata" setup=[TestHelpers] begin
     using Natter
     using Dates

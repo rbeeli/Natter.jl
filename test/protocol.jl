@@ -282,4 +282,18 @@ end
     token_cmd = N._connect_command(token_client, N.ServerInfo(), "secret", nothing)
     token_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", token_cmd).captures))
     @test token_body.auth_token == "secret"
+
+    userpass_cmd = N._connect_command(client, N.ServerInfo(), "user", "pass")
+    userpass_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", userpass_cmd).captures))
+    @test userpass_body.user == "user"
+    @test userpass_body.pass == "pass"
+    @test !haskey(userpass_body, :auth_token)
+
+    option_token_client = TestHelpers.fake_client(; opts=N.ConnectOptions(token="secret"))
+    @test_throws ArgumentError N._connect_command(option_token_client, N.ServerInfo(), "user", "pass")
+    @test_throws ArgumentError N._connect_command(option_token_client, N.ServerInfo(), "url-token", nothing)
+
+    option_userpass_client = TestHelpers.fake_client(; opts=N.ConnectOptions(user="user", password="pass"))
+    @test_throws ArgumentError N._connect_command(option_userpass_client, N.ServerInfo(), "secret", nothing)
+    @test_throws ArgumentError N._connect_command(option_userpass_client, N.ServerInfo(), "url-user", "url-pass")
 end

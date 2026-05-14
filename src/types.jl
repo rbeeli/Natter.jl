@@ -170,9 +170,9 @@ _bytes_to_string(bytes::AbstractVector{UInt8})::String = String(copy(bytes))
 
 Base.String(msg::Msg) = _bytes_to_string(msg.data)
 
-function _connect_option_servers(servers)::Vector{String}
-    servers isa AbstractVector || throw(ArgumentError("servers must be a vector of strings"))
-    result = String.(servers)
+function _connect_option_servers(servers)
+    servers isa Union{AbstractVector,Tuple} || throw(ArgumentError("servers must be a vector or tuple of strings"))
+    result = Tuple(String.(servers))
     isempty(result) && throw(ArgumentError("at least one server URL is required"))
     any(isempty, result) && throw(ArgumentError("server URL cannot be empty"))
     result
@@ -227,8 +227,21 @@ function _connect_option_reconnect_attempts(value)::Int
     result
 end
 
-mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
-    servers::Vector{String}
+function _validate_connect_option_security(token, user, password, tls_cert_path, tls_key_path)
+    if isnothing(tls_cert_path) != isnothing(tls_key_path)
+        throw(ArgumentError("tls_cert_path and tls_key_path must be provided together"))
+    end
+    if !isnothing(token) && (!isnothing(user) || !isnothing(password))
+        throw(ArgumentError("token authentication cannot be combined with user/password authentication"))
+    end
+    if isnothing(user) != isnothing(password)
+        throw(ArgumentError("user and password must be provided together"))
+    end
+    nothing
+end
+
+struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
+    servers::Servers
     name::Union{String,Nothing}
     verbose::Bool
     pedantic::Bool
@@ -267,7 +280,7 @@ mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCall
     closed_cb::ClosedCallback
     discovered_server_cb::DiscoveredServerCallback
 
-    function ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}(
+    function ConnectOptions(
         servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
         tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
@@ -276,8 +289,9 @@ mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCall
         sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, inbox_prefix,
         error_cb, disconnected_cb, reconnected_cb, closed_cb,
         discovered_server_cb,
-    ) where {ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
+    )
         servers = _connect_option_servers(servers)
+        _validate_connect_option_security(token, user, password, tls_cert_path, tls_key_path)
         connect_timeout = _connect_option_positive_float("connect_timeout", connect_timeout)
         ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
         max_outstanding_pings = _connect_option_positive_int("max_outstanding_pings", max_outstanding_pings)
@@ -298,7 +312,8 @@ mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCall
         sub_pending_bytes_limit = _connect_option_positive_int("sub_pending_bytes_limit", sub_pending_bytes_limit)
         drain_timeout = _connect_option_positive_float("drain_timeout", drain_timeout)
 
-        new{ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}(
+        new{typeof(servers),typeof(error_cb),typeof(disconnected_cb),typeof(reconnected_cb),typeof(closed_cb),
+            typeof(discovered_server_cb)}(
             servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
             tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
@@ -310,27 +325,7 @@ mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCall
     end
 end
 
-function ConnectOptions(servers, name, verbose, pedantic, token, user, password, no_echo, tls_required,
-                        tls_first, tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout,
-                        ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
-                        reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
-                        write_buffer_size, write_buffer_latency, max_control_line, max_inbound_payload,
-                        max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
-                        sub_pending_bytes_limit, drain_timeout, inbox_prefix, error_cb,
-                        disconnected_cb, reconnected_cb, closed_cb, discovered_server_cb)
-    ConnectOptions{typeof(error_cb),typeof(disconnected_cb),typeof(reconnected_cb),typeof(closed_cb),
-                   typeof(discovered_server_cb)}(
-        servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
-        tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
-        max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
-        max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency,
-        max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
-        sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, inbox_prefix,
-        error_cb, disconnected_cb, reconnected_cb, closed_cb,
-        discovered_server_cb)
-end
-
-function ConnectOptions(; servers=[DEFAULT_URL], name=nothing, verbose=false, pedantic=false,
+function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, pedantic=false,
                         token=nothing, user=nothing, password=nothing, no_echo=false,
                         tls_required=false, tls_first=nothing, tls_verify=true,
                         tls_ca_path=nothing, tls_cert_path=nothing, tls_key_path=nothing,
@@ -578,17 +573,37 @@ function _prepend_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8})
     buffer
 end
 
-function _popfirst_pending_chunk!(buffer::PendingBuffer)::Union{Vector{UInt8},Nothing}
-    isempty(buffer) && return nothing
-    chunk = buffer.chunks[buffer.head]
-    buffer.chunks[buffer.head] = EMPTY_BYTES
-    buffer.head += 1
+function _pop_pending_batch!(buffer::PendingBuffer, max_bytes::Int)::Vector{UInt8}
+    isempty(buffer) && return UInt8[]
+    max_bytes = max(1, max_bytes)
+    stop = buffer.head - 1
+    total = 0
+    while stop < length(buffer.chunks)
+        chunk = buffer.chunks[stop + 1]
+        if total > 0 && total + length(chunk) > max_bytes
+            break
+        end
+        stop += 1
+        total += length(chunk)
+        total >= max_bytes && break
+    end
+
+    out = Vector{UInt8}(undef, total)
+    pos = 1
+    for i in buffer.head:stop
+        chunk = buffer.chunks[i]
+        n = length(chunk)
+        copyto!(out, pos, chunk, 1, n)
+        pos += n
+        buffer.chunks[i] = EMPTY_BYTES
+    end
+    buffer.head = stop + 1
     if buffer.head > length(buffer.chunks)
         empty!(buffer)
     elseif buffer.head > 32 && buffer.head > length(buffer.chunks) ÷ 2
         _compact_pending_buffer!(buffer)
     end
-    chunk
+    out
 end
 
 function Base.take!(buffer::PendingBuffer)
@@ -643,6 +658,7 @@ _write_transport_field_type(io) = typeof(io)
 struct _NoSubscriptionControlHandler end
 mutable struct _JetStreamPushControlHandler
     idle_heartbeat::Float64
+    flow_control::Bool
     last_seen::Float64
     consumer_deleted::Bool
     flow_incoming::UInt64
@@ -651,13 +667,55 @@ mutable struct _JetStreamPushControlHandler
     flow_target::UInt64
     lock::ReentrantLock
 end
-_JetStreamPushControlHandler(idle_heartbeat::Real=0.0) =
-    _JetStreamPushControlHandler(Float64(idle_heartbeat), time(), false,
+_JetStreamPushControlHandler(idle_heartbeat::Real=0.0; flow_control::Bool=true) =
+    _JetStreamPushControlHandler(Float64(idle_heartbeat), flow_control, time(), false,
                                  UInt64(0), UInt64(0), nothing, UInt64(0),
                                  ReentrantLock())
 struct _RequestMuxControlHandler end
 
 const _SubscriptionControlHandler = Union{_NoSubscriptionControlHandler,_JetStreamPushControlHandler,_RequestMuxControlHandler}
+
+mutable struct MsgQueue{T}
+    buffer::Vector{Union{T,Nothing}}
+    head::Int
+    len::Int
+    closed::Bool
+end
+
+function MsgQueue{T}(capacity::Int) where {T}
+    capacity > 0 || throw(ArgumentError("message queue capacity must be positive"))
+    buffer = Vector{Union{T,Nothing}}(undef, capacity)
+    fill!(buffer, nothing)
+    MsgQueue{T}(buffer, 1, 0, false)
+end
+
+Base.isopen(q::MsgQueue) = !q.closed
+Base.isready(q::MsgQueue) = q.len > 0
+Base.n_avail(q::MsgQueue) = q.len
+Base.length(q::MsgQueue) = q.len
+
+function Base.close(q::MsgQueue)
+    q.closed = true
+    q
+end
+
+function Base.put!(q::MsgQueue{T}, msg::T) where {T}
+    q.closed && throw(InvalidStateException("message queue is closed", :closed))
+    q.len < length(q.buffer) || throw(InvalidStateException("message queue is full", :open))
+    idx = mod1(q.head + q.len, length(q.buffer))
+    q.buffer[idx] = msg
+    q.len += 1
+    q
+end
+
+function Base.take!(q::MsgQueue{T}) where {T}
+    q.len > 0 || throw(InvalidStateException("message queue is empty", q.closed ? :closed : :open))
+    msg = q.buffer[q.head]::T
+    q.buffer[q.head] = nothing
+    q.len -= 1
+    q.head = q.len == 0 ? 1 : mod1(q.head + 1, length(q.buffer))
+    msg
+end
 
 mutable struct Subscription{C<:AbstractNatterClient}
     client::C
@@ -665,7 +723,7 @@ mutable struct Subscription{C<:AbstractNatterClient}
     subject::String
     queue::Union{String,Nothing}
     has_callback::Bool
-    messages::Channel{Msg}
+    messages::MsgQueue{Msg}
     condition::Base.GenericCondition{ReentrantLock}
     control_handler::_SubscriptionControlHandler
     pending_msgs_limit::Int
@@ -680,7 +738,7 @@ mutable struct Subscription{C<:AbstractNatterClient}
 end
 
 function Subscription(client::C, sid::Int, subject::String, queue::Union{String,Nothing}, callback,
-                      messages::Channel{Msg}, condition::Base.GenericCondition{ReentrantLock},
+                      messages::MsgQueue{Msg}, condition::Base.GenericCondition{ReentrantLock},
                       control_handler::_SubscriptionControlHandler,
                       pending_msgs_limit::Int, pending_bytes_limit::Int, pending_bytes::Int,
                       received::Int, max_msgs::Int, closed::Bool, processor::Union{Task,Nothing},

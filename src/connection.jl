@@ -589,6 +589,29 @@ function _stop_client_tasks!(client::Client; timeout::Real=0.5)
     errors
 end
 
+function _connect_auth_fields(opts::ConnectOptions, url_user, url_pass)
+    option_has_token = !isnothing(opts.token)
+    option_has_userpass = !isnothing(opts.user) || !isnothing(opts.password)
+    url_has_token = !isnothing(url_user) && isnothing(url_pass)
+    url_has_userpass = !isnothing(url_pass)
+    has_token = option_has_token || url_has_token
+    has_userpass = option_has_userpass || url_has_userpass
+    if has_token && has_userpass
+        throw(ArgumentError("token authentication cannot be combined with user/password authentication"))
+    end
+    if (option_has_token && url_has_token) || (option_has_userpass && url_has_userpass)
+        throw(ArgumentError("authentication credentials must be provided either in options or URL userinfo, not both"))
+    end
+
+    token = !isnothing(opts.token) ? opts.token : (isnothing(url_user) || !isnothing(url_pass) ? nothing : url_user)
+    user = !isnothing(opts.user) ? opts.user : (!isnothing(url_pass) ? url_user : nothing)
+    password = !isnothing(opts.password) ? opts.password : url_pass
+    if isnothing(user) != isnothing(password)
+        throw(ArgumentError("user and password must be provided together"))
+    end
+    (token=token, user=user, password=password)
+end
+
 function _connect_command(client::Client, info::ServerInfo, url_user, url_pass)
     opts = client.options
     hdrs = info.headers === true
@@ -603,19 +626,18 @@ function _connect_command(client::Client, info::ServerInfo, url_user, url_pass)
         "echo" => !opts.no_echo,
     )
     isnothing(opts.name) || (body["name"] = opts.name)
-    token = !isnothing(opts.token) ? opts.token : (isnothing(url_user) || !isnothing(url_pass) ? nothing : url_user)
-    user = !isnothing(opts.user) ? opts.user : (!isnothing(url_pass) ? url_user : nothing)
-    pass = !isnothing(opts.password) ? opts.password : url_pass
-    isnothing(token) || (body["auth_token"] = token)
-    if !isnothing(user) && !isnothing(pass)
-        body["user"] = user
-        body["pass"] = pass
+    auth = _connect_auth_fields(opts, url_user, url_pass)
+    isnothing(auth.token) || (body["auth_token"] = auth.token)
+    if !isnothing(auth.user)
+        body["user"] = auth.user
+        body["pass"] = auth.password
     end
     "CONNECT $(JSON3.write(body))$CRLF"
 end
 
 function _connect_once!(client::Client, server::Server; mark_connected::Bool=true, generation::Union{Nothing,Int}=nothing)
     scheme, host, port, url_user, url_pass = _server_parts(server.url)
+    _connect_auth_fields(client.options, url_user, url_pass)
     deadline::Float64 = time() + client.options.connect_timeout
     sock = _connect_tcp(host, port, _remaining_timeout(deadline))
     read_io = sock
@@ -1193,15 +1215,20 @@ function _restore_pending_after_replay_failure!(client::Client, data::Vector{UIn
     nothing
 end
 
+function _pending_replay_batch_size(client::Client)::Int
+    threshold = max(0, client.options.write_buffer_size)
+    threshold > 0 ? threshold : DEFAULT_WRITE_BUFFER_SIZE
+end
+
 function _flush_pending_buffer(client::Client; generation::Union{Int,Nothing}=nothing)
     while true
-        data = nothing
+        data = UInt8[]
         replay_generation = 0
         @lock client.lock begin
             replay_generation = isnothing(generation) ? client.generation : generation
-            data = _popfirst_pending_chunk!(client.pending)
+            data = _pop_pending_batch!(client.pending, _pending_replay_batch_size(client))
         end
-        isnothing(data) && return
+        isempty(data) && return
         try
             _write_raw(client, data; force_flush=true)
             _release_pending_bytes!(client, length(data))

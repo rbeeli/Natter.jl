@@ -54,7 +54,7 @@ publish_async(client::Client, subject::AbstractString, data=nothing; kwargs...):
 subscribe_async(client::Client, subject::AbstractString; kwargs...)::NatterTask =
     _natter_async(subscribe, client, subject; kwargs...)
 
-subscribe_async(callback::Function, client::Client, subject::AbstractString; kwargs...)::NatterTask =
+subscribe_async(callback, client::Client, subject::AbstractString; kwargs...)::NatterTask =
     _natter_async(subscribe, callback, client, subject; kwargs...)
 
 unsubscribe_async(sub::Subscription; kwargs...)::NatterTask =
@@ -207,7 +207,7 @@ kv_keys_async(kv::KeyValue; kwargs...)::NatterTask =
 kv_watch_async(kv::KeyValue; kwargs...)::NatterTask =
     _natter_async(kv_watch, kv; kwargs...)
 
-kv_watch_async(callback::Function, kv::KeyValue; kwargs...)::NatterTask =
+kv_watch_async(callback, kv::KeyValue; kwargs...)::NatterTask =
     _natter_async(kv_watch, callback, kv; kwargs...)
 
 kv_purge_deletes_async(kv::KeyValue; kwargs...)::NatterTask =

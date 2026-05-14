@@ -7,7 +7,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | Type | Purpose |
 | :--- | :--- |
 | `Client` | Active client connection with background reader, ping, and reconnect tasks. |
-| `ConnectOptions` | Keyword-backed connection configuration. |
+| `ConnectOptions` | Immutable keyword-backed connection configuration. |
 | `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
 | `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. Failed handles throw `CapturedException`; inspect `err.ex` for the original operation error. |
 | `Msg` | Core received message data with `subject`, `reply`, and byte-vector `data`; use `header(msg, key)` or `headers(msg)` for headers. |

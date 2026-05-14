@@ -30,6 +30,10 @@ Core messaging covers the NATS protocol without JetStream persistence.
 
 Durations and production limits are validated when `ConnectOptions` is built. Timeouts, keepalive intervals, pending limits, parser limits, stale waiter limits, and subscription pending limits must be positive. `reconnect_jitter`, `write_buffer_latency`, and `write_buffer_size` can be zero, and `max_reconnect_attempts` must be `-1` or non-negative.
 
+Authentication must use either `token` or a complete `user`/`password` pair. Provide credentials either in options or URL userinfo, not both.
+
+`ConnectOptions` is immutable. Connection settings are frozen when options are built and the client reads them concurrently from background tasks; create a new client to change connection behavior.
+
 Use `status(client)`, `stats(client)`, and `connected_url(client)` for runtime inspection.
 
 ## Julia Task Concurrency

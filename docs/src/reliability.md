@@ -67,6 +67,8 @@ client = connect("tls://nats.example.com:4222";
 )
 ```
 
+Client certificate authentication requires both `tls_cert_path` and `tls_key_path`.
+
 For deployments that require the server `INFO` line before upgrading to TLS, pass `tls_first=false`.
 
 ```julia

@@ -508,16 +508,6 @@ function _find_byte(bytes::AbstractVector{UInt8}, byte::UInt8, pos::Int, stop::I
     nothing
 end
 
-function _has_header_terminator(raw::AbstractVector{UInt8}, first::Int, last::Int)::Bool
-    pos = first
-    @inbounds while pos + 3 <= last
-        raw[pos] == UInt8('\r') && raw[pos + 1] == UInt8('\n') &&
-            raw[pos + 2] == UInt8('\r') && raw[pos + 3] == UInt8('\n') && return true
-        pos += 1
-    end
-    false
-end
-
 function _all_digits(bytes::AbstractVector{UInt8}, first::Int, last::Int)::Bool
     first <= last || return false
     @inbounds for pos in first:last
@@ -544,7 +534,6 @@ function _parse_headers(raw::AbstractVector{UInt8})
     isempty(raw) && return h
     raw_first = firstindex(raw)
     raw_last = lastindex(raw)
-    _has_header_terminator(raw, raw_first, raw_last) || throw(ProtocolError("NATS header block missing terminator"))
 
     newline = _find_byte(raw, UInt8('\n'), raw_first, raw_last)
     isnothing(newline) && throw(ProtocolError("NATS header block missing terminator"))
@@ -575,7 +564,7 @@ function _parse_headers(raw::AbstractVector{UInt8})
         push!(get!(h, key, String[]), value)
         pos = newline + 1
     end
-    h
+    throw(ProtocolError("NATS header block missing terminator"))
 end
 
 function _status_header(msg::AbstractMsg)
@@ -753,6 +742,57 @@ function _pub_cmd(frame::PublishFrame)::Vector{UInt8}
     out
 end
 
+function _pub_prefix_size(frame::PublishFrame)::Int
+    subject_len = ncodeunits(frame.subject)
+    reply_len = isnothing(frame.reply) ? 0 : ncodeunits(frame.reply)
+    if isempty(frame.headers)
+        return 4 + subject_len + 1 + reply_len + (isnothing(frame.reply) ? 0 : 1) +
+               _decimal_digits(length(frame.payload)) + 2
+    end
+    headers_len = length(frame.headers)
+    total = headers_len + length(frame.payload)
+    5 + subject_len + 1 + reply_len + (isnothing(frame.reply) ? 0 : 1) +
+    _decimal_digits(headers_len) + 1 + _decimal_digits(total) + 2
+end
+
+function _pub_prefix(frame::PublishFrame)::Vector{UInt8}
+    out = Vector{UInt8}(undef, _pub_prefix_size(frame))
+    pos = 1
+    if isempty(frame.headers)
+        pos = _copy_codeunits!(out, pos, "PUB ")
+        pos = _copy_codeunits!(out, pos, frame.subject)
+        pos = _copy_byte!(out, pos, UInt8(' '))
+        if !isnothing(frame.reply)
+            pos = _copy_codeunits!(out, pos, frame.reply)
+            pos = _copy_byte!(out, pos, UInt8(' '))
+        end
+        pos = _copy_decimal!(out, pos, length(frame.payload))
+    else
+        total = _pub_payload_size(frame)
+        pos = _copy_codeunits!(out, pos, "HPUB ")
+        pos = _copy_codeunits!(out, pos, frame.subject)
+        pos = _copy_byte!(out, pos, UInt8(' '))
+        if !isnothing(frame.reply)
+            pos = _copy_codeunits!(out, pos, frame.reply)
+            pos = _copy_byte!(out, pos, UInt8(' '))
+        end
+        pos = _copy_decimal!(out, pos, length(frame.headers))
+        pos = _copy_byte!(out, pos, UInt8(' '))
+        pos = _copy_decimal!(out, pos, total)
+    end
+    pos = _copy_bytes!(out, pos, CRLF_BYTES)
+    pos == length(out) + 1 || throw(AssertionError("publish prefix size mismatch"))
+    out
+end
+
+function _write_pub_frame_direct(io, frame::PublishFrame)
+    write(io, _pub_prefix(frame))
+    isempty(frame.headers) || write(io, frame.headers)
+    write(io, frame.payload)
+    write(io, CRLF)
+    nothing
+end
+
 function _write_pub_frame(io, frame::PublishFrame)
     if isempty(frame.headers)
         write(io, "PUB ")
@@ -763,7 +803,7 @@ function _write_pub_frame(io, frame::PublishFrame)
             write(io, UInt8(' '))
         end
         _write_decimal(io, length(frame.payload))
-        write(io, CRLF_BYTES)
+        write(io, CRLF)
         write(io, frame.payload)
     else
         write(io, "HPUB ")
@@ -776,11 +816,11 @@ function _write_pub_frame(io, frame::PublishFrame)
         _write_decimal(io, length(frame.headers))
         write(io, UInt8(' '))
         _write_decimal(io, _pub_payload_size(frame))
-        write(io, CRLF_BYTES)
+        write(io, CRLF)
         write(io, frame.headers)
         write(io, frame.payload)
     end
-    write(io, CRLF_BYTES)
+    write(io, CRLF)
     nothing
 end
 
@@ -846,7 +886,7 @@ end
 
 _validate_publish_subject(subject::AbstractString) = _validate_subject(subject; allow_wildcards=false)
 
-function _validate_queue(queue::Union{String,Nothing})
+function _validate_queue(queue::Union{AbstractString,Nothing})
     isnothing(queue) && return nothing
     q = String(queue)
     isempty(q) && throw(ArgumentError("queue cannot be empty"))

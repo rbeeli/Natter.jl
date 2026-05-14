@@ -46,7 +46,7 @@ _should_write_publish_direct(frame_size::Int, threshold::Int)::Bool =
 
 function _write_publish_frame(client::Client, io::IO, frame::PublishFrame; replayable::Bool=false,
                               threshold::Int=0, frame_size::Int=_serialized_size(frame))
-    _write_pub_frame(io, frame)
+    _write_pub_frame_direct(io, frame)
     false
 end
 
@@ -56,7 +56,7 @@ function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::Publis
     if _should_write_publish_direct(frame_size, threshold)
         _flush_write_io(client, io)
         transport = _underlying_transport(io)
-        _write_pub_frame(transport, frame)
+        _write_pub_frame_direct(transport, frame)
         flush(transport)
         return false
     end
@@ -127,12 +127,14 @@ function _ensure_connected_for_request(client::Client)
 end
 
 function _send_publish(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true,
+                       force_flush::Bool=false,
                        frame_size::Int=_serialized_size(frame))
     st = status(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         replayable_captured = false
         try
-            replayable_captured = _write_publish(client, frame; replayable=buffer_on_reconnect, frame_size)
+            replayable_captured = _write_publish(client, frame; force_flush,
+                                                 replayable=buffer_on_reconnect, frame_size)
         catch err
             err isa OutboundBufferLimitError && rethrow()
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
@@ -249,9 +251,9 @@ function _enqueue_pending(client::Client, data)
     end
 end
 
-function _prepare_publish_frame(subject::AbstractString, data, reply::Union{String,Nothing}, headers)::PublishFrame
+function _prepare_publish_frame(subject::AbstractString, data, reply::Union{AbstractString,Nothing}, headers)::PublishFrame
     subject = _validate_publish_subject(subject)
-    !isnothing(reply) && _validate_publish_subject(reply)
+    reply = isnothing(reply) ? nothing : _validate_publish_subject(reply)
     payload = _payload_bytes(data)
     hdr = isnothing(headers) ? EMPTY_BYTES : _headers_bytes(_headers_from_input(headers))
     PublishFrame(subject, reply, payload, hdr)
@@ -267,7 +269,8 @@ function _validate_publish_frame_for_client(client::Client, frame::PublishFrame)
     nothing
 end
 
-function _publish_prepared(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true)
+function _publish_prepared(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true,
+                           force_flush::Bool=false)
     frame_size = _serialized_size(frame)
     total = _pub_payload_size(frame)
     st, max_payload, headers_supported = @lock client.lock begin
@@ -276,30 +279,33 @@ function _publish_prepared(client::Client, frame::PublishFrame; buffer_on_reconn
     _ensure_usable_status_for_publish(st)
     !isempty(frame.headers) && !headers_supported && throw(UnsupportedFeatureError("headers are not supported by the connected server"))
     total > max_payload && throw(MaxPayloadError(max_payload, total))
-    _send_publish(client, frame; buffer_on_reconnect, frame_size)
+    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size)
     _record_out!(client, length(frame.payload))
     nothing
 end
 
-function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{String,Nothing}=nothing,
-                  headers=nothing, buffer_on_reconnect::Bool=true)
-    _publish_prepared(client, _prepare_publish_frame(subject, data, reply, headers); buffer_on_reconnect)
+function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
+                  headers=nothing, buffer_on_reconnect::Bool=true, force_flush::Bool=false)
+    _publish_prepared(client, _prepare_publish_frame(subject, data, reply, headers);
+                      buffer_on_reconnect, force_flush)
 end
 
-function _publish_frame_unchecked(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true)
+function _publish_frame_unchecked(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true,
+                                  force_flush::Bool=false)
     frame_size = _serialized_size(frame)
     _ensure_usable_for_publish(client)
-    _send_publish(client, frame; buffer_on_reconnect, frame_size)
+    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size)
     _record_out!(client, length(frame.payload))
     nothing
 end
 
 function _publish_unchecked(client::Client, subject::String, payload::AbstractVector{UInt8};
-                            buffer_on_reconnect::Bool=true)
-    _publish_frame_unchecked(client, PublishFrame(subject, nothing, payload, EMPTY_BYTES); buffer_on_reconnect)
+                            buffer_on_reconnect::Bool=true, force_flush::Bool=false)
+    _publish_frame_unchecked(client, PublishFrame(subject, nothing, payload, EMPTY_BYTES);
+                             buffer_on_reconnect, force_flush)
 end
 
-function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{String,Nothing}=nothing, headers=nothing)
+function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing, headers=nothing)
     _publish(client, subject, data; reply, headers)
 end
 
@@ -310,7 +316,7 @@ function _validate_subscription_limits(max_msgs::Int, pending_msgs_limit::Int, p
     nothing
 end
 
-function _subscribe(client::Client, subject::AbstractString; queue::Union{String,Nothing}=nothing, callback::Union{Function,Nothing}=nothing,
+function _subscribe(client::Client, subject::AbstractString; queue::Union{AbstractString,Nothing}=nothing, callback=nothing,
                     max_msgs::Int=0, pending_msgs_limit::Int=client.options.sub_pending_msgs_limit,
                     pending_bytes_limit::Int=client.options.sub_pending_bytes_limit,
                     _control_handler::_SubscriptionControlHandler=_NoSubscriptionControlHandler(),
@@ -327,7 +333,7 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{String
         st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
         client.sid += 1
         sid = client.sid
-        ch = Channel{Msg}(pending_msgs_limit)
+        ch = MsgQueue{Msg}(pending_msgs_limit)
         condition = Base.Threads.Condition(client.lock)
         sub = Subscription(client, sid, subject, queue, callback, ch, condition, _control_handler, pending_msgs_limit, pending_bytes_limit, 0, 0, max_msgs, false, nothing, false, 0)
         client.subscriptions[sid] = sub
@@ -357,28 +363,24 @@ function subscribe(client::Client, subject::AbstractString; kwargs...)
     _subscribe(client, subject; kwargs...)
 end
 
-function subscribe(callback::Function, client::Client, subject::AbstractString; kwargs...)
+function subscribe(callback, client::Client, subject::AbstractString; kwargs...)
     subscribe(client, subject; callback, kwargs...)
 end
 
 function _subscription_processor(sub::Subscription, callback::Callback) where {Callback}
     while true
-        keep_running = @lock sub.client.lock !sub.closed
-        (keep_running || isready(sub.messages)) || return
-        msg = nothing
-        try
+        msg, control_handler = @lock sub.client.lock begin
+            while !isready(sub.messages) && !sub.closed
+                wait(sub.condition)
+            end
+            !isready(sub.messages) && return nothing
             msg = take!(sub.messages)
-        catch err
-            err isa InvalidStateException && return
-            _report_error(sub.client, err)
-            continue
-        end
-        msg_bytes = _msg_pending_bytes(msg)
-        control_handler = @lock sub.client.lock begin
+            msg_bytes = _msg_pending_bytes(msg)
             sub.pending_bytes = max(0, sub.pending_bytes - msg_bytes)
             sub.processing += 1
-            sub.control_handler
+            msg, sub.control_handler
         end
+        isnothing(msg) && return
         _maybe_reply_to_subscription_flow_control!(sub, control_handler)
         try
             callback(msg)
@@ -397,16 +399,18 @@ _handle_subscription_control(::_NoSubscriptionControlHandler, _sub::Subscription
 _record_subscription_data_received!(::_SubscriptionControlHandler) = nothing
 _maybe_reply_to_subscription_flow_control!(::Subscription, ::_SubscriptionControlHandler) = nothing
 
-function _request_mux_token(prefix::String, subject::String)::Union{String,Nothing}
+function _request_mux_token(prefix::String, subject::String)::Union{SubString{String},Nothing}
     prefix_len = ncodeunits(prefix)
     subject_len = ncodeunits(subject)
     subject_len > prefix_len + 1 || return nothing
     startswith(subject, prefix) || return nothing
     codeunit(subject, prefix_len + 1) == UInt8('.') || return nothing
-    token = SubString(subject, prefix_len + 2)
-    isempty(token) && return nothing
-    occursin('.', token) && return nothing
-    String(token)
+    token_start = prefix_len + 2
+    token_start <= subject_len || return nothing
+    @inbounds for i in token_start:subject_len
+        codeunit(subject, i) == UInt8('.') && return nothing
+    end
+    SubString(subject, token_start, subject_len)
 end
 
 function _handle_subscription_control(::_RequestMuxControlHandler, sub::Subscription, msg::Msg)::Bool
@@ -482,6 +486,8 @@ function _dispatch_msg(client::Client, msg::Msg)
             client.stats.in_bytes += length(msg.data)
             sub.pending_bytes += msg_bytes
             should_close = sub.max_msgs > 0 && sub.received >= sub.max_msgs
+            put!(sub.messages, msg)
+            _notify_subscription_waiters_locked(sub)
             true
         end
     end
@@ -491,41 +497,23 @@ function _dispatch_msg(client::Client, msg::Msg)
         end
         return
     end
-    try
-        put!(sub.messages, msg)
-        @lock client.lock _notify_subscription_waiters_locked(sub)
-    catch err
-        @lock client.lock sub.pending_bytes = max(0, sub.pending_bytes - msg_bytes)
-        if err isa InvalidStateException || (@lock client.lock sub.closed)
-            _record_drop!(client)
-            return
-        end
-        rethrow()
-    end
     _record_subscription_data_received!(control_handler)
     if should_close
         _close_subscription_locally!(sub; throw_errors=false)
     end
 end
 
-function _take_subscription_channel_msg_if_ready!(sub::Subscription)::Union{Msg,Nothing}
-    lock(sub.messages)
-    try
-        isready(sub.messages) || return nothing
-        return take!(sub.messages)
-    finally
-        unlock(sub.messages)
-    end
-end
-
 function _take_subscription_msg_if_ready!(sub::Subscription)::Union{Msg,Nothing}
-    msg = _take_subscription_channel_msg_if_ready!(sub)
-    isnothing(msg) && return nothing
-    msg_bytes = _msg_pending_bytes(msg)
-    control_handler = @lock sub.client.lock begin
+    msg = nothing
+    control_handler = _NoSubscriptionControlHandler()
+    @lock sub.client.lock begin
+        isready(sub.messages) || return nothing
+        msg = take!(sub.messages)
+        msg_bytes = _msg_pending_bytes(msg)
         sub.pending_bytes = max(0, sub.pending_bytes - msg_bytes)
-        sub.control_handler
+        control_handler = sub.control_handler
     end
+    isnothing(msg) && return nothing
     _maybe_reply_to_subscription_flow_control!(sub, control_handler)
     _notify_subscription_waiters!(sub; all=true)
     msg
@@ -781,7 +769,7 @@ function close(client::Client; throw_errors::Bool=false)
     nothing
 end
 
-function new_inbox(client::Client; prefix::String=client.options.inbox_prefix)
+function new_inbox(client::Client; prefix::AbstractString=client.options.inbox_prefix)
     suffix = @lock client.lock randstring(client.rng, NUID_ALPHABET, 22)
     "$prefix.$suffix"
 end
@@ -896,7 +884,7 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     try
         _validate_publish_subject(reply)
         frame = PublishFrame(request_frame.subject, reply, request_frame.payload, request_frame.headers)
-        _publish_prepared(client, frame; buffer_on_reconnect=false)
+        _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true)
         return _wait_request_reply(waiter, timeout)
     finally
         _remove_request_waiter!(client, mux, token, waiter)

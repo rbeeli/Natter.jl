@@ -45,7 +45,7 @@ const _KeyValueWatchUpdate = Union{KeyValueEntry,KeyValueWatchInitialDone}
 
 mutable struct _KeyValueWatcherState
     updates::Union{Channel{_KeyValueWatchUpdate},Nothing}
-    callback::Union{Function,Nothing}
+    callback
     notify_initial_done::Bool
     lock::ReentrantLock
     closed::Bool
@@ -170,7 +170,7 @@ function _kv_entry_from_consumer_msg(kv::KeyValue, msg::AbstractMsg)::KeyValueEn
     _kv_entry(kv, msg, meta.stream_sequence, _kv_created_from_timestamp_ns(meta.timestamp_ns), meta.pending)
 end
 
-function _kv_watcher_state(callback::Union{Function,Nothing}, channel_size::Integer,
+function _kv_watcher_state(callback, channel_size::Integer,
                            notify_initial_done::Bool)
     updates = isnothing(callback) ? Channel{_KeyValueWatchUpdate}(Int(channel_size)) : nothing
     _KeyValueWatcherState(updates, callback, notify_initial_done, ReentrantLock(), false, false, -1, 0)
@@ -576,7 +576,7 @@ function _kv_watch_callback(kv::KeyValue, state::_KeyValueWatcherState, ignore_d
     end
 end
 
-function _kv_watch(callback::Union{Function,Nothing}, kv::KeyValue; key::AbstractString=">",
+function _kv_watch(callback, kv::KeyValue; key::AbstractString=">",
                    keys=nothing, history::Bool=false, updates_only::Bool=false,
                    ignore_deletes::Bool=false, meta_only::Bool=false,
                    resume_revision::Union{Integer,Nothing}=nothing,
@@ -594,7 +594,7 @@ end
 
 kv_watch(kv::KeyValue; kwargs...) = _kv_watch(nothing, kv; kwargs...)
 
-function kv_watch(callback::Function, kv::KeyValue; kwargs...)
+function kv_watch(callback, kv::KeyValue; kwargs...)
     _kv_watch(callback, kv; kwargs...)
 end
 

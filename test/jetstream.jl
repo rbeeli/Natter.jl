@@ -308,7 +308,7 @@ end
         "orders.created",
         "payload";
         timeout=0.001,
-        stream="ORDERS",
+        stream=SubString("ORDERS.extra", 1, 6),
         msg_id="msg-1",
         expected_last_sequence=10,
         expected_last_subject_sequence=3,
@@ -580,6 +580,46 @@ end
     @test N._push_callback_auto_ack(false, callback, Dict{String,Any}())
 end
 
+@testitem "JetStream APIs accept abstract strings and callable objects" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct JetStreamCallable
+        subjects::Vector{String}
+    end
+    function (cb::JetStreamCallable)(msg::JetStreamMsg)
+        push!(cb.subjects, msg.subject)
+        nothing
+    end
+
+    stream = SubString("ORDERS.extra", 1, 6)
+    durable = SubString("worker.extra", 1, 6)
+    queue = SubString("workers.extra", 1, 7)
+    callback = JetStreamCallable(String[])
+    client = TestHelpers.fake_client()
+    js = jetstream(client; prefix=SubString("\$JS.API.extra", 1, 7))
+    @test js.prefix == "\$JS.API"
+
+    wrapped = N._jetstream_push_callback(js, callback, false)
+    wrapped(Msg("orders.created", "\$JS.ACK.ORDERS.worker.1.1.1.0.0", TestHelpers.bytes("work")))
+    @test callback.subjects == ["orders.created"]
+
+    @test_throws ConnectionClosedError pull_subscribe(js, "orders.created"; stream, durable)
+    @test_throws ArgumentError push_subscribe(
+        js,
+        "orders.created";
+        stream,
+        durable,
+        queue,
+        callback,
+        config=ConsumerConfig(flow_control=true, idle_heartbeat=0.1),
+    )
+
+    req = N._stream_message_get_request(nothing, SubString("orders.created.extra", 1, 14), false)
+    @test req["last_by_subj"] == "orders.created"
+end
+
 @testitem "JetStream in-progress ack is allowed only before terminal ack" setup=[TestHelpers] begin
     using Natter
 
@@ -595,17 +635,17 @@ end
     progress_msg, progress_capture = fresh_msg()
     in_progress(progress_msg)
     in_progress(progress_msg)
-    @test !progress_msg._acked
+    @test !N._acknowledged(progress_msg)
     @test TestHelpers.capture_text(progress_capture) ==
           "PUB ACK.REPLY 4\r\n+WPI\r\nPUB ACK.REPLY 4\r\n+WPI\r\n"
 
     for terminal_ack in (ack, msg -> nak(msg), term)
         terminal_msg, terminal_capture = fresh_msg()
         in_progress(terminal_msg)
-        @test !terminal_msg._acked
+        @test !N._acknowledged(terminal_msg)
 
         terminal_ack(terminal_msg)
-        @test terminal_msg._acked
+        @test N._acknowledged(terminal_msg)
         written = TestHelpers.capture_text(terminal_capture)
 
         @test_throws JetStreamError in_progress(terminal_msg)
@@ -630,13 +670,13 @@ end
     for delay in (-0.001, Inf, -Inf, NaN, true, "1")
         msg, capture = fresh_msg()
         @test_throws ArgumentError nak(msg; delay)
-        @test !msg._acked
+        @test !N._acknowledged(msg)
         @test TestHelpers.capture_text(capture) == ""
     end
 
     msg, capture = fresh_msg()
     nak(msg; delay=0)
-    @test msg._acked
+    @test N._acknowledged(msg)
     @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 16\r\n-NAK {\"delay\":0}\r\n"
 end
 
@@ -695,7 +735,7 @@ end
 
     @test count(isnothing, results) == 1
     @test count(err -> err isa JetStreamError, results) == 1
-    @test msg._acked
+    @test N._acknowledged(msg)
     @test TestHelpers.capture_text(capture.capture) == "PUB ACK.REPLY 0\r\n\r\n"
 end
 
