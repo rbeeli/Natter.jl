@@ -7,11 +7,12 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | Type | Purpose |
 | :--- | :--- |
 | `Client` | Active client connection with background reader, ping, and reconnect tasks. |
-| `ConnectOptions` | Immutable keyword-backed connection configuration, including connection, reconnect, buffering, write timeout, parser, and subscription limits. |
+| `ConnectOptions` | Immutable keyword-backed connection configuration, including authentication, TLS, reconnect, buffering, write timeout, parser, subscription, and close callback limits. |
 | `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
-| `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. Failed handles throw `CapturedException`; inspect `err.ex` for the original operation error. |
+| `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. Failed handles throw the same operation error that the synchronous API would throw. |
 | `Msg` | Core received message data with `subject`, `reply`, and byte-vector `data`; use `header(msg, key)` or `headers(msg)` for headers. |
 | `Headers` | Case-insensitive dictionary of header names to `Vector{String}` values; publish and request APIs also accept dictionaries with string or vector values and pair iterators. Outbound header names must be valid NATS/HTTP token field names. Mixed-case duplicates are merged under one entry, with the first inserted field spelling used for iteration and serialization. |
+| `PublishFrame` | Validated, immutable prepared core publish frame. Use `prepare_publish` when the same subject, reply, headers, and payload are published repeatedly on a hot path. |
 | `Subscription` | Core subscription handle. |
 | `Stats` | Snapshot of message, byte, reconnect, error, and drop counters. |
 
@@ -21,6 +22,8 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | :--- | :--- |
 | `connect(url_or_urls=nothing; kwargs...)` | Connect to one or more servers. |
 | `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | Publish a core message; header publishes require server INFO header support. Reconnect replay is best-effort and can duplicate retained frames after ambiguous transport failures. |
+| `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | Validate and serialize publish metadata once, returning a `PublishFrame` for repeated `publish(client, frame)` calls. |
+| `publish(client, frame::PublishFrame)` | Publish a prepared frame without repeating subject, reply, payload, or header serialization work. Server capability and size checks still run against the active client. |
 | `subscribe(client, subject; queue=nothing, callback=nothing, max_msgs=0, ...)` | Create a core subscription; positive `max_msgs` closes after that many total messages. Per-subscription pending limits must be positive. |
 | `next(sub; timeout=1.0)` | Wait for the next message from a non-callback subscription. |
 | `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | Send a request and wait for one response; request headers require server INFO header support. |
@@ -29,7 +32,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `unsubscribe(sub; max_msgs=0)` | Unsubscribe immediately or after `max_msgs` additional messages. `max_msgs` must be non-negative. |
 | `drain(sub; timeout=...)` | Unsubscribe and wait for queued callback work within one deadline. |
 | `drain(client; timeout=...)` | Drain subscriptions and flush within one shared deadline, then close the client. |
-| `close(client; throw_errors=false)` | Close transports, tasks, subscriptions, and callbacks. |
+| `close(client; throw_errors=false, callback_timeout=nothing)` | Close transports, tasks, and subscriptions. Active callbacks are waited on without interruption for `callback_timeout` or `close_callback_timeout`. |
 | `new_inbox(client; prefix=...)` | Generate a reply inbox subject. |
 | `header(msg, key)` | Return the first header value by case-insensitive key lookup or `nothing`. |
 | `headers(msg)` | Return a copy of all message headers. |
@@ -43,6 +46,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | :--- | :--- |
 | `connect_async(url_or_urls=nothing; kwargs...)` | Start `connect` and return `NatterTask`. |
 | `publish_async(client, subject, data=nothing; kwargs...)` | Start core `publish` and return `NatterTask`. |
+| `publish_async(client, frame::PublishFrame)` | Start prepared-frame publish and return `NatterTask`. |
 | `subscribe_async(client, subject; kwargs...)` | Start `subscribe` and return `NatterTask`; callback-first style is supported. |
 | `next_async(sub; timeout=1.0)` | Start `next` and return `NatterTask`. |
 | `request_async(client, subject, data=nothing; kwargs...)` | Start `request` and return `NatterTask`. |
@@ -106,7 +110,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig())` | Create or bind a pull subscription without mutating existing consumers. Configs with `deliver_subject` or `deliver_group` are rejected because they describe push delivery. |
 | `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions receive `JetStreamMsg` and auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`; channel-backed subscriptions use `next(psub)` for `JetStreamMsg` delivery. |
 | `fetch(psub, batch=1; timeout=..., expires=<shorter than timeout>, heartbeat=nothing)` | Fetch a batch of `JetStreamMsg` values from a pull subscription; fetches on one subscription are serialized. Each request uses a unique reply subject and ignores stale terminal statuses from older requests. The default server expiration is shorter than the local timeout; explicit `expires` values must also be shorter than `timeout`. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive, and callers should retry after reconnect. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
-| `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for `JetStreamMsg` values. |
+| `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for `JetStreamMsg` values. Terminal acks are not queued during reconnect and remain retryable if the send fails. |
 | `metadata(msg)` | Parse JetStream delivery metadata. |
 
 ## JetStream Task Handle Helpers

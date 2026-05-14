@@ -1455,7 +1455,8 @@ function close(psub::PushSubscription)
     catch err
         push!(errors, err)
     end
-    _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task)
+    _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task;
+                interrupt=true)
     handler = psub.control_handler
     server_deleted = !isnothing(handler) && handler.consumer_deleted[]
     if psub.delete_on_close && !server_deleted
@@ -1627,21 +1628,21 @@ function _parse_msg_metadata(reply::String)::_ParsedMsgMetadata
 end
 
 function _parse_msg_metadata(msg::Msg)::_ParsedMsgMetadata
-    reply = msg.reply
-    isnothing(reply) && _ack_metadata_error()
-    _parse_msg_metadata(reply::String)
+    reply = getfield(msg, :reply)
+    reply === nothing && _ack_metadata_error()
+    _parse_msg_metadata(reply)
 end
 
 function _parse_msg_metadata(msg::JetStreamMsg)::_ParsedMsgMetadata
-    reply = msg.reply
-    isnothing(reply) && _ack_metadata_error()
-    _parse_msg_metadata(reply::String)
+    reply = getfield(msg, :reply)
+    reply === nothing && _ack_metadata_error()
+    _parse_msg_metadata(reply)
 end
 
 function _parse_msg_metadata(msg::AbstractMsg)::_ParsedMsgMetadata
     reply = msg.reply
-    isnothing(reply) && _ack_metadata_error()
-    _parse_msg_metadata(reply::String)
+    reply === nothing && _ack_metadata_error()
+    _parse_msg_metadata(reply)
 end
 
 function metadata(msg::AbstractMsg)
@@ -1731,7 +1732,9 @@ function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing)::Nothing
     _begin_ack!(msg)
     succeeded = false
     try
-        _publish_unchecked(msg._client, reply, payload)
+        _publish_unchecked(msg._client, reply, payload;
+                           buffer_on_reconnect=!terminal,
+                           force_flush=terminal)
         succeeded = true
     finally
         _finish_ack!(msg, terminal, succeeded)

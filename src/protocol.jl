@@ -20,6 +20,8 @@ function _server_info(bytes_or_string)::ServerInfo
             info.version = String(value)
         elseif key == "headers" && !isnothing(value)
             info.headers = Bool(value)
+        elseif key == "nonce" && !isnothing(value)
+            info.nonce = String(value)
         elseif key == "ldm" && !isnothing(value)
             info.ldm = Bool(value)
         end
@@ -125,7 +127,15 @@ function _read_some!(io::IOStream, scratch::Vector{UInt8})::Int
 end
 
 function _read_some!(io::MbedTLS.SSLContext, scratch::Vector{UInt8})::Int
-    readbytes!(io, scratch, length(scratch); all=false)
+    n = readbytes!(io, scratch, 1; all=true)
+    n == 0 && return 0
+
+    pending = min(bytesavailable(io), length(scratch) - n)
+    if pending > 0
+        GC.@preserve scratch unsafe_read(io, pointer(scratch, n + 1), UInt(pending))
+        n += pending
+    end
+    n
 end
 
 function _read_some!(io::Base.LibuvStream, scratch::Vector{UInt8})::Int
@@ -654,6 +664,68 @@ function _lazy_status_description(headers::LazyHeaders)
     description_start <= line_last ? _bytes_string(raw, description_start, line_last) : ""
 end
 
+function _ascii_equal_foldcase(a::AbstractString, b::AbstractString)::Bool
+    ncodeunits(a) == ncodeunits(b) || return false
+    @inbounds for i in 1:ncodeunits(a)
+        _ascii_lower(codeunit(a, i)) == _ascii_lower(codeunit(b, i)) || return false
+    end
+    true
+end
+
+function _header_key_matches(raw::AbstractVector{UInt8}, first::Int, last::Int, key::String)::Bool
+    last - first + 1 == ncodeunits(key) || return false
+    @inbounds for i in 1:ncodeunits(key)
+        _ascii_lower(raw[first + i - 1]) == _ascii_lower(codeunit(key, i)) || return false
+    end
+    true
+end
+
+function _lazy_description_header(headers::LazyHeaders)
+    raw = headers.raw
+    line_first, line_last = _lazy_header_protocol_line(raw)
+    line_first <= line_last || return nothing
+    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || return nothing
+    pos = _skip_hspace(raw, line_first + ncodeunits("NATS/1.0"), line_last)
+    pos <= line_last || return nothing
+    status_start, status_end, pos = _next_token(raw, pos, line_last)
+    _all_digits(raw, status_start, status_end) || return nothing
+    description_start = _skip_hspace(raw, pos, line_last)
+    description_start <= line_last ? _bytes_string(raw, description_start, line_last) : nothing
+end
+
+function _lazy_header_first(headers::LazyHeaders, key::AbstractString)
+    key_string = String(key)
+    if _ascii_equal_foldcase(key_string, "Status")
+        status = _lazy_status_header(headers)
+        !isnothing(status) && return string(status)
+    elseif _ascii_equal_foldcase(key_string, "Description")
+        description = _lazy_description_header(headers)
+        !isnothing(description) && return description
+    end
+
+    raw = headers.raw
+    raw_first = firstindex(raw)
+    raw_last = lastindex(raw)
+    newline = _find_byte(raw, UInt8('\n'), raw_first, raw_last)
+    isnothing(newline) && return nothing
+    pos = newline + 1
+    while pos <= raw_last
+        newline = _find_byte(raw, UInt8('\n'), pos, raw_last)
+        isnothing(newline) && return nothing
+        line_end = newline - 1
+        line_end >= pos && raw[line_end] == UInt8('\r') && (line_end -= 1)
+        line_end < pos && return nothing
+
+        colon = _find_byte(raw, UInt8(':'), pos, line_end)
+        if !isnothing(colon) && colon > pos && _header_key_matches(raw, pos, colon - 1, key_string)
+            value_start = _skip_hspace(raw, colon + 1, line_end)
+            return value_start <= line_end ? _bytes_string(raw, value_start, line_end) : ""
+        end
+        pos = newline + 1
+    end
+    nothing
+end
+
 function _status_header(msg::AbstractMsg)
     msg.headers isa LazyHeaders && return _lazy_status_header(msg.headers)
     value = header(msg, "Status")
@@ -712,15 +784,35 @@ function _headers_bytes(headers::Headers)
     out
 end
 
-struct PublishFrame{Payload<:AbstractVector{UInt8}}
-    subject::String
-    reply::Union{String,Nothing}
-    payload::Payload
-    headers::Vector{UInt8}
+struct PublishFrame
+    _subject::String
+    _reply::Union{String,Nothing}
+    _payload::String
+    _headers::String
+
+    function PublishFrame(subject::AbstractString, reply::Union{AbstractString,Nothing},
+                          data, headers)
+        subject = _validate_publish_subject(subject)
+        reply = isnothing(reply) ? nothing : _validate_publish_subject(reply)
+        new(subject, reply, _payload_string(data), _publish_header_string(headers))
+    end
 end
 
-PublishFrame(subject::String, reply::Union{String,Nothing}, payload::AbstractVector{UInt8}, headers::Headers) =
-    PublishFrame(subject, reply, payload, _headers_bytes(headers))
+function Base.getproperty(frame::PublishFrame, name::Symbol)
+    name === :subject && return getfield(frame, :_subject)
+    name === :reply && return getfield(frame, :_reply)
+    name === :payload && return codeunits(getfield(frame, :_payload))
+    name === :headers && return codeunits(getfield(frame, :_headers))
+    getfield(frame, name)
+end
+
+Base.propertynames(::PublishFrame, private::Bool=false) =
+    private ? fieldnames(PublishFrame) : (:subject, :reply, :payload, :headers)
+
+PublishFrame(subject::AbstractString, data=nothing;
+             reply::Union{AbstractString,Nothing}=nothing,
+             headers=nothing) =
+    PublishFrame(subject, reply, data, headers)
 
 _pub_payload_size(payload::AbstractVector{UInt8}, hdr::AbstractVector{UInt8}) = length(hdr) + length(payload)
 _pub_payload_size(frame::PublishFrame) = _pub_payload_size(frame.payload, frame.headers)
@@ -925,11 +1017,11 @@ function _write_pub_frame(io, frame::PublishFrame)
     nothing
 end
 
-function _pub_cmd(subject::String, reply::Union{String,Nothing}, payload::Vector{UInt8}, headers::Headers)
+function _pub_cmd(subject::String, reply::Union{String,Nothing}, payload::AbstractVector{UInt8}, headers::Headers)
     _pub_cmd(PublishFrame(subject, reply, payload, headers))
 end
 
-function _pub_cmd(subject::String, reply::Union{String,Nothing}, payload::AbstractVector{UInt8}, hdr::Vector{UInt8})
+function _pub_cmd(subject::String, reply::Union{String,Nothing}, payload::AbstractVector{UInt8}, hdr::AbstractVector{UInt8})
     _pub_cmd(PublishFrame(subject, reply, payload, hdr))
 end
 
@@ -1000,5 +1092,25 @@ _payload_bytes(data::Vector{UInt8}) = data
 _payload_bytes(data::AbstractVector{UInt8}) = data
 _payload_bytes(data::AbstractString) = codeunits(String(data))
 _payload_bytes(data) = codeunits(JSON3.write(data))
+
+_payload_string(::Nothing) = ""
+_payload_string(data::String) = data
+_payload_string(data::AbstractString) = String(data)
+_payload_string(data::AbstractVector{UInt8}) = _bytes_to_string(data)
+_payload_string(data) = JSON3.write(data)
+
+_publish_header_string(::Nothing) = ""
+function _publish_header_string(headers::AbstractVector{UInt8})
+    isempty(headers) && return ""
+    try
+        _validate_headers(headers)
+    catch err
+        err isa ProtocolError && throw(ArgumentError(err.message))
+        rethrow()
+    end
+    _bytes_to_string(headers)
+end
+_publish_header_string(headers::Headers) = _bytes_to_string(_headers_bytes(headers))
+_publish_header_string(headers) = _publish_header_string(_headers_from_input(headers))
 
 _bytes(data) = Vector{UInt8}(_payload_bytes(data))

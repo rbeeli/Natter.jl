@@ -24,7 +24,7 @@ executes JetStream and KeyValue tests.
 | Wildcard subscriptions | Supported | `*` and terminal `>` subscriptions are validated. Publish subjects reject wildcards. |
 | MSG / HMSG parser | Supported | Streaming line/payload parser written from scratch. |
 | Request/reply | Supported | Uses a shared request inbox mux with per-request waiters. |
-| Direct public API and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code and `fetch(handle)` returns the sync result or throws `CapturedException` with the original operation error and task backtrace. |
+| Direct public API and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code and `fetch(handle)` returns the sync result or throws the same operation error that the synchronous API would throw. |
 | No responders | Supported | Advertised only when server INFO reports header support; status `503` replies become `NoRespondersError`. |
 | Flush | Supported | Implemented as a ping/pong round trip. |
 | Drain | Supported | Subscription and client drain are implemented with one overall timeout deadline and covered by unit and real-server tests. |
@@ -42,8 +42,8 @@ executes JetStream and KeyValue tests.
 |---|---:|---|
 | Token auth | Supported | URL or option. |
 | Username/password auth | Supported | URL or options. |
-| NKEY/JWT credentials | Planned | Important for secure deployments, but not in the initial implementation. |
-| `.creds` file parsing | Planned | Depends on NKEY/JWT signing support. |
+| NKEY/JWT credentials | Supported | CONNECT nonce signing is implemented for public NKEY plus callback, seed-backed NKEY auth, user JWT plus seed/callback, and user credentials. |
+| `.creds` file parsing | Supported | `credentials` and `credentials_path` extract the user JWT and NKEY seed from standard decorated credentials content. |
 | TLS first handshake | Supported | `tls://` uses TLS before INFO by default. `tls_first=true` enables it for other URLs and `tls_first=false` preserves INFO-first TLS upgrade behavior when needed. |
 | TLS certificate verification control | Supported | Verification is enabled by default. Use `tls_verify=false` to intentionally disable peer certificate verification. |
 | WebSocket custom headers | Planned | Depends on WebSocket transport. |
@@ -100,7 +100,6 @@ executes JetStream and KeyValue tests.
 ## Explicitly Missing From Initial Coverage
 
 - WebSocket transport and WebSocket custom headers.
-- NKEY, JWT, and `.creds` authentication.
 - Object Store.
 - Services/micro framework.
 - Full ordered-consumer automatic reset behavior.

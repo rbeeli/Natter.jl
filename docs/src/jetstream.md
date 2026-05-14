@@ -196,4 +196,6 @@ in_progress(msg)
 term(msg)
 ```
 
+Terminal acknowledgements (`ack`, `nak`, and `term`) are written through the active transport and are not queued for reconnect replay. If the client is reconnecting or the write fails before Natter can confirm the transport write, the call throws and the local message can be acknowledged again. `ack_sync` additionally waits for the server acknowledgement response.
+
 Use `metadata(msg)` for JetStream delivery metadata on received consumer messages.

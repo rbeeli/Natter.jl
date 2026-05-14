@@ -8,12 +8,13 @@ using MbedTLS
 using Random
 using Sockets
 using URIs
+using libsodium_jll
 
 import Base: close, fetch, flush
 
 export Client, ConnectOptions, ConnectionStatus, NatterTask
-export Msg, Headers, Subscription, Stats
-export connect, close, drain, flush, ping, publish, subscribe, unsubscribe, request, next, new_inbox
+export Msg, Headers, PublishFrame, Subscription, Stats
+export connect, close, drain, flush, ping, publish, prepare_publish, subscribe, unsubscribe, request, next, new_inbox
 export connect_async, close_async, drain_async, flush_async, ping_async, publish_async, subscribe_async, unsubscribe_async, request_async, next_async
 export header, headers, status, stats, connected_url
 export JetStreamContext, StreamInfo, ConsumerInfo, PubAck, JetStreamMsg, PullSubscription, PushSubscription
@@ -58,6 +59,7 @@ const DEFAULT_MAX_HEADER_BYTES = 64 * 1024
 
 include("errors.jl")
 include("types.jl")
+include("auth.jl")
 include("protocol.jl")
 include("connection.jl")
 include("core.jl")

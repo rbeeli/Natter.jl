@@ -9,7 +9,10 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | Option | Default | Purpose |
 | :--- | :--- | :--- |
 | `name` | `nothing` | Human-readable connection name sent to the server. |
-| `token`, `user`, `password` | `nothing` | Authentication credentials. |
+| `token`, `user`, `password` | `nothing` | Token or user/password authentication credentials. |
+| `nkey`, `nkey_seed`, `nkey_seed_path` | `nothing` | NKEY authentication. A seed can derive the public NKEY and sign the server nonce. |
+| `jwt`, `jwt_path`, `credentials`, `credentials_path` | `nothing` | User JWT and `.creds` authentication. |
+| `signature_cb` | `nothing` | Callback for custom nonce signing; return the raw 64-byte Ed25519 signature. |
 | `no_echo` | `false` | Prevent this connection from receiving its own publishes. |
 | `connect_timeout` | `2.0` | Socket and handshake timeout in seconds. |
 | `ping_interval` | `120.0` | Background keepalive interval in seconds. |
@@ -27,11 +30,14 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `max_stale_pong_waiters` | `1024` | Maximum timed-out flush waiters retained to preserve PING/PONG ordering. |
 | `sub_pending_msgs_limit` | `1024` | Default per-subscription queued message limit. |
 | `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit, including NATS header blocks. |
+| `close_callback_timeout` | `5.0` | Seconds `close(client)` waits for subscription callback tasks before reporting a cleanup timeout. User callbacks are not interrupted. |
 | `error_cb` | warning callback | Receives asynchronous callback, cleanup, and background task errors. |
 
-Durations and production limits are validated when `ConnectOptions` is built. Timeouts, keepalive intervals, pending limits, parser limits, stale waiter limits, and subscription pending limits must be positive. `reconnect_jitter`, `write_buffer_latency`, and `write_buffer_size` can be zero, and `max_reconnect_attempts` must be `-1` or non-negative.
+Durations and production limits are validated when `ConnectOptions` is built. Timeouts, keepalive intervals, pending limits, parser limits, stale waiter limits, and subscription pending limits must be positive. `reconnect_jitter`, `write_buffer_latency`, `write_buffer_size`, and `close_callback_timeout` can be zero, and `max_reconnect_attempts` must be `-1` or non-negative.
 
-Authentication must use either `token` or a complete `user`/`password` pair. Provide credentials either in options or URL userinfo, not both.
+Authentication must use one scheme: token, complete `user`/`password`, NKEY, or user JWT credentials. Provide credentials either in options or URL userinfo, not both.
+
+For NKEY auth, pass `nkey_seed` or `nkey_seed_path` to derive the public key, or pass `nkey` with `signature_cb` when signing is managed externally. For user JWT auth, pass a `.creds` file with `credentials_path`, inline `.creds` content with `credentials`, or pair `jwt`/`jwt_path` with a seed or signing callback. NKEY/JWT auth requires a server nonce, which nats-server 2.x provides.
 
 `ConnectOptions` is immutable. Connection settings are frozen when options are built and the client reads them concurrently from background tasks; create a new client to change connection behavior.
 
@@ -63,7 +69,7 @@ end
 build_response(user[], permissions[])
 ```
 
-The `_async` APIs return `NatterTask` handles for explicit handle-oriented code. They are not needed just because code runs in a task. If the operation fails, `fetch(handle)` throws a `CapturedException` whose `ex` field is the original operation error and whose displayed stack trace points at the failed task.
+The `_async` APIs return `NatterTask` handles for explicit handle-oriented code. They are not needed just because code runs in a task. If the operation fails, `fetch(handle)` throws the same operation error that the synchronous API would throw.
 
 ## Publish
 
@@ -71,11 +77,14 @@ The `_async` APIs return `NatterTask` handles for explicit handle-oriented code.
 publish(client, "events.created", "payload")
 publish(client, "events.created", UInt8[0x01, 0x02])
 publish(client, "events.created"; headers=Dict("trace-id" => "abc-123"))
+
+frame = prepare_publish("events.created", "payload")
+publish(client, frame)
 ```
 
 Payloads are converted to bytes. `String`, `Vector{UInt8}`, `AbstractVector{UInt8}`, and `nothing` are supported by the public API.
 
-`publish` validates subjects and server `max_payload`. Connected clients use a buffered write flusher for throughput; small writes are coalesced up to `write_buffer_latency` unless the buffer threshold is reached first. Transport writes and flushes are bounded by `write_timeout`; a timed-out write closes the active transport so reconnect or close can proceed. Call `flush(client)` when the application needs a server round trip confirming earlier commands were processed. Publish data retained for reconnect replay, whether queued during reconnect or still buffered on a connected transport, is bounded by `pending_size` and replayed after reconnect on a best-effort basis.
+`publish` validates subjects and server `max_payload`. Use `prepare_publish` for repeated hot-path publishes with the same subject, reply, headers, and payload; the returned `PublishFrame` is a validated immutable snapshot, and publishing it still checks the active server capability and payload limit. Connected clients use a buffered write flusher for throughput; small writes are coalesced up to `write_buffer_latency` unless the buffer threshold is reached first. Transport writes and flushes are bounded by `write_timeout`; a timed-out write closes the active transport so reconnect or close can proceed. Call `flush(client)` when the application needs a server round trip confirming earlier commands were processed. Publish data retained for reconnect replay, whether queued during reconnect or still buffered on a connected transport, is bounded by `pending_size` and replayed after reconnect on a best-effort basis.
 
 Core publish replay should be treated as at-least-once for retained frames, not exactly-once. Ambiguous transport failures can duplicate delivery, and frames at or above `write_buffer_size` are not retained after a successful direct write. Use JetStream publish message IDs or idempotent consumers when duplicate effects are unacceptable.
 
@@ -154,7 +163,7 @@ flush(client; timeout=2.0)
 drain(client; timeout=10.0)
 ```
 
-`close(client)` stops background tasks, closes subscriptions and transports, and invokes the close callback. Use `close(client; throw_errors=true)` if cleanup failures must be surfaced to the caller.
+`close(client)` stops background tasks, closes subscriptions and transports, waits up to `close_callback_timeout` for active subscription callbacks, and invokes the close callback. It does not interrupt user callback code; use `drain` first when shutdown must wait for queued callback work. Use `close(client; throw_errors=true)` if cleanup failures must be surfaced to the caller.
 
 ```julia
 close(client; throw_errors=true)

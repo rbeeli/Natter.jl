@@ -18,10 +18,10 @@ function _parse_options(url_or_urls; kwargs...)
             [DEFAULT_URL]
         elseif url_or_urls isa AbstractString
             _parse_server_urls(split(String(url_or_urls), ","; keepempty=false); drop_empty=true)
-        elseif url_or_urls isa AbstractVector
+        elseif url_or_urls isa Union{AbstractVector,Tuple}
             _parse_server_urls(url_or_urls)
         else
-            throw(ArgumentError("servers must be a string or vector of strings"))
+            throw(ArgumentError("servers must be a string, vector, or tuple of strings"))
         end
     ConnectOptions(; servers, kwargs...)
 end
@@ -79,6 +79,36 @@ function _normalize_discovered_url(raw_url::AbstractString, base_url::Union{Stri
     "$scheme://$userinfo$url"
 end
 
+function _host_is_ip(host::AbstractString)::Bool
+    value = String(host)
+    if startswith(value, "[") && endswith(value, "]")
+        value = value[2:end-1]
+    end
+
+    if occursin(':', value)
+        try
+            Sockets.IPv6(value)
+            return true
+        catch
+            return false
+        end
+    end
+
+    if occursin('.', value)
+        parts = split(value, '.')
+        length(parts) == 4 || return false
+        for part in parts
+            isempty(part) && return false
+            all(isdigit, part) || return false
+            parsed = tryparse(Int, part)
+            isnothing(parsed) && return false
+            0 <= parsed <= 255 || return false
+        end
+        return true
+    end
+    false
+end
+
 function _server_parts(url::String)
     uri = URI(_normalize_url(url))
     scheme = isempty(uri.scheme) ? "nats" : uri.scheme
@@ -90,10 +120,41 @@ function _server_parts(url::String)
     password = nothing
     if !isempty(uri.userinfo)
         pieces = split(uri.userinfo, ":"; limit=2)
-        user = String(first(pieces))
-        password = length(pieces) == 2 ? String(last(pieces)) : nothing
+        user = unescapeuri(String(first(pieces)))
+        password = length(pieces) == 2 ? unescapeuri(String(last(pieces))) : nothing
     end
     scheme, host, port, user, password
+end
+
+_tls_hostname(server::Server, host::String)::String = something(server.tls_name, host)
+
+function _current_tls_name_for_discovery(current_server::Union{Server,Nothing},
+                                         base_url::Union{String,Nothing})::Union{String,Nothing}
+    if !isnothing(current_server)
+        !isnothing(current_server.tls_name) && return current_server.tls_name
+        _, host, _, _, _ = _server_parts(current_server.url)
+        return _host_is_ip(host) ? nothing : host
+    end
+    isnothing(base_url) && return nothing
+
+    _, host, _, _, _ = _server_parts(base_url)
+    _host_is_ip(host) ? nothing : host
+end
+
+function _discovery_uses_tls(opts::ConnectOptions, info::ServerInfo,
+                             current_server::Union{Server,Nothing},
+                             base_url::Union{String,Nothing})::Bool
+    !isnothing(current_server) && !isnothing(current_server.tls_name) && return true
+    source_url = !isnothing(current_server) ? current_server.url : base_url
+    scheme = isnothing(source_url) ? "nats" : first(_server_parts(source_url))
+    scheme == "tls" || opts.tls_required || opts.tls_first === true || info.tls_required === true
+end
+
+function _discovered_tls_name(url::String, current_server::Union{Server,Nothing},
+                              base_url::Union{String,Nothing}, tls_active::Bool)::Union{String,Nothing}
+    tls_active || return nothing
+    _, host, _, _, _ = _server_parts(url)
+    _host_is_ip(host) ? _current_tls_name_for_discovery(current_server, base_url) : nothing
 end
 
 function _tls_first_for_connection(opts::ConnectOptions, scheme::AbstractString)::Bool
@@ -147,7 +208,8 @@ function _connect_tcp(host::String, port::Int, timeout::Real)
         timed_out[] = true
         @async begin
             errors = Any[]
-            _wait_task!(errors, "stop timed-out connect to $host:$port task", task; interrupt=true)
+            _wait_task!(errors, "stop timed-out connect to $host:$port task", task;
+                        interrupt=true, interrupt_first=true)
             if isready(ch)
                 late = take!(ch)
                 late isa Sockets.TCPSocket && _close_resource!(errors, "close timed-out connect socket", late)
@@ -205,14 +267,14 @@ function _record_stopped_task_error!(errors::Vector, operation::String, task::Ta
 end
 
 function _wait_task!(errors::Vector, operation::String, task::Union{Task,Nothing};
-                     timeout::Real=0.5, interrupt::Bool=false)
+                     timeout::Real=0.5, interrupt::Bool=false, interrupt_first::Bool=false)
     (isnothing(task) || istaskdone(task) || task === current_task()) && return errors
 
-    interrupted = interrupt && _request_task_stop!(errors, operation, task)
+    interrupted = interrupt && interrupt_first && _request_task_stop!(errors, operation, task)
     result = timedwait(timeout; pollint=0.005) do
         istaskdone(task)
     end
-    if result == :timed_out && !interrupt
+    if result == :timed_out && interrupt && !interrupted
         interrupted = _request_task_stop!(errors, operation, task)
         result = timedwait(min(timeout, 0.5); pollint=0.005) do
             istaskdone(task)
@@ -235,7 +297,7 @@ function _schedule_timeout_cleanup(operation::String, cleanup::Function,
         catch err
             push!(errors, CleanupError("timeout cleanup after $operation", err))
         end
-        _wait_task!(errors, "stop timed-out $operation task", task; interrupt=true)
+        _wait_task!(errors, "stop timed-out $operation task", task; interrupt=true, interrupt_first=true)
         if !isempty(errors)
             try
                 report_cleanup_errors(errors)
@@ -306,26 +368,84 @@ function _abort_timed_out_write(client::Client, io, operation::String)
     nothing
 end
 
-function _run_transport_write(f::Function, client::Client, io, operation::String)
-    timeout = client.options.write_timeout
-    timed_out = Threads.Atomic{Bool}(false)
-    done = Threads.Atomic{Bool}(false)
-    timer = Timer(timeout) do _
-        if !done[]
-            timed_out[] = true
-            _abort_timed_out_write(client, io, operation)
+function _ensure_write_watchdog_locked!(client::Client)
+    task = client.write_timeout_task
+    if isnothing(task) || istaskdone(task)
+        client.write_timeout_task = @async _write_watchdog_loop(client)
+    end
+    nothing
+end
+
+function _begin_write_timeout_locked!(client::Client, io, operation::String)::Int
+    epoch = client.write_epoch[] + 1
+    client.write_epoch[] = epoch
+    client.write_timeout_io[] = io
+    client.write_timeout_operation[] = operation
+    client.write_deadline[] = time() + client.options.write_timeout
+    _ensure_write_watchdog_locked!(client)
+    epoch
+end
+
+function _finish_write_timeout!(client::Client, epoch::Int)::Bool
+    @lock client.lock begin
+        timed_out = client.write_timed_out_epoch[] == epoch
+        if client.write_epoch[] == epoch
+            client.write_deadline[] = Inf
+            client.write_timeout_io[] = nothing
+            client.write_timeout_operation[] = ""
+        end
+        timed_out
+    end
+end
+
+function _write_watchdog_loop(client::Client)
+    while true
+        deadline = client.write_deadline[]
+        observed_epoch = client.write_epoch[]
+        if !isfinite(deadline)
+            status(client) == ConnectionStatus.CLOSED && return nothing
+            sleep(0.05)
+            continue
+        end
+
+        remaining = deadline - time()
+        if remaining > 0
+            sleep(min(remaining, 0.05))
+            continue
+        end
+
+        io = nothing
+        operation = ""
+        epoch = 0
+        @lock client.lock begin
+            if client.write_epoch[] == observed_epoch &&
+               client.write_deadline[] == deadline &&
+               isfinite(client.write_deadline[])
+                epoch = observed_epoch
+                client.write_timed_out_epoch[] = epoch
+                io = client.write_timeout_io[]
+                operation = client.write_timeout_operation[]
+            end
+        end
+        isnothing(io) || _abort_timed_out_write(client, io, operation)
+        @lock client.lock begin
+            if epoch != 0 && client.write_epoch[] == epoch
+                client.write_deadline[] = Inf
+                client.write_timeout_io[] = nothing
+                client.write_timeout_operation[] = ""
+            end
         end
     end
+end
+
+function _run_transport_write(f::Function, client::Client, io, operation::String)
+    epoch = @lock client.lock _begin_write_timeout_locked!(client, io, operation)
     try
         result = f()
-        done[] = true
-        close(timer)
-        timed_out[] && throw(_write_timeout_error(operation))
+        _finish_write_timeout!(client, epoch) && throw(_write_timeout_error(operation))
         return result
     catch err
-        done[] = true
-        close(timer)
-        timed_out[] && throw(_write_timeout_error(operation))
+        _finish_write_timeout!(client, epoch) && throw(_write_timeout_error(operation))
         rethrow()
     end
 end
@@ -603,12 +723,16 @@ end
 
 function _notify_request_waiters!(client::Client, err::Exception; clear_mux::Bool=false)
     errors = Any[]
-    @lock client.lock begin
-        mux = client.request_mux
-        if !isnothing(mux)
+    mux = @lock client.lock begin
+        mux = @atomic client.request_mux
+        clear_mux && (@atomic client.request_mux = nothing)
+        mux
+    end
+    if !isnothing(mux)
+        lock(mux.condition)
+        try
             waiters = collect(values(mux.waiters))
             empty!(mux.waiters)
-            clear_mux && (client.request_mux = nothing)
             for waiter in waiters
                 try
                     _resolve_request_waiter_locked!(waiter, err, mux.condition)
@@ -616,6 +740,9 @@ function _notify_request_waiters!(client::Client, err::Exception; clear_mux::Boo
                     push!(errors, CleanupError("notify request waiter", notify_err))
                 end
             end
+            notify(mux.condition; all=true)
+        finally
+            unlock(mux.condition)
         end
     end
     errors
@@ -623,8 +750,7 @@ end
 
 function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     subs = Subscription[]
-    request_waiters = RequestWaiter[]
-    request_condition = nothing
+    request_mux = nothing
     terminal = @lock client.lock begin
         if client.generation == generation &&
            client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.RECONNECTING, ConnectionStatus.DISCONNECTED)
@@ -639,15 +765,14 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
 
             subs = collect(values(client.subscriptions))
             empty!(client.subscriptions)
+            @atomic client.subscription_snapshot = Vector{Union{Subscription{typeof(client)},Nothing}}()
             reader = client.reader
             isnothing(reader) || empty!(reader.subject_cache)
 
-            mux = client.request_mux
+            mux = @atomic client.request_mux
             if !isnothing(mux)
-                request_waiters = collect(values(mux.waiters))
-                request_condition = mux.condition
-                empty!(mux.waiters)
-                client.request_mux = nothing
+                request_mux = mux
+                @atomic client.request_mux = nothing
             end
             true
         else
@@ -666,15 +791,22 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     _wake_flusher(client)
     errors = Any[]
     append!(errors, _notify_pong_waiters!(client, false))
-    if !isnothing(request_condition)
-        @lock client.lock begin
-        for waiter in request_waiters
-            try
-                _resolve_request_waiter_locked!(waiter, ConnectionClosedError("connection is disconnected"), request_condition)
-            catch notify_err
-                push!(errors, CleanupError("notify request waiter", notify_err))
+    if !isnothing(request_mux)
+        lock(request_mux.condition)
+        try
+            request_waiters = collect(values(request_mux.waiters))
+            empty!(request_mux.waiters)
+            for waiter in request_waiters
+                try
+                    _resolve_request_waiter_locked!(waiter, ConnectionClosedError("connection is disconnected"),
+                                                    request_mux.condition)
+                catch notify_err
+                    push!(errors, CleanupError("notify request waiter", notify_err))
+                end
             end
-        end
+            notify(request_mux.condition; all=true)
+        finally
+            unlock(request_mux.condition)
         end
     end
     for sub in subs
@@ -710,11 +842,14 @@ function _take_client_tasks!(client::Client)
             ("stop ping task", client.ping_task),
             ("stop reconnect task", client.reconnect_task),
             ("stop flusher task", client.flusher_task),
+            ("stop write watchdog task", client.write_timeout_task),
         )
         client.reader_task = nothing
         client.ping_task = nothing
         client.reconnect_task = nothing
         client.flusher_task = nothing
+        client.write_timeout_task = nothing
+        client.write_deadline[] = time()
         tasks
     end
 end
@@ -723,7 +858,7 @@ function _stop_client_tasks!(client::Client; timeout::Real=0.5)
     tasks = _take_client_tasks!(client)
     errors = Any[]
     for (operation, task) in tasks
-        _wait_task!(errors, operation, task; timeout)
+        _wait_task!(errors, operation, task; timeout, interrupt=true)
     end
     errors
 end
@@ -731,16 +866,21 @@ end
 function _connect_auth_fields(opts::ConnectOptions, url_user, url_pass)
     option_has_token = !isnothing(opts.token)
     option_has_userpass = !isnothing(opts.user) || !isnothing(opts.password)
+    option_has_nkey_jwt = _connect_option_has_nkey_jwt(opts)
+    option_has_auth = option_has_token || option_has_userpass || option_has_nkey_jwt
     url_has_token = !isnothing(url_user) && isnothing(url_pass)
     url_has_userpass = !isnothing(url_pass)
+    url_has_auth = url_has_token || url_has_userpass
     has_token = option_has_token || url_has_token
     has_userpass = option_has_userpass || url_has_userpass
     if has_token && has_userpass
         throw(ArgumentError("token authentication cannot be combined with user/password authentication"))
     end
-    if (option_has_token && url_has_token) || (option_has_userpass && url_has_userpass)
+    if option_has_auth && url_has_auth
         throw(ArgumentError("authentication credentials must be provided either in options or URL userinfo, not both"))
     end
+    !isnothing(opts.nkey) && _nkey_decode_public(opts.nkey)
+    !isnothing(opts.nkey_seed) && _validate_nkey_seed(opts.nkey_seed)
 
     token = !isnothing(opts.token) ? opts.token : (isnothing(url_user) || !isnothing(url_pass) ? nothing : url_user)
     user = !isnothing(opts.user) ? opts.user : (!isnothing(url_pass) ? url_user : nothing)
@@ -771,11 +911,16 @@ function _connect_command(client::Client, info::ServerInfo, url_user, url_pass)
         body["user"] = auth.user
         body["pass"] = auth.password
     end
+    nkey_jwt_auth = _connect_nkey_jwt_fields(opts, info)
+    isnothing(nkey_jwt_auth.jwt) || (body["jwt"] = nkey_jwt_auth.jwt)
+    isnothing(nkey_jwt_auth.nkey) || (body["nkey"] = nkey_jwt_auth.nkey)
+    isnothing(nkey_jwt_auth.sig) || (body["sig"] = nkey_jwt_auth.sig)
     "CONNECT $(JSON3.write(body))$CRLF"
 end
 
 function _connect_once!(client::Client, server::Server; mark_connected::Bool=true, generation::Union{Nothing,Int}=nothing)
     scheme, host, port, url_user, url_pass = _server_parts(server.url)
+    tls_host = _tls_hostname(server, host)
     _connect_auth_fields(client.options, url_user, url_pass)
     deadline::Float64 = time() + client.options.connect_timeout
     sock = _connect_tcp(host, port, _remaining_timeout(deadline))
@@ -788,7 +933,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
         tls_active::Bool = false
         if _tls_first_for_connection(client.options, scheme)
             tls = _run_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
-                _tls_wrap(sock, client.options, host)
+                _tls_wrap(sock, client.options, tls_host)
             end
             read_io = tls
             write_io = tls
@@ -805,7 +950,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             available = something(info.tls_available, info.tls_required === true)
             available == true || throw(ProtocolError("TLS requested but server did not advertise TLS availability"))
             tls = _run_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
-                _tls_wrap(sock, client.options, host)
+                _tls_wrap(sock, client.options, tls_host)
             end
             read_io = tls
             write_io = tls
@@ -845,6 +990,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
                     client.current_server = server
                     client.connected_url = server.url
                     client.info = info
+                    _sync_server_info_cache_locked!(client)
                     client.socket = sock
                     client.read_io = read_io
                     client.reader = reader
@@ -1039,23 +1185,32 @@ function _merge_discovered_servers!(client::Client, info::ServerInfo)
     @lock client.lock begin
         base_url = client.connected_url
         current_server = client.current_server
+        tls_active = _discovery_uses_tls(client.options, info, current_server, base_url)
         discovered_urls = Set{String}()
-        normalized_urls = String[]
+        normalized_servers = Vector{Tuple{String,Union{String,Nothing}}}()
+        discovered_tls_names = Dict{String,Union{String,Nothing}}()
         for raw in urls
             url = _normalize_discovered_url(raw, base_url)
             if !(url in discovered_urls)
+                tls_name = _discovered_tls_name(url, current_server, base_url, tls_active)
                 push!(discovered_urls, url)
-                push!(normalized_urls, url)
+                push!(normalized_servers, (url, tls_name))
+                discovered_tls_names[url] = tls_name
             end
         end
         # Configured seed servers are sticky; discovered routes track the latest INFO snapshot.
         filter!(client.servers) do server
             !server.discovered || server === current_server || server.url in discovered_urls
         end
+        for server in client.servers
+            if server.discovered && server !== current_server && haskey(discovered_tls_names, server.url)
+                server.tls_name = discovered_tls_names[server.url]
+            end
+        end
         existing = Set(s.url for s in client.servers)
-        for url in normalized_urls
+        for (url, tls_name) in normalized_servers
             if !(url in existing)
-                push!(client.servers, Server(url; discovered=true))
+                push!(client.servers, Server(url; discovered=true, tls_name))
                 push!(existing, url)
                 added = true
             end
@@ -1074,10 +1229,11 @@ function _sleep_interruptibly(client::Client, generation::Int, seconds::Real)
     deadline = time() + max(0.0, seconds)
     while time() < deadline
         _generation_matches(client, generation) || return false
-        status(client) == ConnectionStatus.CLOSED && return false
+        status(client) in (ConnectionStatus.CLOSED, ConnectionStatus.DISCONNECTED) && return false
         sleep(min(0.05, max(0.0, deadline - time())))
     end
-    _generation_matches(client, generation) && status(client) != ConnectionStatus.CLOSED
+    _generation_matches(client, generation) &&
+        !(status(client) in (ConnectionStatus.CLOSED, ConnectionStatus.DISCONNECTED))
 end
 
 function _reader_loop(client::Client, generation::Int)
@@ -1107,7 +1263,10 @@ function _reader_loop_with_reader(client::Client, generation::Int,
                 _notify_pong(client)
             elseif op == :INFO
                 info = _protocol_info(frame)
-                @lock client.lock _merge_server_info!(client.info, info)
+                @lock client.lock begin
+                    _merge_server_info!(client.info, info)
+                    _sync_server_info_cache_locked!(client)
+                end
                 _merge_discovered_servers!(client, info)
                 if info.ldm
                     _trigger_reconnect(client, ProtocolError("server entered lame duck mode"))
@@ -1252,6 +1411,10 @@ function _reconnect_loop(client::Client, generation::Int)
             servers = copy(client.servers)
             shuffle!(client.rng, servers)
             servers
+        end
+        if isempty(servers)
+            _terminal_disconnect!(client, generation, NoServersError())
+            return
         end
         for server in servers
             _generation_matches(client, generation) && status(client) == ConnectionStatus.RECONNECTING || return

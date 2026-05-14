@@ -33,6 +33,18 @@ using TestItems
     @test startswith(publish_frame, "HPUB foo ")
     @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nbar\r\n", publish_frame)
 
+    prepared_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    prepared = prepare_publish("prepared.subject", "body"; headers=Headers("Trace" => "abc"))
+    @test prepared isa PublishFrame
+    publish(prepared_client, prepared)
+    prepared_frame = String(take!(prepared_client.write_io))
+    @test startswith(prepared_frame, "HPUB prepared.subject ")
+    @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nbody\r\n", prepared_frame)
+    empty_prepared = prepare_publish("prepared.empty")
+    @test isempty(empty_prepared.payload)
+    @test_throws MethodError push!(empty_prepared.payload, 0x41)
+    @test isempty(prepare_publish("prepared.empty.again").payload)
+
     unsupported_headers = TestHelpers.fake_client(;
         status=N.ConnectionStatus.CONNECTED,
         info=N.ServerInfo(; headers=false),
@@ -57,8 +69,8 @@ using TestItems
     payload = TestHelpers.bytes("body")
     total = N._pub_payload_size(payload, N._headers_bytes(headers))
     max_payload = total - 1
-    limited = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    limited.info.max_payload = max_payload
+    limited = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+                                      info=N.ServerInfo(; headers=true, max_payload))
     try
         publish(limited, "foo", payload; headers)
         @test false
@@ -127,11 +139,14 @@ end
     const N = Natter
 
     opts = N.ConnectOptions(connect_timeout=1, ping_interval=2, max_outstanding_pings=1,
-                            reconnect_jitter=0, write_buffer_size=0, write_timeout=3)
+                            reconnect_jitter=0, write_buffer_size=0, write_timeout=3,
+                            close_callback_timeout=4)
     @test opts.connect_timeout == 1.0
     @test opts.ping_interval == 2.0
     @test opts.write_buffer_size == 0
     @test opts.write_timeout == 3.0
+    @test opts.close_callback_timeout == 4.0
+    @test N.ConnectOptions(close_callback_timeout=0).close_callback_timeout == 0.0
     @test !ismutable(opts)
     @test opts.servers isa Tuple{Vararg{String}}
     source_servers = ["nats://one.example:4222"]
@@ -144,8 +159,14 @@ end
         "nats://two.example:4223",
     )
     @test N._parse_options([" nats://one.example:4222 "]).servers == ("nats://one.example:4222",)
+    tuple_opts = N._parse_options((" nats://one.example:4222 ", "nats://two.example:4222"))
+    @test tuple_opts.servers == (
+        "nats://one.example:4222",
+        "nats://two.example:4222",
+    )
     @test_throws ArgumentError N._parse_options(" , ")
     @test_throws ArgumentError N._parse_options(["nats://one.example:4222", " "])
+    @test_throws ArgumentError N._parse_options(("nats://one.example:4222", " "))
 
     function rejects(; kwargs...)
         @test_throws ArgumentError N.ConnectOptions(; kwargs...)
@@ -170,6 +191,20 @@ end
                  token="secret", user="user", password="pass")
     rejects_with("user and password must be provided together"; user="user")
     rejects_with("user and password must be provided together"; password="pass")
+    rejects_with("JWT authentication requires a signature source"; jwt="jwt")
+    rejects_with("nkey authentication requires nkey_seed, nkey_seed_path, or signature_cb"; nkey="UABC")
+    rejects_with("JWT authentication cannot be combined with nkey authentication"; jwt="jwt", nkey="UABC",
+                 signature_cb=nonce -> fill(UInt8(0), 64))
+    rejects_with("nkey seed authentication must use either nkey_seed or nkey_seed_path, not both";
+                 nkey_seed="seed", nkey_seed_path="seed.nk")
+    rejects_with("JWT authentication must use only one of jwt, jwt_path, credentials, or credentials_path";
+                 jwt="jwt", credentials="creds")
+    rejects_with("JWT authentication must use only one signature source";
+                 credentials="creds", signature_cb=nonce -> fill(UInt8(0), 64))
+    rejects_with("signature_cb requires nkey or JWT authentication";
+                 signature_cb=nonce -> fill(UInt8(0), 64))
+    rejects_with("token authentication cannot be combined with nkey or JWT authentication";
+                 token="secret", nkey_seed="seed")
     rejects(connect_timeout=0)
     rejects(connect_timeout=Inf)
     rejects(ping_interval=0)
@@ -185,6 +220,8 @@ end
     rejects(write_buffer_size=-1)
     rejects(write_timeout=0)
     rejects(write_timeout=Inf)
+    rejects(close_callback_timeout=-1)
+    rejects(close_callback_timeout=Inf)
     rejects(max_control_line=0)
     rejects(max_inbound_payload=0)
     rejects(max_header_bytes=0)
@@ -192,6 +229,24 @@ end
     rejects(sub_pending_msgs_limit=0)
     rejects(sub_pending_bytes_limit=0)
     rejects(drain_timeout=0)
+end
+
+@testitem "server URL userinfo is percent-decoded" begin
+    using Natter
+
+    const N = Natter
+
+    @test N._server_parts("nats://u:p%40ss@example.test") ==
+        ("nats", "example.test", 4222, "u", "p@ss")
+    @test N._server_parts("nats://tok%40n@example.test") ==
+        ("nats", "example.test", 4222, "tok@n", nothing)
+    @test N._server_parts("nats://u%3Aname:p%3Aword@example.test") == (
+        "nats",
+        "example.test",
+        4222,
+        "u:name",
+        "p:word",
+    )
 end
 
 @testitem "connect rejects mixed URL and option authentication before transport IO" setup=[TestHelpers] begin
@@ -349,6 +404,29 @@ end
     finally
         close(sub)
     end
+end
+
+@testitem "subscription snapshot trims closed trailing sids" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    sub1 = subscribe(client, "events.1")
+    sub2 = subscribe(client, "events.2")
+    sub3 = subscribe(client, "events.3")
+
+    @test N._lookup_subscription(client, sub3.sid) === sub3
+    @test length(@atomic client.subscription_snapshot) == sub3.sid
+
+    close(sub3)
+    @test isnothing(N._lookup_subscription(client, sub3.sid))
+    @test length(@atomic client.subscription_snapshot) == sub2.sid
+
+    close(sub2)
+    @test length(@atomic client.subscription_snapshot) == sub1.sid
+
+    close(client)
 end
 
 @testitem "next timeout survives concurrent direct channel consumption" setup=[TestHelpers] begin
@@ -847,6 +925,20 @@ end
     @test status(closing) == N.ConnectionStatus.CLOSED
     @test closing.pending_bytes == 0
     @test isempty(take!(closing.pending))
+end
+
+@testitem "reconnect with no servers terminates" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED)
+    N._trigger_reconnect(client, ErrorException("lost"))
+
+    @test timedwait(1.0; pollint=0.01) do
+        status(client) == N.ConnectionStatus.DISCONNECTED
+    end != :timed_out
+    @test isnothing(client.reconnect_task) || istaskdone(client.reconnect_task)
 end
 
 @testitem "foreground publish write failure starts reconnect and buffers" setup=[TestHelpers] begin
@@ -1512,13 +1604,89 @@ end
     take!(started)
 
     errors = Any[]
-    N._wait_task!(errors, "stop blocked test task", task; timeout=0.2)
+    N._wait_task!(errors, "stop blocked test task", task; timeout=0.2, interrupt=true)
 
     @test timedwait(0.5; pollint=0.01) do
         isready(stopped)
     end != :timed_out
     @test istaskdone(task)
     @test isempty(errors)
+end
+
+@testitem "_wait_task! leaves blocked task running when interruption is disabled" begin
+    using Natter
+
+    const N = Natter
+
+    started = Channel{Bool}(1)
+    stopped = Channel{Bool}(1)
+    blocker = Channel{Bool}(1)
+    task = @async begin
+        put!(started, true)
+        try
+            take!(blocker)
+        finally
+            put!(stopped, true)
+        end
+    end
+    take!(started)
+
+    errors = Any[]
+    N._wait_task!(errors, "wait blocked test task", task; timeout=0.05)
+
+    @test !istaskdone(task)
+    @test !isready(stopped)
+    @test length(errors) == 1
+    @test errors[1] isa CleanupError
+    @test errors[1].cause isa TimeoutError
+
+    put!(blocker, true)
+    wait(task)
+    @test isready(stopped)
+end
+
+@testitem "client close does not interrupt subscription callbacks" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    reported = Any[]
+    opts = N.ConnectOptions(close_callback_timeout=0.05, error_cb=err -> push!(reported, err))
+    transport = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+    entered = Channel{Bool}(1)
+    release = Channel{Bool}(1)
+    stopped = Channel{Bool}(1)
+    interrupted = Ref(false)
+
+    sub = subscribe(client, "events") do _
+        put!(entered, true)
+        try
+            take!(release)
+        catch err
+            interrupted[] = err isa InterruptException
+            rethrow()
+        finally
+            put!(stopped, true)
+        end
+    end
+    N._dispatch_msg(client, Msg("events", nothing, UInt8[]; sid=sub.sid))
+    take!(entered)
+
+    close(client)
+
+    @test !interrupted[]
+    @test !istaskdone(sub.processor)
+    @test length(reported) == 1
+    @test reported[1] isa CleanupError
+    @test reported[1].cause isa TimeoutError
+
+    put!(release, true)
+    @test timedwait(1.0; pollint=0.01) do
+        istaskdone(sub.processor)
+    end != :timed_out
+    @test isready(stopped)
 end
 
 @testitem "close notifies pending flush waiters" setup=[TestHelpers] begin
@@ -1679,6 +1847,47 @@ end
     @test status(client) == N.ConnectionStatus.CLOSED
 end
 
+@testitem "client drain close respects remaining timeout budget" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct ImmediatePongTransportForCallbacks <: IO
+        client::Base.RefValue{Any}
+    end
+    Base.write(::ImmediatePongTransportForCallbacks, data::Vector{UInt8}) = length(data)
+    Base.write(::ImmediatePongTransportForCallbacks, data::String) = ncodeunits(data)
+    Base.flush(t::ImmediatePongTransportForCallbacks) = (N._notify_pong(t.client[]); nothing)
+    Base.close(::ImmediatePongTransportForCallbacks) = nothing
+
+    reported = Any[]
+    opts = N.ConnectOptions(; close_callback_timeout=5.0, error_cb=err -> push!(reported, err))
+    client_ref = Ref{Any}(nothing)
+    transport = ImmediatePongTransportForCallbacks(client_ref)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    client_ref[] = client
+
+    entered = Channel{Bool}(1)
+    release = Channel{Bool}(1)
+    sub = subscribe(client, "callback.work") do _
+        put!(entered, true)
+        take!(release)
+    end
+    N._dispatch_msg(client, N.Msg("callback.work", nothing, UInt8[]; sid=sub.sid))
+    take!(entered)
+
+    start = time()
+    err = TestHelpers.thrown_exception(() -> drain(client; timeout=0.05))
+    elapsed = time() - start
+
+    @test N._drain_timed_out(err)
+    @test elapsed < 1.0
+    @test status(client) == N.ConnectionStatus.CLOSED
+
+    put!(release, true)
+    wait(sub.processor)
+end
+
 @testitem "transport close waits for in-flight writes" setup=[TestHelpers] begin
     using Natter
 
@@ -1770,12 +1979,22 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED)
     client.connected_url = "tls://user:pass@example.test:4222"
-    push!(client.servers, N.Server(client.connected_url))
+    current = N.Server(client.connected_url)
+    push!(client.servers, current)
+    client.current_server = current
 
-    N._merge_discovered_servers!(client, N.ServerInfo(; connect_urls=["10.0.0.2:4222", "nats://plain.test:4222"]))
+    info = N.ServerInfo(; connect_urls=["10.0.0.2:4222", "nats://plain.test:4222"])
+    N._merge_discovered_servers!(client, info)
     urls = [server.url for server in client.servers]
     @test "tls://user:pass@10.0.0.2:4222" in urls
     @test "nats://plain.test:4222" in urls
+    ip_server = client.servers[findfirst(server -> server.url == "tls://user:pass@10.0.0.2:4222",
+                                         client.servers)]
+    plain_server = client.servers[findfirst(server -> server.url == "nats://plain.test:4222",
+                                            client.servers)]
+    @test ip_server.tls_name == "example.test"
+    @test N._tls_hostname(ip_server, "10.0.0.2") == "example.test"
+    @test isnothing(plain_server.tls_name)
 end
 
 @testitem "discovered server merge prunes stale routes" setup=[TestHelpers] begin

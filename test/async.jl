@@ -21,18 +21,15 @@ using TestItems
     callback_sub = fetch(subscribe_async(_ -> nothing, client, "foo.callback"))
     @test callback_sub.has_callback
     next_err = TestHelpers.thrown_exception(() -> fetch(next_async(callback_sub; timeout=0.1)))
-    @test next_err isa CapturedException
-    @test next_err.ex isa ArgumentError
+    @test next_err isa ArgumentError
     @test isnothing(fetch(close_async(callback_sub)))
 
     closed = TestHelpers.fake_client(; status=N.ConnectionStatus.DISCONNECTED)
     publish_err = TestHelpers.thrown_exception(() -> fetch(publish_async(closed, "foo", "bar")))
-    @test publish_err isa CapturedException
-    @test publish_err.ex isa ConnectionClosedError
+    @test publish_err isa ConnectionClosedError
 
     subscribe_err = TestHelpers.thrown_exception(() -> fetch(subscribe_async(closed, "foo")))
-    @test subscribe_err isa CapturedException
-    @test subscribe_err.ex isa ConnectionClosedError
+    @test subscribe_err isa ConnectionClosedError
 end
 
 @testitem "async wrappers preserve synchronous validation failures" setup=[TestHelpers] begin
@@ -45,40 +42,36 @@ end
     kv = KeyValue(js, "bucket", "KV_bucket", "\$KV.bucket.")
 
     get_err = TestHelpers.thrown_exception(() -> fetch(stream_message_get_async(js, "ORDERS"; seq=0)))
-    @test get_err isa CapturedException
-    @test get_err.ex isa ArgumentError
+    @test get_err isa ArgumentError
 
     delete_err = TestHelpers.thrown_exception(() -> fetch(stream_message_delete_async(js, "ORDERS", 0)))
-    @test delete_err isa CapturedException
-    @test delete_err.ex isa ArgumentError
+    @test delete_err isa ArgumentError
 
     ack_msg = JetStreamMsg(Msg("s", nothing, UInt8[]), client)
     ack_err = TestHelpers.thrown_exception(() -> fetch(ack_async(ack_msg)))
-    @test ack_err isa CapturedException
-    @test ack_err.ex isa JetStreamError
+    @test ack_err isa JetStreamError
 
     put_err = TestHelpers.thrown_exception(() -> fetch(kv_put_async(kv, "bad.*", "value")))
-    @test put_err isa CapturedException
-    @test put_err.ex isa ArgumentError
+    @test put_err isa ArgumentError
 end
 
-@testitem "NatterTask failures preserve task backtraces" setup=[TestHelpers] begin
+@testitem "NatterTask failures rethrow original operation errors" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
 
-    function natter_async_backtrace_marker()
-        throw(ArgumentError("async marker"))
+    mutable struct NatterAsyncMarkerError <: Exception
+        msg::String
     end
 
-    err = TestHelpers.thrown_exception(() -> fetch(N._natter_async(natter_async_backtrace_marker)))
-    @test err isa CapturedException
-    @test err.ex isa ArgumentError
-    @test err.ex.msg == "async marker"
+    marker = NatterAsyncMarkerError("async marker")
 
-    shown = sprint(showerror, err)
-    @test occursin("natter_async_backtrace_marker", shown)
-    @test !occursin("_rethrow_task_failure", shown)
+    function natter_async_marker()
+        throw(marker)
+    end
+
+    err = TestHelpers.thrown_exception(() -> fetch(N._natter_async(natter_async_marker)))
+    @test err === marker
 
     function natter_nested_async_failure()
         try
@@ -89,8 +82,6 @@ end
     end
 
     nested_err = TestHelpers.thrown_exception(() -> fetch(N._natter_async(natter_nested_async_failure)))
-    @test nested_err isa CapturedException
-    @test nested_err.ex isa ArgumentError
-    @test nested_err.ex.msg == "outer"
-    @test occursin("natter_nested_async_failure", sprint(showerror, nested_err))
+    @test nested_err isa ArgumentError
+    @test nested_err.msg == "outer"
 end

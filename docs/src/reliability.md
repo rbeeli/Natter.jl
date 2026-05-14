@@ -87,7 +87,7 @@ client = connect("tls://127.0.0.1:4222"; tls_verify=false)
 
 ## Cleanup
 
-`close(client)` reports cleanup failures through `error_cb` and returns. Use `close(client; throw_errors=true)` in tests or strict shutdown code.
+`close(client)` reports cleanup failures through `error_cb` and returns. It waits up to `close_callback_timeout` for active subscription callbacks and reports a cleanup timeout if they keep running; it does not interrupt user callback code. Use `drain` before `close` when shutdown must wait for queued callback work. Use `close(client; throw_errors=true)` in tests or strict shutdown code.
 
 ```julia
 try

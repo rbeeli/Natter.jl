@@ -17,30 +17,51 @@ Base.@kwdef mutable struct Stats
     dropped_msgs::Int = 0
 end
 
+struct AtomicCounter
+    shards::Vector{Threads.Atomic{Int}}
+end
+
+function AtomicCounter(value::Int=0)
+    shards = [Threads.Atomic{Int}(0) for _ in 1:max(1, Threads.nthreads())]
+    shards[1][] = value
+    AtomicCounter(shards)
+end
+
 struct AtomicStats
-    in_msgs::Threads.Atomic{Int}
-    out_msgs::Threads.Atomic{Int}
-    in_bytes::Threads.Atomic{Int}
-    out_bytes::Threads.Atomic{Int}
-    reconnects::Threads.Atomic{Int}
-    errors::Threads.Atomic{Int}
-    dropped_msgs::Threads.Atomic{Int}
+    in_msgs::AtomicCounter
+    out_msgs::AtomicCounter
+    in_bytes::AtomicCounter
+    out_bytes::AtomicCounter
+    reconnects::AtomicCounter
+    errors::AtomicCounter
+    dropped_msgs::AtomicCounter
 end
 
 AtomicStats(; in_msgs::Int=0, out_msgs::Int=0, in_bytes::Int=0, out_bytes::Int=0,
             reconnects::Int=0, errors::Int=0, dropped_msgs::Int=0) =
-    AtomicStats(Threads.Atomic{Int}(in_msgs), Threads.Atomic{Int}(out_msgs),
-                Threads.Atomic{Int}(in_bytes), Threads.Atomic{Int}(out_bytes),
-                Threads.Atomic{Int}(reconnects), Threads.Atomic{Int}(errors),
-                Threads.Atomic{Int}(dropped_msgs))
+    AtomicStats(AtomicCounter(in_msgs), AtomicCounter(out_msgs),
+                AtomicCounter(in_bytes), AtomicCounter(out_bytes),
+                AtomicCounter(reconnects), AtomicCounter(errors),
+                AtomicCounter(dropped_msgs))
 
 AtomicStats(stats::Stats) = AtomicStats(; in_msgs=stats.in_msgs, out_msgs=stats.out_msgs,
                                         in_bytes=stats.in_bytes, out_bytes=stats.out_bytes,
                                         reconnects=stats.reconnects, errors=stats.errors,
                                         dropped_msgs=stats.dropped_msgs)
 
-@inline _stat_add!(counter::Threads.Atomic{Int}, value::Int=1) = (Threads.atomic_add!(counter, value); nothing)
-@inline _stat_get(counter::Threads.Atomic{Int})::Int = counter[]
+@inline function _stat_add!(counter::AtomicCounter, value::Int=1)
+    shards = counter.shards
+    @inbounds Threads.atomic_add!(shards[min(Threads.threadid(), length(shards))], value)
+    nothing
+end
+
+function _stat_get(counter::AtomicCounter)::Int
+    total = 0
+    @inbounds for shard in counter.shards
+        total += shard[]
+    end
+    total
+end
 
 function _default_error_cb(err)
     @warn "Natter client error" exception=err
@@ -137,7 +158,6 @@ Base.empty!(headers::Headers) = (empty!(headers.data); headers)
 Base.copy(headers::Headers) = _headers_from_pairs(name => copy(values) for (name, values) in headers)
 
 Headers(pairs::Pair...) = _headers_from_pairs(pairs)
-Headers(header_pairs) = _headers_from_pairs(header_pairs)
 
 mutable struct LazyHeaders <: AbstractDict{String,Vector{String}}
     raw::Vector{UInt8}
@@ -217,6 +237,13 @@ function _header_values(headers::Headers, key::AbstractString)
     get(headers, key, nothing)
 end
 
+_header_first(::Nothing, _key::AbstractString) = nothing
+_header_first(headers::LazyHeaders, key::AbstractString) = _lazy_header_first(headers, key)
+function _header_first(headers::Headers, key::AbstractString)
+    values = get(headers, key, nothing)
+    isnothing(values) || isempty(values) ? nothing : first(values)
+end
+
 function _delete_header!(headers::Headers, key::AbstractString)
     delete!(headers, key)
     headers
@@ -241,10 +268,7 @@ function _msg_header_bytes(headers::HeaderStorage, header_bytes::Union{Int,Nothi
 end
 
 headers(msg::AbstractMsg) = _headers_copy(msg.headers)
-header(msg::AbstractMsg, key::AbstractString) = begin
-    values = _header_values(msg.headers, key)
-    isnothing(values) || isempty(values) ? nothing : first(values)
-end
+header(msg::AbstractMsg, key::AbstractString) = _header_first(msg.headers, key)
 
 struct MsgMetadata
     stream::String
@@ -342,20 +366,66 @@ function _connect_option_reconnect_attempts(value)::Int
     result
 end
 
-function _validate_connect_option_security(token, user, password, tls_cert_path, tls_key_path)
+_connect_option_present(value)::Bool = !isnothing(value)
+_connect_option_count_present(values...)::Int = count(_connect_option_present, values)
+
+function _validate_connect_option_security(token, user, password, nkey, nkey_seed,
+                                           nkey_seed_path, jwt, jwt_path, credentials,
+                                           credentials_path, signature_cb,
+                                           tls_cert_path, tls_key_path)
     if isnothing(tls_cert_path) != isnothing(tls_key_path)
         throw(ArgumentError("tls_cert_path and tls_key_path must be provided together"))
-    end
-    if !isnothing(token) && (!isnothing(user) || !isnothing(password))
-        throw(ArgumentError("token authentication cannot be combined with user/password authentication"))
     end
     if isnothing(user) != isnothing(password)
         throw(ArgumentError("user and password must be provided together"))
     end
+    jwt_source_count = _connect_option_count_present(jwt, jwt_path, credentials, credentials_path)
+    jwt_source_count <= 1 ||
+        throw(ArgumentError("JWT authentication must use only one of jwt, jwt_path, credentials, or credentials_path"))
+    seed_source_count = _connect_option_count_present(nkey_seed, nkey_seed_path)
+    seed_source_count <= 1 ||
+        throw(ArgumentError("nkey seed authentication must use either nkey_seed or nkey_seed_path, not both"))
+
+    has_userpass = !isnothing(user) || !isnothing(password)
+    has_jwt = jwt_source_count > 0
+    has_credentials = !isnothing(credentials) || !isnothing(credentials_path)
+    has_nkey = !isnothing(nkey) || (!has_jwt && seed_source_count > 0)
+    has_signature_cb = !isnothing(signature_cb)
+    has_nkey_jwt = has_jwt || has_nkey || has_signature_cb
+
+    if !isnothing(token) && has_userpass
+        throw(ArgumentError("token authentication cannot be combined with user/password authentication"))
+    end
+    if !isnothing(token) && has_nkey_jwt
+        throw(ArgumentError("token authentication cannot be combined with nkey or JWT authentication"))
+    end
+    if has_userpass && has_nkey_jwt
+        throw(ArgumentError("user/password authentication cannot be combined with nkey or JWT authentication"))
+    end
+    if has_jwt && !isnothing(nkey)
+        throw(ArgumentError("JWT authentication cannot be combined with nkey authentication"))
+    end
+    if !has_jwt && isnothing(nkey) && has_signature_cb
+        throw(ArgumentError("signature_cb requires nkey or JWT authentication"))
+    end
+
+    signature_source_count = seed_source_count + (has_signature_cb ? 1 : 0)
+    if has_jwt
+        jwt_signature_sources = signature_source_count + (has_credentials ? 1 : 0)
+        jwt_signature_sources > 0 ||
+            throw(ArgumentError("JWT authentication requires a signature source"))
+        jwt_signature_sources == 1 ||
+            throw(ArgumentError("JWT authentication must use only one signature source"))
+    elseif !isnothing(nkey)
+        signature_source_count > 0 ||
+            throw(ArgumentError("nkey authentication requires nkey_seed, nkey_seed_path, or signature_cb"))
+        signature_source_count == 1 ||
+            throw(ArgumentError("nkey authentication must use only one signature source"))
+    end
     nothing
 end
 
-struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
+struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
     servers::Servers
     name::Union{String,Nothing}
     verbose::Bool
@@ -363,6 +433,14 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedC
     token::Union{String,Nothing}
     user::Union{String,Nothing}
     password::Union{String,Nothing}
+    nkey::Union{String,Nothing}
+    nkey_seed::Union{String,Nothing}
+    nkey_seed_path::Union{String,Nothing}
+    jwt::Union{String,Nothing}
+    jwt_path::Union{String,Nothing}
+    credentials::Union{String,Nothing}
+    credentials_path::Union{String,Nothing}
+    signature_cb::SignatureCallback
     no_echo::Bool
     tls_required::Bool
     tls_first::Union{Bool,Nothing}
@@ -389,6 +467,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedC
     sub_pending_msgs_limit::Int
     sub_pending_bytes_limit::Int
     drain_timeout::Float64
+    close_callback_timeout::Float64
     inbox_prefix::String
     error_cb::ErrorCallback
     disconnected_cb::DisconnectedCallback
@@ -397,17 +476,22 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedC
     discovered_server_cb::DiscoveredServerCallback
 
     function ConnectOptions(
-        servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
+        servers, name, verbose, pedantic, token, user, password, nkey, nkey_seed,
+        nkey_seed_path, jwt, jwt_path, credentials, credentials_path, signature_cb,
+        no_echo, tls_required, tls_first,
         tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
         max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
-        sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, inbox_prefix,
+        sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
+        inbox_prefix,
         error_cb, disconnected_cb, reconnected_cb, closed_cb,
         discovered_server_cb,
     )
         servers = _connect_option_servers(servers)
-        _validate_connect_option_security(token, user, password, tls_cert_path, tls_key_path)
+        _validate_connect_option_security(token, user, password, nkey, nkey_seed, nkey_seed_path,
+                                          jwt, jwt_path, credentials, credentials_path,
+                                          signature_cb, tls_cert_path, tls_key_path)
         connect_timeout = _connect_option_positive_float("connect_timeout", connect_timeout)
         ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
         max_outstanding_pings = _connect_option_positive_int("max_outstanding_pings", max_outstanding_pings)
@@ -428,23 +512,30 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedC
         sub_pending_msgs_limit = _connect_option_positive_int("sub_pending_msgs_limit", sub_pending_msgs_limit)
         sub_pending_bytes_limit = _connect_option_positive_int("sub_pending_bytes_limit", sub_pending_bytes_limit)
         drain_timeout = _connect_option_positive_float("drain_timeout", drain_timeout)
+        close_callback_timeout = _connect_option_nonnegative_float("close_callback_timeout", close_callback_timeout)
 
-        new{typeof(servers),typeof(error_cb),typeof(disconnected_cb),typeof(reconnected_cb),typeof(closed_cb),
+        new{typeof(servers),typeof(signature_cb),typeof(error_cb),typeof(disconnected_cb),typeof(reconnected_cb),typeof(closed_cb),
             typeof(discovered_server_cb)}(
-            servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
+            servers, name, verbose, pedantic, token, user, password, nkey, nkey_seed,
+            nkey_seed_path, jwt, jwt_path, credentials, credentials_path, signature_cb,
+            no_echo, tls_required, tls_first,
             tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
             max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
             max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
-            sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, inbox_prefix,
+            sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
+            inbox_prefix,
             error_cb, disconnected_cb, reconnected_cb, closed_cb,
             discovered_server_cb)
     end
 end
 
 function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, pedantic=false,
-                        token=nothing, user=nothing, password=nothing, no_echo=false,
-                        tls_required=false, tls_first=nothing, tls_verify=true,
+                        token=nothing, user=nothing, password=nothing, nkey=nothing,
+                        nkey_seed=nothing, nkey_seed_path=nothing, jwt=nothing,
+                        jwt_path=nothing, credentials=nothing, credentials_path=nothing,
+                        signature_cb=nothing, no_echo=false, tls_required=false,
+                        tls_first=nothing, tls_verify=true,
                         tls_ca_path=nothing, tls_cert_path=nothing, tls_key_path=nothing,
                         connect_timeout=2.0, ping_interval=120.0, max_outstanding_pings=2,
                         allow_reconnect=true, reconnect_wait=0.5, reconnect_max_wait=5.0,
@@ -456,18 +547,21 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                         max_header_bytes=DEFAULT_MAX_HEADER_BYTES,
                         max_stale_pong_waiters=1024, sub_pending_msgs_limit=1024,
                         sub_pending_bytes_limit=128 * 1024 * 1024, drain_timeout=30.0,
-                        inbox_prefix=DEFAULT_INBOX_PREFIX, error_cb=_default_error_cb,
-                        disconnected_cb=_default_noop_cb, reconnected_cb=_default_noop_cb,
-                        closed_cb=_default_noop_cb, discovered_server_cb=_default_noop_cb)
-    ConnectOptions(servers, name, verbose, pedantic, token, user, password, no_echo, tls_required,
-                   tls_first, tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout,
+                        close_callback_timeout=5.0, inbox_prefix=DEFAULT_INBOX_PREFIX,
+                        error_cb=_default_error_cb, disconnected_cb=_default_noop_cb,
+                        reconnected_cb=_default_noop_cb, closed_cb=_default_noop_cb,
+                        discovered_server_cb=_default_noop_cb)
+    ConnectOptions(servers, name, verbose, pedantic, token, user, password, nkey, nkey_seed,
+                   nkey_seed_path, jwt, jwt_path, credentials, credentials_path, signature_cb,
+                   no_echo, tls_required, tls_first, tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout,
                    ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
                    reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
                    write_buffer_size, write_buffer_latency, write_timeout,
                    max_control_line, max_inbound_payload,
                    max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
-                   sub_pending_bytes_limit, drain_timeout, inbox_prefix, error_cb,
-                   disconnected_cb, reconnected_cb, closed_cb, discovered_server_cb)
+                   sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
+                   inbox_prefix, error_cb, disconnected_cb, reconnected_cb, closed_cb,
+                   discovered_server_cb)
 end
 
 mutable struct Server
@@ -475,9 +569,13 @@ mutable struct Server
     reconnects::Int
     last_attempt::Float64
     discovered::Bool
+    tls_name::Union{String,Nothing}
     last_auth_error::Union{AuthenticationError,Nothing}
 end
-Server(url::String; discovered=false) = Server(url, 0, 0.0, discovered, nothing)
+function Server(url::String; discovered=false, tls_name=nothing)
+    normalized_tls_name = isnothing(tls_name) ? nothing : String(tls_name)
+    Server(url, 0, 0.0, discovered, normalized_tls_name, nothing)
+end
 
 Base.@kwdef mutable struct ServerInfo
     max_payload::Union{Int,Nothing} = nothing
@@ -486,6 +584,7 @@ Base.@kwdef mutable struct ServerInfo
     connect_urls::Union{Vector{String},Nothing} = nothing
     version::Union{String,Nothing} = nothing
     headers::Union{Bool,Nothing} = nothing
+    nonce::Union{String,Nothing} = nothing
     ldm::Bool = false
 end
 
@@ -496,6 +595,7 @@ function _merge_server_info!(dest::ServerInfo, src::ServerInfo)
     isnothing(src.connect_urls) || (dest.connect_urls = copy(src.connect_urls))
     isnothing(src.version) || (dest.version = src.version)
     isnothing(src.headers) || (dest.headers = src.headers)
+    isnothing(src.nonce) || (dest.nonce = src.nonce)
     dest.ldm = src.ldm
     dest
 end
@@ -985,6 +1085,8 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     status::ConnectionStatus.T
     status_code::Threads.Atomic{Int}
     info::ServerInfo
+    max_payload_value::Threads.Atomic{Int}
+    headers_supported::Threads.Atomic{Bool}
     socket::Union{Sockets.TCPSocket,Nothing}
     read_io::Union{ReadIO,Nothing}
     reader::Union{ProtocolReader{<:ReadIO},Nothing}
@@ -992,11 +1094,18 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     lock::ReentrantLock
     write_lock::ReentrantLock
     write_scratch::Vector{UInt8}
+    write_deadline::Threads.Atomic{Float64}
+    write_epoch::Threads.Atomic{Int}
+    write_timed_out_epoch::Threads.Atomic{Int}
+    write_timeout_io::Base.RefValue{Any}
+    write_timeout_operation::Base.RefValue{String}
+    write_timeout_task::Union{Task,Nothing}
     flush_signal::Channel{Bool}
     flusher_task::Union{Task,Nothing}
     sid::Int
     subscriptions::Dict{Int,Subscription{Client{Options,ReadIO,WriteIO}}}
-    request_mux::Union{RequestMux{Client{Options,ReadIO,WriteIO}},Nothing}
+    @atomic subscription_snapshot::Vector{Union{Subscription{Client{Options,ReadIO,WriteIO}},Nothing}}
+    @atomic request_mux::Union{RequestMux{Client{Options,ReadIO,WriteIO}},Nothing}
     request_mux_lock::ReentrantLock
     pending::PendingBuffer
     pending_bytes::Int
@@ -1028,6 +1137,15 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
     for (sub_sid, sub) in subscriptions
         typed_subscriptions[Int(sub_sid)] = sub
     end
+    max_sid = 0
+    for sub_sid in keys(typed_subscriptions)
+        max_sid = max(max_sid, sub_sid)
+    end
+    subscription_snapshot = Vector{Union{Subscription{client_type},Nothing}}(undef, max_sid)
+    fill!(subscription_snapshot, nothing)
+    for (sub_sid, sub) in typed_subscriptions
+        sub_sid > 0 && (subscription_snapshot[sub_sid] = sub)
+    end
     typed_request_mux = if isnothing(request_mux)
         nothing
     else
@@ -1042,20 +1160,60 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
             end
             waiters[token] = typed_waiter
         end
-        RequestMux{client_type}(request_mux.prefix, sub, waiters, Base.Threads.Condition(lock), nothing)
+        RequestMux{client_type}(request_mux.prefix, sub, waiters, Base.Threads.Condition(ReentrantLock()), nothing)
     end
     reader = isnothing(read_io) ? nothing : ProtocolReader(read_io)
     pending = _pending_buffer_from(pending)
     atomic_stats = stats isa AtomicStats ? stats : AtomicStats(stats)
     Client{Options,ReadIO,WriteIO}(options, servers, current_server, connected_url, status,
                                    Threads.Atomic{Int}(Int(status)),
-                                   info, socket, read_io, reader, write_io, lock, write_lock,
-                                   UInt8[],
+                                   info, Threads.Atomic{Int}(something(info.max_payload, typemax(Int))),
+                                   Threads.Atomic{Bool}(info.headers === true),
+                                   socket, read_io, reader, write_io, lock, write_lock,
+                                   UInt8[], Threads.Atomic{Float64}(Inf), Threads.Atomic{Int}(0),
+                                   Threads.Atomic{Int}(0), Ref{Any}(nothing), Ref(""), nothing,
                                    flush_signal, flusher_task,
-                                   sid, typed_subscriptions, typed_request_mux, request_mux_lock,
+                                   sid, typed_subscriptions, subscription_snapshot,
+                                   typed_request_mux, request_mux_lock,
                                    pending, pending_bytes, pongs,
                                    reader_task, ping_task, reconnect_task, pings_out, atomic_stats,
                                    rng, generation, Threads.Atomic{Int}(generation))
+end
+
+function _set_subscription_snapshot_locked!(client::C, sid::Int,
+                                            sub::Union{Subscription{C},Nothing}) where {C<:Client}
+    sid > 0 || return nothing
+    current = @atomic client.subscription_snapshot
+    isnothing(sub) && sid > length(current) && return nothing
+    if sid <= length(current) && current[sid] === sub
+        return nothing
+    end
+    snapshot = if sid <= length(current)
+        copy(current)
+    else
+        expanded = Vector{Union{Subscription{C},Nothing}}(undef, sid)
+        fill!(expanded, nothing)
+        isempty(current) || copyto!(expanded, 1, current, 1, length(current))
+        expanded
+    end
+    snapshot[sid] = sub
+    if isnothing(sub)
+        last = length(snapshot)
+        while last > 0 && isnothing(snapshot[last])
+            last -= 1
+        end
+        last < length(snapshot) && resize!(snapshot, last)
+    end
+    @atomic client.subscription_snapshot = snapshot
+    nothing
+end
+
+@inline function _lookup_subscription(client::Client, sid::Int)
+    snapshot = @atomic client.subscription_snapshot
+    if 0 < sid <= length(snapshot)
+        @inbounds return snapshot[sid]
+    end
+    nothing
 end
 
 function _wait_until_condition_locked(predicate::Function, condition::Base.GenericCondition{ReentrantLock},
@@ -1129,6 +1287,14 @@ end
     (client.generation = value; client.generation_value[] = value; value)
 @inline _bump_generation_locked!(client::Client)::Int =
     _store_generation_locked!(client, client.generation + 1)
+@inline _client_max_payload(client::Client)::Int = client.max_payload_value[]
+@inline _client_headers_supported(client::Client)::Bool = client.headers_supported[]
+
+@inline function _sync_server_info_cache_locked!(client::Client)
+    client.max_payload_value[] = something(client.info.max_payload, typemax(Int))
+    client.headers_supported[] = client.info.headers === true
+    nothing
+end
 
 status(client::Client) = _load_status(client)
 stats(client::Client) = Stats(; in_msgs=_stat_get(client.stats.in_msgs),

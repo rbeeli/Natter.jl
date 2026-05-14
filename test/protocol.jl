@@ -5,11 +5,12 @@ using TestItems
 
     const N = Natter
 
-    frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("INFO {\"server_id\":\"srv\",\"max_payload\":64,\"headers\":true}\r\n")))
+    frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("INFO {\"server_id\":\"srv\",\"max_payload\":64,\"headers\":true,\"nonce\":\"abc123\"}\r\n")))
     @test frame.op == :INFO
     data = N._protocol_info(frame)
     @test data.max_payload == 64
     @test data.headers == true
+    @test data.nonce == "abc123"
 
     info = N.ServerInfo(; headers=true)
     N._merge_server_info!(info, N.ServerInfo(; connect_urls=["127.0.0.1:4222"]))
@@ -32,12 +33,21 @@ using TestItems
     @test frame.op == :MSG
     msg = N._protocol_msg(frame)
     @test msg.subject == "events"
+    @test msg.headers isa N.LazyHeaders
+    @test isnothing(msg.headers.parsed)
     @test header(msg, "Trace") == "abc"
     @test header(msg, "trace") == "abc"
     @test header(msg, "TRACE") == "abc"
+    @test isnothing(msg.headers.parsed)
     @test msg.header_bytes == length(hdr)
     @test N._msg_pending_bytes(msg) == length(payload)
     @test String(msg) == "body"
+
+    status_field_hdr = N._headers_bytes(Headers("Status" => ["abc"], "Description" => ["plain"]))
+    status_field_msg = N.Msg("events", nothing, UInt8[], N.LazyHeaders(status_field_hdr), 9, length(status_field_hdr))
+    @test header(status_field_msg, "Status") == "abc"
+    @test header(status_field_msg, "Description") == "plain"
+    @test isnothing(status_field_msg.headers.parsed)
 
     hdr = N._headers_bytes(Headers("Trace" => ["abc", "def"]))
     payload = vcat(hdr, TestHelpers.bytes("work"))
@@ -232,6 +242,7 @@ end
 end
 
 @testitem "protocol writer" setup=[TestHelpers] begin
+    using Base64
     using JSON3
     using Natter
 
@@ -252,12 +263,31 @@ end
         N._write_pub_frame(io, frame)
         take!(io)
     end
-    plain_frame = N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), UInt8[])
+    plain_payload = TestHelpers.bytes("hi")
+    plain_frame = N.PublishFrame("foo", nothing, plain_payload, UInt8[])
+    push!(plain_payload, UInt8('!'))
+    @test collect(plain_frame.payload) == TestHelpers.bytes("hi")
+    @test plain_frame.payload isa Base.CodeUnits{UInt8,String}
+    @test plain_frame.headers isa Base.CodeUnits{UInt8,String}
+    @test_throws MethodError push!(plain_frame.payload, 0x41)
+
+    raw_headers = N._headers_bytes(Headers("A" => ["b"]))
+    header_snapshot = copy(raw_headers)
+    copied_header_frame = N.PublishFrame("foo", nothing, UInt8[], raw_headers)
+    raw_headers[1] = UInt8('X')
+    @test collect(copied_header_frame.headers) == header_snapshot
+    @test_throws ArgumentError N.PublishFrame("foo.*", nothing, TestHelpers.bytes("hi"), UInt8[])
+    @test_throws ArgumentError N.PublishFrame("foo", "bar.*", TestHelpers.bytes("hi"), UInt8[])
+    @test_throws ArgumentError N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), TestHelpers.bytes("bad\r\n\r\n"))
+
     reply_frame = N.PublishFrame("foo", "bar", TestHelpers.bytes("hi"), UInt8[])
     header_frame = N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), N._headers_bytes(Headers("A" => ["b"])))
     @test write_frame(plain_frame) == N._pub_cmd(plain_frame)
     @test write_frame(reply_frame) == N._pub_cmd(reply_frame)
     @test write_frame(header_frame) == N._pub_cmd(header_frame)
+    @test_throws ArgumentError N.PublishFrame("foo", "bad.>", TestHelpers.bytes("hi"), UInt8[])
+    @test_throws ArgumentError N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"),
+                                              TestHelpers.bytes("NATS/1.0\r\nMalformed\r\n\r\n"))
 
     io = IOBuffer()
     for _ in 1:1000
@@ -311,4 +341,44 @@ end
     option_userpass_client = TestHelpers.fake_client(; opts=N.ConnectOptions(user="user", password="pass"))
     @test_throws ArgumentError N._connect_command(option_userpass_client, N.ServerInfo(), "secret", nothing)
     @test_throws ArgumentError N._connect_command(option_userpass_client, N.ServerInfo(), "url-user", "url-pass")
+
+    seed = "SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY"
+    public_nkey = "UAT6BWCSCWLUKJT6K6MBJJOEOTXZ5AJDOYKNEVRFC7VNO6OA43N4TRNO"
+    expected_sig = "m50It12aTgfbJwsQhucujqhXbsq7tLM-Mf_hSjBQsG_4onm8y2Vkw6JG1bbcDkdxXe-Ng0K-7X9ov4rZ4wFcDg"
+
+    nkey_client = TestHelpers.fake_client(; opts=N.ConnectOptions(nkey_seed=seed))
+    nkey_cmd = N._connect_command(nkey_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+    nkey_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", nkey_cmd).captures))
+    @test nkey_body.nkey == public_nkey
+    @test nkey_body.sig == expected_sig
+    @test !haskey(nkey_body, :jwt)
+    @test !haskey(nkey_body, :auth_token)
+    @test_throws UnsupportedFeatureError N._connect_command(nkey_client, N.ServerInfo(), nothing, nothing)
+
+    callback_client = TestHelpers.fake_client(; opts=N.ConnectOptions(
+        nkey=public_nkey,
+        signature_cb=nonce -> fill(UInt8(0x01), 64),
+    ))
+    callback_cmd = N._connect_command(callback_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+    callback_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", callback_cmd).captures))
+    callback_sig = replace(base64encode(fill(UInt8(0x01), 64)), '+' => '-', '/' => '_')
+    callback_sig = replace(callback_sig, r"=+$" => "")
+    @test callback_body.nkey == public_nkey
+    @test callback_body.sig == callback_sig
+
+    creds = join([
+        "-----BEGIN NATS USER JWT-----",
+        "header.payload.signature",
+        "------END NATS USER JWT------",
+        "",
+        "-----BEGIN USER NKEY SEED-----",
+        seed,
+        "------END USER NKEY SEED------",
+    ], "\n")
+    creds_client = TestHelpers.fake_client(; opts=N.ConnectOptions(credentials=creds))
+    creds_cmd = N._connect_command(creds_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+    creds_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", creds_cmd).captures))
+    @test creds_body.jwt == "header.payload.signature"
+    @test creds_body.sig == expected_sig
+    @test !haskey(creds_body, :nkey)
 end

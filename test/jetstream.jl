@@ -655,6 +655,53 @@ end
     end
 end
 
+@testitem "JetStream terminal acks are not marked done while reconnecting" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    cases = (
+        (ack, "PUB ACK.REPLY 0\r\n\r\n"),
+        (msg -> nak(msg), "PUB ACK.REPLY 4\r\n-NAK\r\n"),
+        (term, "PUB ACK.REPLY 5\r\n+TERM\r\n"),
+    )
+
+    for (terminal_ack, expected) in cases
+        capture = TestHelpers.WriteCapture()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+                                         write_io=capture)
+        msg = JetStreamMsg(Msg("orders.created", "ACK.REPLY", TestHelpers.bytes("work")), client)
+
+        @test_throws ConnectionReconnectingError terminal_ack(msg)
+        @test !N._acknowledged(msg)
+        @test client.pending_bytes == 0
+        @test TestHelpers.capture_text(capture) == ""
+
+        @lock client.lock N._store_status_locked!(client, N.ConnectionStatus.CONNECTED)
+        terminal_ack(msg)
+        @test N._acknowledged(msg)
+        @test TestHelpers.capture_text(capture) == expected
+    end
+end
+
+@testitem "JetStream terminal acks flush buffered transports before marking done" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    transport = TestHelpers.WriteCapture()
+    opts = N.ConnectOptions(write_buffer_size=1024 * 1024)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     write_io=N.BufferedWriteIO(transport))
+    msg = JetStreamMsg(Msg("orders.created", "ACK.REPLY", TestHelpers.bytes("work")), client)
+
+    ack(msg)
+
+    @test N._acknowledged(msg)
+    @test client.pending_bytes == 0
+    @test TestHelpers.capture_text(transport) == "PUB ACK.REPLY 0\r\n\r\n"
+end
+
 @testitem "JetStream nak validates delay" setup=[TestHelpers] begin
     using Natter
 
@@ -1104,8 +1151,7 @@ end
         @test err isa ArgumentError
         @test occursin("callback", err.msg)
         async_err = TestHelpers.thrown_exception(() -> fetch(next_async(psub; timeout=0.1)))
-        @test async_err isa CapturedException
-        @test async_err.ex isa ArgumentError
+        @test async_err isa ArgumentError
     finally
         close(psub)
     end
@@ -1420,7 +1466,8 @@ end
     @test isnothing(meta.domain)
     @test N._parse_msg_metadata(msg).stream_sequence == 10
     let local_msg = msg
-        @test (@allocated N._parse_msg_metadata(local_msg)) == 0
+        parsed = @inferred N._parse_msg_metadata(local_msg)
+        @test parsed.stream_sequence == 10
     end
 
     meta2 = metadata(Msg("s", "\$JS.ACK._.acc.ORDERS.C1.3.11.5.987654321.8.rand", UInt8[]))

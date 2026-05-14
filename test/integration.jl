@@ -33,8 +33,7 @@ using TestItems
             async_no_responders = TestHelpers.thrown_exception() do
                 fetch(request_async(client, "$subject.none", ""; timeout=2.0))
             end
-            @test async_no_responders isa CapturedException
-            @test async_no_responders.ex isa NoRespondersError
+            @test async_no_responders isa NoRespondersError
 
             slow_started = Channel{Bool}(1)
             slow_service = subscribe(client, "$subject.slow") do req
@@ -120,6 +119,26 @@ using TestItems
         end
     else
         @info "Skipping real nats-server core integration tests; set NATTER_RUN_INTEGRATION=true to enable them."
+    end
+end
+
+@testitem "real nats-server NKEY auth integration" begin
+    using Natter
+    using Random
+
+    if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" &&
+       haskey(ENV, "NATTER_NKEY_AUTH_URL") && haskey(ENV, "NATTER_NKEY_AUTH_SEED")
+        client = connect(ENV["NATTER_NKEY_AUTH_URL"]; nkey_seed=ENV["NATTER_NKEY_AUTH_SEED"])
+        try
+            subject = "natter.auth.$(randstring(10))"
+            sub = subscribe(client, subject)
+            publish(client, subject, "nkey")
+            @test String(next(sub; timeout=2.0)) == "nkey"
+        finally
+            close(client)
+        end
+    else
+        @info "Skipping real nats-server NKEY auth integration test; set NATTER_RUN_INTEGRATION=true, NATTER_NKEY_AUTH_URL, and NATTER_NKEY_AUTH_SEED to enable it."
     end
 end
 
@@ -678,8 +697,7 @@ end
                 async_deleted = TestHelpers.thrown_exception() do
                     fetch(kv_get_async(kv[], "beta"))
                 end
-                @test async_deleted isa CapturedException
-                @test async_deleted.ex isa KeyValueKeyDeletedError
+                @test async_deleted isa KeyValueKeyDeletedError
                 purge_ack = kv_put(kv[], "purge-me", "value")
                 @test_throws KeyValueWrongRevisionError kv_purge(kv[], "purge-me"; revision=purge_ack.seq + 100)
                 fetch(kv_purge_async(kv[], "purge-me"; revision=purge_ack.seq))

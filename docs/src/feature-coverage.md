@@ -6,10 +6,10 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
-| Connect handshake | Supported | Includes authentication fields, client name, no echo, TLS requirements, and server INFO parsing. |
+| Connect handshake | Supported | Includes token, user/password, NKEY, JWT, and `.creds` authentication fields, client name, no echo, TLS requirements, and server INFO parsing. |
 | Publish and subscribe | Supported | Includes wildcards, queue groups, INFO-negotiated headers, max payload checks, size- and latency-bound buffered outbound writes, and per-subscription pending limits. |
 | Request reply | Supported | Uses a shared request inbox mux and maps negotiated no-responder status to `NoRespondersError`. |
-| Direct APIs and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code, and failed handles preserve the original operation error and task backtrace in `CapturedException`. |
+| Direct APIs and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code, and `fetch(handle)` returns the sync result or throws the same operation error that the synchronous API would throw. |
 | Flush and ping | Supported | Drains buffered outbound writes and uses PING/PONG synchronization. |
 | Drain and close | Supported | Drains subscriptions and reports cleanup failures. |
 | Automatic reconnect | Partial | Reconnects in the background, replays subscriptions, and flushes bounded pending publishes on a best-effort basis. Retained publishes can be delivered more than once after ambiguous transport failures; large direct-write frames are not retained after a successful socket write. Use JetStream `msg_id` deduplication or idempotent handlers for duplicate-sensitive effects. Real-server coverage includes same-server reconnect and multi-URL failover; multi-node cluster chaos and auth failover need more coverage before treating this as fully hardened cluster behavior. |
@@ -26,7 +26,7 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | INFO-first TLS upgrade | Supported | Use `tls_first=false` for deployments that require it. |
 | CA and client certificates | Supported | `tls_ca_path`, `tls_cert_path`, and `tls_key_path`. |
 | Disable certificate verification | Supported | `tls_verify=false`; intended only for trusted environments. |
-| nkeys and JWT credentials | Not implemented | Authentication currently covers token and user/password credentials. |
+| nkeys and JWT credentials | Supported | Supports public NKEY plus signing callback, seed-backed NKEY auth, user JWT plus seed/callback, and `.creds` content or file parsing. |
 
 ## JetStream
 

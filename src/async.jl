@@ -3,10 +3,9 @@
 
 Run the matching synchronous operation in a Julia task and return a `NatterTask`.
 Use `fetch(handle)` to get the same return value as the synchronous operation, or
-to throw a `CapturedException` containing the original operation exception and
-task backtrace. These helpers intentionally share the synchronous implementation
-so reconnect, cleanup, validation, and timeout behavior stay identical across
-both API styles.
+to throw the original operation exception. These helpers intentionally share the
+synchronous implementation so reconnect, cleanup, validation, and timeout
+behavior stay identical across both API styles.
 """
 struct NatterTask
     task::Task
@@ -17,18 +16,27 @@ function _task_failure(task::Task)
     isempty(exceptions) ? nothing : last(exceptions)
 end
 
-function _rethrow_task_failure(task::Task)
+function _throw_task_failure(task::Task)
     failure = _task_failure(task)
     if isnothing(failure)
         throw(TaskFailedException(task))
     end
-    throw(CapturedException(failure.exception, failure.backtrace))
+    throw(failure.exception)
+end
+
+function _wait_task_done(task::Task)
+    try
+        wait(task)
+    catch err
+        err isa TaskFailedException && err.task === task || rethrow()
+    end
+    task
 end
 
 function Base.wait(handle::NatterTask)
-    wait(handle.task; throw=false)
+    _wait_task_done(handle.task)
     if istaskfailed(handle.task)
-        _rethrow_task_failure(handle.task)
+        _throw_task_failure(handle.task)
     end
     handle
 end
@@ -50,6 +58,9 @@ connect_async(url_or_urls=nothing; kwargs...)::NatterTask = _natter_async(connec
 
 publish_async(client::Client, subject::AbstractString, data=nothing; kwargs...)::NatterTask =
     _natter_async(publish, client, subject, data; kwargs...)
+
+publish_async(client::Client, frame::PublishFrame; kwargs...)::NatterTask =
+    _natter_async(publish, client, frame; kwargs...)
 
 subscribe_async(client::Client, subject::AbstractString; kwargs...)::NatterTask =
     _natter_async(subscribe, client, subject; kwargs...)
