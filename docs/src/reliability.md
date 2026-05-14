@@ -9,7 +9,7 @@ Reconnect is enabled by default. After a transient disconnect, the client:
 - marks the connection as `ConnectionStatus.RECONNECTING`;
 - reconnects to known and discovered servers;
 - replays active subscriptions;
-- flushes buffered publish commands;
+- flushes buffered publish commands on a best-effort basis;
 - invokes `disconnected_cb` and `reconnected_cb` callbacks.
 
 ```julia
@@ -40,7 +40,9 @@ Reconnect coverage currently includes same-server reconnect and multi-URL failov
 
 ## Publish Buffering
 
-Core publishes retained for reconnect replay are buffered up to `pending_size`. This includes publishes made while reconnecting and connected publishes that have not yet been flushed successfully. If the transport fails after the server has accepted some bytes but before the client observes success, replay can duplicate delivery. Use idempotent consumers, application message IDs, or JetStream publish expectations when duplicate effects are unacceptable.
+Core publishes retained for reconnect replay are buffered up to `pending_size`. This includes publishes made while reconnecting and buffered connected publishes that have not yet been flushed successfully. Treat reconnect publish replay as best-effort, at-least-once behavior for retained frames, not exactly-once delivery. If the transport fails after the server has accepted some bytes but before the client observes success, replay can duplicate delivery.
+
+Publish frames at or above `write_buffer_size` bypass the buffered replay capture path. If such a direct write fails inside the publish call, Natter can requeue the frame for reconnect; after a successful direct socket write and flush, the frame is no longer retained for later reconnect replay. Use JetStream `js_publish` with `msg_id` and an appropriate stream `duplicate_window`, plus idempotent application storage, when duplicate effects are unacceptable.
 
 ## Subscription Backpressure
 

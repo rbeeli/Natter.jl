@@ -1171,7 +1171,7 @@ end
     opts = ConnectOptions(error_cb=err -> put!(errors, err))
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
     sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
-    @lock client.lock client.status = N.ConnectionStatus.DISCONNECTED
+    @lock client.lock N._store_status_locked!(client, N.ConnectionStatus.DISCONNECTED)
 
     flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
                        headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
@@ -1557,7 +1557,8 @@ end
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))
     end != :timed_out
-    @lock client.lock client.status = N.ConnectionStatus.RECONNECTING
+    @lock client.lock N._store_status_locked!(client, N.ConnectionStatus.RECONNECTING)
+    N._notify_subscription_waiters!(core_sub; all=true)
     @test task_error(fetch_task) isa FetchDisconnectedError
     close(psub)
 
@@ -1573,8 +1574,11 @@ end
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(terminal_capture))
     end != :timed_out
     @lock terminal_client.lock begin
-        terminal_client.status = N.ConnectionStatus.DISCONNECTED
+        N._store_status_locked!(terminal_client, N.ConnectionStatus.DISCONNECTED)
+    end
+    @lock terminal_core_sub.lock begin
         terminal_core_sub.closed = true
+        N._notify_subscription_waiters_locked(terminal_core_sub; all=true)
     end
     @test task_error(terminal_task) isa FetchDisconnectedError
     close(terminal_psub)
@@ -1591,7 +1595,8 @@ end
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(partial_capture))
     end != :timed_out
-    @lock partial_client.lock partial_client.status = N.ConnectionStatus.RECONNECTING
+    @lock partial_client.lock N._store_status_locked!(partial_client, N.ConnectionStatus.RECONNECTING)
+    N._notify_subscription_waiters!(partial_core_sub; all=true)
     msgs = fetch(partial_task)
     @test length(msgs) == 1
     @test String(first(msgs)) == "payload"

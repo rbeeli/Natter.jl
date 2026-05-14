@@ -81,6 +81,25 @@ function _bytes_string(bytes::AbstractVector{UInt8}, first::Int, last::Int)::Str
     String(@view bytes[first:last])
 end
 
+function _bytes_equal_string(bytes::AbstractVector{UInt8}, first::Int, last::Int, value::String)::Bool
+    len = last - first + 1
+    len == ncodeunits(value) || return false
+    @inbounds for i in 1:len
+        bytes[first + i - 1] == codeunit(value, i) || return false
+    end
+    true
+end
+
+function _cached_subject!(reader::ProtocolReader, sid::Int, first::Int, last::Int)::String
+    cached = get(reader.subject_cache, sid, nothing)
+    if !isnothing(cached) && _bytes_equal_string(reader.buffer, first, last, cached)
+        return cached
+    end
+    subject = _bytes_string(reader.buffer, first, last)
+    reader.subject_cache[sid] = subject
+    subject
+end
+
 _reader_available(reader::ProtocolReader)::Int = reader.last - reader.first + 1
 
 const _READER_COMPACT_MIN_PREFIX = 8192
@@ -375,8 +394,8 @@ function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
     fourth_start, fourth_end, pos = _next_token(bytes, pos, line_last)
     _has_more_tokens(bytes, pos, line_last) && _malformed_control_line("MSG", bytes, line_first, line_last)
 
-    subject = _bytes_string(bytes, subject_start, subject_end)
     sid = _parse_int_token(bytes, sid_start, sid_end)
+    subject = _cached_subject!(reader, sid, subject_start, subject_end)
     reply = fourth_start == 0 ? nothing : _bytes_string(bytes, third_start, third_end)
     size_start, size_end = fourth_start == 0 ? (third_start, third_end) : (fourth_start, fourth_end)
     size = _validate_payload_size(_parse_int_token(bytes, size_start, size_end), max_payload)
@@ -398,8 +417,8 @@ function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int
     fifth_start, fifth_end, pos = _next_token(bytes, pos, line_last)
     _has_more_tokens(bytes, pos, line_last) && _malformed_control_line("HMSG", bytes, line_first, line_last)
 
-    subject = _bytes_string(bytes, subject_start, subject_end)
     sid = _parse_int_token(bytes, sid_start, sid_end)
+    subject = _cached_subject!(reader, sid, subject_start, subject_end)
     has_reply = fifth_start != 0
     reply = has_reply ? _bytes_string(bytes, third_start, third_end) : nothing
     hsize_start, hsize_end = has_reply ? (fourth_start, fourth_end) : (third_start, third_end)
@@ -407,7 +426,8 @@ function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int
     hsize = _validate_header_size(_parse_int_token(bytes, hsize_start, hsize_end), max_header_bytes)
     total = _validate_payload_size(_parse_int_token(bytes, total_start, total_end), max_payload)
     header_bytes, payload = _read_exact_header_payload(reader, hsize, total)
-    hdrs = _parse_headers(header_bytes)
+    _validate_headers(header_bytes)
+    hdrs = LazyHeaders(header_bytes)
     _protocol_msg_frame(Msg(subject, reply, payload, hdrs, sid, hsize))
 end
 
@@ -529,6 +549,37 @@ function _parse_header_protocol_line!(headers::Headers, raw::AbstractVector{UInt
     headers
 end
 
+function _validate_header_protocol_line(raw::AbstractVector{UInt8}, line_first::Int, line_last::Int)
+    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || throw(ProtocolError("invalid NATS header block"))
+    nothing
+end
+
+function _validate_headers(raw::AbstractVector{UInt8})
+    isempty(raw) && return nothing
+    raw_first = firstindex(raw)
+    raw_last = lastindex(raw)
+
+    newline = _find_byte(raw, UInt8('\n'), raw_first, raw_last)
+    isnothing(newline) && throw(ProtocolError("NATS header block missing terminator"))
+    protocol_end = newline - 1
+    protocol_end >= raw_first && raw[protocol_end] == UInt8('\r') && (protocol_end -= 1)
+    _validate_header_protocol_line(raw, raw_first, protocol_end)
+
+    pos = newline + 1
+    while pos <= raw_last
+        newline = _find_byte(raw, UInt8('\n'), pos, raw_last)
+        isnothing(newline) && throw(ProtocolError("NATS header block missing terminator"))
+        line_end = newline - 1
+        line_end >= pos && raw[line_end] == UInt8('\r') && (line_end -= 1)
+        line_end < pos && return nothing
+
+        colon = _find_byte(raw, UInt8(':'), pos, line_end)
+        isnothing(colon) && throw(ProtocolError("malformed NATS header line"))
+        pos = newline + 1
+    end
+    throw(ProtocolError("NATS header block missing terminator"))
+end
+
 function _parse_headers(raw::AbstractVector{UInt8})
     h = Headers()
     isempty(raw) && return h
@@ -567,13 +618,51 @@ function _parse_headers(raw::AbstractVector{UInt8})
     throw(ProtocolError("NATS header block missing terminator"))
 end
 
+function _lazy_header_protocol_line(raw::AbstractVector{UInt8})
+    isempty(raw) && return 1, 0
+    raw_first = firstindex(raw)
+    raw_last = lastindex(raw)
+    newline = _find_byte(raw, UInt8('\n'), raw_first, raw_last)
+    isnothing(newline) && return 1, 0
+    line_end = newline - 1
+    line_end >= raw_first && raw[line_end] == UInt8('\r') && (line_end -= 1)
+    raw_first, line_end
+end
+
+function _lazy_status_header(headers::LazyHeaders)
+    raw = headers.raw
+    line_first, line_last = _lazy_header_protocol_line(raw)
+    line_first <= line_last || return nothing
+    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || return nothing
+    pos = _skip_hspace(raw, line_first + ncodeunits("NATS/1.0"), line_last)
+    pos <= line_last || return nothing
+    status_start, status_end, _ = _next_token(raw, pos, line_last)
+    _all_digits(raw, status_start, status_end) || return nothing
+    _parse_int_token(raw, status_start, status_end)
+end
+
+function _lazy_status_description(headers::LazyHeaders)
+    raw = headers.raw
+    line_first, line_last = _lazy_header_protocol_line(raw)
+    line_first <= line_last || return ""
+    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || return ""
+    pos = _skip_hspace(raw, line_first + ncodeunits("NATS/1.0"), line_last)
+    pos <= line_last || return ""
+    status_start, status_end, pos = _next_token(raw, pos, line_last)
+    _all_digits(raw, status_start, status_end) || return ""
+    description_start = _skip_hspace(raw, pos, line_last)
+    description_start <= line_last ? _bytes_string(raw, description_start, line_last) : ""
+end
+
 function _status_header(msg::AbstractMsg)
+    msg.headers isa LazyHeaders && return _lazy_status_header(msg.headers)
     value = header(msg, "Status")
     !isnothing(value) && !isempty(value) && all(isdigit, value) && return parse(Int, value)
     nothing
 end
 
 function _status_description(msg::AbstractMsg)
+    msg.headers isa LazyHeaders && return _lazy_status_description(msg.headers)
     value = header(msg, "Description")
     isnothing(value) ? "" : value
 end
@@ -755,8 +844,8 @@ function _pub_prefix_size(frame::PublishFrame)::Int
     _decimal_digits(headers_len) + 1 + _decimal_digits(total) + 2
 end
 
-function _pub_prefix(frame::PublishFrame)::Vector{UInt8}
-    out = Vector{UInt8}(undef, _pub_prefix_size(frame))
+function _pub_prefix!(out::Vector{UInt8}, frame::PublishFrame)::Vector{UInt8}
+    resize!(out, _pub_prefix_size(frame))
     pos = 1
     if isempty(frame.headers)
         pos = _copy_codeunits!(out, pos, "PUB ")
@@ -785,8 +874,20 @@ function _pub_prefix(frame::PublishFrame)::Vector{UInt8}
     out
 end
 
+function _pub_prefix(frame::PublishFrame)::Vector{UInt8}
+    _pub_prefix!(UInt8[], frame)
+end
+
 function _write_pub_frame_direct(io, frame::PublishFrame)
     write(io, _pub_prefix(frame))
+    isempty(frame.headers) || write(io, frame.headers)
+    write(io, frame.payload)
+    write(io, CRLF)
+    nothing
+end
+
+function _write_pub_frame_direct(io, frame::PublishFrame, scratch::Vector{UInt8})
+    write(io, _pub_prefix!(scratch, frame))
     isempty(frame.headers) || write(io, frame.headers)
     write(io, frame.payload)
     write(io, CRLF)

@@ -25,7 +25,7 @@ using TestItems
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     publish(client, "foo", "bar")
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
-    @test client.stats.out_msgs == 1
+    @test stats(client).out_msgs == 1
 
     ergonomic_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     publish(ergonomic_headers, "foo", "bar"; headers=Dict("Trace" => "abc"))
@@ -127,10 +127,11 @@ end
     const N = Natter
 
     opts = N.ConnectOptions(connect_timeout=1, ping_interval=2, max_outstanding_pings=1,
-                            reconnect_jitter=0, write_buffer_size=0)
+                            reconnect_jitter=0, write_buffer_size=0, write_timeout=3)
     @test opts.connect_timeout == 1.0
     @test opts.ping_interval == 2.0
     @test opts.write_buffer_size == 0
+    @test opts.write_timeout == 3.0
     @test !ismutable(opts)
     @test opts.servers isa Tuple{Vararg{String}}
     source_servers = ["nats://one.example:4222"]
@@ -182,6 +183,8 @@ end
     rejects(max_reconnect_attempts=-2)
     rejects(pending_size=0)
     rejects(write_buffer_size=-1)
+    rejects(write_timeout=0)
+    rejects(write_timeout=Inf)
     rejects(max_control_line=0)
     rejects(max_inbound_payload=0)
     rejects(max_header_bytes=0)
@@ -355,16 +358,16 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     sub = subscribe(client, "events")
-    @lock client.lock put!(sub.messages, Msg("events", nothing, TestHelpers.bytes("stolen"); sid=sub.sid))
+    @lock sub.lock put!(sub.messages, Msg("events", nothing, TestHelpers.bytes("stolen"); sid=sub.sid))
 
-    lock(client.lock)
+    lock(sub.lock)
     task = @async next(sub; timeout=0.05)
     try
         sleep(0.01)
         stolen = take!(sub.messages)
         @test String(stolen) == "stolen"
     finally
-        unlock(client.lock)
+        unlock(sub.lock)
     end
 
     result = timedwait(1.0; pollint=0.001) do
@@ -445,6 +448,125 @@ end
     @test isempty(N._take_replayable_writes!(write_io))
 
     close(client)
+end
+
+@testitem "raw transport writes time out and close active transport" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct RawTimeoutTransport <: IO
+        entered::Channel{Bool}
+        release::Channel{Bool}
+        closes::Base.RefValue{Int}
+        closed::Base.RefValue{Bool}
+    end
+    RawTimeoutTransport() = RawTimeoutTransport(Channel{Bool}(1), Channel{Bool}(1), Ref(0), Ref(false))
+
+    function Base.write(t::RawTimeoutTransport, data::Vector{UInt8})
+        put!(t.entered, true)
+        take!(t.release)
+        t.closed[] && throw(ErrorException("transport closed"))
+        length(data)
+    end
+    Base.flush(::RawTimeoutTransport) = nothing
+    function Base.close(t::RawTimeoutTransport)
+        t.closes[] += 1
+        t.closed[] = true
+        isready(t.release) || put!(t.release, true)
+        nothing
+    end
+
+    transport = RawTimeoutTransport()
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(write_buffer_size=0, write_timeout=0.02),
+                                     status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+
+    task = @async try
+        N._write_raw(client, TestHelpers.bytes("PING\r\n"))
+        nothing
+    catch err
+        err
+    end
+    @test timedwait(1.0; pollint=0.001) do
+        isready(transport.entered) || istaskdone(task)
+    end != :timed_out
+    entered_ready = isready(transport.entered)
+    @test entered_ready
+    entered_ready && (@test take!(transport.entered))
+    result = timedwait(1.0; pollint=0.001) do
+        istaskdone(task)
+    end
+    result == :timed_out && close(transport)
+
+    @test result != :timed_out
+    @test fetch(task) isa N.TimeoutError
+    @test transport.closes[] >= 1
+
+    close(client)
+end
+
+@testitem "large direct publish writes time out under write deadline" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct PublishTimeoutTransport <: IO
+        entered::Channel{Bool}
+        release::Channel{Bool}
+        closes::Base.RefValue{Int}
+        closed::Base.RefValue{Bool}
+    end
+    PublishTimeoutTransport() = PublishTimeoutTransport(Channel{Bool}(1), Channel{Bool}(1), Ref(0), Ref(false))
+
+    function Base.write(t::PublishTimeoutTransport, data::Vector{UInt8})
+        put!(t.entered, true)
+        take!(t.release)
+        t.closed[] && throw(ErrorException("transport closed"))
+        length(data)
+    end
+    Base.write(t::PublishTimeoutTransport, data::Base.CodeUnits{UInt8}) = (length(data))
+    Base.write(t::PublishTimeoutTransport, data::AbstractString) = ncodeunits(data)
+    Base.flush(::PublishTimeoutTransport) = nothing
+    function Base.close(t::PublishTimeoutTransport)
+        t.closes[] += 1
+        t.closed[] = true
+        isready(t.release) || put!(t.release, true)
+        nothing
+    end
+
+    transport = PublishTimeoutTransport()
+    opts = N.ConnectOptions(write_buffer_size=16, write_timeout=0.02, allow_reconnect=false,
+                            error_cb=err -> nothing)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=N.BufferedWriteIO(transport))
+
+    task = @async try
+        publish(client, "foo", repeat("x", 64))
+        nothing
+    catch err
+        err
+    end
+    @test timedwait(1.0; pollint=0.001) do
+        isready(transport.entered) || istaskdone(task)
+    end != :timed_out
+    entered_ready = isready(transport.entered)
+    @test entered_ready
+    entered_ready && (@test take!(transport.entered))
+    result = timedwait(1.0; pollint=0.001) do
+        istaskdone(task)
+    end
+    result == :timed_out && close(transport)
+
+    @test result != :timed_out
+    @test fetch(task) isa N.TimeoutError
+    @test transport.closes[] >= 1
+
+    close_task = @async close(client)
+    @test timedwait(1.0; pollint=0.001) do
+        istaskdone(close_task)
+    end != :timed_out
+    wait(close_task)
 end
 
 @testitem "direct publish writes use coalesced frame chunks" setup=[TestHelpers] begin
@@ -1038,8 +1160,8 @@ end
     replay_mux = replay_client.request_mux
     @test isempty(replay_mux.waiters)
     TestHelpers.clear_capture!(replay_transport)
-    replay_client.status = N.ConnectionStatus.RECONNECTING
-    replay_mux.sub.server_active = false
+    N._store_status_locked!(replay_client, N.ConnectionStatus.RECONNECTING)
+    @lock replay_mux.sub.lock replay_mux.sub.server_active = false
     N._replay_subscriptions(replay_client)
     replayed = TestHelpers.capture_text(replay_transport)
     @test replayed == N._sub_cmd(replay_mux.sub.subject, nothing, replay_mux.sub.sid)
@@ -1338,6 +1460,65 @@ end
     @test thrown_error isa CleanupError
     @test thrown_error.operation == "timeout cleanup after thrown cleanup"
     @test thrown_error.cause === cleanup_exception
+end
+
+@testitem "timed operation timeout interrupts worker task" begin
+    using Natter
+
+    const N = Natter
+
+    worker_done = Channel{Bool}(1)
+    cleanup_done = Channel{Bool}(1)
+    blocker = Channel{Bool}(0)
+    reported = Channel{Any}(1)
+    cleanup = () -> begin
+        put!(cleanup_done, true)
+        nothing
+    end
+    reporter = errors -> foreach(err -> put!(reported, err), errors)
+
+    @test_throws TimeoutError N._run_with_timeout("blocked operation", 0.01, cleanup, reporter) do
+        try
+            take!(blocker)
+        finally
+            put!(worker_done, true)
+        end
+    end
+    @test timedwait(0.5; pollint=0.01) do
+        isready(cleanup_done)
+    end != :timed_out
+    @test timedwait(0.5; pollint=0.01) do
+        isready(worker_done)
+    end != :timed_out
+    @test !isready(reported)
+end
+
+@testitem "_wait_task! interrupts blocked task after grace timeout" begin
+    using Natter
+
+    const N = Natter
+
+    started = Channel{Bool}(1)
+    stopped = Channel{Bool}(1)
+    blocker = Channel{Bool}(0)
+    task = @async begin
+        put!(started, true)
+        try
+            take!(blocker)
+        finally
+            put!(stopped, true)
+        end
+    end
+    take!(started)
+
+    errors = Any[]
+    N._wait_task!(errors, "stop blocked test task", task; timeout=0.2)
+
+    @test timedwait(0.5; pollint=0.01) do
+        isready(stopped)
+    end != :timed_out
+    @test istaskdone(task)
+    @test isempty(errors)
 end
 
 @testitem "close notifies pending flush waiters" setup=[TestHelpers] begin

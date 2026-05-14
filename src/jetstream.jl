@@ -934,21 +934,25 @@ PushSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString
     PushSubscription(js, sub, String(stream), String(consumer), close_lock, delete_on_close, closed, nothing, nothing)
 
 function _touch_push_control_handler!(handler::_JetStreamPushControlHandler)
-    handler.idle_heartbeat > 0 || return nothing
-    @lock handler.lock handler.last_seen = time()
+    handler.idle_heartbeat[] > 0 || return nothing
+    handler.last_seen[] = time()
     nothing
 end
 
 function _close_subscription_from_control!(sub::Subscription)
-    already_closed = @lock sub.client.lock begin
+    already_closed = @lock sub.lock begin
         was_closed = sub.closed
         if !was_closed
-            delete!(sub.client.subscriptions, sub.sid)
             sub.closed = true
+            sub.server_active = false
+            _notify_subscription_waiters_locked(sub; all=true)
         end
         was_closed
     end
     already_closed && return nothing
+    @lock sub.client.lock begin
+        _delete_subscription_locked!(sub.client, sub.sid, sub)
+    end
     errors = Any[]
     _close_subscription_channel!(errors, sub)
     _report_cleanup_errors(sub.client, errors)
@@ -956,20 +960,21 @@ function _close_subscription_from_control!(sub::Subscription)
 end
 
 function _record_subscription_data_received!(handler::_JetStreamPushControlHandler)
-    handler.flow_control || return nothing
-    @lock handler.lock handler.flow_incoming += one(UInt64)
+    handler.flow_control[] || return nothing
+    Threads.atomic_add!(handler.flow_incoming, one(UInt64))
     nothing
 end
 
 function _update_flow_delivered_locked!(handler::_JetStreamPushControlHandler, queued::UInt64)
-    delivered = handler.flow_incoming > queued ? handler.flow_incoming - queued : UInt64(0)
+    incoming = handler.flow_incoming[]
+    delivered = incoming > queued ? incoming - queued : UInt64(0)
     delivered > handler.flow_delivered && (handler.flow_delivered = delivered)
     handler.flow_delivered
 end
 
 function _maybe_reply_to_subscription_flow_control!(sub::Subscription, handler::_JetStreamPushControlHandler)
-    handler.flow_control || return nothing
-    queued = @lock sub.client.lock UInt64(Base.n_avail(sub.messages))
+    handler.flow_control[] || return nothing
+    queued = @lock sub.lock UInt64(Base.n_avail(sub.messages))
     reply = @lock handler.lock begin
         _update_flow_delivered_locked!(handler, queued)
         if !isnothing(handler.flow_reply) && handler.flow_delivered >= handler.flow_target
@@ -996,20 +1001,21 @@ function _handle_subscription_control(handler::_JetStreamPushControlHandler, sub
         _report_error(sub.client, err)
     end
     if action == :consumer_deleted
-        @lock handler.lock handler.consumer_deleted = true
+        handler.consumer_deleted[] = true
         _close_subscription_from_control!(sub)
     end
     true
 end
 
 function _push_heartbeat_monitor(psub::PushSubscription, handler::_JetStreamPushControlHandler)
-    interval = handler.idle_heartbeat
+    interval = handler.idle_heartbeat[]
     interval > 0 || return nothing
     poll = min(0.25, max(0.01, interval / 2))
     while true
         sleep(poll)
         closed = (@lock psub.close_lock psub.closed) ||
-                 (@lock psub.sub.client.lock psub.sub.closed || psub.sub.client.status in (ConnectionStatus.CLOSED, ConnectionStatus.DISCONNECTED))
+                 (@lock psub.sub.lock psub.sub.closed) ||
+                 status(psub.sub.client) in (ConnectionStatus.CLOSED, ConnectionStatus.DISCONNECTED)
         closed && return nothing
         st = status(psub.js.client)
         if st in (ConnectionStatus.CONNECTING, ConnectionStatus.RECONNECTING)
@@ -1017,7 +1023,7 @@ function _push_heartbeat_monitor(psub::PushSubscription, handler::_JetStreamPush
             continue
         end
         _maybe_reply_to_subscription_flow_control!(psub.sub, handler)
-        missed = @lock handler.lock time() - handler.last_seen > 2 * interval
+        missed = time() - handler.last_seen[] > 2 * interval
         if missed
             _report_error(psub.js.client, _jetstream_heartbeat_error())
             _touch_push_control_handler!(handler)
@@ -1026,7 +1032,7 @@ function _push_heartbeat_monitor(psub::PushSubscription, handler::_JetStreamPush
 end
 
 function _start_push_heartbeat_monitor(psub::PushSubscription, handler::_JetStreamPushControlHandler)
-    handler.idle_heartbeat > 0 || return nothing
+    handler.idle_heartbeat[] > 0 || return nothing
     @async _push_heartbeat_monitor(psub, handler)
 end
 
@@ -1082,18 +1088,18 @@ function _schedule_or_reply_to_flow_control(sub::Subscription, handler::_JetStre
     end
 
     reply = msg.reply
-    if !handler.flow_control
+    if !handler.flow_control[]
         _publish_flow_control_reply(sub, reply)
         return nothing
     end
-    queued = @lock sub.client.lock UInt64(Base.n_avail(sub.messages))
+    queued = @lock sub.lock UInt64(Base.n_avail(sub.messages))
     send_now = @lock handler.lock begin
         _update_flow_delivered_locked!(handler, queued)
-        if handler.flow_delivered >= handler.flow_incoming
+        if handler.flow_delivered >= handler.flow_incoming[]
             true
         else
             handler.flow_reply = reply
-            handler.flow_target = handler.flow_incoming
+            handler.flow_target = handler.flow_incoming[]
             false
         end
     end
@@ -1182,7 +1188,7 @@ function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real,
     expires > 0 || throw(ArgumentError("fetch expires must be greater than zero"))
     timeout > expires || throw(ArgumentError("fetch timeout must be greater than expires"))
     (@lock psub.close_lock psub.closed) && throw(ConnectionClosedError("pull subscription is closed"))
-    (@lock psub.sub.client.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
+    (@lock psub.sub.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
     _pull_fetch_heartbeat(expires, heartbeat)
 end
 
@@ -1203,17 +1209,19 @@ function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
         msg = _take_subscription_msg_if_ready!(sub)
         !isnothing(msg) && return msg
 
-        closed, st = @lock client.lock (sub.closed, client.status)
-        closed && !isready(sub.messages) && _throw_pull_fetch_wait_interrupted(closed, st)
-        ready = @lock client.lock begin
+        closed, empty = @lock sub.lock (sub.closed, !isready(sub.messages))
+        st = status(client)
+        closed && empty && _throw_pull_fetch_wait_interrupted(closed, st)
+        ready = @lock sub.lock begin
             _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
-                isready(sub.messages) || sub.closed || client.status != ConnectionStatus.CONNECTED
+                isready(sub.messages) || sub.closed || status(client) != ConnectionStatus.CONNECTED
             end
         end
         ready || throw(TimeoutError("next message timed out"))
         msg = _take_subscription_msg_if_ready!(sub)
         !isnothing(msg) && return msg
-        closed, st = @lock client.lock (sub.closed, client.status)
+        closed = @lock sub.lock sub.closed
+        st = status(client)
         (closed || st != ConnectionStatus.CONNECTED) && _throw_pull_fetch_wait_interrupted(closed, st)
     end
 end
@@ -1384,11 +1392,9 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         if !haskey(cfg, "name") || isnothing(cfg["name"])
             cfg["name"] = info.name
         end
-        @lock control_handler.lock begin
-            control_handler.idle_heartbeat = _push_idle_heartbeat_seconds(info)
-            control_handler.flow_control = _push_flow_control_enabled(info)
-            control_handler.last_seen = time()
-        end
+        control_handler.idle_heartbeat[] = _push_idle_heartbeat_seconds(info)
+        control_handler.flow_control[] = _push_flow_control_enabled(info)
+        control_handler.last_seen[] = time()
         psub = PushSubscription(js, sub, String(stream), String(info.name), ReentrantLock(), delete_on_close, false,
                                 nothing, control_handler, info)
         psub.heartbeat_task = _start_push_heartbeat_monitor(psub, control_handler)
@@ -1451,7 +1457,7 @@ function close(psub::PushSubscription)
     end
     _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task)
     handler = psub.control_handler
-    server_deleted = !isnothing(handler) && (@lock handler.lock handler.consumer_deleted)
+    server_deleted = !isnothing(handler) && handler.consumer_deleted[]
     if psub.delete_on_close && !server_deleted
         try
             consumer_delete(psub.js, psub.stream, psub.consumer)
@@ -1741,12 +1747,12 @@ function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::R
     succeeded = false
     try
         mux = _ensure_request_mux(msg._client)
-        token, waiter = _register_request_waiter!(msg._client, mux)
+        token, waiter = _register_request_waiter!(msg._client, mux, timeout)
         response_subject = "$(mux.prefix).$token"
         response = try
             frame = PublishFrame(reply, response_subject, payload, EMPTY_BYTES)
             _publish_frame_unchecked(msg._client, frame; buffer_on_reconnect=false, force_flush=true)
-            _wait_request_reply(waiter, timeout)
+            _wait_request_reply(mux, waiter, timeout)
         finally
             _remove_request_waiter!(msg._client, mux, token, waiter)
         end

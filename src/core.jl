@@ -46,7 +46,7 @@ _should_write_publish_direct(frame_size::Int, threshold::Int)::Bool =
 
 function _write_publish_frame(client::Client, io::IO, frame::PublishFrame; replayable::Bool=false,
                               threshold::Int=0, frame_size::Int=_serialized_size(frame))
-    _write_pub_frame_direct(io, frame)
+    _write_pub_frame_direct_timed(client, io, frame)
     false
 end
 
@@ -56,8 +56,7 @@ function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::Publis
     if _should_write_publish_direct(frame_size, threshold)
         _flush_write_io(client, io)
         transport = _underlying_transport(io)
-        _write_pub_frame_direct(transport, frame)
-        flush(transport)
+        _write_pub_frame_direct_timed(client, transport, frame; force_flush=true)
         return false
     end
 
@@ -87,6 +86,14 @@ function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::Publis
         return true
     end
     false
+end
+
+function _write_pub_frame_direct_timed(client::Client, io::IO, frame::PublishFrame; force_flush::Bool=false)
+    _run_transport_write(client, io, "publish write") do
+        _write_pub_frame_direct(io, frame, client.write_scratch)
+        force_flush && flush(io)
+    end
+    nothing
 end
 
 function _write_publish(client::Client, frame::PublishFrame; force_flush::Bool=false,
@@ -163,45 +170,56 @@ function _send_publish(client::Client, frame::PublishFrame; buffer_on_reconnect:
 end
 
 function _send_subscription_now!(sub::Subscription)
-    sid, subject, queue, max_msgs = @lock sub.client.lock (sub.sid, sub.subject, sub.queue, sub.max_msgs)
+    sid, subject, queue, max_msgs = @lock sub.lock (sub.sid, sub.subject, sub.queue, sub.max_msgs)
     try
         _write_raw(sub.client, _sub_cmd(subject, queue, sid))
         if max_msgs > 0
             _write_raw(sub.client, _unsub_cmd(sid, max_msgs))
         end
-        @lock sub.client.lock sub.server_active = true
+        @lock sub.lock sub.server_active = true
         return true
     catch err
         if _recover_after_write_failure!(sub.client, err)
-            @lock sub.client.lock sub.server_active = false
+            @lock sub.lock sub.server_active = false
             return false
         end
         rethrow()
     end
 end
 
+function _delete_subscription_locked!(client::Client, sid::Int, sub::Subscription)
+    if get(client.subscriptions, sid, nothing) === sub
+        delete!(client.subscriptions, sid)
+    end
+    reader = client.reader
+    isnothing(reader) || delete!(reader.subject_cache, sid)
+    nothing
+end
+
 function _close_subscription_channel!(errors::Vector, sub::Subscription)
-    try
+    @lock sub.lock begin
         if isopen(sub.messages)
             _close_resource!(errors, "close subscription channel $(sub.sid)", sub.messages)
         end
-    finally
-        _notify_subscription_waiters!(sub; all=true)
+        _notify_subscription_waiters_locked(sub; all=true)
     end
     errors
 end
 
 function _close_subscription_locally!(sub::Subscription; throw_errors::Bool=true)
-    already_closed = @lock sub.client.lock begin
+    already_closed = @lock sub.lock begin
         was_closed = sub.closed
         if !was_closed
-            delete!(sub.client.subscriptions, sub.sid)
             sub.closed = true
             sub.server_active = false
+            _notify_subscription_waiters_locked(sub; all=true)
         end
         was_closed
     end
     already_closed && return nothing
+    @lock sub.client.lock begin
+        _delete_subscription_locked!(sub.client, sub.sid, sub)
+    end
 
     errors = Any[]
     _close_subscription_channel!(errors, sub)
@@ -334,8 +352,9 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
         client.sid += 1
         sid = client.sid
         ch = MsgQueue{Msg}(pending_msgs_limit)
-        condition = Base.Threads.Condition(client.lock)
-        sub = Subscription(client, sid, subject, queue, callback, ch, condition, _control_handler, pending_msgs_limit, pending_bytes_limit, 0, 0, max_msgs, false, nothing, false, 0)
+        sub_lock = ReentrantLock()
+        condition = Base.Threads.Condition(sub_lock)
+        sub = Subscription(client, sid, subject, queue, callback, sub_lock, ch, condition, _control_handler, pending_msgs_limit, pending_bytes_limit, 0, 0, max_msgs, false, nothing, false, 0)
         client.subscriptions[sid] = sub
         send_now = st == ConnectionStatus.CONNECTED
         sub
@@ -346,8 +365,11 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
         catch err
             cleanup_errors = Any[]
             @lock client.lock begin
-                delete!(client.subscriptions, sub.sid)
+                _delete_subscription_locked!(client, sub.sid, sub)
+            end
+            @lock sub.lock begin
                 sub.closed = true
+                _notify_subscription_waiters_locked(sub; all=true)
             end
             _close_subscription_channel!(cleanup_errors, sub)
             isempty(cleanup_errors) ? rethrow() : throw(Base.CompositeException(vcat(Any[err], cleanup_errors)))
@@ -369,7 +391,7 @@ end
 
 function _subscription_processor(sub::Subscription, callback::Callback) where {Callback}
     while true
-        msg, control_handler = @lock sub.client.lock begin
+        msg, control_handler = @lock sub.lock begin
             while !isready(sub.messages) && !sub.closed
                 wait(sub.condition)
             end
@@ -387,7 +409,7 @@ function _subscription_processor(sub::Subscription, callback::Callback) where {C
         catch err
             _report_error(sub.client, err)
         finally
-            @lock sub.client.lock begin
+            @lock sub.lock begin
                 sub.processing = max(0, sub.processing - 1)
                 _notify_subscription_waiters_locked(sub; all=true)
             end
@@ -416,6 +438,7 @@ end
 function _handle_subscription_control(::_RequestMuxControlHandler, sub::Subscription, msg::Msg)::Bool
     client = sub.client
     waiter = nothing
+    mux = nothing
     drop = false
     @lock client.lock begin
         mux = client.request_mux
@@ -430,13 +453,13 @@ function _handle_subscription_control(::_RequestMuxControlHandler, sub::Subscrip
                 drop = isnothing(waiter)
             end
         end
-        drop && (client.stats.dropped_msgs += 1)
+        drop && _record_drop!(client)
     end
     if !isnothing(waiter)
         notify_err = nothing
         @lock client.lock begin
             try
-                _resolve_request_waiter_locked!(waiter, msg)
+                _resolve_request_waiter_locked!(waiter, msg, mux.condition)
             catch err
                 notify_err = err
             end
@@ -449,41 +472,40 @@ end
 function _dispatch_msg(client::Client, msg::Msg)
     msg_bytes = _msg_pending_bytes(msg)
     control_handler = _NoSubscriptionControlHandler()
-    sub = @lock client.lock begin
-        sub = get(client.subscriptions, msg.sid, nothing)
-        if isnothing(sub) || sub.closed
-            client.stats.dropped_msgs += 1
-            nothing
+    sub = @lock client.lock get(client.subscriptions, msg.sid, nothing)
+    if isnothing(sub)
+        _record_drop!(client)
+        return
+    end
+    closed = @lock sub.lock begin
+        if sub.closed
+            true
         else
             control_handler = sub.control_handler
-            sub
+            false
         end
     end
-    isnothing(sub) && return
+    if closed
+        _record_drop!(client)
+        return
+    end
 
     if _handle_subscription_control(control_handler, sub, msg)
-        @lock client.lock begin
-            client.stats.in_msgs += 1
-            client.stats.in_bytes += length(msg.data)
-        end
+        _record_in!(client, length(msg.data))
         return
     end
 
     should_close = false
     report_slow = false
-    accepted = @lock client.lock begin
+    accepted = @lock sub.lock begin
         if sub.closed
-            client.stats.dropped_msgs += 1
             report_slow = false
             false
         elseif sub.pending_bytes + msg_bytes > sub.pending_bytes_limit || Base.n_avail(sub.messages) >= sub.pending_msgs_limit
-            client.stats.dropped_msgs += 1
             report_slow = true
             false
         else
             sub.received += 1
-            client.stats.in_msgs += 1
-            client.stats.in_bytes += length(msg.data)
             sub.pending_bytes += msg_bytes
             should_close = sub.max_msgs > 0 && sub.received >= sub.max_msgs
             put!(sub.messages, msg)
@@ -492,11 +514,13 @@ function _dispatch_msg(client::Client, msg::Msg)
         end
     end
     if !accepted
+        _record_drop!(client)
         if report_slow
             _report_error(client, SlowConsumerError(msg.subject, msg.sid, "subscription pending limits exceeded"))
         end
         return
     end
+    _record_in!(client, length(msg.data))
     _record_subscription_data_received!(control_handler)
     if should_close
         _close_subscription_locally!(sub; throw_errors=false)
@@ -506,7 +530,7 @@ end
 function _take_subscription_msg_if_ready!(sub::Subscription)::Union{Msg,Nothing}
     msg = nothing
     control_handler = _NoSubscriptionControlHandler()
-    @lock sub.client.lock begin
+    @lock sub.lock begin
         isready(sub.messages) || return nothing
         msg = take!(sub.messages)
         msg_bytes = _msg_pending_bytes(msg)
@@ -531,7 +555,7 @@ function next(sub::Subscription; timeout::Real=1.0)
         msg = _take_subscription_msg_if_ready!(sub)
         !isnothing(msg) && return msg
 
-        wait_result = @lock sub.client.lock begin
+        wait_result = @lock sub.lock begin
             if sub.closed && !isready(sub.messages)
                 :closed
             else
@@ -554,11 +578,11 @@ end
 
 function unsubscribe(sub::Subscription; max_msgs::Int=0)
     _validate_core_max_msgs(max_msgs)
-    closed, active, st, sid, target, previous_max = @lock sub.client.lock begin
+    st = status(sub.client)
+    closed, active, sid, target, previous_max = @lock sub.lock begin
         if sub.closed
-            (true, false, sub.client.status, sub.sid, 0, sub.max_msgs)
+            (true, false, sub.sid, 0, sub.max_msgs)
         else
-            st = sub.client.status
             target = 0
             previous_max = sub.max_msgs
             if max_msgs > 0
@@ -568,7 +592,7 @@ function unsubscribe(sub::Subscription; max_msgs::Int=0)
                 target = _unsubscribe_target(sub.received, max_msgs)
                 sub.max_msgs = target
             end
-            (false, sub.server_active, st, sub.sid, target, previous_max)
+            (false, sub.server_active, sub.sid, target, previous_max)
         end
     end
     closed && return nothing
@@ -578,16 +602,16 @@ function unsubscribe(sub::Subscription; max_msgs::Int=0)
         catch err
             if !_recover_after_write_failure!(sub.client, err)
                 if max_msgs > 0
-                    @lock sub.client.lock begin
-                        if get(sub.client.subscriptions, sid, nothing) === sub && !sub.closed && sub.max_msgs == target
+                    @lock sub.lock begin
+                        if !sub.closed && sub.max_msgs == target
                             sub.max_msgs = previous_max
                         end
                     end
                 end
                 rethrow()
             end
-            @lock sub.client.lock begin
-                if get(sub.client.subscriptions, sid, nothing) === sub && !sub.closed
+            @lock sub.lock begin
+                if !sub.closed
                     sub.server_active = false
                 end
             end
@@ -607,27 +631,31 @@ _drain_timed_out(err)::Bool =
 _drain_timed_out(errors::Vector)::Bool = any(_drain_timed_out, errors)
 
 function _drain(sub::Subscription, deadline::Float64)
-    closed, active = @lock sub.client.lock (sub.closed, sub.server_active)
+    closed, active, sid = @lock sub.lock (sub.closed, sub.server_active, sub.sid)
     closed && return nothing
     status(sub.client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING) || throw(ConnectionReconnectingError())
     if active
         try
-            _write_raw(sub.client, _unsub_cmd(sub.sid))
+            _write_raw(sub.client, _unsub_cmd(sid))
         catch err
             _recover_after_write_failure!(sub.client, err) || rethrow()
             throw(ConnectionReconnectingError())
         end
     end
     flush(sub.client; timeout=_remaining_timeout(deadline))
-    ready = @lock sub.client.lock begin
+    ready = @lock sub.lock begin
         _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
             !isready(sub.messages) && sub.processing == 0
         end
     end
     ready || throw(TimeoutError("subscription drain timed out"))
-    @lock sub.client.lock begin
-        delete!(sub.client.subscriptions, sub.sid)
+    @lock sub.lock begin
         sub.closed = true
+        sub.server_active = false
+        _notify_subscription_waiters_locked(sub; all=true)
+    end
+    @lock sub.client.lock begin
+        _delete_subscription_locked!(sub.client, sid, sub)
     end
     errors = Any[]
     _close_subscription_channel!(errors, sub)
@@ -689,11 +717,15 @@ ping(client::Client; timeout::Real=10.0) = flush(client; timeout)
 
 function drain(client::Client; timeout::Real=client.options.drain_timeout)
     deadline = _drain_deadline(timeout)
+    notify_subs = Subscription[]
     @lock client.lock begin
         client.status == ConnectionStatus.CLOSED && return nothing
         client.status == ConnectionStatus.CONNECTED || throw(ConnectionReconnectingError())
-        client.status = ConnectionStatus.DRAINING
-        _notify_all_subscription_waiters_locked(client; all=true)
+        _store_status_locked!(client, ConnectionStatus.DRAINING)
+        notify_subs = collect(values(client.subscriptions))
+    end
+    for sub in notify_subs
+        _notify_subscription_waiters!(sub; all=true)
     end
     errors = Any[]
     subs = @lock client.lock collect(values(client.subscriptions))
@@ -729,19 +761,24 @@ function close(client::Client; throw_errors::Bool=false)
     @lock client.lock begin
         already = client.status == ConnectionStatus.CLOSED
         if !already
-            client.status = ConnectionStatus.CLOSED
-            client.generation += 1
+            _store_status_locked!(client, ConnectionStatus.CLOSED)
+            _bump_generation_locked!(client)
             subs = collect(values(client.subscriptions))
             empty!(client.subscriptions)
-            for sub in subs
-                sub.closed = true
-                _notify_subscription_waiters_locked(sub; all=true)
-            end
+            reader = client.reader
+            isnothing(reader) || empty!(reader.subject_cache)
         else
             _clear_pending_buffer_locked!(client)
         end
     end
     already && return nothing
+    for sub in subs
+        @lock sub.lock begin
+            sub.closed = true
+            sub.server_active = false
+            _notify_subscription_waiters_locked(sub; all=true)
+        end
+    end
     _wake_flusher(client)
     errors = Any[]
     append!(errors, _notify_pong_waiters!(client, false))
@@ -776,19 +813,22 @@ end
 
 function _request_mux_active_locked(client::Client)
     mux = client.request_mux
-    if isnothing(mux) || mux.sub.closed || !mux.sub.server_active
+    if isnothing(mux)
         return nothing
     end
-    mux
+    active = @lock mux.sub.lock !mux.sub.closed && mux.sub.server_active
+    active ? mux : nothing
 end
 
 function _close_inactive_request_mux_subscription!(client::Client, sub::Subscription)
     errors = Any[]
     @lock client.lock begin
-        if get(client.subscriptions, sub.sid, nothing) === sub
-            delete!(client.subscriptions, sub.sid)
-        end
+        _delete_subscription_locked!(client, sub.sid, sub)
+    end
+    @lock sub.lock begin
         sub.closed = true
+        sub.server_active = false
+        _notify_subscription_waiters_locked(sub; all=true)
     end
     _close_subscription_channel!(errors, sub)
     _report_cleanup_errors(client, errors)
@@ -807,15 +847,16 @@ function _ensure_request_mux(client::Client)
 
         prefix = new_inbox(client)
         sub = _subscribe(client, "$prefix.*"; _control_handler=_RequestMuxControlHandler(), require_connected=true)
-        active = @lock client.lock client.status == ConnectionStatus.CONNECTED && !sub.closed && sub.server_active
+        active = status(client) == ConnectionStatus.CONNECTED && (@lock sub.lock !sub.closed && sub.server_active)
         if !active
             _close_inactive_request_mux_subscription!(client, sub)
             throw(ConnectionReconnectingError())
         end
 
-        mux = RequestMux(prefix, sub, Dict{String,RequestWaiter{typeof(client)}}())
+        mux = RequestMux(prefix, sub, Dict{String,RequestWaiter{typeof(client)}}(), Base.Threads.Condition(client.lock), nothing)
         assigned = @lock client.lock begin
-            if client.status == ConnectionStatus.CONNECTED && !sub.closed && sub.server_active
+            sub_active = @lock sub.lock !sub.closed && sub.server_active
+            if client.status == ConnectionStatus.CONNECTED && sub_active
                 client.request_mux = mux
                 true
             else
@@ -830,15 +871,49 @@ function _ensure_request_mux(client::Client)
     end
 end
 
-function _register_request_waiter!(client::C, mux::RequestMux{C}) where {C<:Client}
+function _request_timeout_loop(client::C, mux::RequestMux{C}) where {C<:Client}
+    while true
+        delay = @lock client.lock begin
+            client.request_mux === mux || return nothing
+            isempty(mux.waiters) && (mux.timeout_task = nothing; return nothing)
+            now = time()
+            nearest = Inf
+            expired = false
+            for waiter in values(mux.waiters)
+                waiter.active || continue
+                if waiter.deadline <= now
+                    expired = true
+                else
+                    nearest = min(nearest, waiter.deadline)
+                end
+            end
+            expired && notify(mux.condition; all=true)
+            isfinite(nearest) ? max(0.001, min(0.01, nearest - now)) : 0.01
+        end
+        sleep(delay)
+    end
+end
+
+function _ensure_request_timeout_task_locked!(client::C, mux::RequestMux{C}) where {C<:Client}
+    task = mux.timeout_task
+    if isnothing(task) || istaskdone(task)
+        mux.timeout_task = @async _request_timeout_loop(client, mux)
+    end
+    nothing
+end
+
+function _register_request_waiter!(client::C, mux::RequestMux{C}, timeout::Real) where {C<:Client}
     @lock client.lock begin
         client.status == ConnectionStatus.CONNECTED || _throw_not_connected_for_request(client.status)
-        client.request_mux === mux && !mux.sub.closed && mux.sub.server_active || throw(ConnectionReconnectingError())
+        sub_active = @lock mux.sub.lock !mux.sub.closed && mux.sub.server_active
+        client.request_mux === mux && sub_active || throw(ConnectionReconnectingError())
+        deadline = time() + Float64(timeout)
         while true
             token = randstring(client.rng, NUID_ALPHABET, 22)
             if !haskey(mux.waiters, token)
-                waiter = RequestWaiter{C}(Base.Threads.Condition(client.lock))
+                waiter = RequestWaiter{C}(deadline)
                 mux.waiters[token] = waiter
+                _ensure_request_timeout_task_locked!(client, mux)
                 return token, waiter
             end
         end
@@ -852,23 +927,26 @@ function _remove_request_waiter!(client::C, mux::RequestMux{C}, token::String,
         if client.request_mux === mux && get(mux.waiters, token, nothing) === waiter
             delete!(mux.waiters, token)
         end
+        notify(mux.condition; all=true)
     end
     nothing
 end
 
-function _wait_request_reply(waiter::RequestWaiter, timeout::Real)::Msg
-    lock(waiter.condition)
+function _wait_request_reply(mux::RequestMux, waiter::RequestWaiter, timeout::Real)::Msg
+    deadline = waiter.deadline
+    lock(mux.condition)
     value = try
-        ready = _wait_until_condition_locked(waiter.condition, timeout) do
-            waiter.ready
-        end
-        if !ready
-            waiter.active = false
-            throw(TimeoutError("request timed out"))
+        while !waiter.ready
+            remaining = deadline - time()
+            if remaining <= 0
+                waiter.active = false
+                throw(TimeoutError("request timed out"))
+            end
+            wait(mux.condition)
         end
         waiter.value
     finally
-        unlock(waiter.condition)
+        unlock(mux.condition)
     end
     value isa Exception && throw(value)
     value::Msg
@@ -879,13 +957,13 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     _ensure_connected_for_request(client)
     _validate_publish_frame_for_client(client, request_frame)
     mux = _ensure_request_mux(client)
-    token, waiter = _register_request_waiter!(client, mux)
+    token, waiter = _register_request_waiter!(client, mux, timeout)
     reply = "$(mux.prefix).$token"
     try
         _validate_publish_subject(reply)
         frame = PublishFrame(request_frame.subject, reply, request_frame.payload, request_frame.headers)
         _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true)
-        return _wait_request_reply(waiter, timeout)
+        return _wait_request_reply(mux, waiter, timeout)
     finally
         _remove_request_waiter!(client, mux, token, waiter)
     end

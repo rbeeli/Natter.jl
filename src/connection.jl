@@ -125,27 +125,34 @@ end
 
 function _connect_tcp(host::String, port::Int, timeout::Real)
     ch = Channel{Union{Sockets.TCPSocket,Exception}}(1)
+    timed_out = Threads.Atomic{Bool}(false)
     task = @async begin
         try
-            put!(ch, Sockets.connect(host, port))
+            sock = Sockets.connect(host, port)
+            if timed_out[]
+                close_errors = Any[]
+                _close_resource!(close_errors, "close timed-out connect socket", sock)
+                _warn_timeout_cleanup_errors("connect to $host:$port", close_errors)
+            else
+                put!(ch, sock)
+            end
         catch err
-            put!(ch, err)
+            timed_out[] || put!(ch, err)
         end
     end
     result = timedwait(timeout; pollint=0.01) do
         isready(ch)
     end
     if result == :timed_out
+        timed_out[] = true
         @async begin
-            try
-                wait(task)
-            catch err
-                @debug "Natter connect cleanup task failed" exception=(err, catch_backtrace())
-            end
+            errors = Any[]
+            _wait_task!(errors, "stop timed-out connect to $host:$port task", task; interrupt=true)
             if isready(ch)
                 late = take!(ch)
-                late isa Sockets.TCPSocket && close(late)
+                late isa Sockets.TCPSocket && _close_resource!(errors, "close timed-out connect socket", late)
             end
+            _warn_timeout_cleanup_errors("connect to $host:$port", errors)
         end
         throw(TimeoutError("connect to $host:$port timed out"))
     end
@@ -169,8 +176,58 @@ _cleanup_errors(result::Nothing) = Any[]
 _cleanup_errors(result::AbstractVector) = Any[result...]
 _cleanup_errors(result) = Any[result]
 
+function _request_task_stop!(errors::Vector, operation::String, task::Union{Task,Nothing})::Bool
+    (isnothing(task) || istaskdone(task) || task === current_task()) && return false
+    try
+        # Base.throwto yields to the target and can block the caller; scheduling
+        # the exception requests interruption without adding another stuck task.
+        schedule(task, InterruptException(); error=true)
+        return true
+    catch err
+        istaskdone(task) && return false
+        push!(errors, CleanupError("interrupt $operation", err))
+        return false
+    end
+end
+
+_task_interrupted_error(err)::Bool =
+    err isa InterruptException ||
+    (err isa TaskFailedException && err.task.result isa InterruptException)
+
+function _record_stopped_task_error!(errors::Vector, operation::String, task::Task, interrupted::Bool)
+    try
+        wait(task)
+    catch err
+        interrupted && _task_interrupted_error(err) && return errors
+        push!(errors, CleanupError(operation, err))
+    end
+    errors
+end
+
+function _wait_task!(errors::Vector, operation::String, task::Union{Task,Nothing};
+                     timeout::Real=0.5, interrupt::Bool=false)
+    (isnothing(task) || istaskdone(task) || task === current_task()) && return errors
+
+    interrupted = interrupt && _request_task_stop!(errors, operation, task)
+    result = timedwait(timeout; pollint=0.005) do
+        istaskdone(task)
+    end
+    if result == :timed_out && !interrupt
+        interrupted = _request_task_stop!(errors, operation, task)
+        result = timedwait(min(timeout, 0.5); pollint=0.005) do
+            istaskdone(task)
+        end
+    end
+    if result == :timed_out
+        push!(errors, CleanupError(operation, TimeoutError("$operation timed out")))
+        return errors
+    end
+    _record_stopped_task_error!(errors, operation, task, interrupted)
+end
+
 function _schedule_timeout_cleanup(operation::String, cleanup::Function,
-                                   report_cleanup_errors::Function=errors -> _warn_timeout_cleanup_errors(operation, errors))
+                                   report_cleanup_errors::Function=errors -> _warn_timeout_cleanup_errors(operation, errors);
+                                   task::Union{Task,Nothing}=nothing)
     @async begin
         errors = Any[]
         try
@@ -178,6 +235,7 @@ function _schedule_timeout_cleanup(operation::String, cleanup::Function,
         catch err
             push!(errors, CleanupError("timeout cleanup after $operation", err))
         end
+        _wait_task!(errors, "stop timed-out $operation task", task; interrupt=true)
         if !isempty(errors)
             try
                 report_cleanup_errors(errors)
@@ -196,25 +254,21 @@ function _run_with_timeout(f::Function, operation::String, timeout::Real, cleanu
         throw(TimeoutError("$operation timed out"))
     end
     ch = Channel{Tuple{Bool,Any}}(1)
+    timed_out = Threads.Atomic{Bool}(false)
     task = @async begin
         try
-            put!(ch, (true, f()))
+            value = f()
+            timed_out[] || put!(ch, (true, value))
         catch err
-            put!(ch, (false, err))
+            timed_out[] || put!(ch, (false, err))
         end
     end
     result = timedwait(timeout; pollint=0.01) do
         isready(ch)
     end
     if result == :timed_out
-        _schedule_timeout_cleanup(operation, cleanup, report_cleanup_errors)
-        @async begin
-            try
-                wait(task)
-            catch err
-                @debug "Natter timed operation task failed after timeout" operation exception=(err, catch_backtrace())
-            end
-        end
+        timed_out[] = true
+        _schedule_timeout_cleanup(operation, cleanup, report_cleanup_errors; task)
         throw(TimeoutError("$operation timed out"))
     end
     ok, value = take!(ch)
@@ -223,6 +277,58 @@ function _run_with_timeout(f::Function, operation::String, timeout::Real, cleanu
 end
 
 _remaining_timeout(deadline::Float64)::Float64 = max(0.0, deadline - time())
+
+function _write_timeout_error(operation::String)
+    TimeoutError("$operation timed out")
+end
+
+function _write_timeout_matches(active, io)::Bool
+    isnothing(active) && return false
+    active === io && return true
+    _underlying_transport(active) === _underlying_transport(io)
+end
+
+function _write_timeout_transports(client::Client, io)
+    @lock client.lock begin
+        write_io = client.write_io
+        _write_timeout_matches(write_io, io) || return nothing, nothing, nothing
+        client.read_io, write_io, client.socket
+    end
+end
+
+function _abort_timed_out_write(client::Client, io, operation::String)
+    read_io, write_io, sock = _write_timeout_transports(client, io)
+    isnothing(read_io) && isnothing(write_io) && isnothing(sock) && return nothing
+    # The timed-out writer is holding write_lock; closing the active transport is
+    # the deadline breaker that lets normal reconnect/close cleanup take over.
+    errors = _close_transport(read_io, write_io, sock)
+    _report_cleanup_errors(client, errors)
+    nothing
+end
+
+function _run_transport_write(f::Function, client::Client, io, operation::String)
+    timeout = client.options.write_timeout
+    timed_out = Threads.Atomic{Bool}(false)
+    done = Threads.Atomic{Bool}(false)
+    timer = Timer(timeout) do _
+        if !done[]
+            timed_out[] = true
+            _abort_timed_out_write(client, io, operation)
+        end
+    end
+    try
+        result = f()
+        done[] = true
+        close(timer)
+        timed_out[] && throw(_write_timeout_error(operation))
+        return result
+    catch err
+        done[] = true
+        close(timer)
+        timed_out[] && throw(_write_timeout_error(operation))
+        rethrow()
+    end
+end
 
 function _tls_wrap(sock, opts::ConnectOptions, hostname::String)
     conf = _tls_config(opts)
@@ -242,25 +348,29 @@ function _throw_errors(errors::Vector)
 end
 
 function _record_error!(client::Client)
-    @lock client.lock client.stats.errors += 1
+    _stat_add!(client.stats.errors)
+    nothing
+end
+
+function _record_in!(client::Client, bytes::Int)
+    _stat_add!(client.stats.in_msgs)
+    _stat_add!(client.stats.in_bytes, bytes)
     nothing
 end
 
 function _record_out!(client::Client, bytes::Int)
-    @lock client.lock begin
-        client.stats.out_msgs += 1
-        client.stats.out_bytes += bytes
-    end
+    _stat_add!(client.stats.out_msgs)
+    _stat_add!(client.stats.out_bytes, bytes)
     nothing
 end
 
 function _record_drop!(client::Client)
-    @lock client.lock client.stats.dropped_msgs += 1
+    _stat_add!(client.stats.dropped_msgs)
     nothing
 end
 
 function _record_reconnect!(client::Client)
-    @lock client.lock client.stats.reconnects += 1
+    _stat_add!(client.stats.reconnects)
     nothing
 end
 
@@ -334,7 +444,25 @@ end
 
 function _flush_write_io(client::Client, io)
     replayed = _replayable_bytes(io)
-    flush(io)
+    _run_transport_write(client, io, "transport flush") do
+        flush(io)
+    end
+    _release_pending_bytes!(client, replayed)
+    nothing
+end
+
+function _flush_write_io(client::Client, io::BufferedWriteIO)
+    _ensure_open(io)
+    replayed = _replayable_bytes(io)
+    n = position(io.buffer)
+    transport = _underlying_transport(io)
+    _run_transport_write(client, transport, "transport flush") do
+        n > 0 && _write_buffered_bytes(transport, io.buffer.data, n)
+        flush(transport)
+    end
+    truncate(io.buffer, 0)
+    seekstart(io.buffer)
+    empty!(io.replayable_ranges)
     _release_pending_bytes!(client, replayed)
     nothing
 end
@@ -361,8 +489,20 @@ end
 
 function _write_raw_to_io(client::Client, io::WriteIO, data::Union{AbstractString,Vector{UInt8}};
                           force_flush::Bool=false) where {WriteIO<:IO}
-    write(io, data)
+    _write_raw_data_to_io(client, io, data)
     _flush_or_signal_locked(client, io; force_flush)
+    nothing
+end
+
+function _write_raw_data_to_io(client::Client, io::BufferedWriteIO, data::Union{AbstractString,Vector{UInt8}})
+    write(io, data)
+    nothing
+end
+
+function _write_raw_data_to_io(client::Client, io::IO, data::Union{AbstractString,Vector{UInt8}})
+    _run_transport_write(client, io, "transport write") do
+        write(io, data)
+    end
     nothing
 end
 
@@ -471,7 +611,7 @@ function _notify_request_waiters!(client::Client, err::Exception; clear_mux::Boo
             clear_mux && (client.request_mux = nothing)
             for waiter in waiters
                 try
-                    _resolve_request_waiter_locked!(waiter, err)
+                    _resolve_request_waiter_locked!(waiter, err, mux.condition)
                 catch notify_err
                     push!(errors, CleanupError("notify request waiter", notify_err))
                 end
@@ -484,10 +624,11 @@ end
 function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     subs = Subscription[]
     request_waiters = RequestWaiter[]
+    request_condition = nothing
     terminal = @lock client.lock begin
         if client.generation == generation &&
            client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.RECONNECTING, ConnectionStatus.DISCONNECTED)
-            client.status = ConnectionStatus.DISCONNECTED
+            _store_status_locked!(client, ConnectionStatus.DISCONNECTED)
             client.current_server = nothing
             client.connected_url = nothing
             client.flusher_task = nothing
@@ -498,15 +639,13 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
 
             subs = collect(values(client.subscriptions))
             empty!(client.subscriptions)
-            for sub in subs
-                sub.closed = true
-                sub.server_active = false
-                _notify_subscription_waiters_locked(sub; all=true)
-            end
+            reader = client.reader
+            isnothing(reader) || empty!(reader.subject_cache)
 
             mux = client.request_mux
             if !isnothing(mux)
                 request_waiters = collect(values(mux.waiters))
+                request_condition = mux.condition
                 empty!(mux.waiters)
                 client.request_mux = nothing
             end
@@ -517,16 +656,25 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     end
     terminal || return false
 
+    for sub in subs
+        @lock sub.lock begin
+            sub.closed = true
+            sub.server_active = false
+            _notify_subscription_waiters_locked(sub; all=true)
+        end
+    end
     _wake_flusher(client)
     errors = Any[]
     append!(errors, _notify_pong_waiters!(client, false))
-    @lock client.lock begin
+    if !isnothing(request_condition)
+        @lock client.lock begin
         for waiter in request_waiters
             try
-                _resolve_request_waiter_locked!(waiter, ConnectionClosedError("connection is disconnected"))
+                _resolve_request_waiter_locked!(waiter, ConnectionClosedError("connection is disconnected"), request_condition)
             catch notify_err
                 push!(errors, CleanupError("notify request waiter", notify_err))
             end
+        end
         end
     end
     for sub in subs
@@ -553,15 +701,6 @@ function _trim_stale_pong_waiters_locked!(client::Client)
         true
     end
     nothing
-end
-
-function _wait_task!(errors::Vector, operation::String, task::Union{Task,Nothing}; timeout::Real=0.5)
-    (isnothing(task) || istaskdone(task) || task === current_task()) && return errors
-    result = timedwait(timeout; pollint=0.005) do
-        istaskdone(task)
-    end
-    result == :timed_out && push!(errors, CleanupError(operation, TimeoutError("$operation timed out")))
-    errors
 end
 
 function _take_client_tasks!(client::Client)
@@ -710,7 +849,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
                     client.read_io = read_io
                     client.reader = reader
                     client.write_io = _write_transport_for_options(write_io, client.options)
-                    mark_connected && (client.status = ConnectionStatus.CONNECTED)
+                    mark_connected && _store_status_locked!(client, ConnectionStatus.CONNECTED)
                     client.pings_out = 0
                     server.last_auth_error = nothing
                     true
@@ -735,9 +874,8 @@ end
 
 function _connect_initial!(client::Client)
     generation = @lock client.lock begin
-        client.status = ConnectionStatus.CONNECTING
-        client.generation += 1
-        client.generation
+        _store_status_locked!(client, ConnectionStatus.CONNECTING)
+        _bump_generation_locked!(client)
     end
     last_err = nothing
     for server in client.servers
@@ -750,7 +888,7 @@ function _connect_initial!(client::Client)
             _report_error(client, err)
         end
     end
-    @lock client.lock client.status = ConnectionStatus.DISCONNECTED
+    @lock client.lock _store_status_locked!(client, ConnectionStatus.DISCONNECTED)
     isnothing(last_err) ? throw(NoServersError()) : throw(last_err)
 end
 
@@ -929,7 +1067,7 @@ function _merge_discovered_servers!(client::Client, info::ServerInfo)
 end
 
 function _generation_matches(client::Client, generation::Int)
-    @lock client.lock client.generation == generation
+    _load_generation(client) == generation
 end
 
 function _sleep_interruptibly(client::Client, generation::Int, seconds::Real)
@@ -1034,20 +1172,24 @@ function _trigger_reconnect(client::Client, reason)
     opts = client.options
     should_start = false
     generation = 0
+    notify_subs = Subscription[]
     @lock client.lock begin
         if client.status == ConnectionStatus.CONNECTED
-            client.generation += 1
+            _bump_generation_locked!(client)
             generation = client.generation
-            client.status = opts.allow_reconnect ? ConnectionStatus.RECONNECTING : ConnectionStatus.DISCONNECTED
+            _store_status_locked!(client, opts.allow_reconnect ? ConnectionStatus.RECONNECTING : ConnectionStatus.DISCONNECTED)
             client.flusher_task = nothing
             should_start = opts.allow_reconnect
-            for sub in values(client.subscriptions)
-                sub.server_active = false
-            end
-            _notify_all_subscription_waiters_locked(client; all=true)
+            notify_subs = collect(values(client.subscriptions))
         end
     end
     generation == 0 && return nothing
+    for sub in notify_subs
+        @lock sub.lock begin
+            sub.server_active = false
+            _notify_subscription_waiters_locked(sub; all=true)
+        end
+    end
     if should_start
         _wake_flusher(client)
         _report_cleanup_errors(client, _notify_request_waiters!(client, ConnectionReconnectingError()))
@@ -1121,7 +1263,7 @@ function _reconnect_loop(client::Client, generation::Int)
                 _flush_pending_buffer(client; generation=generation)
                 committed = @lock client.lock begin
                     if client.generation == generation && client.status == ConnectionStatus.RECONNECTING
-                        client.status = ConnectionStatus.CONNECTED
+                        _store_status_locked!(client, ConnectionStatus.CONNECTED)
                         true
                     else
                         false
@@ -1142,13 +1284,17 @@ function _reconnect_loop(client::Client, generation::Int)
                     _terminal_disconnect!(client, generation, err)
                     return
                 end
+                notify_subs = Subscription[]
                 @lock client.lock begin
                     if client.generation == generation && client.status != ConnectionStatus.CLOSED
-                        client.status = ConnectionStatus.RECONNECTING
-                        for sub in values(client.subscriptions)
-                            sub.server_active = false
-                        end
-                        _notify_all_subscription_waiters_locked(client; all=true)
+                        _store_status_locked!(client, ConnectionStatus.RECONNECTING)
+                        notify_subs = collect(values(client.subscriptions))
+                    end
+                end
+                for sub in notify_subs
+                    @lock sub.lock begin
+                        sub.server_active = false
+                        _notify_subscription_waiters_locked(sub; all=true)
                     end
                 end
                 _close_transport_report_errors!(client; preserve_replayable=true)
@@ -1164,8 +1310,9 @@ end
 function _replay_subscriptions(client::Client)
     subs = @lock client.lock collect(values(client.subscriptions))
     for sub in subs
-        state = @lock client.lock begin
-            if get(client.subscriptions, sub.sid, nothing) !== sub || sub.closed || sub.server_active
+        present = @lock client.lock get(client.subscriptions, sub.sid, nothing) === sub
+        state = @lock sub.lock begin
+            if !present || sub.closed || sub.server_active
                 nothing
             else
                 remaining = sub.max_msgs > 0 ? sub.max_msgs - sub.received : nothing
@@ -1180,8 +1327,9 @@ function _replay_subscriptions(client::Client)
         sid, subject, queue, remaining = state
         _write_raw(client, _sub_cmd(subject, queue, sid))
         isnothing(remaining) || _write_raw(client, _unsub_cmd(sid, remaining))
-        active = @lock client.lock begin
-            if get(client.subscriptions, sid, nothing) === sub && !sub.closed
+        present = @lock client.lock get(client.subscriptions, sid, nothing) === sub
+        active = @lock sub.lock begin
+            if present && !sub.closed
                 sub.server_active = true
                 true
             else

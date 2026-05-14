@@ -17,6 +17,31 @@ Base.@kwdef mutable struct Stats
     dropped_msgs::Int = 0
 end
 
+struct AtomicStats
+    in_msgs::Threads.Atomic{Int}
+    out_msgs::Threads.Atomic{Int}
+    in_bytes::Threads.Atomic{Int}
+    out_bytes::Threads.Atomic{Int}
+    reconnects::Threads.Atomic{Int}
+    errors::Threads.Atomic{Int}
+    dropped_msgs::Threads.Atomic{Int}
+end
+
+AtomicStats(; in_msgs::Int=0, out_msgs::Int=0, in_bytes::Int=0, out_bytes::Int=0,
+            reconnects::Int=0, errors::Int=0, dropped_msgs::Int=0) =
+    AtomicStats(Threads.Atomic{Int}(in_msgs), Threads.Atomic{Int}(out_msgs),
+                Threads.Atomic{Int}(in_bytes), Threads.Atomic{Int}(out_bytes),
+                Threads.Atomic{Int}(reconnects), Threads.Atomic{Int}(errors),
+                Threads.Atomic{Int}(dropped_msgs))
+
+AtomicStats(stats::Stats) = AtomicStats(; in_msgs=stats.in_msgs, out_msgs=stats.out_msgs,
+                                        in_bytes=stats.in_bytes, out_bytes=stats.out_bytes,
+                                        reconnects=stats.reconnects, errors=stats.errors,
+                                        dropped_msgs=stats.dropped_msgs)
+
+@inline _stat_add!(counter::Threads.Atomic{Int}, value::Int=1) = (Threads.atomic_add!(counter, value); nothing)
+@inline _stat_get(counter::Threads.Atomic{Int})::Int = counter[]
+
 function _default_error_cb(err)
     @warn "Natter client error" exception=err
     nothing
@@ -24,8 +49,104 @@ end
 
 _default_noop_cb() = nothing
 
-const Headers = Dict{String,Vector{String}}
-const HeaderStorage = Union{Headers,Nothing}
+struct _HeaderEntry
+    name::String
+    values::Vector{String}
+end
+
+mutable struct Headers <: AbstractDict{String,Vector{String}}
+    data::Dict{String,_HeaderEntry}
+    Headers(data::Dict{String,_HeaderEntry}) = new(data)
+end
+
+Headers() = Headers(Dict{String,_HeaderEntry}())
+
+_ascii_lower(byte::UInt8) = UInt8('A') <= byte <= UInt8('Z') ? byte + 0x20 : byte
+
+function _canonical_header_key(name::AbstractString)::String
+    key = String(name)
+    out = nothing
+    @inbounds for i in 1:ncodeunits(key)
+        byte = codeunit(key, i)
+        lower = _ascii_lower(byte)
+        if lower != byte
+            if isnothing(out)
+                out = Vector{UInt8}(undef, ncodeunits(key))
+                for j in 1:(i - 1)
+                    out[j] = codeunit(key, j)
+                end
+            end
+            out[i] = lower
+        elseif !isnothing(out)
+            out[i] = byte
+        end
+    end
+    isnothing(out) ? key : String(out)
+end
+
+function Base.iterate(headers::Headers, state...)
+    next = iterate(values(headers.data), state...)
+    isnothing(next) && return nothing
+    entry, next_state = next
+    entry.name => entry.values, next_state
+end
+
+Base.length(headers::Headers) = length(headers.data)
+Base.isempty(headers::Headers) = isempty(headers.data)
+Base.eltype(::Type{Headers}) = Pair{String,Vector{String}}
+
+function Base.getindex(headers::Headers, key::AbstractString)
+    entry = headers.data[_canonical_header_key(key)]
+    entry.values
+end
+
+function Base.setindex!(headers::Headers, values::Vector{String}, key::AbstractString)
+    canonical = _canonical_header_key(key)
+    entry = get(headers.data, canonical, nothing)
+    name = isnothing(entry) ? String(key) : entry.name
+    headers.data[canonical] = _HeaderEntry(name, values)
+    headers
+end
+
+function Base.get(headers::Headers, key::AbstractString, default)
+    entry = get(headers.data, _canonical_header_key(key), nothing)
+    isnothing(entry) ? default : entry.values
+end
+Base.get(::Headers, _key, default) = default
+
+function Base.get!(headers::Headers, key::AbstractString, default::Vector{String})
+    canonical = _canonical_header_key(key)
+    entry = get(headers.data, canonical, nothing)
+    if isnothing(entry)
+        headers.data[canonical] = _HeaderEntry(String(key), default)
+        return default
+    end
+    entry.values
+end
+
+Base.haskey(headers::Headers, key::AbstractString) =
+    haskey(headers.data, _canonical_header_key(key))
+Base.haskey(::Headers, _key) = false
+
+function Base.delete!(headers::Headers, key::AbstractString)
+    delete!(headers.data, _canonical_header_key(key))
+    headers
+end
+Base.delete!(headers::Headers, _key) = headers
+Base.empty!(headers::Headers) = (empty!(headers.data); headers)
+Base.copy(headers::Headers) = _headers_from_pairs(name => copy(values) for (name, values) in headers)
+
+Headers(pairs::Pair...) = _headers_from_pairs(pairs)
+Headers(header_pairs) = _headers_from_pairs(header_pairs)
+
+mutable struct LazyHeaders <: AbstractDict{String,Vector{String}}
+    raw::Vector{UInt8}
+    parsed::Union{Headers,Nothing}
+end
+
+LazyHeaders(raw::Vector{UInt8}) = LazyHeaders(raw, nothing)
+
+const HeaderStorage = Union{Headers,LazyHeaders,Nothing}
 
 abstract type AbstractNatterClient end
 abstract type AbstractMsg end
@@ -67,43 +188,37 @@ _headers_from_input(::Nothing) = Headers()
 _headers_from_input(h::Headers) = h
 _headers_from_input(h) = _headers_from_pairs(h)
 
-_headers_copy(::Nothing) = Headers()
-_headers_copy(h::Headers) = Headers(k => copy(v) for (k, v) in h)
-_headers_copy(h) = _headers_from_pairs(h)
-
-_ascii_lower(byte::UInt8) = UInt8('A') <= byte <= UInt8('Z') ? byte + 0x20 : byte
-
-function _header_name_eq_ci(left::AbstractString, right::AbstractString)::Bool
-    ncodeunits(left) == ncodeunits(right) || return false
-    @inbounds for i in 1:ncodeunits(left)
-        _ascii_lower(codeunit(left, i)) == _ascii_lower(codeunit(right, i)) || return false
+function _headers_materialize!(h::LazyHeaders)::Headers
+    parsed = h.parsed
+    if isnothing(parsed)
+        parsed = _parse_headers(h.raw)
+        h.parsed = parsed
     end
-    true
+    parsed
 end
 
+_headers_copy(::Nothing) = Headers()
+_headers_copy(h::Headers) = _headers_from_pairs(k => copy(v) for (k, v) in h)
+_headers_copy(h::LazyHeaders) = _headers_copy(_headers_materialize!(h))
+_headers_copy(h) = _headers_from_pairs(h)
+
+Base.length(h::LazyHeaders) = length(_headers_materialize!(h))
+Base.iterate(h::LazyHeaders, state...) = iterate(_headers_materialize!(h), state...)
+Base.getindex(h::LazyHeaders, key::AbstractString) = getindex(_headers_materialize!(h), key)
+Base.haskey(h::LazyHeaders, key) = haskey(_headers_materialize!(h), key)
+Base.get(h::LazyHeaders, key, default) = get(_headers_materialize!(h), key, default)
+Base.keys(h::LazyHeaders) = keys(_headers_materialize!(h))
+
 _header_values(::Nothing, _key::AbstractString) = nothing
+_header_values(headers::LazyHeaders, key::AbstractString) =
+    _header_values(_headers_materialize!(headers), key)
 
 function _header_values(headers::Headers, key::AbstractString)
-    key_string = String(key)
-    values = get(headers, key_string, nothing)
-    !isnothing(values) && !isempty(values) && return values
-
-    first_empty = values
-    for (name, candidate) in headers
-        name == key_string && continue
-        _header_name_eq_ci(name, key_string) || continue
-        isempty(candidate) || return candidate
-        isnothing(first_empty) && (first_empty = candidate)
-    end
-    first_empty
+    get(headers, key, nothing)
 end
 
 function _delete_header!(headers::Headers, key::AbstractString)
-    key_string = String(key)
-    delete!(headers, key_string)
-    for name in collect(keys(headers))
-        _header_name_eq_ci(name, key_string) && delete!(headers, name)
-    end
+    delete!(headers, key)
     headers
 end
 _delete_header!(::Nothing, _key::AbstractString) = nothing
@@ -266,6 +381,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedC
     pending_size::Int
     write_buffer_size::Int
     write_buffer_latency::Float64
+    write_timeout::Float64
     max_control_line::Int
     max_inbound_payload::Int
     max_header_bytes::Int
@@ -284,7 +400,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedC
         servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
         tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
-        max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency,
+        max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
         sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, inbox_prefix,
         error_cb, disconnected_cb, reconnected_cb, closed_cb,
@@ -304,6 +420,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedC
         pending_size = _connect_option_positive_int("pending_size", pending_size)
         write_buffer_size = _connect_option_nonnegative_int("write_buffer_size", write_buffer_size)
         write_buffer_latency = _connect_option_nonnegative_float("write_buffer_latency", write_buffer_latency)
+        write_timeout = _connect_option_positive_float("write_timeout", write_timeout)
         max_control_line = _connect_option_positive_int("max_control_line", max_control_line)
         max_inbound_payload = _connect_option_positive_int("max_inbound_payload", max_inbound_payload)
         max_header_bytes = _connect_option_positive_int("max_header_bytes", max_header_bytes)
@@ -317,7 +434,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},ErrorCallback,DisconnectedC
             servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
             tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
-            max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency,
+            max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
             max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
             sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, inbox_prefix,
             error_cb, disconnected_cb, reconnected_cb, closed_cb,
@@ -333,7 +450,7 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                         allow_reconnect=true, reconnect_wait=0.5, reconnect_max_wait=5.0,
                         reconnect_jitter=0.1, max_reconnect_attempts=-1,
                         pending_size=2 * 1024 * 1024, write_buffer_size=DEFAULT_WRITE_BUFFER_SIZE,
-                        write_buffer_latency=0.001,
+                        write_buffer_latency=0.001, write_timeout=DEFAULT_WRITE_TIMEOUT,
                         max_control_line=DEFAULT_MAX_CONTROL_LINE,
                         max_inbound_payload=DEFAULT_MAX_INBOUND_PAYLOAD,
                         max_header_bytes=DEFAULT_MAX_HEADER_BYTES,
@@ -346,7 +463,8 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                    tls_first, tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout,
                    ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
                    reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
-                   write_buffer_size, write_buffer_latency, max_control_line, max_inbound_payload,
+                   write_buffer_size, write_buffer_latency, write_timeout,
+                   max_control_line, max_inbound_payload,
                    max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
                    sub_pending_bytes_limit, drain_timeout, inbox_prefix, error_cb,
                    disconnected_cb, reconnected_cb, closed_cb, discovered_server_cb)
@@ -388,13 +506,14 @@ mutable struct ProtocolReader{I}
     first::Int
     last::Int
     scratch::Vector{UInt8}
+    subject_cache::Dict{Int,String}
 end
 
 ProtocolReader(io::I; read_size::Int=4096) where {I} =
     ProtocolReader{I}(io; read_size)
 
 ProtocolReader{I}(io; read_size::Int=4096) where {I} =
-    ProtocolReader{I}(io, UInt8[], 1, 0, Vector{UInt8}(undef, read_size))
+    ProtocolReader{I}(io, UInt8[], 1, 0, Vector{UInt8}(undef, read_size), Dict{Int,String}())
 
 struct _ProtocolFrame
     op::Symbol
@@ -657,19 +776,23 @@ _write_transport_field_type(io) = typeof(io)
 
 struct _NoSubscriptionControlHandler end
 mutable struct _JetStreamPushControlHandler
-    idle_heartbeat::Float64
-    flow_control::Bool
-    last_seen::Float64
-    consumer_deleted::Bool
-    flow_incoming::UInt64
+    idle_heartbeat::Threads.Atomic{Float64}
+    flow_control::Threads.Atomic{Bool}
+    last_seen::Threads.Atomic{Float64}
+    consumer_deleted::Threads.Atomic{Bool}
+    flow_incoming::Threads.Atomic{UInt64}
     flow_delivered::UInt64
     flow_reply::Union{String,Nothing}
     flow_target::UInt64
     lock::ReentrantLock
 end
 _JetStreamPushControlHandler(idle_heartbeat::Real=0.0; flow_control::Bool=true) =
-    _JetStreamPushControlHandler(Float64(idle_heartbeat), flow_control, time(), false,
-                                 UInt64(0), UInt64(0), nothing, UInt64(0),
+    _JetStreamPushControlHandler(Threads.Atomic{Float64}(Float64(idle_heartbeat)),
+                                 Threads.Atomic{Bool}(flow_control),
+                                 Threads.Atomic{Float64}(time()),
+                                 Threads.Atomic{Bool}(false),
+                                 Threads.Atomic{UInt64}(UInt64(0)),
+                                 UInt64(0), nothing, UInt64(0),
                                  ReentrantLock())
 struct _RequestMuxControlHandler end
 
@@ -719,6 +842,7 @@ end
 
 mutable struct Subscription{C<:AbstractNatterClient}
     client::C
+    lock::ReentrantLock
     sid::Int
     subject::String
     queue::Union{String,Nothing}
@@ -738,12 +862,13 @@ mutable struct Subscription{C<:AbstractNatterClient}
 end
 
 function Subscription(client::C, sid::Int, subject::String, queue::Union{String,Nothing}, callback,
+                      lock::ReentrantLock,
                       messages::MsgQueue{Msg}, condition::Base.GenericCondition{ReentrantLock},
                       control_handler::_SubscriptionControlHandler,
                       pending_msgs_limit::Int, pending_bytes_limit::Int, pending_bytes::Int,
                       received::Int, max_msgs::Int, closed::Bool, processor::Union{Task,Nothing},
                       server_active::Bool, processing::Int) where {C<:AbstractNatterClient}
-    Subscription{C}(client, sid, subject, queue, !isnothing(callback), messages, condition,
+    Subscription{C}(client, lock, sid, subject, queue, !isnothing(callback), messages, condition,
                     control_handler, pending_msgs_limit, pending_bytes_limit, pending_bytes,
                     received, max_msgs, closed, processor, server_active, processing)
 end
@@ -835,19 +960,21 @@ function _filter_pong_waiter_queue!(f::Function, q::PongWaiterQueue)
 end
 
 mutable struct RequestWaiter{C<:AbstractNatterClient}
-    condition::Base.GenericCondition{ReentrantLock}
     ready::Bool
     value::Union{Msg,Exception,Nothing}
     active::Bool
+    deadline::Float64
 end
 
-RequestWaiter{C}(condition::Base.GenericCondition{ReentrantLock}) where {C<:AbstractNatterClient} =
-    RequestWaiter{C}(condition, false, nothing, true)
+RequestWaiter{C}(deadline::Real=Inf) where {C<:AbstractNatterClient} =
+    RequestWaiter{C}(false, nothing, true, Float64(deadline))
 
 mutable struct RequestMux{C<:AbstractNatterClient}
     prefix::String
     sub::Subscription{C}
     waiters::Dict{String,RequestWaiter{C}}
+    condition::Base.GenericCondition{ReentrantLock}
+    timeout_task::Union{Task,Nothing}
 end
 
 mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterClient
@@ -856,6 +983,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     current_server::Union{Server,Nothing}
     connected_url::Union{String,Nothing}
     status::ConnectionStatus.T
+    status_code::Threads.Atomic{Int}
     info::ServerInfo
     socket::Union{Sockets.TCPSocket,Nothing}
     read_io::Union{ReadIO,Nothing}
@@ -863,6 +991,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     write_io::Union{WriteIO,Nothing}
     lock::ReentrantLock
     write_lock::ReentrantLock
+    write_scratch::Vector{UInt8}
     flush_signal::Channel{Bool}
     flusher_task::Union{Task,Nothing}
     sid::Int
@@ -876,9 +1005,10 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     ping_task::Union{Task,Nothing}
     reconnect_task::Union{Task,Nothing}
     pings_out::Int
-    stats::Stats
+    stats::AtomicStats
     rng::MersenneTwister
     generation::Int
+    generation_value::Threads.Atomic{Int}
 end
 
 function Client(options::Options, servers::Vector{Server}, current_server::Union{Server,Nothing},
@@ -889,7 +1019,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                 request_mux::Union{RequestMux,Nothing}, request_mux_lock::ReentrantLock,
                 pending, pending_bytes::Int, pongs::PongWaiterQueue,
                 reader_task::Union{Task,Nothing}, ping_task::Union{Task,Nothing},
-                reconnect_task::Union{Task,Nothing}, pings_out::Int, stats::Stats,
+                reconnect_task::Union{Task,Nothing}, pings_out::Int, stats,
                 rng::MersenneTwister, generation::Int) where {Options<:ConnectOptions}
     ReadIO = _transport_field_type(read_io)
     WriteIO = _write_transport_field_type(write_io)
@@ -904,7 +1034,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
         sub = typed_subscriptions[request_mux.sub.sid]
         waiters = Dict{String,RequestWaiter{client_type}}()
         for (token, waiter) in request_mux.waiters
-            typed_waiter = RequestWaiter{client_type}(Base.Threads.Condition(lock))
+            typed_waiter = RequestWaiter{client_type}(waiter.deadline)
             typed_waiter.ready = waiter.ready
             typed_waiter.active = waiter.active
             if waiter.value isa Exception || isnothing(waiter.value)
@@ -912,17 +1042,20 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
             end
             waiters[token] = typed_waiter
         end
-        RequestMux{client_type}(request_mux.prefix, sub, waiters)
+        RequestMux{client_type}(request_mux.prefix, sub, waiters, Base.Threads.Condition(lock), nothing)
     end
     reader = isnothing(read_io) ? nothing : ProtocolReader(read_io)
     pending = _pending_buffer_from(pending)
+    atomic_stats = stats isa AtomicStats ? stats : AtomicStats(stats)
     Client{Options,ReadIO,WriteIO}(options, servers, current_server, connected_url, status,
+                                   Threads.Atomic{Int}(Int(status)),
                                    info, socket, read_io, reader, write_io, lock, write_lock,
+                                   UInt8[],
                                    flush_signal, flusher_task,
                                    sid, typed_subscriptions, typed_request_mux, request_mux_lock,
                                    pending, pending_bytes, pongs,
-                                   reader_task, ping_task, reconnect_task, pings_out, stats,
-                                   rng, generation)
+                                   reader_task, ping_task, reconnect_task, pings_out, atomic_stats,
+                                   rng, generation, Threads.Atomic{Int}(generation))
 end
 
 function _wait_until_condition_locked(predicate::Function, condition::Base.GenericCondition{ReentrantLock},
@@ -957,13 +1090,13 @@ function _notify_subscription_waiters_locked(sub::Subscription; all::Bool=false)
 end
 
 function _notify_subscription_waiters!(sub::Subscription; all::Bool=false)
-    @lock sub.client.lock _notify_subscription_waiters_locked(sub; all)
+    @lock sub.lock _notify_subscription_waiters_locked(sub; all)
     nothing
 end
 
 function _notify_all_subscription_waiters_locked(client; all::Bool=true)
     for sub in values(client.subscriptions)
-        _notify_subscription_waiters_locked(sub; all)
+        _notify_subscription_waiters!(sub; all)
     end
     nothing
 end
@@ -978,18 +1111,31 @@ function _resolve_pong_waiter_locked!(waiter::PongWaiter, value::Bool)
 end
 
 function _resolve_request_waiter_locked!(waiter::RequestWaiter{C},
-                                         value::Union{Msg,Exception}) where {C<:AbstractNatterClient}
+                                         value::Union{Msg,Exception},
+                                         condition::Base.GenericCondition{ReentrantLock}) where {C<:AbstractNatterClient}
     waiter.active || return false
     waiter.value = value
     waiter.ready = true
     waiter.active = false
-    notify(waiter.condition)
+    notify(condition; all=true)
     true
 end
 
-status(client::Client) = (@lock client.lock client.status)
-stats(client::Client) = @lock client.lock Stats(; in_msgs=client.stats.in_msgs, out_msgs=client.stats.out_msgs,
-                                                 in_bytes=client.stats.in_bytes, out_bytes=client.stats.out_bytes,
-                                                 reconnects=client.stats.reconnects, errors=client.stats.errors,
-                                                 dropped_msgs=client.stats.dropped_msgs)
+@inline _load_status(client::Client)::ConnectionStatus.T = ConnectionStatus.T(client.status_code[])
+@inline _store_status_locked!(client::Client, value::ConnectionStatus.T) =
+    (client.status = value; client.status_code[] = Int(value); value)
+@inline _load_generation(client::Client)::Int = client.generation_value[]
+@inline _store_generation_locked!(client::Client, value::Int) =
+    (client.generation = value; client.generation_value[] = value; value)
+@inline _bump_generation_locked!(client::Client)::Int =
+    _store_generation_locked!(client, client.generation + 1)
+
+status(client::Client) = _load_status(client)
+stats(client::Client) = Stats(; in_msgs=_stat_get(client.stats.in_msgs),
+                              out_msgs=_stat_get(client.stats.out_msgs),
+                              in_bytes=_stat_get(client.stats.in_bytes),
+                              out_bytes=_stat_get(client.stats.out_bytes),
+                              reconnects=_stat_get(client.stats.reconnects),
+                              errors=_stat_get(client.stats.errors),
+                              dropped_msgs=_stat_get(client.stats.dropped_msgs))
 connected_url(client::Client) = (@lock client.lock client.connected_url)

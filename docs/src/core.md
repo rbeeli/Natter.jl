@@ -17,9 +17,10 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `allow_reconnect` | `true` | Enable automatic reconnect after transient failures. |
 | `reconnect_wait`, `reconnect_max_wait`, `reconnect_jitter` | `0.5`, `5.0`, `0.1` | Reconnect backoff timing in seconds. |
 | `max_reconnect_attempts` | `-1` | Maximum reconnect loop attempts; `-1` means unlimited. |
-| `pending_size` | `2 MiB` | Maximum outbound publish data retained for reconnect replay, including unflushed connected publishes. |
+| `pending_size` | `2 MiB` | Maximum outbound publish data retained for reconnect replay, including reconnect-time publishes and buffered connected publishes. |
 | `write_buffer_size` | `32 KiB` | Outbound write buffer size for coalescing small writes. Set to `0` to disable it; publish frames at or above this size bypass the buffer. |
 | `write_buffer_latency` | `0.001` | Maximum background flusher delay in seconds for coalescing non-threshold buffered writes. Set to `0` to yield and flush as soon as possible. |
+| `write_timeout` | `10.0` | Maximum seconds a transport write or flush may block before the active transport is closed and the operation times out. |
 | `max_control_line` | `16 KiB` | Maximum inbound protocol control line length. |
 | `max_inbound_payload` | `64 MiB` | Maximum inbound message payload allocation. |
 | `max_header_bytes` | `64 KiB` | Maximum inbound header block size. |
@@ -74,7 +75,9 @@ publish(client, "events.created"; headers=Dict("trace-id" => "abc-123"))
 
 Payloads are converted to bytes. `String`, `Vector{UInt8}`, `AbstractVector{UInt8}`, and `nothing` are supported by the public API.
 
-`publish` validates subjects and server `max_payload`. Connected clients use a buffered write flusher for throughput; small writes are coalesced up to `write_buffer_latency` unless the buffer threshold is reached first. Call `flush(client)` when the application needs a server round trip confirming earlier commands were processed. Publish data retained for reconnect replay, whether queued during reconnect or still unflushed on a connected transport, is bounded by `pending_size` and replayed after reconnect.
+`publish` validates subjects and server `max_payload`. Connected clients use a buffered write flusher for throughput; small writes are coalesced up to `write_buffer_latency` unless the buffer threshold is reached first. Transport writes and flushes are bounded by `write_timeout`; a timed-out write closes the active transport so reconnect or close can proceed. Call `flush(client)` when the application needs a server round trip confirming earlier commands were processed. Publish data retained for reconnect replay, whether queued during reconnect or still buffered on a connected transport, is bounded by `pending_size` and replayed after reconnect on a best-effort basis.
+
+Core publish replay should be treated as at-least-once for retained frames, not exactly-once. Ambiguous transport failures can duplicate delivery, and frames at or above `write_buffer_size` are not retained after a successful direct write. Use JetStream publish message IDs or idempotent consumers when duplicate effects are unacceptable.
 
 ## Subscribe
 
@@ -121,7 +124,7 @@ When negotiated with a server that supports header status messages, no responder
 
 ## Headers
 
-Received headers are represented as `Dict{String,Vector{String}}` through the `Headers` alias. Publish and request calls accept `Headers`, dictionaries with string or vector values, or pair iterators. Header names must be valid NATS/HTTP token field names.
+Received headers are represented as `Headers`, a case-insensitive dictionary of `String` names to `Vector{String}` values. Publish and request calls accept `Headers`, dictionaries with string or vector values, or pair iterators. Header names must be valid NATS/HTTP token field names.
 Header publish and request calls require server header support advertised in INFO; older servers that do not advertise it raise `UnsupportedFeatureError` before Natter writes an `HPUB`.
 
 ```julia
@@ -134,7 +137,7 @@ publish(client, "events.created", "payload"; headers)
 request(client, "events.lookup", "payload"; headers=("trace-id" => "abc-123",))
 ```
 
-Read headers from received messages with `header(msg, "name")` or copy all headers with `headers(msg)`. Header lookup is case-insensitive; copied headers preserve the casing received on the wire.
+Read headers from received messages with `header(msg, "name")` or copy all headers with `headers(msg)`. Header lookup is case-insensitive, and mixed-case duplicates are merged into one entry using the first inserted field spelling for iteration and serialization.
 
 ## Flush, Drain, And Close
 

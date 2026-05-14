@@ -21,6 +21,7 @@ function make_client()
         reconnect_jitter=0.2,
         max_reconnect_attempts=-1,
         pending_size=16 * 1024 * 1024,
+        write_timeout=5.0,
         sub_pending_msgs_limit=8192,
         sub_pending_bytes_limit=128 * 1024 * 1024,
         tls_ca_path="/etc/nats/ca.pem",

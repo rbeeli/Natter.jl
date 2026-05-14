@@ -69,6 +69,21 @@ using TestItems
     @test parsed_headers["Spaced"] == ["value"]
     @test parsed_headers["Empty"] == [""]
     @test !haskey(parsed_headers, "")
+
+    mixed_headers = Headers("Trace" => "abc", "trace" => ["def"])
+    @test length(mixed_headers) == 1
+    @test mixed_headers["Trace"] == ["abc", "def"]
+    @test mixed_headers["trace"] == ["abc", "def"]
+    @test mixed_headers["TRACE"] == ["abc", "def"]
+    @test haskey(mixed_headers, "TRACE")
+    @test only(collect(keys(mixed_headers))) == "Trace"
+    N._delete_header!(mixed_headers, "TRACE")
+    @test isempty(mixed_headers)
+
+    parsed_mixed_headers = N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nTrace:abc\r\ntrace:def\r\n\r\n"))
+    @test length(parsed_mixed_headers) == 1
+    @test parsed_mixed_headers["TRACE"] == ["abc", "def"]
+
     @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nMalformed\r\n\r\n"))
     @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nTrace: abc\r\n"))
 
