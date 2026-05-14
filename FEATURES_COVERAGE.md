@@ -20,7 +20,7 @@ executes JetStream and KeyValue tests.
 | TLS transport | Partial | CA/client cert/key options are available; broad platform verification still needs integration hardening. |
 | WebSocket transport | Planned | `ws://` and `wss://` are not implemented yet. |
 | INFO / CONNECT / PING / PONG | Supported | Includes async INFO updates and ping-based flush. |
-| PUB / HPUB / SUB / UNSUB | Supported | Headers are negotiated from server INFO before advertising or emitting HPUB. Queue groups are included. Outbound writes use a buffered flusher, with explicit flush/ping forcing a transport flush. |
+| PUB / HPUB / SUB / UNSUB | Supported | Headers are negotiated from server INFO before advertising or emitting HPUB. Queue groups are included. Outbound writes use a size- and latency-bound buffered flusher, with explicit flush/ping forcing a transport flush. |
 | Wildcard subscriptions | Supported | `*` and terminal `>` subscriptions are validated. Publish subjects reject wildcards. |
 | MSG / HMSG parser | Supported | Streaming line/payload parser written from scratch. |
 | Request/reply | Supported | Uses a shared request inbox mux with per-request waiters. |

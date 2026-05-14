@@ -10,7 +10,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `ConnectOptions` | Keyword-backed connection configuration. |
 | `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
 | `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. Failed handles throw `CapturedException`; inspect `err.ex` for the original operation error. |
-| `Msg` | Core received message data with `subject`, `reply`, `data`, and `headers`. |
+| `Msg` | Core received message data with `subject`, `reply`, and byte-vector `data`; use `header(msg, key)` or `headers(msg)` for headers. |
 | `Headers` | Alias for received headers, `Dict{String,Vector{String}}`; publish and request APIs also accept dictionaries with string or vector values and pair iterators. Outbound header names must be valid NATS/HTTP token field names. Header keys preserve source casing, while `header(msg, key)` lookup is case-insensitive. |
 | `Subscription` | Core subscription handle. |
 | `Stats` | Snapshot of message, byte, reconnect, error, and drop counters. |
@@ -21,12 +21,12 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | :--- | :--- |
 | `connect(url_or_urls=nothing; kwargs...)` | Connect to one or more servers. |
 | `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | Publish a core message; header publishes require server INFO header support. |
-| `subscribe(client, subject; queue=nothing, callback=nothing, max_msgs=0, ...)` | Create a core subscription. |
+| `subscribe(client, subject; queue=nothing, callback=nothing, max_msgs=0, ...)` | Create a core subscription; positive `max_msgs` closes after that many total messages. Per-subscription pending limits must be positive. |
 | `next(sub; timeout=1.0)` | Wait for the next message from a non-callback subscription. |
 | `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | Send a request and wait for one response; request headers require server INFO header support. |
 | `flush(client; timeout=10.0)` | Wait until the server has processed previous commands. |
 | `ping(client; timeout=10.0)` | Alias for `flush`. |
-| `unsubscribe(sub; max_msgs=0)` | Unsubscribe immediately or after `max_msgs` additional messages. |
+| `unsubscribe(sub; max_msgs=0)` | Unsubscribe immediately or after `max_msgs` additional messages. `max_msgs` must be non-negative. |
 | `drain(sub; timeout=...)` | Unsubscribe and wait for queued callback work within one deadline. |
 | `drain(client; timeout=...)` | Drain subscriptions and flush within one shared deadline, then close the client. |
 | `close(client; throw_errors=false)` | Close transports, tasks, subscriptions, and callbacks. |

@@ -615,6 +615,90 @@ end
     end
 end
 
+@testitem "JetStream nak validates delay" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function fresh_msg()
+        capture = TestHelpers.WriteCapture()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+        msg = JetStreamMsg(Msg("orders.created", "ACK.REPLY", TestHelpers.bytes("work")), client)
+        msg, capture
+    end
+
+    for delay in (-0.001, Inf, -Inf, NaN, true, "1")
+        msg, capture = fresh_msg()
+        @test_throws ArgumentError nak(msg; delay)
+        @test !msg._acked
+        @test TestHelpers.capture_text(capture) == ""
+    end
+
+    msg, capture = fresh_msg()
+    nak(msg; delay=0)
+    @test msg._acked
+    @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 16\r\n-NAK {\"delay\":0}\r\n"
+end
+
+@testitem "JetStream terminal ack guard is synchronized" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct BlockingWriteCapture <: IO
+        capture::TestHelpers.WriteCapture
+        started::Channel{Nothing}
+        release::Channel{Nothing}
+        blocked::Bool
+    end
+
+    BlockingWriteCapture() =
+        BlockingWriteCapture(TestHelpers.WriteCapture(), Channel{Nothing}(1), Channel{Nothing}(1), false)
+
+    function blocking_write(t::BlockingWriteCapture, data)
+        if !t.blocked
+            t.blocked = true
+            put!(t.started, nothing)
+            take!(t.release)
+        end
+        write(t.capture, data)
+    end
+    Base.write(t::BlockingWriteCapture, byte::UInt8) = blocking_write(t, byte)
+    Base.write(t::BlockingWriteCapture, data::Vector{UInt8}) = blocking_write(t, data)
+    Base.write(t::BlockingWriteCapture, data::Base.CodeUnits{UInt8}) = blocking_write(t, data)
+    Base.write(t::BlockingWriteCapture, data::Union{String,SubString{String}}) = blocking_write(t, data)
+    Base.write(t::BlockingWriteCapture, data::AbstractString) = blocking_write(t, data)
+    Base.write(t::BlockingWriteCapture, ch::Char) = blocking_write(t, ch)
+    Base.flush(t::BlockingWriteCapture) = flush(t.capture)
+    Base.close(t::BlockingWriteCapture) = close(t.capture)
+
+    capture = BlockingWriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    msg = JetStreamMsg(Msg("orders.created", "ACK.REPLY", TestHelpers.bytes("work")), client)
+
+    ack_result() = try
+        ack(msg)
+        nothing
+    catch err
+        err
+    end
+
+    first = @async ack_result()
+    take!(capture.started)
+    second = @async ack_result()
+    for _ in 1:100
+        yield()
+    end
+
+    put!(capture.release, nothing)
+    results = (fetch(first), fetch(second))
+
+    @test count(isnothing, results) == 1
+    @test count(err -> err isa JetStreamError, results) == 1
+    @test msg._acked
+    @test TestHelpers.capture_text(capture.capture) == "PUB ACK.REPLY 0\r\n\r\n"
+end
+
 @testitem "JetStream push flow control requires positive heartbeat" setup=[TestHelpers] begin
     using Natter
 

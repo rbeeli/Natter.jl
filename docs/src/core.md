@@ -19,6 +19,7 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `max_reconnect_attempts` | `-1` | Maximum reconnect loop attempts; `-1` means unlimited. |
 | `pending_size` | `2 MiB` | Maximum outbound publish data retained for reconnect replay, including unflushed connected publishes. |
 | `write_buffer_size` | `32 KiB` | Outbound write buffer size for coalescing small writes. Set to `0` to disable it; publish frames at or above this size bypass the buffer. |
+| `write_buffer_latency` | `0.001` | Maximum background flusher delay in seconds for coalescing non-threshold buffered writes. Set to `0` to yield and flush as soon as possible. |
 | `max_control_line` | `16 KiB` | Maximum inbound protocol control line length. |
 | `max_inbound_payload` | `64 MiB` | Maximum inbound message payload allocation. |
 | `max_header_bytes` | `64 KiB` | Maximum inbound header block size. |
@@ -27,7 +28,7 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit, including NATS header blocks. |
 | `error_cb` | warning callback | Receives asynchronous callback, cleanup, and background task errors. |
 
-Durations and production limits are validated when `ConnectOptions` is built. Timeouts, keepalive intervals, pending limits, parser limits, stale waiter limits, and subscription pending limits must be positive. `reconnect_jitter` can be zero, `write_buffer_size` can be zero to disable buffering, and `max_reconnect_attempts` must be `-1` or non-negative.
+Durations and production limits are validated when `ConnectOptions` is built. Timeouts, keepalive intervals, pending limits, parser limits, stale waiter limits, and subscription pending limits must be positive. `reconnect_jitter`, `write_buffer_latency`, and `write_buffer_size` can be zero, and `max_reconnect_attempts` must be `-1` or non-negative.
 
 Use `status(client)`, `stats(client)`, and `connected_url(client)` for runtime inspection.
 
@@ -69,7 +70,7 @@ publish(client, "events.created"; headers=Dict("trace-id" => "abc-123"))
 
 Payloads are converted to bytes. `String`, `Vector{UInt8}`, `AbstractVector{UInt8}`, and `nothing` are supported by the public API.
 
-`publish` validates subjects and server `max_payload`. Connected clients use a buffered write flusher for throughput; call `flush(client)` when the application needs a server round trip confirming earlier commands were processed. Publish data retained for reconnect replay, whether queued during reconnect or still unflushed on a connected transport, is bounded by `pending_size` and replayed after reconnect.
+`publish` validates subjects and server `max_payload`. Connected clients use a buffered write flusher for throughput; small writes are coalesced up to `write_buffer_latency` unless the buffer threshold is reached first. Call `flush(client)` when the application needs a server round trip confirming earlier commands were processed. Publish data retained for reconnect replay, whether queued during reconnect or still unflushed on a connected transport, is bounded by `pending_size` and replayed after reconnect.
 
 ## Subscribe
 
@@ -81,6 +82,8 @@ sub = subscribe(client, "events.*";
 
 msg = next(sub; timeout=1.0)
 ```
+
+Per-subscription pending limits must be positive.
 
 Callback subscriptions are callback-only; use `next` with subscriptions created without a callback.
 
@@ -98,6 +101,8 @@ end
 one = subscribe(client, "startup.ready"; max_msgs=1)
 msg = next(one; timeout=5.0)
 ```
+
+`unsubscribe(sub; max_msgs=n)` keeps an existing subscription open for `n` additional messages. The client tracks messages already delivered on that subscription and replays only the remaining allowance after reconnect.
 
 ## Request Reply
 

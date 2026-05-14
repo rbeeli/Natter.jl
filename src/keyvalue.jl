@@ -23,7 +23,7 @@ struct KeyValueEntry
     operation::KeyValueOperation.T
 end
 
-Base.String(entry::KeyValueEntry) = String(entry.value)
+Base.String(entry::KeyValueEntry) = _bytes_to_string(entry.value)
 
 struct KeyValueStatus
     bucket::String

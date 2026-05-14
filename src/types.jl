@@ -25,6 +25,7 @@ end
 _default_noop_cb() = nothing
 
 const Headers = Dict{String,Vector{String}}
+const HeaderStorage = Union{Headers,Nothing}
 
 abstract type AbstractNatterClient end
 abstract type AbstractMsg end
@@ -80,6 +81,8 @@ function _header_name_eq_ci(left::AbstractString, right::AbstractString)::Bool
     true
 end
 
+_header_values(::Nothing, _key::AbstractString) = nothing
+
 function _header_values(headers::Headers, key::AbstractString)
     key_string = String(key)
     values = get(headers, key_string, nothing)
@@ -103,9 +106,10 @@ function _delete_header!(headers::Headers, key::AbstractString)
     end
     headers
 end
+_delete_header!(::Nothing, _key::AbstractString) = nothing
 
-function _headers_wire_size(headers::Headers)::Int
-    isempty(headers) && return 0
+function _headers_wire_size(headers::HeaderStorage)::Int
+    (isnothing(headers) || isempty(headers)) && return 0
     bytes = ncodeunits("NATS/1.0") + 2 + 2
     for (name, values) in headers
         for value in values
@@ -115,7 +119,7 @@ function _headers_wire_size(headers::Headers)::Int
     bytes
 end
 
-function _msg_header_bytes(headers::Headers, header_bytes::Union{Int,Nothing})::Int
+function _msg_header_bytes(headers::HeaderStorage, header_bytes::Union{Int,Nothing})::Int
     isnothing(header_bytes) && return _headers_wire_size(headers)
     header_bytes >= 0 || throw(ArgumentError("header_bytes must be non-negative"))
     header_bytes
@@ -142,25 +146,29 @@ struct Msg <: AbstractMsg
     subject::String
     reply::Union{String,Nothing}
     data::Vector{UInt8}
-    headers::Headers
+    headers::HeaderStorage
     sid::Int
     header_bytes::Int
 end
 
 function Msg(subject::String, reply::Union{String,Nothing}, data::Vector{UInt8};
-             headers=Headers(), sid=0, header_bytes::Union{Int,Nothing}=nothing)
-    hdrs = _headers_copy(headers)
+             headers=nothing, sid=0, header_bytes::Union{Int,Nothing}=nothing)
+    hdrs = isnothing(headers) ? nothing : _headers_copy(headers)
     Msg(subject, reply, data, hdrs, sid, _msg_header_bytes(hdrs, header_bytes))
 end
 
 function Msg(subject::String, reply::Union{String,Nothing}, data::Vector{UInt8},
-             headers::Headers, sid::Int)
+             headers::HeaderStorage, sid::Int)
     Msg(subject, reply, data, headers, sid, _headers_wire_size(headers))
 end
 
 _msg_pending_bytes(msg::AbstractMsg)::Int = msg.header_bytes + length(msg.data)
 
-Base.String(msg::Msg) = String(msg.data)
+_bytes_to_string(bytes::Vector{UInt8})::String =
+    isempty(bytes) ? "" : unsafe_string(pointer(bytes), length(bytes))
+_bytes_to_string(bytes::AbstractVector{UInt8})::String = String(copy(bytes))
+
+Base.String(msg::Msg) = _bytes_to_string(msg.data)
 
 function _connect_option_servers(servers)::Vector{String}
     servers isa AbstractVector || throw(ArgumentError("servers must be a vector of strings"))
@@ -244,6 +252,7 @@ mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCall
     max_reconnect_attempts::Int
     pending_size::Int
     write_buffer_size::Int
+    write_buffer_latency::Float64
     max_control_line::Int
     max_inbound_payload::Int
     max_header_bytes::Int
@@ -262,9 +271,10 @@ mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCall
         servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
         tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
-        max_reconnect_attempts, pending_size, write_buffer_size, max_control_line, max_inbound_payload,
-        max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
-        drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb, closed_cb,
+        max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency,
+        max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
+        sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, inbox_prefix,
+        error_cb, disconnected_cb, reconnected_cb, closed_cb,
         discovered_server_cb,
     ) where {ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
         servers = _connect_option_servers(servers)
@@ -279,6 +289,7 @@ mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCall
         max_reconnect_attempts = _connect_option_reconnect_attempts(max_reconnect_attempts)
         pending_size = _connect_option_positive_int("pending_size", pending_size)
         write_buffer_size = _connect_option_nonnegative_int("write_buffer_size", write_buffer_size)
+        write_buffer_latency = _connect_option_nonnegative_float("write_buffer_latency", write_buffer_latency)
         max_control_line = _connect_option_positive_int("max_control_line", max_control_line)
         max_inbound_payload = _connect_option_positive_int("max_inbound_payload", max_inbound_payload)
         max_header_bytes = _connect_option_positive_int("max_header_bytes", max_header_bytes)
@@ -291,9 +302,10 @@ mutable struct ConnectOptions{ErrorCallback,DisconnectedCallback,ReconnectedCall
             servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
             tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
-            max_reconnect_attempts, pending_size, write_buffer_size, max_control_line, max_inbound_payload,
-            max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
-            drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb, closed_cb,
+            max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency,
+            max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
+            sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, inbox_prefix,
+            error_cb, disconnected_cb, reconnected_cb, closed_cb,
             discovered_server_cb)
     end
 end
@@ -302,18 +314,19 @@ function ConnectOptions(servers, name, verbose, pedantic, token, user, password,
                         tls_first, tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout,
                         ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
                         reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
-                        write_buffer_size, max_control_line, max_inbound_payload, max_header_bytes,
-                        max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
-                        drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb,
-                        closed_cb, discovered_server_cb)
+                        write_buffer_size, write_buffer_latency, max_control_line, max_inbound_payload,
+                        max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
+                        sub_pending_bytes_limit, drain_timeout, inbox_prefix, error_cb,
+                        disconnected_cb, reconnected_cb, closed_cb, discovered_server_cb)
     ConnectOptions{typeof(error_cb),typeof(disconnected_cb),typeof(reconnected_cb),typeof(closed_cb),
                    typeof(discovered_server_cb)}(
         servers, name, verbose, pedantic, token, user, password, no_echo, tls_required, tls_first,
         tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
-        max_reconnect_attempts, pending_size, write_buffer_size, max_control_line, max_inbound_payload,
-        max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
-        drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb, closed_cb,
+        max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency,
+        max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
+        sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, inbox_prefix,
+        error_cb, disconnected_cb, reconnected_cb, closed_cb,
         discovered_server_cb)
 end
 
@@ -325,6 +338,7 @@ function ConnectOptions(; servers=[DEFAULT_URL], name=nothing, verbose=false, pe
                         allow_reconnect=true, reconnect_wait=0.5, reconnect_max_wait=5.0,
                         reconnect_jitter=0.1, max_reconnect_attempts=-1,
                         pending_size=2 * 1024 * 1024, write_buffer_size=DEFAULT_WRITE_BUFFER_SIZE,
+                        write_buffer_latency=0.001,
                         max_control_line=DEFAULT_MAX_CONTROL_LINE,
                         max_inbound_payload=DEFAULT_MAX_INBOUND_PAYLOAD,
                         max_header_bytes=DEFAULT_MAX_HEADER_BYTES,
@@ -337,10 +351,10 @@ function ConnectOptions(; servers=[DEFAULT_URL], name=nothing, verbose=false, pe
                    tls_first, tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout,
                    ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
                    reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
-                   write_buffer_size, max_control_line, max_inbound_payload, max_header_bytes,
-                   max_stale_pong_waiters, sub_pending_msgs_limit, sub_pending_bytes_limit,
-                   drain_timeout, inbox_prefix, error_cb, disconnected_cb, reconnected_cb,
-                   closed_cb, discovered_server_cb)
+                   write_buffer_size, write_buffer_latency, max_control_line, max_inbound_payload,
+                   max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
+                   sub_pending_bytes_limit, drain_timeout, inbox_prefix, error_cb,
+                   disconnected_cb, reconnected_cb, closed_cb, discovered_server_cb)
 end
 
 mutable struct Server
@@ -457,27 +471,30 @@ function Base.write(io::BufferedWriteIO, ch::Char)
     write(io.buffer, ch)
 end
 
+function _write_buffered_bytes(io, data::AbstractVector{UInt8}, n::Int)
+    try
+        unsafe_write(io, pointer(data), UInt(n))
+    catch err
+        if err isa MethodError || (err isa ErrorException && occursin("does not support byte I/O", err.msg))
+            bytes = Vector{UInt8}(undef, n)
+            copyto!(bytes, 1, data, 1, n)
+            write(io, bytes)
+        else
+            rethrow()
+        end
+    end
+end
+
 function Base.flush(io::BufferedWriteIO)
     _ensure_open(io)
-    data = take!(io.buffer)
-    ranges = io.replayable_ranges
-    io.replayable_ranges = Tuple{Int,Int}[]
-    try
-        isempty(data) || write(io.io, data)
-        flush(io.io)
-    catch
-        newer = take!(io.buffer)
-        newer_ranges = io.replayable_ranges
-        io.replayable_ranges = Tuple{Int,Int}[]
-        write(io.buffer, data)
-        write(io.buffer, newer)
-        io.replayable_ranges = ranges
-        offset = length(data)
-        for (first, last) in newer_ranges
-            push!(io.replayable_ranges, (first + offset, last + offset))
-        end
-        rethrow()
+    n = position(io.buffer)
+    if n > 0
+        _write_buffered_bytes(io.io, io.buffer.data, n)
     end
+    flush(io.io)
+    truncate(io.buffer, 0)
+    seekstart(io.buffer)
+    empty!(io.replayable_ranges)
     nothing
 end
 
@@ -492,10 +509,14 @@ _buffered_bytes(::IO) = 0
 _buffered_bytes(io::BufferedWriteIO) = position(io.buffer)
 _take_replayable_writes!(::IO) = UInt8[]
 function _take_replayable_writes!(io::BufferedWriteIO)
-    data = take!(io.buffer)
     ranges = io.replayable_ranges
-    io.replayable_ranges = Tuple{Int,Int}[]
-    isempty(ranges) && return UInt8[]
+    data = io.buffer.data
+    if isempty(ranges)
+        truncate(io.buffer, 0)
+        seekstart(io.buffer)
+        empty!(io.replayable_ranges)
+        return UInt8[]
+    end
 
     bytes = 0
     for (first, last) in ranges
@@ -508,10 +529,108 @@ function _take_replayable_writes!(io::BufferedWriteIO)
         copyto!(replayable, pos, data, first, n)
         pos += n
     end
+    truncate(io.buffer, 0)
+    seekstart(io.buffer)
+    empty!(io.replayable_ranges)
     replayable
 end
 _underlying_transport(io) = io
 _underlying_transport(io::BufferedWriteIO) = io.io
+
+mutable struct PendingBuffer
+    chunks::Vector{Vector{UInt8}}
+    head::Int
+end
+
+PendingBuffer() = PendingBuffer(Vector{UInt8}[], 1)
+
+Base.isempty(buffer::PendingBuffer) = buffer.head > length(buffer.chunks)
+
+function Base.empty!(buffer::PendingBuffer)
+    empty!(buffer.chunks)
+    buffer.head = 1
+    buffer
+end
+
+function _compact_pending_buffer!(buffer::PendingBuffer)
+    if buffer.head > 1
+        deleteat!(buffer.chunks, 1:(buffer.head - 1))
+        buffer.head = 1
+    end
+    buffer
+end
+
+function _push_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8})
+    push!(buffer.chunks, data)
+    buffer
+end
+
+function _prepend_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8})
+    if isempty(buffer)
+        empty!(buffer)
+        push!(buffer.chunks, data)
+    elseif buffer.head > 1
+        buffer.head -= 1
+        buffer.chunks[buffer.head] = data
+    else
+        pushfirst!(buffer.chunks, data)
+    end
+    buffer
+end
+
+function _popfirst_pending_chunk!(buffer::PendingBuffer)::Union{Vector{UInt8},Nothing}
+    isempty(buffer) && return nothing
+    chunk = buffer.chunks[buffer.head]
+    buffer.chunks[buffer.head] = EMPTY_BYTES
+    buffer.head += 1
+    if buffer.head > length(buffer.chunks)
+        empty!(buffer)
+    elseif buffer.head > 32 && buffer.head > length(buffer.chunks) ÷ 2
+        _compact_pending_buffer!(buffer)
+    end
+    chunk
+end
+
+function Base.take!(buffer::PendingBuffer)
+    isempty(buffer) && return UInt8[]
+    total = 0
+    for i in buffer.head:length(buffer.chunks)
+        total += length(buffer.chunks[i])
+    end
+    out = Vector{UInt8}(undef, total)
+    pos = 1
+    for i in buffer.head:length(buffer.chunks)
+        chunk = buffer.chunks[i]
+        n = length(chunk)
+        copyto!(out, pos, chunk, 1, n)
+        pos += n
+    end
+    empty!(buffer)
+    out
+end
+
+function Base.write(buffer::PendingBuffer, data::Vector{UInt8})
+    _push_pending_chunk!(buffer, copy(data))
+    length(data)
+end
+
+function Base.write(buffer::PendingBuffer, data::AbstractString)
+    bytes = Vector{UInt8}(undef, ncodeunits(data))
+    copyto!(bytes, 1, codeunits(data), 1, length(bytes))
+    _push_pending_chunk!(buffer, bytes)
+    length(bytes)
+end
+
+function _pending_buffer_from(buffer::PendingBuffer)
+    buffer
+end
+
+function _pending_buffer_from(buffer::IOBuffer)
+    data = take!(buffer)
+    pending = PendingBuffer()
+    isempty(data) || _push_pending_chunk!(pending, data)
+    pending
+end
 
 const DefaultTransportIO = Union{Sockets.TCPSocket,MbedTLS.SSLContext}
 const DefaultWriteTransportIO = Union{DefaultTransportIO,BufferedWriteIO{Sockets.TCPSocket},BufferedWriteIO{MbedTLS.SSLContext}}
@@ -692,7 +811,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     subscriptions::Dict{Int,Subscription{Client{Options,ReadIO,WriteIO}}}
     request_mux::Union{RequestMux{Client{Options,ReadIO,WriteIO}},Nothing}
     request_mux_lock::ReentrantLock
-    pending::IOBuffer
+    pending::PendingBuffer
     pending_bytes::Int
     pongs::PongWaiterQueue
     reader_task::Union{Task,Nothing}
@@ -710,7 +829,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                 lock::ReentrantLock, write_lock::ReentrantLock, flush_signal::Channel{Bool},
                 flusher_task::Union{Task,Nothing}, sid::Int, subscriptions,
                 request_mux::Union{RequestMux,Nothing}, request_mux_lock::ReentrantLock,
-                pending::IOBuffer, pending_bytes::Int, pongs::PongWaiterQueue,
+                pending, pending_bytes::Int, pongs::PongWaiterQueue,
                 reader_task::Union{Task,Nothing}, ping_task::Union{Task,Nothing},
                 reconnect_task::Union{Task,Nothing}, pings_out::Int, stats::Stats,
                 rng::MersenneTwister, generation::Int) where {Options<:ConnectOptions}
@@ -738,6 +857,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
         RequestMux{client_type}(request_mux.prefix, sub, waiters)
     end
     reader = isnothing(read_io) ? nothing : ProtocolReader(read_io)
+    pending = _pending_buffer_from(pending)
     Client{Options,ReadIO,WriteIO}(options, servers, current_server, connected_url, status,
                                    info, socket, read_io, reader, write_io, lock, write_lock,
                                    flush_signal, flusher_task,

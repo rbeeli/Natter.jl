@@ -58,6 +58,19 @@ using TestItems
             @test String(fetch(next_async(async_sub; timeout=2.0))) == "from task"
             fetch(unsubscribe_async(async_sub))
 
+            limited = subscribe(client, "$subject.limited")
+            publish(client, "$subject.limited", "first")
+            @test String(next(limited; timeout=2.0)) == "first"
+            unsubscribe(limited; max_msgs=2)
+            flush(client; timeout=2.0)
+            publish(client, "$subject.limited", "second")
+            publish(client, "$subject.limited", "third")
+            publish(client, "$subject.limited", "fourth")
+            @test String(next(limited; timeout=2.0)) == "second"
+            @test String(next(limited; timeout=2.0)) == "third"
+            @test_throws ConnectionClosedError next(limited; timeout=0.5)
+            @test limited.closed
+
             close(client.socket)
             result = timedwait(5.0; pollint=0.05) do
                 reconnected[] && status(client) == N.ConnectionStatus.CONNECTED

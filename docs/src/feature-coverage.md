@@ -7,7 +7,7 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
 | Connect handshake | Supported | Includes authentication fields, client name, no echo, TLS requirements, and server INFO parsing. |
-| Publish and subscribe | Supported | Includes wildcards, queue groups, INFO-negotiated headers, max payload checks, buffered outbound writes, and per-subscription pending limits. |
+| Publish and subscribe | Supported | Includes wildcards, queue groups, INFO-negotiated headers, max payload checks, size- and latency-bound buffered outbound writes, and per-subscription pending limits. |
 | Request reply | Supported | Uses a shared request inbox mux and maps negotiated no-responder status to `NoRespondersError`. |
 | Direct APIs and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code, and failed handles preserve the original operation error and task backtrace in `CapturedException`. |
 | Flush and ping | Supported | Drains buffered outbound writes and uses PING/PONG synchronization. |

@@ -224,6 +224,9 @@ end
 
     @test String(N._pub_cmd("foo", nothing, TestHelpers.bytes("hi"), Headers())) == "PUB foo 2\r\nhi\r\n"
     @test String(N._pub_cmd("foo", "bar", TestHelpers.bytes("hi"), Headers())) == "PUB foo bar 2\r\nhi\r\n"
+    @test N._unsub_cmd(7) == "UNSUB 7\r\n"
+    @test N._unsub_cmd(7, 3) == "UNSUB 7 3\r\n"
+    @test_throws ArgumentError N._unsub_cmd(7, -1)
 
     cmd = String(N._pub_cmd("foo", nothing, TestHelpers.bytes("hi"), Headers("A" => ["b"])))
     @test startswith(cmd, "HPUB foo ")

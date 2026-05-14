@@ -381,7 +381,7 @@ function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
     size_start, size_end = fourth_start == 0 ? (third_start, third_end) : (fourth_start, fourth_end)
     size = _validate_payload_size(_parse_int_token(bytes, size_start, size_end), max_payload)
     payload = _read_exact_payload(reader, size)
-    _protocol_msg_frame(Msg(subject, reply, payload, Headers(), sid))
+    _protocol_msg_frame(Msg(subject, reply, payload, nothing, sid))
 end
 
 function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
@@ -408,7 +408,7 @@ function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int
     total = _validate_payload_size(_parse_int_token(bytes, total_start, total_end), max_payload)
     header_bytes, payload = _read_exact_header_payload(reader, hsize, total)
     hdrs = _parse_headers(header_bytes)
-    _protocol_msg_frame(Msg(subject, reply, payload; headers=hdrs, sid, header_bytes=hsize))
+    _protocol_msg_frame(Msg(subject, reply, payload, hdrs, sid, hsize))
 end
 
 function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
@@ -615,16 +615,23 @@ end
 
 function _headers_bytes(headers::Headers)
     isempty(headers) && return EMPTY_BYTES
-    io = IOBuffer()
-    write(io, "NATS/1.0", CRLF)
+    out = Vector{UInt8}(undef, _headers_wire_size(headers))
+    pos = 1
+    pos = _copy_codeunits!(out, pos, "NATS/1.0")
+    pos = _copy_bytes!(out, pos, CRLF_BYTES)
     for (k, values) in headers
         for v in values
             key, value = _validate_header_pair(k, v)
-            write(io, key, ": ", value, CRLF)
+            pos = _copy_codeunits!(out, pos, key)
+            pos = _copy_byte!(out, pos, UInt8(':'))
+            pos = _copy_byte!(out, pos, UInt8(' '))
+            pos = _copy_codeunits!(out, pos, value)
+            pos = _copy_bytes!(out, pos, CRLF_BYTES)
         end
     end
-    write(io, CRLF)
-    take!(io)
+    pos = _copy_bytes!(out, pos, CRLF_BYTES)
+    pos == length(out) + 1 || throw(AssertionError("header frame size mismatch"))
+    out
 end
 
 struct PublishFrame{Payload<:AbstractVector{UInt8}}
@@ -789,7 +796,15 @@ function _sub_cmd(subject::String, queue::Union{String,Nothing}, sid::Int)
     isnothing(queue) || isempty(queue) ? "SUB $subject $sid$CRLF" : "SUB $subject $queue $sid$CRLF"
 end
 
-_unsub_cmd(sid::Int, max_msgs::Int=0) = max_msgs > 0 ? "UNSUB $sid $max_msgs$CRLF" : "UNSUB $sid$CRLF"
+function _validate_core_max_msgs(max_msgs::Int)
+    max_msgs < 0 && throw(ArgumentError("max_msgs must be non-negative"))
+    max_msgs
+end
+
+function _unsub_cmd(sid::Int, max_msgs::Int=0)
+    _validate_core_max_msgs(max_msgs)
+    max_msgs > 0 ? "UNSUB $sid $max_msgs$CRLF" : "UNSUB $sid$CRLF"
+end
 
 function _validate_subject_token(wildcard::Char, token_chars::Int, allow_wildcards::Bool)
     wildcard == '\0' && return nothing

@@ -313,7 +313,7 @@ function _release_pending_bytes!(client::Client, bytes::Int)
 end
 
 function _clear_pending_buffer_locked!(client::Client)
-    client.pending = IOBuffer()
+    empty!(client.pending)
     client.pending_bytes = 0
     nothing
 end
@@ -782,6 +782,17 @@ function _flusher_loop(client::Client, generation::Int)
             _report_error(client, err)
             return
         end
+        latency = max(0.0, client.options.write_buffer_latency)
+        latency > 0 ? sleep(latency) : yield()
+        while isready(ch)
+            try
+                take!(ch)
+            catch err
+                err isa InvalidStateException && return
+                _report_error(client, err)
+                return
+            end
+        end
         _generation_matches(client, generation) &&
             status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING) || return
         try
@@ -1135,11 +1146,15 @@ function _replay_subscriptions(client::Client)
             if get(client.subscriptions, sub.sid, nothing) !== sub || sub.closed || sub.server_active
                 nothing
             else
-                remaining = sub.max_msgs > 0 ? max(0, sub.max_msgs - sub.received) : nothing
-                remaining == 0 ? nothing : (sub.sid, sub.subject, sub.queue, remaining)
+                remaining = sub.max_msgs > 0 ? sub.max_msgs - sub.received : nothing
+                !isnothing(remaining) && remaining <= 0 ? :close : (sub.sid, sub.subject, sub.queue, remaining)
             end
         end
         isnothing(state) && continue
+        if state === :close
+            _close_subscription_locally!(sub; throw_errors=false)
+            continue
+        end
         sid, subject, queue, remaining = state
         _write_raw(client, _sub_cmd(subject, queue, sid))
         isnothing(remaining) || _write_raw(client, _unsub_cmd(sid, remaining))
@@ -1158,10 +1173,7 @@ end
 function _prepend_pending_locked!(client::Client, data::Vector{UInt8}; already_counted::Bool=false)
     bytes = length(data)
     already_counted || _reserve_pending_bytes_locked!(client, bytes)
-    existing = take!(client.pending)
-    client.pending = IOBuffer()
-    write(client.pending, data)
-    write(client.pending, existing)
+    _prepend_pending_chunk!(client.pending, data)
     nothing
 end
 
@@ -1182,18 +1194,20 @@ function _restore_pending_after_replay_failure!(client::Client, data::Vector{UIn
 end
 
 function _flush_pending_buffer(client::Client; generation::Union{Int,Nothing}=nothing)
-    data = UInt8[]
-    replay_generation = 0
-    @lock client.lock begin
-        replay_generation = isnothing(generation) ? client.generation : generation
-        data = take!(client.pending)
-    end
-    isempty(data) && return
-    try
-        _write_raw(client, data; force_flush=true)
-        _release_pending_bytes!(client, length(data))
-    catch err
-        _restore_pending_after_replay_failure!(client, data, replay_generation)
-        rethrow()
+    while true
+        data = nothing
+        replay_generation = 0
+        @lock client.lock begin
+            replay_generation = isnothing(generation) ? client.generation : generation
+            data = _popfirst_pending_chunk!(client.pending)
+        end
+        isnothing(data) && return
+        try
+            _write_raw(client, data; force_flush=true)
+            _release_pending_bytes!(client, length(data))
+        catch err
+            _restore_pending_after_replay_failure!(client, data, replay_generation)
+            rethrow()
+        end
     end
 end

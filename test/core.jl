@@ -135,6 +135,82 @@ end
     @test client.pending_bytes == 0
 end
 
+@testitem "subscribe validates per-subscription limits before protocol writes" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    transport = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+    invalid_kwargs = (
+        (; max_msgs=-1),
+        (; pending_msgs_limit=0),
+        (; pending_msgs_limit=-1),
+        (; pending_bytes_limit=0),
+        (; pending_bytes_limit=-1),
+    )
+
+    for kwargs in invalid_kwargs
+        @test_throws ArgumentError subscribe(client, "events"; kwargs...)
+        @test TestHelpers.capture_text(transport) == ""
+        @test isempty(client.subscriptions)
+        @test client.sid == 0
+    end
+end
+
+@testitem "unsubscribe max_msgs uses additional messages and closes exhausted replay state" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    transport = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+    sub = subscribe(client, "foo")
+    TestHelpers.clear_capture!(transport)
+
+    sub.received = 3
+    unsubscribe(sub; max_msgs=2)
+    @test TestHelpers.capture_text(transport) == "UNSUB $(sub.sid) 5\r\n"
+    @test sub.max_msgs == 5
+    @test !sub.closed
+    @test sub.sid in keys(client.subscriptions)
+
+    N._dispatch_msg(client, Msg("foo", nothing, TestHelpers.bytes("four"); sid=sub.sid))
+    @test !sub.closed
+    N._dispatch_msg(client, Msg("foo", nothing, TestHelpers.bytes("five"); sid=sub.sid))
+    @test sub.closed
+    @test !(sub.sid in keys(client.subscriptions))
+
+    negative = subscribe(client, "negative")
+    TestHelpers.clear_capture!(transport)
+    @test_throws ArgumentError unsubscribe(negative; max_msgs=-1)
+    @test TestHelpers.capture_text(transport) == ""
+    @test !negative.closed
+    @test negative.sid in keys(client.subscriptions)
+    @test_throws ArgumentError subscribe(client, "bad"; max_msgs=-1)
+
+    replay_transport = TestHelpers.WriteCapture()
+    replay_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+                                            read_io=replay_transport, write_io=replay_transport)
+    replay_sub = subscribe(replay_client, "replay"; max_msgs=5)
+    replay_sub.received = 3
+    N._replay_subscriptions(replay_client)
+    @test TestHelpers.capture_text(replay_transport) ==
+          "SUB replay $(replay_sub.sid)\r\nUNSUB $(replay_sub.sid) 2\r\n"
+    @test replay_sub.server_active
+
+    exhausted = subscribe(replay_client, "done"; max_msgs=2)
+    exhausted.received = 2
+    TestHelpers.clear_capture!(replay_transport)
+    N._replay_subscriptions(replay_client)
+    @test TestHelpers.capture_text(replay_transport) == ""
+    @test exhausted.closed
+    @test !(exhausted.sid in keys(replay_client.subscriptions))
+    @test !isopen(exhausted.messages)
+end
+
 @testitem "subscription pending byte limits include HMSG headers" setup=[TestHelpers] begin
     using Natter
 

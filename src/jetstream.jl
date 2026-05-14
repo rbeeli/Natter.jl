@@ -8,17 +8,24 @@ mutable struct JetStreamMsg{C<:Client} <: AbstractMsg
     subject::String
     reply::Union{String,Nothing}
     data::Vector{UInt8}
-    headers::Headers
+    headers::HeaderStorage
     sid::Int
     header_bytes::Int
     _client::C
     _acked::Bool
+    _ack_lock::ReentrantLock
 end
+
+JetStreamMsg{C}(subject::String, reply::Union{String,Nothing}, data::Vector{UInt8},
+                headers::HeaderStorage, sid::Int, header_bytes::Int, client::C,
+                acked::Bool) where {C<:Client} =
+    JetStreamMsg{C}(subject, reply, data, headers, sid, header_bytes, client, acked,
+                    ReentrantLock())
 
 JetStreamMsg(msg::Msg, client::C) where {C<:Client} =
     JetStreamMsg{C}(msg.subject, msg.reply, msg.data, msg.headers, msg.sid, msg.header_bytes, client, false)
 
-Base.String(msg::JetStreamMsg) = String(msg.data)
+Base.String(msg::JetStreamMsg) = _bytes_to_string(msg.data)
 
 struct PubAck
     stream::String
@@ -146,13 +153,26 @@ end
 _jetstream_heartbeat_error() =
     JetStreamError(_JS_STATUS_TIMEOUT, nothing, "JetStream idle heartbeat timed out")
 
-function _js_decode(msg::Msg)
-    obj = isempty(msg.data) ? Dict{String,Any}() : _json_dict(String(msg.data))
-    if haskey(obj, "error")
-        err = Dict{String,Any}(String(k) => v for (k, v) in pairs(obj["error"]))
-        throw(JetStreamError(Int(get(err, "code", 0)), get(err, "err_code", nothing), String(get(err, "description", ""))))
-    end
+_json_get(obj, key::Symbol, default) = haskey(obj, key) ? obj[key] : default
+
+function _js_error_from_object(err)
+    code = Int(_json_get(err, :code, 0))
+    err_code_value = _json_get(err, :err_code, nothing)
+    err_code = isnothing(err_code_value) ? nothing : Int(err_code_value)
+    description = String(_json_get(err, :description, ""))
+    JetStreamError(code, err_code, description)
+end
+
+function _js_read_response(msg::Msg)
+    isempty(msg.data) && return nothing
+    obj = JSON3.read(msg.data)
+    haskey(obj, :error) && throw(_js_error_from_object(obj[:error]))
     obj
+end
+
+function _js_decode(msg::Msg)
+    obj = _js_read_response(msg)
+    isnothing(obj) ? Dict{String,Any}() : _string_key_dict(obj)
 end
 
 function _api_request(js::JetStreamContext, subject::String, payload=nothing; timeout::Real=js.timeout)
@@ -161,7 +181,8 @@ function _api_request(js::JetStreamContext, subject::String, payload=nothing; ti
 end
 
 function _puback(obj)
-    PubAck(String(obj["stream"]), Int(obj["seq"]), Bool(get(obj, "duplicate", false)), haskey(obj, "domain") ? String(obj["domain"]) : nothing)
+    PubAck(String(obj[:stream]), Int(obj[:seq]), Bool(_json_get(obj, :duplicate, false)),
+           haskey(obj, :domain) ? String(obj[:domain]) : nothing)
 end
 
 function _js_header_nonempty(name::AbstractString, value)::String
@@ -301,7 +322,9 @@ function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing;
         remaining > 0 || throw(TimeoutError("request timed out"))
         try
             msg = request(js.client, subject, data; timeout=remaining, headers=hdrs)
-            return _puback(_js_decode(msg))
+            obj = _js_read_response(msg)
+            isnothing(obj) && throw(ProtocolError("JetStream publish response is empty"))
+            return _puback(obj)
         catch err
             err isa NoRespondersError && attempt < attempts || rethrow()
             attempt += 1
@@ -1418,6 +1441,10 @@ end
 
 const _JS_ACK_PREFIX = "\$JS.ACK."
 const _JS_ACK_NOT_MESSAGE = "message is not a JetStream message"
+const _ACK_PAYLOAD_NAK = Vector{UInt8}(codeunits("-NAK"))
+const _ACK_PAYLOAD_PROGRESS = Vector{UInt8}(codeunits("+WPI"))
+const _ACK_PAYLOAD_TERM = Vector{UInt8}(codeunits("+TERM"))
+const _ACK_PAYLOAD_NEXT = Vector{UInt8}(codeunits("+NXT"))
 
 struct _ParsedMsgMetadata
     stream_first::Int
@@ -1603,22 +1630,34 @@ function metadata(msg::AbstractMsg)
                 parsed.timestamp_ns, parsed.pending, domain)
 end
 
-function _ack_payload(kind::Symbol; delay::Union{Nothing,Real}=nothing)
+function _ack_delay_ns(delay)::Int
+    delay isa Real && !(delay isa Bool) ||
+        throw(ArgumentError("delay must be a finite non-negative number"))
+    seconds = Float64(delay)
+    isfinite(seconds) && seconds >= 0 ||
+        throw(ArgumentError("delay must be a finite non-negative number"))
+    ns = seconds * 1_000_000_000
+    isfinite(ns) && ns <= typemax(Int) ||
+        throw(ArgumentError("delay is too large"))
+    round(Int, ns)
+end
+
+function _ack_payload(kind::Symbol; delay=nothing)
     if kind == :ack
-        UInt8[]
+        EMPTY_BYTES
     elseif kind == :nak
         if isnothing(delay)
-            Vector{UInt8}(codeunits("-NAK"))
+            _ACK_PAYLOAD_NAK
         else
-            args = JSON3.write(Dict("delay" => round(Int, delay * 1_000_000_000)))
+            args = JSON3.write(Dict("delay" => _ack_delay_ns(delay)))
             Vector{UInt8}(codeunits("-NAK $args"))
         end
     elseif kind == :progress
-        Vector{UInt8}(codeunits("+WPI"))
+        _ACK_PAYLOAD_PROGRESS
     elseif kind == :term
-        Vector{UInt8}(codeunits("+TERM"))
+        _ACK_PAYLOAD_TERM
     elseif kind == :next
-        Vector{UInt8}(codeunits("+NXT"))
+        _ACK_PAYLOAD_NEXT
     else
         throw(ArgumentError("unknown ack kind $kind"))
     end
@@ -1633,20 +1672,39 @@ _ack_terminal(kind::Symbol)::Bool = kind != :progress
 
 function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing)::Nothing
     reply = _ack_reply_subject(msg)
-    msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
     payload = _ack_payload(kind; delay)
-    publish(msg._client, reply, payload)
-    _ack_terminal(kind) && (msg._acked = true)
+    @lock msg._ack_lock begin
+        msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
+        _publish_unchecked(msg._client, reply, payload)
+        _ack_terminal(kind) && (msg._acked = true)
+    end
     nothing
 end
 
 function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::Real=1.0)::Msg
     reply = _ack_reply_subject(msg)
-    msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
     payload = _ack_payload(kind; delay)
-    response = request(msg._client, reply, payload; timeout)
-    _ack_terminal(kind) && (msg._acked = true)
-    response
+    @lock msg._ack_lock begin
+        msg._acked && throw(JetStreamError(400, nothing, "message already acknowledged"))
+        mux = _ensure_request_mux(msg._client)
+        token, waiter = _register_request_waiter!(msg._client, mux)
+        response_subject = "$(mux.prefix).$token"
+        response = try
+            frame = PublishFrame(reply, response_subject, payload, EMPTY_BYTES)
+            _publish_frame_unchecked(msg._client, frame; buffer_on_reconnect=false)
+            _wait_request_reply(waiter, timeout)
+        finally
+            _remove_request_waiter!(msg._client, mux, token, waiter)
+        end
+        code = _status_header(response)
+        if code == 503
+            throw(NoRespondersError(reply))
+        elseif !isnothing(code) && code >= 400
+            throw(ProtocolError("request failed with status $code $(_status_description(response))"))
+        end
+        _ack_terminal(kind) && (msg._acked = true)
+        response
+    end
 end
 
 ack(msg::JetStreamMsg)::Nothing = _ack_publish(msg, :ack)
