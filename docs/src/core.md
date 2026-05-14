@@ -20,7 +20,7 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `max_header_bytes` | `64 KiB` | Maximum inbound header block size. |
 | `max_stale_pong_waiters` | `1024` | Maximum timed-out flush waiters retained to preserve PING/PONG ordering. |
 | `sub_pending_msgs_limit` | `1024` | Default per-subscription queued message limit. |
-| `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit. |
+| `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit, including NATS header blocks. |
 | `error_cb` | warning callback | Receives asynchronous callback, cleanup, and background task errors. |
 
 Use `status(client)`, `stats(client)`, and `connected_url(client)` for runtime inspection.
@@ -51,7 +51,7 @@ end
 build_response(user[], permissions[])
 ```
 
-The `_async` APIs return `NatterTask` handles for explicit handle-oriented code. They are not needed just because code runs in a task.
+The `_async` APIs return `NatterTask` handles for explicit handle-oriented code. They are not needed just because code runs in a task. If the operation fails, `fetch(handle)` throws a `CapturedException` whose `ex` field is the original operation error and whose displayed stack trace points at the failed task.
 
 ## Publish
 

@@ -8,6 +8,15 @@ using TestItems
 
     bytes(s) = Vector{UInt8}(codeunits(s))
 
+    function thrown_exception(f)
+        try
+            f()
+        catch err
+            return err
+        end
+        throw(AssertionError("expected exception"))
+    end
+
     mutable struct WriteCapture <: IO
         bytes::Vector{UInt8}
         closed::Bool

@@ -103,6 +103,23 @@ function _delete_header!(headers::Headers, key::AbstractString)
     headers
 end
 
+function _headers_wire_size(headers::Headers)::Int
+    isempty(headers) && return 0
+    bytes = ncodeunits("NATS/1.0") + 2 + 2
+    for (name, values) in headers
+        for value in values
+            bytes += ncodeunits(name) + 2 + ncodeunits(value) + 2
+        end
+    end
+    bytes
+end
+
+function _msg_header_bytes(headers::Headers, header_bytes::Union{Int,Nothing})::Int
+    isnothing(header_bytes) && return _headers_wire_size(headers)
+    header_bytes >= 0 || throw(ArgumentError("header_bytes must be non-negative"))
+    header_bytes
+end
+
 headers(msg) = _headers_copy(msg.headers)
 header(msg, key::AbstractString) = begin
     values = _header_values(msg.headers, key)
@@ -128,10 +145,21 @@ mutable struct Msg
     client::Union{AbstractNatterClient,Nothing}
     sid::Int
     acked::Bool
+    header_bytes::Int
 end
 
-Msg(subject::String, reply::Union{String,Nothing}, data::Vector{UInt8}; headers=Headers(), client=nothing, sid=0) =
-    Msg(subject, reply, data, _headers_copy(headers), client, sid, false)
+function Msg(subject::String, reply::Union{String,Nothing}, data::Vector{UInt8};
+             headers=Headers(), client=nothing, sid=0, header_bytes::Union{Int,Nothing}=nothing)
+    hdrs = _headers_copy(headers)
+    Msg(subject, reply, data, hdrs, client, sid, false, _msg_header_bytes(hdrs, header_bytes))
+end
+
+function Msg(subject::String, reply::Union{String,Nothing}, data::Vector{UInt8},
+             headers::Headers, client::Union{AbstractNatterClient,Nothing}, sid::Int, acked::Bool)
+    Msg(subject, reply, data, headers, client, sid, acked, _headers_wire_size(headers))
+end
+
+_msg_pending_bytes(msg::Msg)::Int = msg.header_bytes + length(msg.data)
 
 Base.String(msg::Msg) = String(msg.data)
 

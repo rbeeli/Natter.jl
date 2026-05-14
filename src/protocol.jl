@@ -371,7 +371,7 @@ function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int
     total = _validate_payload_size(_parse_int_token(bytes, total_start, total_end), max_payload)
     header_bytes, payload = _read_exact_header_payload(reader, hsize, total)
     hdrs = _parse_headers(header_bytes)
-    :MSG, Msg(subject, reply, payload, hdrs, nothing, sid, false)
+    :MSG, Msg(subject, reply, payload, hdrs, nothing, sid, false, hsize)
 end
 
 function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,

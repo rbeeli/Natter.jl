@@ -29,6 +29,73 @@ end
     @test kv.direct == true
 end
 
+@testitem "KeyValue bucket config maps to stream config" begin
+    using Natter
+
+    const N = Natter
+
+    cfg = N._kv_stream_config(
+        "bucket";
+        history=64,
+        ttl=30.0,
+        max_bytes=4096,
+        max_value_size=512,
+        storage=StorageType.MEMORY,
+        replicas=3,
+        direct=true,
+        compression=true,
+        metadata=Dict(:owner => "kv"),
+        limit_marker_ttl=60.0,
+    )
+    payload = N._js_config_payload(cfg)
+
+    @test payload["name"] == "KV_bucket"
+    @test payload["subjects"] == ["\$KV.bucket.>"]
+    @test payload["max_msgs_per_subject"] == 64
+    @test payload["max_msgs"] == -1
+    @test payload["max_consumers"] == -1
+    @test payload["max_bytes"] == 4096
+    @test payload["max_msg_size"] == 512
+    @test payload["max_age"] == 30_000_000_000
+    @test payload["storage"] == "memory"
+    @test payload["num_replicas"] == 3
+    @test payload["allow_direct"] == true
+    @test payload["allow_rollup_hdrs"] == true
+    @test payload["deny_delete"] == true
+    @test payload["discard"] == "new"
+    @test payload["compression"] == "s2"
+    @test payload["allow_msg_ttl"] == true
+    @test payload["subject_delete_marker_ttl"] == 60_000_000_000
+    @test payload["metadata"] == Dict("owner" => "kv")
+
+    default_payload = N._js_config_payload(N._kv_stream_config("bucket"))
+    @test default_payload["max_msgs_per_subject"] == 1
+    @test default_payload["max_bytes"] == -1
+    @test default_payload["max_msg_size"] == -1
+    @test !haskey(default_payload, "max_age")
+    @test !haskey(default_payload, "compression")
+    @test !haskey(default_payload, "allow_msg_ttl")
+    @test !haskey(default_payload, "subject_delete_marker_ttl")
+    @test !haskey(default_payload, "metadata")
+end
+
+@testitem "KeyValue bucket config validates local limits" begin
+    using Natter
+
+    const N = Natter
+
+    @test N._validate_kv_history(1) == 1
+    @test N._validate_kv_history(64) == 64
+    @test_throws ArgumentError N._kv_stream_config("bucket"; history=0)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; history=65)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; ttl=-0.1)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; ttl=Inf)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; max_bytes=-2)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; max_value_size=-2)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; limit_marker_ttl=0)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; metadata=Dict("owner" => 1))
+end
+
 @testitem "KeyValue status summarizes stream state" setup=[TestHelpers] begin
     using Natter
 
@@ -151,6 +218,33 @@ end
     @test N._kv_delete_marker_revision(deleted, 2) == 2
     @test N._kv_delete_marker_revision(purged, 3) == 3
     @test isnothing(N._kv_delete_marker_revision(live, 4))
+end
+
+@testitem "KeyValue delete and purge include expected revision headers" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    kv = KeyValue(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
+
+    @test_throws TimeoutError kv_delete(kv, "alpha"; revision=7)
+    written = TestHelpers.capture_text(capture)
+    @test occursin("HPUB \$KV.bucket.alpha ", written)
+    @test occursin("KV-Operation: DEL\r\n", written)
+    @test occursin("Nats-Expected-Last-Subject-Sequence: 7\r\n", written)
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws TimeoutError kv_purge(kv, "alpha"; revision=8)
+    written = TestHelpers.capture_text(capture)
+    @test occursin("HPUB \$KV.bucket.alpha ", written)
+    @test occursin("KV-Operation: PURGE\r\n", written)
+    @test occursin("Nats-Rollup: sub\r\n", written)
+    @test occursin("Nats-Expected-Last-Subject-Sequence: 8\r\n", written)
+
+    @test_throws ArgumentError kv_delete(kv, "alpha"; revision=-1)
+    @test_throws ArgumentError kv_purge(kv, "alpha"; revision=-1)
 end
 
 @testitem "KeyValue entries expose typed metadata" setup=[TestHelpers] begin

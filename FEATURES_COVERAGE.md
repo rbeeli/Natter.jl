@@ -24,7 +24,7 @@ executes JetStream and KeyValue tests.
 | Wildcard subscriptions | Supported | `*` and terminal `>` subscriptions are validated. Publish subjects reject wildcards. |
 | MSG / HMSG parser | Supported | Streaming line/payload parser written from scratch. |
 | Request/reply | Supported | Uses a shared request inbox mux with per-request waiters. |
-| Direct public API and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code and `fetch(handle)` returns the sync result or rethrows the original operation error. |
+| Direct public API and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code and `fetch(handle)` returns the sync result or throws `CapturedException` with the original operation error and task backtrace. |
 | No responders | Supported | Advertised only when server INFO reports header support; status `503` replies become `NoRespondersError`. |
 | Flush | Supported | Implemented as a ping/pong round trip. |
 | Drain | Supported | Subscription and client drain are implemented with one overall timeout deadline and covered by unit and real-server tests. |
@@ -75,8 +75,8 @@ executes JetStream and KeyValue tests.
 
 | Feature | Status | Notes |
 |---|---:|---|
-| Create/open/delete/status bucket | Supported | Built on stream APIs and covered by real-server tests. `kv_status` exposes values, history, TTL, bytes, storage, replicas, direct-read support, and backing stream info. |
-| Get/put/create/update/delete/purge | Supported | `kv_get` returns typed entries with key, value, revision, created timestamp, delta, and operation. Revision checks use expected-last-subject-sequence headers, including create after delete/purge markers; common paths covered by real-server tests. Missing/deleted keys and optimistic-write conflicts raise KV-specific errors. |
+| Create/open/delete/status bucket | Supported | Built on stream APIs and covered by real-server tests. `kv_create` exposes history, bucket TTL, max bucket bytes, max value size, storage, replicas, direct reads, compression, metadata, and delete-marker TTL; history is locally limited to 1 through 64. `kv_status` exposes values, history, TTL, bytes, storage, replicas, direct-read support, and backing stream info. |
+| Get/put/create/update/delete/purge | Supported | `kv_get` returns typed entries with key, value, revision, created timestamp, delta, and operation. Revision checks use expected-last-subject-sequence headers, including create after delete/purge markers and guarded delete/purge operations; common paths covered by real-server tests. Missing/deleted keys and optimistic-write conflicts raise KV-specific errors. |
 | Keys/history | Partial | Common paths implemented with temporary consumer cleanup and looped fetches; history returns typed entries including delete and purge operations. |
 | Watch/watchall | Partial | Callback watcher delivers typed entries through a closable push subscription; default watch delivers last value per subject plus updates. |
 | Direct get | Supported | `kv_create(...; direct=true)` enables direct reads, `kv_open` detects existing direct buckets, and `kv_get` uses direct access by default when available. |

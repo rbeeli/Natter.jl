@@ -118,7 +118,7 @@ deleted = stream_message_delete(js, "ORDERS", 42)
 
 ## Pull Consumers
 
-Pull subscriptions create or bind a consumer and fetch batches on demand. Durable or named consumers are bound when they already exist; any supplied config fields must match the existing consumer config. Missing durable or named consumers are created strictly, and random ephemeral consumers are created strictly and deleted on close.
+Pull subscriptions create or bind a consumer and fetch batches on demand. Durable or named consumers are bound when they already exist; any supplied config fields must match the existing consumer config. Pull subscription configs cannot set push delivery fields such as `deliver_subject` or `deliver_group`. Missing durable or named consumers are created strictly, and random ephemeral consumers are created strictly and deleted on close.
 
 ```julia
 sub = pull_subscribe(js, "orders.created";

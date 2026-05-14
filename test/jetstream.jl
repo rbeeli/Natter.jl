@@ -122,6 +122,24 @@ end
     @test startswith(payload["pause_until"], "2026-01-03T00:00:00")
 end
 
+@testitem "JetStream consumer filter config validation" begin
+    using Natter
+
+    const N = Natter
+
+    payload = N._js_config_payload(ConsumerConfig(filter_subject="orders.created", filter_subjects=String[]))
+    @test payload["filter_subject"] == "orders.created"
+    @test !haskey(payload, "filter_subjects")
+
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(
+        filter_subject="orders.created",
+        filter_subjects=["orders.updated"],
+    ))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(filter_subject="orders..created"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(filter_subjects=["orders.created", "orders..updated"]))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(filter_subjects=["orders.*", "orders.created"]))
+end
+
 @testitem "JetStream raw dict config serialization matches typed config units" begin
     using Dates
     using Natter
@@ -269,6 +287,59 @@ end
     @test_throws ArgumentError N._js_field_value(:metadata, Dict{String,Any}("ok" => 1))
 end
 
+@testitem "JetStream consumer filter config validation happens before request" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    @test_throws ArgumentError N._consumer_create_payload_request(
+        js,
+        "ORDERS",
+        Dict{String,Any}("name" => "worker", "filter_subject" => "orders..created");
+        timeout=0.001,
+        action="create",
+    )
+    @test TestHelpers.capture_text(capture) == ""
+
+    @test_throws ArgumentError N._consumer_create_payload_request(
+        js,
+        "ORDERS",
+        Dict{String,Any}(
+            "name" => "worker",
+            "filter_subject" => "orders.created",
+            "filter_subjects" => ["orders.updated"],
+        );
+        timeout=0.001,
+        action="create",
+    )
+    @test TestHelpers.capture_text(capture) == ""
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws ArgumentError pull_subscribe(js, "orders.created"; config=Dict("filter_subject" => "orders..created"))
+    @test TestHelpers.capture_text(capture) == ""
+
+    TestHelpers.clear_capture!(capture)
+    @test_throws ArgumentError push_subscribe(js, "orders.created"; config=Dict("filter_subject" => "orders..created"))
+    @test TestHelpers.capture_text(capture) == ""
+end
+
+@testitem "JetStream stream purge validates filter locally" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    @test_throws ArgumentError stream_purge(js, "ORDERS"; filter_subject="orders..created", timeout=0.001)
+    @test TestHelpers.capture_text(capture) == ""
+end
+
 @testitem "JetStream push callback auto ack respects ack none policy" begin
     using Natter
 
@@ -305,6 +376,45 @@ end
 
     cfg = Dict{String,Any}("flow_control" => true, "idle_heartbeat" => 1)
     @test N._validate_push_consumer_control_config!(cfg) === cfg
+end
+
+@testitem "JetStream pull rejects push delivery config before create" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    function rejects_without_write(config)
+        TestHelpers.clear_capture!(capture)
+        @test_throws ArgumentError pull_subscribe(js, "orders.created"; stream="ORDERS", config=config)
+        @test TestHelpers.capture_text(capture) == ""
+    end
+
+    rejects_without_write(ConsumerConfig(deliver_subject="_INBOX.worker"))
+    rejects_without_write(ConsumerConfig(deliver_group="workers"))
+    rejects_without_write(Dict("deliver_subject" => "_INBOX.worker"))
+    rejects_without_write(Dict("deliver_group" => "workers"))
+
+    push_info = N._consumer_info(Dict{String,Any}(
+        "stream_name" => "ORDERS",
+        "name" => "worker",
+        "config" => Dict{String,Any}(
+            "deliver_subject" => "_INBOX.worker",
+        ),
+    ))
+    queue_info = N._consumer_info(Dict{String,Any}(
+        "stream_name" => "ORDERS",
+        "name" => "worker",
+        "config" => Dict{String,Any}(
+            "deliver_group" => "workers",
+        ),
+    ))
+
+    @test_throws ArgumentError N._validate_existing_pull_consumer(push_info)
+    @test_throws ArgumentError N._validate_existing_pull_consumer(queue_info)
 end
 
 @testitem "JetStream push queue configuration is resolved before create" setup=[TestHelpers] begin

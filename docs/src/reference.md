@@ -9,7 +9,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `Client` | Active client connection with background reader, ping, and reconnect tasks. |
 | `ConnectOptions` | Keyword-backed connection configuration. |
 | `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
-| `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. |
+| `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. Failed handles throw `CapturedException`; inspect `err.ex` for the original operation error. |
 | `Msg` | Received message with `subject`, `reply`, `data`, `headers`, and acknowledgement state. |
 | `Headers` | Alias for received headers, `Dict{String,Vector{String}}`; publish and request APIs also accept dictionaries with string or vector values and pair iterators. Outbound header names must be valid NATS/HTTP token field names. Header keys preserve source casing, while `header(msg, key)` lookup is case-insensitive. |
 | `Subscription` | Core subscription handle. |
@@ -102,7 +102,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `consumer_info(js, stream, consumer)` | Fetch consumer info. |
 | `consumer_list(js, stream; offset=0)` | List consumers for a stream. |
 | `consumer_delete(js, stream, consumer)` | Delete a consumer. |
-| `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig())` | Create or bind a pull subscription without mutating existing consumers. |
+| `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig())` | Create or bind a pull subscription without mutating existing consumers. Configs with `deliver_subject` or `deliver_group` are rejected because they describe push delivery. |
 | `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`. |
 | `fetch(psub, batch=1; timeout=..., expires=<shorter than timeout>, heartbeat=nothing)` | Fetch a batch from a pull subscription. Each request uses a unique reply subject and ignores stale terminal statuses from older requests. The default server expiration is shorter than the local timeout; explicit `expires` values must also be shorter than `timeout`. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
 | `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for JetStream messages. |
@@ -140,7 +140,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 
 | Function | Purpose |
 | :--- | :--- |
-| `kv_create(js, bucket; history=1, storage="file", replicas=1, direct=false)` | Create a bucket. |
+| `kv_create(js, bucket; history=1, ttl=nothing, max_bytes=-1, max_value_size=-1, storage="file", replicas=1, direct=false, compression=nothing, metadata=nothing, limit_marker_ttl=nothing)` | Create a bucket. Durations are seconds; `history` is limited to 1 through 64. |
 | `kv_open(js, bucket)` | Open an existing bucket. |
 | `kv_delete_bucket(kv)` | Delete a bucket. |
 | `kv_status(kv)` | Return bucket status and stream-backed configuration. |
@@ -148,8 +148,8 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `kv_put(kv, key, value; revision=nothing)` | Put a value, optionally expecting a revision. |
 | `kv_create_key(kv, key, value)` | Put a value only if the key is absent or currently deleted. |
 | `kv_update(kv, key, value, revision)` | Put a value only if the key is at `revision`. |
-| `kv_delete(kv, key)` | Mark a key deleted. |
-| `kv_purge(kv, key)` | Purge a key with rollup. |
+| `kv_delete(kv, key; revision=nothing)` | Mark a key deleted, optionally only if the key is at `revision`. |
+| `kv_purge(kv, key; revision=nothing)` | Purge a key with rollup, optionally only if the key is at `revision`. |
 | `kv_history(kv, key; batch=256)` | Return historical `KeyValueEntry` values for a key. |
 | `kv_keys(kv)` | Return active keys. |
 | `kv_watch(callback, kv; key=">", history=false)` | Watch bucket updates as `KeyValueEntry` values with a push subscription. |
@@ -166,8 +166,8 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `kv_put_async(kv, key, value; kwargs...)` | Start `kv_put` and return `NatterTask`. |
 | `kv_create_key_async(kv, key, value)` | Start `kv_create_key` and return `NatterTask`. |
 | `kv_update_async(kv, key, value, revision)` | Start `kv_update` and return `NatterTask`. |
-| `kv_delete_async(kv, key)` | Start `kv_delete` and return `NatterTask`. |
-| `kv_purge_async(kv, key)` | Start `kv_purge` and return `NatterTask`. |
+| `kv_delete_async(kv, key; kwargs...)` | Start `kv_delete` and return `NatterTask`. |
+| `kv_purge_async(kv, key; kwargs...)` | Start `kv_purge` and return `NatterTask`. |
 | `kv_history_async(kv, key; batch=256)` | Start `kv_history` and return `NatterTask`. |
 | `kv_keys_async(kv)` | Start `kv_keys` and return `NatterTask`. |
 | `kv_watch_async(callback, kv; kwargs...)` | Start `kv_watch` and return `NatterTask`. |

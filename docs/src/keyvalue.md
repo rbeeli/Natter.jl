@@ -12,11 +12,19 @@ js = jetstream(client)
 ```julia
 kv = kv_create(js, "settings";
     history=5,
+    ttl=3600.0,
+    max_bytes=128 * 1024 * 1024,
+    max_value_size=1 * 1024 * 1024,
     storage=StorageType.FILE,
     replicas=1,
     direct=true,
+    compression=true,
+    metadata=Dict("owner" => "config-service"),
+    limit_marker_ttl=86400.0,
 )
 ```
+
+Durations are expressed in seconds. `history` must be between 1 and 64. `limit_marker_ttl` enables the backing stream support needed for expiring delete markers and per-message TTL markers.
 
 Open an existing bucket:
 
@@ -62,13 +70,14 @@ kv_update(kv, "theme", "light", ack.seq)
 ## Delete And Purge
 
 ```julia
-kv_delete(kv, "theme")
+latest = kv_get(kv, "theme")
+kv_delete(kv, "theme"; revision=latest.revision)
 kv_purge(kv, "theme")
 ```
 
 Absent keys raise `KeyValueKeyNotFoundError` from `kv_get`. Deleted and purged keys raise `KeyValueKeyDeletedError` with the tombstone entry attached.
 
-Optimistic writes raise KV-specific errors. `kv_update` and `kv_put(...; revision=rev)` raise `KeyValueWrongRevisionError` when the expected revision does not match, and `kv_create_key` raises `KeyValueKeyExistsError` when the key is already active.
+Optimistic operations raise KV-specific errors. `kv_update`, `kv_put(...; revision=rev)`, `kv_delete(...; revision=rev)`, and `kv_purge(...; revision=rev)` raise `KeyValueWrongRevisionError` when the expected revision does not match. `kv_create_key` raises `KeyValueKeyExistsError` when the key is already active.
 
 ## History And Keys
 

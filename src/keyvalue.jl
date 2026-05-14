@@ -46,10 +46,58 @@ _validate_kv_bucket(bucket::AbstractString)::String = _validate_api_name("bucket
 _validate_kv_key(key::AbstractString)::String = _validate_publish_subject(key)
 _validate_kv_watch_key(key::AbstractString)::String = _validate_subject(key)
 
+const _KV_MAX_HISTORY = 64
 const _KV_INACTIVE_OPERATIONS = ("DEL", "PURGE")
+const _KV_EXPECTED_LAST_SUBJECT_SEQUENCE = "Nats-Expected-Last-Subject-Sequence"
 
 _kv_keys_consumer_config() = ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT, headers_only=true)
 _kv_key_active(msg::Msg)::Bool = !(header(msg, "KV-Operation") in _KV_INACTIVE_OPERATIONS)
+
+function _validate_kv_history(history::Integer)::Int
+    1 <= history <= _KV_MAX_HISTORY ||
+        throw(ArgumentError("key-value history must be between 1 and $_KV_MAX_HISTORY"))
+    Int(history)
+end
+
+function _validate_kv_limit(name::AbstractString, value::Integer)::Int
+    value >= -1 || throw(ArgumentError("$name must be -1 or non-negative"))
+    Int(value)
+end
+
+function _kv_optional_seconds(name::AbstractString, value::Union{Real,Nothing}; allow_zero::Bool=true)
+    isnothing(value) && return nothing
+    seconds = Float64(value)
+    isfinite(seconds) || throw(ArgumentError("$name must be finite"))
+    if allow_zero
+        seconds >= 0 || throw(ArgumentError("$name must be non-negative"))
+    else
+        seconds > 0 || throw(ArgumentError("$name must be positive"))
+    end
+    seconds
+end
+
+function _parse_kv_compression(value)
+    isnothing(value) && return nothing
+    value isa Bool && return value ? StoreCompression.S2 : nothing
+    value isa StoreCompression.T && return value
+    _parse_store_compression(value)
+end
+
+_kv_metadata(::Nothing) = nothing
+_kv_metadata(value) = _string_dict(value, "metadata")
+
+_kv_expected_revision(::Nothing) = nothing
+
+function _kv_expected_revision(revision::Integer)::Int
+    revision >= 0 || throw(ArgumentError("revision must be non-negative"))
+    Int(revision)
+end
+
+function _kv_add_expected_revision!(hdrs::Headers, revision::Union{Integer,Nothing})::Union{Int,Nothing}
+    expected = _kv_expected_revision(revision)
+    isnothing(expected) || push!(get!(hdrs, _KV_EXPECTED_LAST_SUBJECT_SEQUENCE, String[]), string(expected))
+    expected
+end
 
 function _kv_key_from_subject(kv::KeyValue, subject::AbstractString)::String
     startswith(subject, kv.prefix) ||
@@ -127,23 +175,43 @@ function _kv_status(kv::KeyValue, info::StreamInfo)::KeyValueStatus
     )
 end
 
-function kv_create(js::JetStreamContext, bucket::AbstractString; history::Int=1,
-                   storage::Union{String,StorageType.T}="file", replicas::Int=1, direct::Bool=false)
+function _kv_stream_config(bucket::AbstractString; history::Integer=1,
+                           ttl::Union{Real,Nothing}=nothing, max_bytes::Integer=-1,
+                           max_value_size::Integer=-1, storage::Union{AbstractString,StorageType.T}="file",
+                           replicas::Integer=1, direct::Bool=false, compression=nothing,
+                           metadata=nothing, limit_marker_ttl::Union{Real,Nothing}=nothing)
     bucket = _validate_kv_bucket(bucket)
-    cfg = StreamConfig(
+    marker_ttl = _kv_optional_seconds("limit_marker_ttl", limit_marker_ttl; allow_zero=false)
+    StreamConfig(
         name=_kv_stream(bucket),
         subjects=["\$KV.$bucket.>"],
-        max_msgs_per_subject=history,
+        max_msgs_per_subject=_validate_kv_history(history),
         max_msgs=-1,
-        max_bytes=-1,
+        max_bytes=_validate_kv_limit("max_bytes", max_bytes),
         max_consumers=-1,
+        max_age=_kv_optional_seconds("ttl", ttl),
+        max_msg_size=_validate_kv_limit("max_value_size", max_value_size),
         storage=_parse_storage_type(storage),
-        num_replicas=replicas,
+        num_replicas=Int(replicas),
         allow_rollup_hdrs=true,
         allow_direct=direct,
         deny_delete=true,
         discard=DiscardPolicy.NEW,
+        compression=_parse_kv_compression(compression),
+        allow_msg_ttl=isnothing(marker_ttl) ? nothing : true,
+        metadata=_kv_metadata(metadata),
+        subject_delete_marker_ttl=marker_ttl,
     )
+end
+
+function kv_create(js::JetStreamContext, bucket::AbstractString; history::Integer=1,
+                   ttl::Union{Real,Nothing}=nothing, max_bytes::Integer=-1,
+                   max_value_size::Integer=-1, storage::Union{AbstractString,StorageType.T}="file",
+                   replicas::Integer=1, direct::Bool=false, compression=nothing,
+                   metadata=nothing, limit_marker_ttl::Union{Real,Nothing}=nothing)
+    bucket = _validate_kv_bucket(bucket)
+    cfg = _kv_stream_config(bucket; history, ttl, max_bytes, max_value_size, storage,
+                            replicas, direct, compression, metadata, limit_marker_ttl)
     info = stream_create(js, cfg)
     KeyValue(js, bucket, _kv_stream(bucket), _kv_prefix(bucket), something(info.config.allow_direct, false))
 end
@@ -184,11 +252,11 @@ end
 function kv_put(kv::KeyValue, key::AbstractString, value; revision::Union{Nothing,Int}=nothing)
     key = _validate_kv_key(key)
     hdrs = Headers()
-    isnothing(revision) || push!(get!(hdrs, "Nats-Expected-Last-Subject-Sequence", String[]), string(revision))
+    expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
         js_publish(kv.js, "$(kv.prefix)$key", value; headers=hdrs)
     catch err
-        _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, revision, err))
+        _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
         rethrow()
     end
 end
@@ -211,14 +279,14 @@ end
 function kv_create_key(kv::KeyValue, key::AbstractString, value)
     key = _validate_kv_key(key)
     subject = "$(kv.prefix)$key"
-    hdrs = Headers("Nats-Expected-Last-Subject-Sequence" => ["0"])
+    hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => ["0"])
     try
         return js_publish(kv.js, subject, value; headers=hdrs)
     catch err
         _kv_wrong_last_sequence(err) || rethrow()
         marker_revision = _kv_latest_delete_marker_revision(kv, subject)
         isnothing(marker_revision) && throw(_kv_key_exists_error(kv, key, err))
-        retry_hdrs = Headers("Nats-Expected-Last-Subject-Sequence" => [string(marker_revision)])
+        retry_hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => [string(marker_revision)])
         try
             return js_publish(kv.js, subject, value; headers=retry_hdrs)
         catch retry_err
@@ -231,16 +299,28 @@ end
 
 kv_update(kv::KeyValue, key::AbstractString, value, revision::Int) = kv_put(kv, key, value; revision)
 
-function kv_delete(kv::KeyValue, key::AbstractString)
+function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing)
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["DEL"])
-    js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs)
+    expected_revision = _kv_add_expected_revision!(hdrs, revision)
+    try
+        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs)
+    catch err
+        _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
+        rethrow()
+    end
 end
 
-function kv_purge(kv::KeyValue, key::AbstractString)
+function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing)
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["PURGE"], "Nats-Rollup" => ["sub"])
-    js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs)
+    expected_revision = _kv_add_expected_revision!(hdrs, revision)
+    try
+        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs)
+    catch err
+        _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
+        rethrow()
+    end
 end
 
 function kv_history(kv::KeyValue, key::AbstractString; batch::Int=256)

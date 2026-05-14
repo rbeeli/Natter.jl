@@ -3,9 +3,10 @@
 
 Run the matching synchronous operation in a Julia task and return a `NatterTask`.
 Use `fetch(handle)` to get the same return value as the synchronous operation, or
-to rethrow the original operation exception. These helpers intentionally share
-the synchronous implementation so reconnect, cleanup, validation, and timeout
-behavior stay identical across both API styles.
+to throw a `CapturedException` containing the original operation exception and
+task backtrace. These helpers intentionally share the synchronous implementation
+so reconnect, cleanup, validation, and timeout behavior stay identical across
+both API styles.
 """
 struct NatterTask
     task::Task
@@ -13,19 +14,20 @@ end
 
 function _task_failure(task::Task)
     exceptions = Base.current_exceptions(task)
-    isempty(exceptions) ? nothing : first(exceptions).exception
+    isempty(exceptions) ? nothing : last(exceptions)
 end
 
 function _rethrow_task_failure(task::Task)
-    err = _task_failure(task)
-    isnothing(err) ? throw(TaskFailedException(task)) : throw(err)
+    failure = _task_failure(task)
+    if isnothing(failure)
+        throw(TaskFailedException(task))
+    end
+    throw(CapturedException(failure.exception, failure.backtrace))
 end
 
 function Base.wait(handle::NatterTask)
-    try
-        wait(handle.task)
-    catch err
-        err isa TaskFailedException || rethrow()
+    wait(handle.task; throw=false)
+    if istaskfailed(handle.task)
         _rethrow_task_failure(handle.task)
     end
     handle

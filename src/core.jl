@@ -296,8 +296,9 @@ function _subscription_processor(sub::Subscription, callback::Callback) where {C
             _report_error(sub.client, err)
             continue
         end
+        msg_bytes = _msg_pending_bytes(msg)
         control_handler = @lock sub.client.lock begin
-            sub.pending_bytes = max(0, sub.pending_bytes - length(msg.data))
+            sub.pending_bytes = max(0, sub.pending_bytes - msg_bytes)
             sub.processing += 1
             sub.control_handler
         end
@@ -359,6 +360,7 @@ function _handle_subscription_control(::_RequestMuxControlHandler, sub::Subscrip
 end
 
 function _dispatch_msg(client::Client, msg::Msg)
+    msg_bytes = _msg_pending_bytes(msg)
     sub = @lock client.lock begin
         sub = get(client.subscriptions, msg.sid, nothing)
         if isnothing(sub) || sub.closed
@@ -384,14 +386,14 @@ function _dispatch_msg(client::Client, msg::Msg)
         if sub.closed
             client.stats.dropped_msgs += 1
             false
-        elseif sub.pending_bytes + length(msg.data) > sub.pending_bytes_limit || Base.n_avail(sub.messages) >= sub.pending_msgs_limit
+        elseif sub.pending_bytes + msg_bytes > sub.pending_bytes_limit || Base.n_avail(sub.messages) >= sub.pending_msgs_limit
             client.stats.dropped_msgs += 1
             false
         else
             sub.received += 1
             client.stats.in_msgs += 1
             client.stats.in_bytes += length(msg.data)
-            sub.pending_bytes += length(msg.data)
+            sub.pending_bytes += msg_bytes
             should_close = sub.max_msgs > 0 && sub.received >= sub.max_msgs
             true
         end
@@ -405,7 +407,7 @@ function _dispatch_msg(client::Client, msg::Msg)
     try
         put!(sub.messages, msg)
     catch err
-        @lock client.lock sub.pending_bytes = max(0, sub.pending_bytes - length(msg.data))
+        @lock client.lock sub.pending_bytes = max(0, sub.pending_bytes - msg_bytes)
         if err isa InvalidStateException || (@lock client.lock sub.closed)
             _record_drop!(client)
             return
@@ -426,8 +428,9 @@ end
 
 function _take_subscription_msg!(sub::Subscription)
     msg = take!(sub.messages)
+    msg_bytes = _msg_pending_bytes(msg)
     control_handler = @lock sub.client.lock begin
-        sub.pending_bytes = max(0, sub.pending_bytes - length(msg.data))
+        sub.pending_bytes = max(0, sub.pending_bytes - msg_bytes)
         sub.control_handler
     end
     _maybe_reply_to_subscription_flow_control!(sub, control_handler)

@@ -226,7 +226,8 @@ stream_delete(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeo
     Bool(_api_request(js, "$(js.prefix).STREAM.DELETE.$(_validate_api_name("stream", name))", ""; timeout)["success"])
 
 stream_purge(js::JetStreamContext, name::AbstractString; filter_subject::Union{String,Nothing}=nothing, timeout::Real=js.timeout) = begin
-    req = isnothing(filter_subject) ? Dict{String,Any}() : Dict{String,Any}("filter" => filter_subject)
+    filter = isnothing(filter_subject) ? nothing : _validate_subject(filter_subject)
+    req = isnothing(filter) ? Dict{String,Any}() : Dict{String,Any}("filter" => filter)
     Bool(_api_request(js, "$(js.prefix).STREAM.PURGE.$(_validate_api_name("stream", name))", JSON3.write(req); timeout)["success"])
 end
 
@@ -408,6 +409,7 @@ end
 function _consumer_create_payload_request(js::JetStreamContext, stream::AbstractString, payload::Dict{String,Any};
                                           timeout::Real=js.timeout, action::Union{String,Nothing}=nothing)
     stream = _validate_api_name("stream", stream)
+    _validate_consumer_config_payload!(payload)
     subject = _consumer_create_subject(js, stream, payload)
     _consumer_info(_api_request(js, subject, JSON3.write(_consumer_request_payload(js, stream, payload, action)); timeout))
 end
@@ -527,6 +529,22 @@ function _validate_push_consumer_control_config!(config::Dict{String,Any})
     config
 end
 
+function _validate_pull_consumer_config!(config::Dict{String,Any})
+    if haskey(config, "deliver_subject") && !isnothing(config["deliver_subject"])
+        throw(ArgumentError("pull subscriptions do not support deliver_subject"))
+    elseif haskey(config, "deliver_group") && !isnothing(config["deliver_group"])
+        throw(ArgumentError("pull subscriptions do not support deliver_group"))
+    end
+    config
+end
+
+function _validate_existing_pull_consumer(info::ConsumerInfo)
+    if !isnothing(info.config.deliver_subject) || !isnothing(info.config.deliver_group)
+        throw(ArgumentError("existing consumer $(info.name) is configured for push delivery"))
+    end
+    info
+end
+
 function _push_config_deliver_group!(config::Dict{String,Any})
     haskey(config, "deliver_group") || return nothing
     value = config["deliver_group"]
@@ -605,7 +623,8 @@ end
 
 _consumer_has_filter(config::Dict{String,Any}) =
     (haskey(config, "filter_subject") && !isnothing(config["filter_subject"])) ||
-    (haskey(config, "filter_subjects") && !isnothing(config["filter_subjects"]))
+    (haskey(config, "filter_subjects") && !isnothing(config["filter_subjects"]) &&
+     (!(config["filter_subjects"] isa AbstractVector) || !isempty(config["filter_subjects"])))
 
 function _consumer_bind_name(config::Dict{String,Any})
     if haskey(config, "name") && !isnothing(config["name"])
@@ -630,6 +649,7 @@ end
 
 function _bind_or_create_consumer(js::JetStreamContext, stream::AbstractString, name::AbstractString,
                                   config::Dict{String,Any}, bind_fields; timeout::Real=js.timeout)
+    _validate_consumer_config_payload!(config)
     existing = _consumer_info_or_nothing(js, stream, name; timeout)
     if !isnothing(existing)
         return _validate_bound_consumer_config(existing, config, bind_fields), false
@@ -829,8 +849,11 @@ end
 
 function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{String,Nothing}=nothing, durable::Union{String,Nothing}=nothing,
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig())
-    stream = isnothing(stream) ? _stream_by_subject(js, subject) : stream
     cfg = _js_config_payload(config)
+    _validate_pull_consumer_config!(cfg)
+    _validate_consumer_config_payload!(cfg)
+
+    stream = isnothing(stream) ? _stream_by_subject(js, subject) : stream
     bind_fields = Set{String}(keys(cfg))
     if !_consumer_has_filter(cfg)
         cfg["filter_subject"] = String(subject)
@@ -849,9 +872,7 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
             _consumer_create_payload_request(js, stream, cfg; action="create")
         else
             consumer, _created = _bind_or_create_consumer(js, stream, bind_name, cfg, bind_fields)
-            isnothing(consumer.config.deliver_subject) ||
-                throw(ArgumentError("existing consumer $(consumer.name) is configured for push delivery"))
-            consumer
+            _validate_existing_pull_consumer(consumer)
         end
     if !haskey(cfg, "name") || isnothing(cfg["name"])
         cfg["name"] = info.name
@@ -1013,12 +1034,13 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
                         queue::Union{String,Nothing}=nothing, callback::Union{Function,Nothing}=nothing, manual_ack::Bool=false,
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig())
     cfg = _js_config_payload(config)
-    bind_fields = Set{String}(keys(cfg))
     queue_explicit = !isnothing(queue)
     local_queue = _resolve_push_queue!(cfg, queue)
-    !isnothing(queue) && push!(bind_fields, "deliver_group")
     _validate_push_queue_control_config!(cfg, local_queue)
     _validate_push_consumer_control_config!(cfg)
+    _validate_consumer_config_payload!(cfg)
+    bind_fields = Set{String}(keys(cfg))
+    !isnothing(queue) && push!(bind_fields, "deliver_group")
 
     stream = isnothing(stream) ? _stream_by_subject(js, subject) : stream
     deliver = new_inbox(js.client)
@@ -1032,6 +1054,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         push!(bind_fields, "durable_name")
     end
     _default_push_queue_consumer!(cfg, bind_fields, local_queue)
+    _validate_consumer_config_payload!(cfg)
     bind_name = _consumer_bind_name(cfg)
     delete_on_close = isnothing(bind_name)
     info::Union{ConsumerInfo,Nothing} = nothing

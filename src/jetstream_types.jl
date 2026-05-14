@@ -301,11 +301,74 @@ function _js_config_payload(config::_JSConfigObject)::Dict{String,Any}
         isnothing(value) && continue
         payload[String(field)] = _js_field_value(field, value)
     end
+    config isa ConsumerConfig && _validate_consumer_config_payload!(payload)
     payload
 end
 
 function _js_config_payload(config::AbstractDict)::Dict{String,Any}
     Dict{String,Any}(String(k) => _js_field_value(Symbol(String(k)), v) for (k, v) in pairs(config))
+end
+
+function _validate_filter_subjects_value(value)::Vector{String}
+    value isa AbstractVector || throw(ArgumentError("filter_subjects must be a vector of subjects"))
+    subjects = String[]
+    sizehint!(subjects, length(value))
+    for subject in value
+        subject isa AbstractString || throw(ArgumentError("filter_subjects entries must be strings"))
+        push!(subjects, _validate_subject(subject))
+    end
+    subjects
+end
+
+function _subject_tokens_overlap(a::Vector{SubString{String}}, ai::Int,
+                                 b::Vector{SubString{String}}, bi::Int)::Bool
+    ai > length(a) && return bi > length(b)
+    bi > length(b) && return false
+
+    atok = a[ai]
+    btok = b[bi]
+    atok == ">" && return true
+    btok == ">" && return true
+    (atok == "*" || btok == "*" || atok == btok) ||
+        return false
+    _subject_tokens_overlap(a, ai + 1, b, bi + 1)
+end
+
+function _subjects_overlap(a::String, b::String)::Bool
+    _subject_tokens_overlap(split(a, "."), 1, split(b, "."), 1)
+end
+
+function _validate_filter_subjects_do_not_overlap(subjects::Vector{String})
+    for i in eachindex(subjects)
+        for j in (i + 1):lastindex(subjects)
+            _subjects_overlap(subjects[i], subjects[j]) &&
+                throw(ArgumentError("consumer subject filters cannot overlap"))
+        end
+    end
+    subjects
+end
+
+function _validate_consumer_config_payload!(payload::Dict{String,Any})::Dict{String,Any}
+    if haskey(payload, "filter_subject") && !isnothing(payload["filter_subject"])
+        payload["filter_subject"] = _validate_subject(payload["filter_subject"])
+    end
+
+    has_filter_subjects = false
+    if haskey(payload, "filter_subjects") && !isnothing(payload["filter_subjects"])
+        subjects = _validate_filter_subjects_value(payload["filter_subjects"])
+        if isempty(subjects)
+            delete!(payload, "filter_subjects")
+        else
+            payload["filter_subjects"] = subjects
+            has_filter_subjects = true
+        end
+    end
+
+    if haskey(payload, "filter_subject") && !isnothing(payload["filter_subject"]) && has_filter_subjects
+        throw(ArgumentError("consumer cannot have both filter_subject and filter_subjects specified"))
+    end
+    has_filter_subjects && _validate_filter_subjects_do_not_overlap(payload["filter_subjects"])
+    payload
 end
 
 _present(d::Dict{String,Any}, field::Symbol)::Bool = haskey(d, String(field)) && !isnothing(d[String(field)])

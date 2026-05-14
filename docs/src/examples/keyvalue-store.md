@@ -10,8 +10,12 @@ js = jetstream(client)
 
 kv = kv_create(js, "profiles";
     history=10,
+    ttl=7 * 24 * 60 * 60,
+    max_bytes=256 * 1024 * 1024,
     storage=StorageType.FILE,
     direct=true,
+    compression=true,
+    metadata=Dict("app" => "profiles"),
 )
 
 created = kv_create_key(kv, "users.42.name", "Ada")

@@ -1,6 +1,6 @@
 using TestItems
 
-@testitem "real nats-server core integration" begin
+@testitem "real nats-server core integration" setup=[TestHelpers] begin
     using Natter
     using Dates
     using Random
@@ -30,7 +30,11 @@ using TestItems
             close(service)
 
             @test_throws NoRespondersError request(client, "$subject.none", ""; timeout=2.0)
-            @test_throws NoRespondersError fetch(request_async(client, "$subject.none", ""; timeout=2.0))
+            async_no_responders = TestHelpers.thrown_exception() do
+                fetch(request_async(client, "$subject.none", ""; timeout=2.0))
+            end
+            @test async_no_responders isa CapturedException
+            @test async_no_responders.ex isa NoRespondersError
 
             slow_started = Channel{Bool}(1)
             slow_service = subscribe(client, "$subject.slow") do req
@@ -278,7 +282,7 @@ end
     end
 end
 
-@testitem "real nats-server JetStream integration" begin
+@testitem "real nats-server JetStream integration" setup=[TestHelpers] begin
     using Natter
     using Dates
     using Random
@@ -553,6 +557,7 @@ end
                 @test pa3.seq >= 1
                 @test String(fetch(kv_get_async(kv[], "beta"))) == "async-one"
                 @test_throws KeyValueWrongRevisionError kv_update(kv[], "beta", "wrong-revision", pa3.seq + 100)
+                @test_throws KeyValueWrongRevisionError kv_delete(kv[], "beta"; revision=pa3.seq + 100)
                 updates = Channel{KeyValueEntry}(4)
                 watcher = kv_watch(kv[]; key="gamma") do entry
                     put!(updates, entry)
@@ -570,8 +575,16 @@ end
                 finally
                     close(watcher)
                 end
-                fetch(kv_delete_async(kv[], "beta"))
-                @test_throws KeyValueKeyDeletedError fetch(kv_get_async(kv[], "beta"))
+                fetch(kv_delete_async(kv[], "beta"; revision=pa3.seq))
+                async_deleted = TestHelpers.thrown_exception() do
+                    fetch(kv_get_async(kv[], "beta"))
+                end
+                @test async_deleted isa CapturedException
+                @test async_deleted.ex isa KeyValueKeyDeletedError
+                purge_ack = kv_put(kv[], "purge-me", "value")
+                @test_throws KeyValueWrongRevisionError kv_purge(kv[], "purge-me"; revision=purge_ack.seq + 100)
+                fetch(kv_purge_async(kv[], "purge-me"; revision=purge_ack.seq))
+                @test_throws KeyValueKeyDeletedError kv_get(kv[], "purge-me")
                 kv_delete(kv[], "alpha")
                 @test_throws KeyValueKeyDeletedError kv_get(kv[], "alpha")
                 @test !("alpha" in kv_keys(kv[]))

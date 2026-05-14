@@ -33,6 +33,8 @@ using TestItems
     @test header(msg, "Trace") == "abc"
     @test header(msg, "trace") == "abc"
     @test header(msg, "TRACE") == "abc"
+    @test msg.header_bytes == length(hdr)
+    @test N._msg_pending_bytes(msg) == length(payload)
     @test String(msg) == "body"
 
     hdr = N._headers_bytes(Headers("Trace" => ["abc", "def"]))

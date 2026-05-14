@@ -85,6 +85,43 @@ end
     @test client.pending_bytes == 0
 end
 
+@testitem "subscription pending byte limits include HMSG headers" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function parse_header_msg(sid, hdr)
+        raw = vcat(TestHelpers.bytes("HMSG events $sid $(length(hdr)) $(length(hdr))\r\n"),
+                   hdr,
+                   N.CRLF_BYTES)
+        op, msg = N._read_control_or_msg(IOBuffer(raw))
+        @test op == :MSG
+        msg
+    end
+
+    hdr = N._headers_bytes(Headers("Trace" => [repeat("x", 64)]))
+
+    accepted = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    accepted_sub = subscribe(accepted, "events"; pending_bytes_limit=length(hdr))
+    accepted_msg = parse_header_msg(accepted_sub.sid, hdr)
+    N._dispatch_msg(accepted, accepted_msg)
+    @test isready(accepted_sub.messages)
+    @test accepted_sub.pending_bytes == length(hdr)
+    @test N._msg_pending_bytes(next(accepted_sub; timeout=0.1)) == length(hdr)
+    @test accepted_sub.pending_bytes == 0
+
+    reported = Any[]
+    opts = N.ConnectOptions(error_cb=err -> push!(reported, err))
+    rejected = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
+    rejected_sub = subscribe(rejected, "events"; pending_bytes_limit=length(hdr) - 1)
+    rejected_msg = parse_header_msg(rejected_sub.sid, hdr)
+    N._dispatch_msg(rejected, rejected_msg)
+    @test !isready(rejected_sub.messages)
+    @test rejected_sub.pending_bytes == 0
+    @test stats(rejected).dropped_msgs == 1
+    @test only(reported) isa SlowConsumerError
+end
+
 @testitem "publish writes use buffered flusher" setup=[TestHelpers] begin
     using Natter
 
