@@ -1,9 +1,5 @@
 # Natter.jl - Pure Julia NATS client
 
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/rbeeli/Natter.jl/blob/main/LICENSE)
-![Maintenance](https://img.shields.io/maintenance/yes/2026)
-[![Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://rbeeli.github.io/Natter.jl/)
-
 Natter.jl is a Julia client for [NATS](https://nats.io). It provides ergonomic direct APIs for application code and uses Julia tasks internally for the reader loop, pings, reconnects, subscription callbacks, and explicit async handles.
 
 The client is intended for long-running services:
