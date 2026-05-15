@@ -27,6 +27,23 @@ using TestItems
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
     @test stats(client).out_msgs == 1
 
+    binary_payload = TestHelpers.bytes("bin")
+    binary_pending = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    publish(binary_pending, "foo", binary_payload)
+    binary_payload[1] = UInt8('B')
+    @test String(take!(binary_pending.pending)) == "PUB foo 3\r\nbin\r\n"
+
+    hot_payload = fill(UInt8('x'), 64 * 1024)
+    direct_frame = N._prepare_publish_frame("foo", hot_payload, nothing, nothing)
+    @test direct_frame.payload === hot_payload
+    direct_frame = nothing
+    GC.gc()
+    @test (@allocated N._prepare_publish_frame("foo", hot_payload, nothing, nothing)) < 1024
+    hot_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=devnull)
+    publish(hot_client, "foo", hot_payload)
+    GC.gc()
+    @test (@allocated publish(hot_client, "foo", hot_payload)) < 1024
+
     ergonomic_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     publish(ergonomic_headers, "foo", "bar"; headers=Dict("Trace" => "abc"))
     publish_frame = String(take!(ergonomic_headers.pending))
@@ -167,6 +184,26 @@ end
     @test_throws ArgumentError N._parse_options(" , ")
     @test_throws ArgumentError N._parse_options(["nats://one.example:4222", " "])
     @test_throws ArgumentError N._parse_options(("nats://one.example:4222", " "))
+
+    seed = "SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY"
+    creds = join([
+        "-----BEGIN NATS USER JWT-----",
+        "header.payload.signature",
+        "------END NATS USER JWT------",
+        "",
+        "-----BEGIN USER NKEY SEED-----",
+        seed,
+        "------END USER NKEY SEED------",
+    ], "\n")
+    seed_opts = N.ConnectOptions(; nkey_seed=seed)
+    @test seed_opts.nkey_seed isa N.SecretBytes
+    jwt_opts = N.ConnectOptions(; jwt="header.payload.signature", nkey_seed=seed)
+    @test jwt_opts.jwt isa N.SecretBytes
+    secret_opts = N.ConnectOptions(; credentials=creds)
+    @test secret_opts.credentials isa N.SecretBytes
+    @test !occursin(seed, sprint(show, secret_opts))
+    @test !occursin("header.payload.signature", sprint(show, secret_opts))
+    @test occursin("SecretBytes(<redacted>", sprint(show, secret_opts))
 
     function rejects(; kwargs...)
         @test_throws ArgumentError N.ConnectOptions(; kwargs...)

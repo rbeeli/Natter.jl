@@ -142,6 +142,31 @@ end
     end
 end
 
+@testitem "real nats-server JWT credentials auth integration" begin
+    using Natter
+    using Random
+
+    credentials_path = get(ENV, "NATTER_JWT_AUTH_CREDENTIALS_PATH", "")
+    credentials = get(ENV, "NATTER_JWT_AUTH_CREDENTIALS", "")
+
+    if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" &&
+       haskey(ENV, "NATTER_JWT_AUTH_URL") &&
+       (!isempty(credentials_path) || !isempty(credentials))
+        auth_kwargs = !isempty(credentials_path) ? (; credentials_path) : (; credentials)
+        client = connect(ENV["NATTER_JWT_AUTH_URL"]; auth_kwargs...)
+        try
+            subject = "natter.auth.jwt.$(randstring(10))"
+            sub = subscribe(client, subject)
+            publish(client, subject, "jwt")
+            @test String(next(sub; timeout=2.0)) == "jwt"
+        finally
+            close(client)
+        end
+    else
+        @info "Skipping real nats-server JWT credentials auth integration test; set NATTER_RUN_INTEGRATION=true, NATTER_JWT_AUTH_URL, and NATTER_JWT_AUTH_CREDENTIALS or NATTER_JWT_AUTH_CREDENTIALS_PATH to enable it."
+    end
+end
+
 @testitem "real nats-server reconnect server-pool failover" begin
     using Natter
     using Random

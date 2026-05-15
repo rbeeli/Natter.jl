@@ -40,13 +40,13 @@ end
 _should_write_publish_direct(frame_size::Int, threshold::Int)::Bool =
     threshold <= 0 || frame_size >= threshold
 
-function _write_publish_frame(client::Client, io::IO, frame::PublishFrame; replayable::Bool=false,
+function _write_publish_frame(client::Client, io::IO, frame::_AbstractPublishFrame; replayable::Bool=false,
                               threshold::Int=0, frame_size::Int=_serialized_size(frame))
     _write_pub_frame_direct_timed(client, io, frame)
     false
 end
 
-function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::PublishFrame; replayable::Bool=false,
+function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::_AbstractPublishFrame; replayable::Bool=false,
                               threshold::Int=0, frame_size::Int=_serialized_size(frame))
     _ensure_open(io)
     if _should_write_publish_direct(frame_size, threshold)
@@ -84,7 +84,7 @@ function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::Publis
     false
 end
 
-function _write_pub_frame_direct_timed(client::Client, io::IO, frame::PublishFrame; force_flush::Bool=false)
+function _write_pub_frame_direct_timed(client::Client, io::IO, frame::_AbstractPublishFrame; force_flush::Bool=false)
     _run_transport_write(client, io, "publish write") do
         _write_pub_frame_direct(io, frame, client.write_scratch)
         force_flush && flush(io)
@@ -92,7 +92,7 @@ function _write_pub_frame_direct_timed(client::Client, io::IO, frame::PublishFra
     nothing
 end
 
-function _write_publish(client::Client, frame::PublishFrame; force_flush::Bool=false,
+function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flush::Bool=false,
                         replayable::Bool=false, frame_size::Int=_serialized_size(frame))::Bool
     captured = false
     @lock client.write_lock begin
@@ -108,7 +108,7 @@ function _write_publish(client::Client, frame::PublishFrame; force_flush::Bool=f
     captured
 end
 
-function _write_publish_to_io(client::Client, io::WriteIO, frame::PublishFrame, force_flush::Bool,
+function _write_publish_to_io(client::Client, io::WriteIO, frame::_AbstractPublishFrame, force_flush::Bool,
                               replayable::Bool, frame_size::Int) where {WriteIO<:IO}
     threshold = max(0, client.options.write_buffer_size)
     captured = _write_publish_frame(client, io, frame; replayable, threshold, frame_size)
@@ -129,7 +129,7 @@ function _ensure_connected_for_request(client::Client)
     _throw_not_connected_for_request(st)
 end
 
-function _send_publish(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true,
+function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
                        force_flush::Bool=false,
                        frame_size::Int=_serialized_size(frame),
                        st::ConnectionStatus.T=status(client))
@@ -230,10 +230,10 @@ end
 
 _pending_size(data::Vector{UInt8}) = length(data)
 _pending_size(data::AbstractString) = ncodeunits(data)
-_pending_size(frame::PublishFrame) = _serialized_size(frame)
+_pending_size(frame::_AbstractPublishFrame) = _serialized_size(frame)
 
 _write_pending(io::IO, data::Union{AbstractString,Vector{UInt8}}) = write(io, data)
-_write_pending(io::IO, frame::PublishFrame) = _write_pub_frame(io, frame)
+_write_pending(io::IO, frame::_AbstractPublishFrame) = _write_pub_frame(io, frame)
 
 _pending_chunk(data::Vector{UInt8}) = copy(data)
 function _pending_chunk(data::AbstractString)
@@ -241,7 +241,7 @@ function _pending_chunk(data::AbstractString)
     copyto!(bytes, 1, codeunits(data), 1, length(bytes))
     bytes
 end
-_pending_chunk(frame::PublishFrame) = _pub_cmd(frame)
+_pending_chunk(frame::_AbstractPublishFrame) = _pub_cmd(frame)
 
 function _ensure_pending_enqueue_allowed_locked(client::Client)
     st = client.status
@@ -266,23 +266,15 @@ function _enqueue_pending(client::Client, data)
     end
 end
 
-function _prepare_publish_frame(subject::AbstractString, data, reply::Union{AbstractString,Nothing}, headers)::PublishFrame
-    PublishFrame(subject, data; reply, headers)
+function _prepare_publish_frame(subject::AbstractString, data, reply::Union{AbstractString,Nothing}, headers)
+    _publish_frame(subject, reply, data, headers)
 end
 
 prepare_publish(subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
                 headers=nothing)::PublishFrame =
-    _prepare_publish_frame(subject, data, reply, headers)
+    PublishFrame(subject, reply, data, headers)
 
-function _validate_publish_frame(frame::PublishFrame)
-    _validate_publish_subject(frame.subject)
-    isnothing(frame.reply) || _validate_publish_subject(frame.reply)
-    isempty(frame.headers) || _validate_headers(frame.headers)
-    nothing
-end
-
-function _validate_publish_frame_for_client(client::Client, frame::PublishFrame)
-    _validate_publish_frame(frame)
+function _validate_publish_frame_for_client(client::Client, frame::_AbstractPublishFrame)
     total = _pub_payload_size(frame)
     max_payload = _client_max_payload(client)
     headers_supported = _client_headers_supported(client)
@@ -291,9 +283,8 @@ function _validate_publish_frame_for_client(client::Client, frame::PublishFrame)
     nothing
 end
 
-function _publish_prepared(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true,
+function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
                            force_flush::Bool=false)
-    _validate_publish_frame(frame)
     frame_size = _serialized_size(frame)
     total = _pub_payload_size(frame)
     st = status(client)
@@ -313,7 +304,7 @@ function _publish(client::Client, subject::AbstractString, data=nothing; reply::
                       buffer_on_reconnect, force_flush)
 end
 
-function _publish_frame_unchecked(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true,
+function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
                                   force_flush::Bool=false)
     frame_size = _serialized_size(frame)
     st = status(client)
@@ -325,7 +316,7 @@ end
 
 function _publish_unchecked(client::Client, subject::String, payload::AbstractVector{UInt8};
                             buffer_on_reconnect::Bool=true, force_flush::Bool=false)
-    _publish_frame_unchecked(client, PublishFrame(subject, nothing, payload, EMPTY_BYTES);
+    _publish_frame_unchecked(client, _publish_frame(subject, nothing, payload, EMPTY_BYTES);
                              buffer_on_reconnect, force_flush)
 end
 
@@ -1028,7 +1019,7 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     reply = "$(mux.prefix).$token"
     try
         _validate_publish_subject(reply)
-        frame = PublishFrame(request_frame.subject, reply, request_frame.payload, request_frame.headers)
+        frame = _PublishFrame(request_frame.subject, reply, request_frame.payload, request_frame.headers)
         _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true)
         return _wait_request_reply(mux, waiter, timeout)
     finally

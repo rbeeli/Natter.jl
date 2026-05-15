@@ -355,6 +355,16 @@ end
     @test !haskey(nkey_body, :auth_token)
     @test_throws UnsupportedFeatureError N._connect_command(nkey_client, N.ServerInfo(), nothing, nothing)
 
+    mktemp() do path, io
+        write(io, seed)
+        close(io)
+        nkey_path_client = TestHelpers.fake_client(; opts=N.ConnectOptions(nkey_seed_path=path))
+        nkey_path_cmd = N._connect_command(nkey_path_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+        nkey_path_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", nkey_path_cmd).captures))
+        @test nkey_path_body.nkey == public_nkey
+        @test nkey_path_body.sig == expected_sig
+    end
+
     callback_client = TestHelpers.fake_client(; opts=N.ConnectOptions(
         nkey=public_nkey,
         signature_cb=nonce -> fill(UInt8(0x01), 64),
@@ -381,4 +391,15 @@ end
     @test creds_body.jwt == "header.payload.signature"
     @test creds_body.sig == expected_sig
     @test !haskey(creds_body, :nkey)
+
+    mktemp() do path, io
+        write(io, creds)
+        close(io)
+        creds_path_client = TestHelpers.fake_client(; opts=N.ConnectOptions(credentials_path=path))
+        creds_path_cmd = N._connect_command(creds_path_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+        creds_path_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", creds_path_cmd).captures))
+        @test creds_path_body.jwt == "header.payload.signature"
+        @test creds_path_body.sig == expected_sig
+        @test !haskey(creds_path_body, :nkey)
+    end
 end

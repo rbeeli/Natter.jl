@@ -42,8 +42,9 @@ executes JetStream and KeyValue tests.
 |---|---:|---|
 | Token auth | Supported | URL or option. |
 | Username/password auth | Supported | URL or options. |
-| NKEY/JWT credentials | Supported | CONNECT nonce signing is implemented for public NKEY plus callback, seed-backed NKEY auth, user JWT plus seed/callback, and user credentials. |
-| `.creds` file parsing | Supported | `credentials` and `credentials_path` extract the user JWT and NKEY seed from standard decorated credentials content. |
+| NKEY auth | Supported | CONNECT nonce signing is implemented for public NKEY plus callback and seed-backed NKEY auth. NKEY seeds are stored in redacted mutable buffers, path-loaded seed input buffers are wiped after CONNECT fields are derived, and unit tests cover CONNECT fields; CI real-server coverage runs through `NATTER_NKEY_AUTH_URL` and `NATTER_NKEY_AUTH_SEED`. |
+| JWT credentials | Supported | CONNECT nonce signing is implemented for user JWT plus seed/callback and user credentials, including standard decorated `.creds` content. JWT and inline credentials are stored in redacted mutable buffers, path-loaded auth input buffers are wiped after CONNECT fields are derived, and CONNECT serialization and `.creds` parsing are unit-tested; CI real-server coverage runs with generated NSC credentials through `NATTER_JWT_AUTH_URL` and `NATTER_JWT_AUTH_CREDENTIALS_PATH`. |
+| `.creds` file parsing | Supported | `credentials` and `credentials_path` extract the user JWT and NKEY seed from standard decorated credentials content without retaining the whole file as an immutable string. |
 | TLS first handshake | Supported | `tls://` uses TLS before INFO by default. `tls_first=true` enables it for other URLs and `tls_first=false` preserves INFO-first TLS upgrade behavior when needed. |
 | TLS certificate verification control | Supported | Verification is enabled by default. Use `tls_verify=false` to intentionally disable peer certificate verification. |
 | WebSocket custom headers | Planned | Depends on WebSocket transport. |

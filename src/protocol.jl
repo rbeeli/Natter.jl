@@ -784,7 +784,9 @@ function _headers_bytes(headers::Headers)
     out
 end
 
-struct PublishFrame
+abstract type _AbstractPublishFrame end
+
+struct PublishFrame <: _AbstractPublishFrame
     _subject::String
     _reply::Union{String,Nothing}
     _payload::String
@@ -814,8 +816,22 @@ PublishFrame(subject::AbstractString, data=nothing;
              headers=nothing) =
     PublishFrame(subject, reply, data, headers)
 
+struct _PublishFrame{P<:AbstractVector{UInt8},H<:AbstractVector{UInt8}} <: _AbstractPublishFrame
+    subject::String
+    reply::Union{String,Nothing}
+    payload::P
+    headers::H
+end
+
+function _publish_frame(subject::AbstractString, reply::Union{AbstractString,Nothing},
+                        data, headers)
+    subject = _validate_publish_subject(subject)
+    reply = isnothing(reply) ? nothing : _validate_publish_subject(reply)
+    _PublishFrame(subject, reply, _payload_bytes(data), _publish_header_bytes(headers))
+end
+
 _pub_payload_size(payload::AbstractVector{UInt8}, hdr::AbstractVector{UInt8}) = length(hdr) + length(payload)
-_pub_payload_size(frame::PublishFrame) = _pub_payload_size(frame.payload, frame.headers)
+_pub_payload_size(frame::_AbstractPublishFrame) = _pub_payload_size(frame.payload, frame.headers)
 
 function _decimal_digits(value::Int)::Int
     value >= 0 || throw(ArgumentError("value must be non-negative"))
@@ -827,7 +843,7 @@ function _decimal_digits(value::Int)::Int
     digits
 end
 
-function _serialized_size(frame::PublishFrame)::Int
+function _serialized_size(frame::_AbstractPublishFrame)::Int
     payload_len = length(frame.payload)
     subject_len = ncodeunits(frame.subject)
     reply_len = isnothing(frame.reply) ? 0 : ncodeunits(frame.reply)
@@ -888,7 +904,7 @@ function _copy_byte!(dest::Vector{UInt8}, pos::Int, byte::UInt8)::Int
     pos + 1
 end
 
-function _pub_cmd(frame::PublishFrame)::Vector{UInt8}
+function _pub_cmd(frame::_AbstractPublishFrame)::Vector{UInt8}
     out = Vector{UInt8}(undef, _serialized_size(frame))
     pos = 1
     if isempty(frame.headers)
@@ -923,7 +939,7 @@ function _pub_cmd(frame::PublishFrame)::Vector{UInt8}
     out
 end
 
-function _pub_prefix_size(frame::PublishFrame)::Int
+function _pub_prefix_size(frame::_AbstractPublishFrame)::Int
     subject_len = ncodeunits(frame.subject)
     reply_len = isnothing(frame.reply) ? 0 : ncodeunits(frame.reply)
     if isempty(frame.headers)
@@ -936,7 +952,7 @@ function _pub_prefix_size(frame::PublishFrame)::Int
     _decimal_digits(headers_len) + 1 + _decimal_digits(total) + 2
 end
 
-function _pub_prefix!(out::Vector{UInt8}, frame::PublishFrame)::Vector{UInt8}
+function _pub_prefix!(out::Vector{UInt8}, frame::_AbstractPublishFrame)::Vector{UInt8}
     resize!(out, _pub_prefix_size(frame))
     pos = 1
     if isempty(frame.headers)
@@ -966,11 +982,11 @@ function _pub_prefix!(out::Vector{UInt8}, frame::PublishFrame)::Vector{UInt8}
     out
 end
 
-function _pub_prefix(frame::PublishFrame)::Vector{UInt8}
+function _pub_prefix(frame::_AbstractPublishFrame)::Vector{UInt8}
     _pub_prefix!(UInt8[], frame)
 end
 
-function _write_pub_frame_direct(io, frame::PublishFrame)
+function _write_pub_frame_direct(io, frame::_AbstractPublishFrame)
     write(io, _pub_prefix(frame))
     isempty(frame.headers) || write(io, frame.headers)
     write(io, frame.payload)
@@ -978,7 +994,7 @@ function _write_pub_frame_direct(io, frame::PublishFrame)
     nothing
 end
 
-function _write_pub_frame_direct(io, frame::PublishFrame, scratch::Vector{UInt8})
+function _write_pub_frame_direct(io, frame::_AbstractPublishFrame, scratch::Vector{UInt8})
     write(io, _pub_prefix!(scratch, frame))
     isempty(frame.headers) || write(io, frame.headers)
     write(io, frame.payload)
@@ -986,7 +1002,7 @@ function _write_pub_frame_direct(io, frame::PublishFrame, scratch::Vector{UInt8}
     nothing
 end
 
-function _write_pub_frame(io, frame::PublishFrame)
+function _write_pub_frame(io, frame::_AbstractPublishFrame)
     if isempty(frame.headers)
         write(io, "PUB ")
         write(io, frame.subject)
@@ -1018,11 +1034,11 @@ function _write_pub_frame(io, frame::PublishFrame)
 end
 
 function _pub_cmd(subject::String, reply::Union{String,Nothing}, payload::AbstractVector{UInt8}, headers::Headers)
-    _pub_cmd(PublishFrame(subject, reply, payload, headers))
+    _pub_cmd(_publish_frame(subject, reply, payload, headers))
 end
 
 function _pub_cmd(subject::String, reply::Union{String,Nothing}, payload::AbstractVector{UInt8}, hdr::AbstractVector{UInt8})
-    _pub_cmd(PublishFrame(subject, reply, payload, hdr))
+    _pub_cmd(_publish_frame(subject, reply, payload, hdr))
 end
 
 function _sub_cmd(subject::String, queue::Union{String,Nothing}, sid::Int)
@@ -1098,6 +1114,20 @@ _payload_string(data::String) = data
 _payload_string(data::AbstractString) = String(data)
 _payload_string(data::AbstractVector{UInt8}) = _bytes_to_string(data)
 _payload_string(data) = JSON3.write(data)
+
+_publish_header_bytes(::Nothing) = EMPTY_BYTES
+function _publish_header_bytes(headers::AbstractVector{UInt8})
+    isempty(headers) && return EMPTY_BYTES
+    try
+        _validate_headers(headers)
+    catch err
+        err isa ProtocolError && throw(ArgumentError(err.message))
+        rethrow()
+    end
+    headers
+end
+_publish_header_bytes(headers::Headers) = _headers_bytes(headers)
+_publish_header_bytes(headers) = _publish_header_bytes(_headers_from_input(headers))
 
 _publish_header_string(::Nothing) = ""
 function _publish_header_string(headers::AbstractVector{UInt8})

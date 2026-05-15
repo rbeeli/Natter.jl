@@ -30,6 +30,37 @@ jobs:
       - run: docker run -d --name nats -p 4222:4222 nats:2.11-alpine -js
       - run: |
           set -euo pipefail
+          auth_dir="${RUNNER_TEMP}/natter-auth"
+          mkdir -p "${auth_dir}"
+          cat > "${auth_dir}/nkey.conf" <<'EOF'
+          port: 4222
+          authorization {
+            users = [
+              {
+                nkey: "UAT6BWCSCWLUKJT6K6MBJJOEOTXZ5AJDOYKNEVRFC7VNO6OA43N4TRNO"
+                permissions: {
+                  publish: "natter.>"
+                  subscribe: "natter.>"
+                }
+              }
+            ]
+          }
+          EOF
+      - run: docker run -d --name nats-nkey -p 4224:4222 -v "${RUNNER_TEMP}/natter-auth:/auth:ro" nats:2.11-alpine -c /auth/nkey.conf
+      - run: |
+          set -euo pipefail
+          jwt_dir="${RUNNER_TEMP}/natter-jwt"
+          mkdir -p "${jwt_dir}"
+          docker run --rm --user "$(id -u):$(id -g)" -v "${jwt_dir}:/work" natsio/nats-box:latest sh -lc '
+            set -euo pipefail
+            nsc -H /work add operator -n OP --generate-signing-key --sys >/work/nsc.log
+            nsc -H /work add account -n APP >>/work/nsc.log
+            nsc -H /work add user -a APP -n app --allow-pubsub "natter.>" >>/work/nsc.log
+            nsc -H /work generate config --mem-resolver --sys-account SYS --config-file /work/server.conf >>/work/nsc.log
+          '
+      - run: docker run -d --name nats-jwt -p 4225:4222 -v "${RUNNER_TEMP}/natter-jwt:/jwt:ro" nats:2.11-alpine -c /jwt/server.conf
+      - run: |
+          set -euo pipefail
           cert_dir="${RUNNER_TEMP}/natter-tls"
           mkdir -p "${cert_dir}"
           openssl genrsa -out "${cert_dir}/ca.key" 2048
@@ -57,7 +88,7 @@ jobs:
       - run: docker run -d --name nats-tls -p 4223:4222 -v "${RUNNER_TEMP}/natter-tls:/certs:ro" nats:2.11-alpine -js -c /certs/nats.conf
       - run: |
           set -euo pipefail
-          for port in 4222 4223; do
+          for port in 4222 4223 4224 4225; do
             ready=false
             for i in {1..30}; do
               if nc -z 127.0.0.1 "${port}"; then
@@ -68,6 +99,8 @@ jobs:
             done
             if [ "${ready}" != "true" ]; then
               docker logs nats
+              docker logs nats-nkey
+              docker logs nats-jwt
               docker logs nats-tls
               exit 1
             fi
@@ -77,5 +110,9 @@ jobs:
           NATTER_RUN_INTEGRATION: 'true'
           NATTER_RUN_JETSTREAM: 'true'
           NATTER_RUN_TLS: 'true'
+          NATTER_NKEY_AUTH_URL: nats://127.0.0.1:4224
+          NATTER_NKEY_AUTH_SEED: SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY
+          NATTER_JWT_AUTH_URL: nats://127.0.0.1:4225
+          NATTER_JWT_AUTH_CREDENTIALS_PATH: ${{ runner.temp }}/natter-jwt/creds/OP/APP/app.creds
           NATTER_TLS_URL: 'tls://127.0.0.1:4223'
           NATTER_TLS_CA: ${{ runner.temp }}/natter-tls/ca.pem

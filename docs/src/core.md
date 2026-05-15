@@ -39,6 +39,8 @@ Authentication must use one scheme: token, complete `user`/`password`, NKEY, or 
 
 For NKEY auth, pass `nkey_seed` or `nkey_seed_path` to derive the public key, or pass `nkey` with `signature_cb` when signing is managed externally. For user JWT auth, pass a `.creds` file with `credentials_path`, inline `.creds` content with `credentials`, or pair `jwt`/`jwt_path` with a seed or signing callback. NKEY/JWT auth requires a server nonce, which nats-server 2.x provides.
 
+NKEY seeds, JWTs, and inline `.creds` content are stored inside redacted mutable buffers in `ConnectOptions`; path-loaded auth files are parsed from mutable byte buffers that are wiped after CONNECT fields are derived. The CONNECT frame necessarily contains the auth fields until it is written. When possible, prefer `*_path` options or `signature_cb` so Natter can own the input buffer lifecycle. A Julia `String` passed by the caller may still remain in caller-owned memory outside Natter's control.
+
 For short connection security snippets, see [Connection Auth And TLS](examples/connection-auth-tls.md).
 
 `ConnectOptions` is immutable. Connection settings are frozen when options are built and the client reads them concurrently from background tasks; create a new client to change connection behavior.

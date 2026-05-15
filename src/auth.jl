@@ -12,9 +12,27 @@ const _NKEY_PUBLIC_PREFIXES = (
     _NKEY_PREFIX_USER,
 )
 const _NKEY_BASE32_ALPHABET = codeunits("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
-const _NKEY_DECORATED_BLOCK_RE = r"-{3,}[^\r\n]*-{3,}\r?\n([\w\-.=]+)\r?\n-{3,}[^\r\n]*-{3,}"
 
 _nkey_valid_public_prefix(prefix::UInt8)::Bool = prefix in _NKEY_PUBLIC_PREFIXES
+
+_ascii_space(byte::UInt8)::Bool =
+    byte == UInt8(' ') || byte == UInt8('\t') ||
+    byte == UInt8('\r') || byte == UInt8('\n')
+
+function _stripped_bytes(bytes::AbstractVector{UInt8})
+    lo = firstindex(bytes)
+    hi = lastindex(bytes)
+    while lo <= hi && _ascii_space(bytes[lo])
+        lo += 1
+    end
+    while hi >= lo && _ascii_space(bytes[hi])
+        hi -= 1
+    end
+    @view bytes[lo:hi]
+end
+
+_stripped_bytes(value::SecretBytes) = _stripped_bytes(value.bytes)
+_stripped_bytes(value::AbstractString) = _stripped_bytes(codeunits(value))
 
 function _nkey_base32_value(byte::UInt8)::UInt8
     if UInt8('A') <= byte <= UInt8('Z')
@@ -25,14 +43,14 @@ function _nkey_base32_value(byte::UInt8)::UInt8
     throw(ArgumentError("invalid nkey base32 character"))
 end
 
-function _nkey_base32_decode(encoded::AbstractString)::Vector{UInt8}
-    input = strip(String(encoded))
+function _nkey_base32_decode(encoded)::Vector{UInt8}
+    input = _stripped_bytes(encoded)
     isempty(input) && throw(ArgumentError("nkey value cannot be empty"))
     out = UInt8[]
-    sizehint!(out, (ncodeunits(input) * 5) ÷ 8)
+    sizehint!(out, (length(input) * 5) ÷ 8)
     acc::UInt32 = 0
     bits::Int = 0
-    @inbounds for byte in codeunits(input)
+    @inbounds for byte in input
         byte == UInt8('=') && throw(ArgumentError("nkey base32 padding is not allowed"))
         value = UInt32(_nkey_base32_value(byte))
         acc = (acc << 5) | value
@@ -84,7 +102,7 @@ function _nkey_crc16(bytes::AbstractVector{UInt8})::UInt16
     crc
 end
 
-function _nkey_decode_checked(encoded::AbstractString, label::String)::Vector{UInt8}
+function _nkey_decode_checked(encoded, label::String)::Vector{UInt8}
     raw = _nkey_base32_decode(encoded)
     try
         length(raw) >= 4 || throw(ArgumentError("invalid $label encoding"))
@@ -94,11 +112,11 @@ function _nkey_decode_checked(encoded::AbstractString, label::String)::Vector{UI
         actual == expected || throw(ArgumentError("invalid $label checksum"))
         data
     finally
-        fill!(raw, 0)
+        _wipe_bytes!(raw)
     end
 end
 
-function _nkey_decode_seed(encoded::AbstractString)
+function _nkey_decode_seed(encoded)
     raw = _nkey_decode_checked(encoded, "nkey seed")
     try
         length(raw) == 34 || throw(ArgumentError("invalid nkey seed length"))
@@ -109,13 +127,13 @@ function _nkey_decode_seed(encoded::AbstractString)
             throw(ArgumentError("invalid nkey public prefix in seed"))
         (public_prefix=public_prefix, seed=raw[3:end])
     finally
-        fill!(raw, 0)
+        _wipe_bytes!(raw)
     end
 end
 
-function _validate_nkey_seed(encoded::AbstractString)
+function _validate_nkey_seed(encoded)
     decoded = _nkey_decode_seed(encoded)
-    fill!(decoded.seed, 0)
+    _wipe_bytes!(decoded.seed)
     nothing
 end
 
@@ -157,7 +175,7 @@ function _ed25519_keypair_from_seed(seed::Vector{UInt8})
     public_key, secret_key
 end
 
-function _nkey_public_from_seed(encoded_seed::AbstractString)::String
+function _nkey_public_from_seed(encoded_seed)::String
     decoded = _nkey_decode_seed(encoded_seed)
     seed = decoded.seed
     public_key = UInt8[]
@@ -166,12 +184,12 @@ function _nkey_public_from_seed(encoded_seed::AbstractString)::String
         public_key, secret_key = _ed25519_keypair_from_seed(seed)
         _nkey_encode_public(decoded.public_prefix, public_key)
     finally
-        fill!(seed, 0)
-        fill!(secret_key, 0)
+        _wipe_bytes!(seed)
+        _wipe_bytes!(secret_key)
     end
 end
 
-function _nkey_sign(encoded_seed::AbstractString, message::AbstractVector{UInt8})::Vector{UInt8}
+function _nkey_sign(encoded_seed, message::AbstractVector{UInt8})::Vector{UInt8}
     decoded = _nkey_decode_seed(encoded_seed)
     seed = decoded.seed
     secret_key = UInt8[]
@@ -186,12 +204,12 @@ function _nkey_sign(encoded_seed::AbstractString, message::AbstractVector{UInt8}
         signature_len[] == 64 || error("ed25519 signing returned an unexpected signature length")
         signature
     finally
-        fill!(seed, 0)
-        fill!(secret_key, 0)
+        _wipe_bytes!(seed)
+        _wipe_bytes!(secret_key)
     end
 end
 
-_nkey_sign(encoded_seed::AbstractString, message::AbstractString) =
+_nkey_sign(encoded_seed, message::AbstractString) =
     _nkey_sign(encoded_seed, Vector{UInt8}(codeunits(message)))
 
 function _base64url_encode_raw(bytes::AbstractVector{UInt8})::String
@@ -200,87 +218,236 @@ function _base64url_encode_raw(bytes::AbstractVector{UInt8})::String
     replace(encoded, r"=+$" => "")
 end
 
-function _read_auth_text(path::AbstractString)::String
-    bytes = read(String(path))
-    try
-        return String(bytes)
-    finally
-        fill!(bytes, 0)
-    end
+function _secret_data(value::SecretBytes)
+    value.bytes
 end
 
-function _decorated_blocks(text::AbstractString)::Vector{String}
-    blocks = String[]
-    for m in eachmatch(_NKEY_DECORATED_BLOCK_RE, text)
-        push!(blocks, strip(only(m.captures)))
-    end
-    blocks
+function _secret_data(value::AbstractVector{UInt8})
+    value
 end
 
-function _extract_jwt(text::AbstractString)::String
-    blocks = _decorated_blocks(text)
-    jwt = isempty(blocks) ? strip(String(text)) : first(blocks)
-    isempty(jwt) && throw(ArgumentError("JWT credentials do not contain a user JWT"))
-    jwt
+function _secret_data(value::AbstractString)
+    codeunits(value)
 end
 
-function _extract_nkey_seed(text::AbstractString)::String
-    blocks = _decorated_blocks(text)
-    if length(blocks) > 1
-        seed = blocks[2]
-    else
-        seed = nothing
-        for line in eachline(IOBuffer(String(text)))
-            candidate = strip(line)
-            if startswith(candidate, "SO") || startswith(candidate, "SA") ||
-               startswith(candidate, "SU")
-                seed = candidate
+function _secret_to_string(secret::SecretBytes)::String
+    String(secret.bytes)
+end
+
+function _read_auth_secret(path::AbstractString)::SecretBytes
+    SecretBytes(read(String(path)); take=true)
+end
+
+function _range_contains(bytes::AbstractVector{UInt8}, lo::Int, hi::Int,
+                         needle::AbstractString)::Bool
+    needle_bytes = codeunits(needle)
+    n = length(needle_bytes)
+    n == 0 && return true
+    n <= hi - lo + 1 || return false
+    @inbounds for start in lo:(hi - n + 1)
+        matched = true
+        for offset in 1:n
+            if bytes[start + offset - 1] != needle_bytes[offset]
+                matched = false
                 break
             end
         end
+        matched && return true
     end
-    isnothing(seed) && throw(ArgumentError("credentials do not contain an nkey seed"))
-    _validate_nkey_seed(seed)
-    seed
+    false
 end
 
-function _resolve_credentials(opts::ConnectOptions)
-    if !isnothing(opts.credentials)
-        text = String(opts.credentials)
-        return (jwt=_extract_jwt(text), seed=_extract_nkey_seed(text))
-    elseif !isnothing(opts.credentials_path)
-        text = _read_auth_text(opts.credentials_path)
-        return (jwt=_extract_jwt(text), seed=_extract_nkey_seed(text))
+function _decorated_line(bytes::AbstractVector{UInt8}, lo::Int, hi::Int)::Bool
+    hi - lo + 1 >= 6 || return false
+    bytes[lo] == UInt8('-') && bytes[lo + 1] == UInt8('-') &&
+        bytes[lo + 2] == UInt8('-') &&
+        bytes[hi] == UInt8('-') && bytes[hi - 1] == UInt8('-') &&
+        bytes[hi - 2] == UInt8('-')
+end
+
+function _line_bounds(bytes::AbstractVector{UInt8}, start::Int)
+    i = start
+    hi = lastindex(bytes)
+    while i <= hi && bytes[i] != UInt8('\n')
+        i += 1
+    end
+    line_hi = i - 1
+    if line_hi >= start && bytes[line_hi] == UInt8('\r')
+        line_hi -= 1
+    end
+    (start, line_hi, i + 1)
+end
+
+function _decorated_blocks(text)::Vector{SecretBytes}
+    bytes = _secret_data(text)
+    blocks = SecretBytes[]
+    in_block = false
+    content = nothing
+    i = firstindex(bytes)
+    hi = lastindex(bytes)
+    while i <= hi
+        line_lo, line_hi, next_i = _line_bounds(bytes, i)
+        stripped = _stripped_bytes(@view bytes[line_lo:line_hi])
+        stripped_lo = firstindex(stripped)
+        stripped_hi = lastindex(stripped)
+        if !isempty(stripped) && _decorated_line(stripped, stripped_lo, stripped_hi)
+            if _range_contains(stripped, stripped_lo, stripped_hi, "BEGIN")
+                _wipe_secret!(content)
+                in_block = true
+                content = nothing
+            elseif in_block && _range_contains(stripped, stripped_lo, stripped_hi, "END")
+                isnothing(content) || push!(blocks, content)
+                content = nothing
+                in_block = false
+            end
+        elseif in_block && isnothing(content) && !isempty(stripped)
+            content = SecretBytes(stripped)
+        end
+        i = next_i
+    end
+    _wipe_secret!(content)
+    blocks
+end
+
+function _wipe_except!(blocks::Vector{SecretBytes}, keep::Int)
+    for i in eachindex(blocks)
+        i == keep || _wipe_secret!(blocks[i])
     end
     nothing
 end
 
-function _resolve_jwt(opts::ConnectOptions)::String
-    credentials = _resolve_credentials(opts)
-    isnothing(credentials) || return credentials.jwt
-    if !isnothing(opts.jwt)
-        jwt = strip(String(opts.jwt))
-    elseif !isnothing(opts.jwt_path)
-        jwt = _extract_jwt(_read_auth_text(opts.jwt_path))
-    else
-        throw(ArgumentError("JWT authentication requires jwt, jwt_path, credentials, or credentials_path"))
+function _extract_jwt(text)::SecretBytes
+    blocks = _decorated_blocks(text)
+    jwt =
+        if isempty(blocks)
+            SecretBytes(_stripped_bytes(text))
+        else
+            _wipe_except!(blocks, firstindex(blocks))
+            first(blocks)
+        end
+    if isempty(jwt)
+        _wipe_secret!(jwt)
+        throw(ArgumentError("JWT credentials do not contain a user JWT"))
     end
-    isempty(jwt) && throw(ArgumentError("JWT cannot be empty"))
     jwt
 end
 
-function _resolve_signature_seed(opts::ConnectOptions, credential_seed::Union{String,Nothing}=nothing)::String
-    if !isnothing(credential_seed)
-        return credential_seed
-    elseif !isnothing(opts.nkey_seed)
-        seed = strip(String(opts.nkey_seed))
-    elseif !isnothing(opts.nkey_seed_path)
-        seed = _extract_nkey_seed(_read_auth_text(opts.nkey_seed_path))
-    else
-        throw(ArgumentError("nkey/JWT authentication requires a signature source"))
+function _find_nkey_seed_line(text)
+    bytes = _secret_data(text)
+    i = firstindex(bytes)
+    hi = lastindex(bytes)
+    while i <= hi
+        line_lo, line_hi, next_i = _line_bounds(bytes, i)
+        candidate = _stripped_bytes(@view bytes[line_lo:line_hi])
+        candidate_lo = firstindex(candidate)
+        candidate_hi = lastindex(candidate)
+        if length(candidate) >= 2 &&
+           ((candidate[candidate_lo] == UInt8('S') &&
+             candidate[candidate_lo + 1] == UInt8('O')) ||
+            (candidate[candidate_lo] == UInt8('S') &&
+             candidate[candidate_lo + 1] == UInt8('A')) ||
+            (candidate[candidate_lo] == UInt8('S') &&
+             candidate[candidate_lo + 1] == UInt8('U')))
+            return SecretBytes(candidate)
+        end
+        i = next_i
     end
-    isempty(seed) && throw(ArgumentError("nkey seed cannot be empty"))
-    seed
+    nothing
+end
+
+function _extract_nkey_seed(text)::SecretBytes
+    blocks = _decorated_blocks(text)
+    seed =
+        if length(blocks) > 1
+            _wipe_except!(blocks, 2)
+            blocks[2]
+        else
+            foreach(_wipe_secret!, blocks)
+            _find_nkey_seed_line(text)
+        end
+    isnothing(seed) && throw(ArgumentError("credentials do not contain an nkey seed"))
+    try
+        _validate_nkey_seed(seed)
+        return seed
+    catch
+        _wipe_secret!(seed)
+        rethrow()
+    end
+end
+
+function _with_resolved_credentials(f, opts::ConnectOptions)
+    text = nothing
+    jwt = nothing
+    seed = nothing
+    try
+        if !isnothing(opts.credentials)
+            text = opts.credentials
+        elseif !isnothing(opts.credentials_path)
+            text = _read_auth_secret(opts.credentials_path)
+        else
+            return f(nothing)
+        end
+        jwt = _extract_jwt(text)
+        seed = _extract_nkey_seed(text)
+        return f((jwt=jwt, seed=seed))
+    finally
+        _wipe_secret!(jwt)
+        _wipe_secret!(seed)
+        opts.credentials === text || _wipe_secret!(text)
+    end
+end
+
+function _with_resolved_jwt(f, opts::ConnectOptions)
+    jwt = nothing
+    text = nothing
+    try
+        if !isnothing(opts.jwt)
+            jwt = SecretBytes(_stripped_bytes(opts.jwt))
+        elseif !isnothing(opts.jwt_path)
+            text = _read_auth_secret(opts.jwt_path)
+            jwt = _extract_jwt(text)
+        else
+            throw(ArgumentError("JWT authentication requires jwt, jwt_path, credentials, or credentials_path"))
+        end
+        isempty(jwt) && throw(ArgumentError("JWT cannot be empty"))
+        return f(jwt)
+    finally
+        _wipe_secret!(jwt)
+        _wipe_secret!(text)
+    end
+end
+
+function _resolve_jwt(opts::ConnectOptions)::String
+    _with_resolved_credentials(opts) do credentials
+        if !isnothing(credentials)
+            return _secret_to_string(credentials.jwt)
+        end
+        _with_resolved_jwt(opts) do jwt
+            _secret_to_string(jwt)
+        end
+    end
+end
+
+function _with_signature_seed(f, opts::ConnectOptions, credential_seed=nothing)
+    text = nothing
+    seed = nothing
+    try
+        if !isnothing(credential_seed)
+            seed = credential_seed
+        elseif !isnothing(opts.nkey_seed)
+            seed = opts.nkey_seed
+        elseif !isnothing(opts.nkey_seed_path)
+            text = _read_auth_secret(opts.nkey_seed_path)
+            seed = _extract_nkey_seed(text)
+        else
+            throw(ArgumentError("nkey/JWT authentication requires a signature source"))
+        end
+        isempty(seed) && throw(ArgumentError("nkey seed cannot be empty"))
+        return f(seed)
+    finally
+        seed === credential_seed || seed === opts.nkey_seed || _wipe_secret!(seed)
+        _wipe_secret!(text)
+    end
 end
 
 function _signature_bytes(signature)::Vector{UInt8}
@@ -292,15 +459,22 @@ function _signature_bytes(signature)::Vector{UInt8}
     bytes
 end
 
-function _resolve_signature(opts::ConnectOptions, nonce::String;
-                            credential_seed::Union{String,Nothing}=nothing)::String
+function _resolve_signature(opts::ConnectOptions, nonce::String; credential_seed=nothing)::String
     nonce_bytes = Vector{UInt8}(codeunits(nonce))
+    raw = UInt8[]
     if !isnothing(opts.signature_cb)
         raw = _signature_bytes(opts.signature_cb(nonce_bytes))
     else
-        raw = _nkey_sign(_resolve_signature_seed(opts, credential_seed), nonce_bytes)
+        raw = _with_signature_seed(opts, credential_seed) do seed
+            _nkey_sign(seed, nonce_bytes)
+        end
     end
-    _base64url_encode_raw(raw)
+    try
+        _base64url_encode_raw(raw)
+    finally
+        _wipe_bytes!(nonce_bytes)
+        _wipe_bytes!(raw)
+    end
 end
 
 function _resolve_nkey(opts::ConnectOptions)::String
@@ -309,12 +483,16 @@ function _resolve_nkey(opts::ConnectOptions)::String
         _nkey_decode_public(nkey)
         if isnothing(opts.signature_cb) &&
            (!isnothing(opts.nkey_seed) || !isnothing(opts.nkey_seed_path))
-            derived = _nkey_public_from_seed(_resolve_signature_seed(opts))
+            derived = _with_signature_seed(opts) do seed
+                _nkey_public_from_seed(seed)
+            end
             derived == nkey || throw(ArgumentError("nkey does not match nkey seed"))
         end
         return nkey
     end
-    _nkey_public_from_seed(_resolve_signature_seed(opts))
+    _with_signature_seed(opts) do seed
+        _nkey_public_from_seed(seed)
+    end
 end
 
 function _connect_option_has_jwt(opts::ConnectOptions)::Bool
@@ -336,14 +514,26 @@ function _connect_nonce(info::ServerInfo)::String
     nonce
 end
 
-function _connect_nkey_jwt_fields(opts::ConnectOptions, info::ServerInfo)
-    _connect_option_has_nkey_jwt(opts) || return (jwt=nothing, nkey=nothing, sig=nothing)
+function _with_connect_nkey_jwt_fields(f, opts::ConnectOptions, info::ServerInfo)
+    _connect_option_has_nkey_jwt(opts) || return f((jwt=nothing, nkey=nothing, sig=nothing))
     nonce = _connect_nonce(info)
     if _connect_option_has_jwt(opts)
-        credentials = _resolve_credentials(opts)
-        jwt = isnothing(credentials) ? _resolve_jwt(opts) : credentials.jwt
-        seed = isnothing(credentials) ? nothing : credentials.seed
-        return (jwt=jwt, nkey=nothing, sig=_resolve_signature(opts, nonce; credential_seed=seed))
+        return _with_resolved_credentials(opts) do credentials
+            if isnothing(credentials)
+                return _with_resolved_jwt(opts) do jwt
+                    f((jwt=_secret_to_string(jwt),
+                       nkey=nothing,
+                       sig=_resolve_signature(opts, nonce)))
+                end
+            end
+            f((jwt=_secret_to_string(credentials.jwt),
+               nkey=nothing,
+               sig=_resolve_signature(opts, nonce; credential_seed=credentials.seed)))
+        end
     end
-    (jwt=nothing, nkey=_resolve_nkey(opts), sig=_resolve_signature(opts, nonce))
+    f((jwt=nothing, nkey=_resolve_nkey(opts), sig=_resolve_signature(opts, nonce)))
+end
+
+function _connect_nkey_jwt_fields(opts::ConnectOptions, info::ServerInfo)
+    _with_connect_nkey_jwt_fields(identity, opts, info)
 end

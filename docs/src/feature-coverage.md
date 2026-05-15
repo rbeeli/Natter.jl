@@ -26,7 +26,8 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | INFO-first TLS upgrade | Supported | Use `tls_first=false` for deployments that require it. |
 | CA and client certificates | Supported | `tls_ca_path`, `tls_cert_path`, and `tls_key_path`. |
 | Disable certificate verification | Supported | `tls_verify=false`; intended only for trusted environments. |
-| nkeys and JWT credentials | Supported | Supports public NKEY plus signing callback, seed-backed NKEY auth, user JWT plus seed/callback, and `.creds` content or file parsing. |
+| NKEY auth | Supported | Supports public NKEY plus signing callback and seed-backed NKEY auth. NKEY seeds are stored in redacted mutable buffers, path-loaded seed input buffers are wiped after CONNECT fields are derived, and unit plus CI real-server coverage are available. |
+| JWT and `.creds` auth | Supported | Supports user JWT plus seed/callback and `.creds` content or file parsing. JWT and inline credentials are stored in redacted mutable buffers, path-loaded auth input buffers are wiped after CONNECT fields are derived, CONNECT serialization and parsing are unit-tested, and CI real-server coverage runs with generated NSC credentials. |
 
 ## JetStream
 

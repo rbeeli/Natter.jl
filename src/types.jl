@@ -434,11 +434,11 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
     user::Union{String,Nothing}
     password::Union{String,Nothing}
     nkey::Union{String,Nothing}
-    nkey_seed::Union{String,Nothing}
+    nkey_seed::Union{SecretBytes,Nothing}
     nkey_seed_path::Union{String,Nothing}
-    jwt::Union{String,Nothing}
+    jwt::Union{SecretBytes,Nothing}
     jwt_path::Union{String,Nothing}
-    credentials::Union{String,Nothing}
+    credentials::Union{SecretBytes,Nothing}
     credentials_path::Union{String,Nothing}
     signature_cb::SignatureCallback
     no_echo::Bool
@@ -489,6 +489,9 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
         discovered_server_cb,
     )
         servers = _connect_option_servers(servers)
+        nkey_seed = _secret_bytes(nkey_seed)
+        jwt = _secret_bytes(jwt)
+        credentials = _secret_bytes(credentials)
         _validate_connect_option_security(token, user, password, nkey, nkey_seed, nkey_seed_path,
                                           jwt, jwt_path, credentials, credentials_path,
                                           signature_cb, tls_cert_path, tls_key_path)

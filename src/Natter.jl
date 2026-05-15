@@ -58,6 +58,7 @@ const DEFAULT_MAX_INBOUND_PAYLOAD = 64 * 1024 * 1024
 const DEFAULT_MAX_HEADER_BYTES = 64 * 1024
 
 include("errors.jl")
+include("secrets.jl")
 include("types.jl")
 include("auth.jl")
 include("protocol.jl")
