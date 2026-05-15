@@ -1,6 +1,6 @@
 # Reliability And TLS
 
-Natter.jl uses Julia tasks for connection readers, ping timers, reconnects, subscription callbacks, and explicit async handles. Application code can usually call Natter directly inside web handlers, workers, and other Julia tasks; use `@sync` and `@async` when independent work should run concurrently.
+Natter.jl uses Julia tasks for connection readers, ping timers, reconnects, subscription callbacks, and explicit async handles. Natter.jl uses task-based cooperative concurrency over Julia's async I/O model. It is not a multithreaded client implementation. Application code can usually call Natter directly inside web handlers, workers, and other Julia tasks; use `@sync` and `@async` when independent work should run concurrently.
 
 ## Automatic Reconnect
 

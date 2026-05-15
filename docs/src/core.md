@@ -50,6 +50,8 @@ Use `status(client)`, `stats(client)`, and `connected_url(client)` for runtime i
 
 ## Julia Task Concurrency
 
+Natter.jl uses task-based cooperative concurrency over Julia's async I/O model. It is not a multithreaded client implementation.
+
 Julia does not require `async`/`await` syntax for normal task-based application code. A web handler or service task can call Natter directly:
 
 ```julia

@@ -1,6 +1,6 @@
 # Natter.jl - Pure Julia NATS client
 
-Natter.jl is a Julia client for [NATS](https://nats.io). It provides ergonomic direct APIs for application code and uses Julia tasks internally for the reader loop, pings, reconnects, subscription callbacks, and explicit async handles.
+Natter.jl is a Julia client for [NATS](https://nats.io). It provides ergonomic direct APIs for application code and uses Julia tasks internally for the reader loop, pings, reconnects, subscription callbacks, and explicit async handles. Natter.jl uses task-based cooperative concurrency over Julia's async I/O model. It is not a multithreaded client implementation.
 
 The client is intended for long-running services:
 
