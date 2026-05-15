@@ -8,12 +8,11 @@ These examples show the supported connection security modes. Use one NATS authen
 using Natter
 
 token_client = connect("nats://nats.example.com:4222";
-    token=ENV["NATS_TOKEN"],
+    auth=TokenAuth(ENV["NATS_TOKEN"]),
 )
 
 user_client = connect("nats://nats.example.com:4222";
-    user=ENV["NATS_USER"],
-    password=ENV["NATS_PASSWORD"],
+    auth=UserPassAuth(ENV["NATS_USER"], ENV["NATS_PASSWORD"]),
 )
 ```
 
@@ -30,7 +29,7 @@ Use a seed file when Natter should derive the public NKEY and sign the server no
 
 ```julia
 nkey_client = connect("nats://nats.example.com:4222";
-    nkey_seed_path="/etc/nats/user.nk",
+    auth=NKeyAuth(; seed_path="/etc/nats/user.nk"),
 )
 ```
 
@@ -38,7 +37,7 @@ Use a standard decorated `.creds` file for user JWT auth:
 
 ```julia
 creds_client = connect("nats://nats.example.com:4222";
-    credentials_path="/etc/nats/user.creds",
+    auth=CredentialsAuth(; path="/etc/nats/user.creds"),
 )
 ```
 
@@ -46,8 +45,7 @@ Separate JWT and seed files are also supported:
 
 ```julia
 jwt_client = connect("nats://nats.example.com:4222";
-    jwt_path="/etc/nats/user.jwt",
-    nkey_seed_path="/etc/nats/user.nk",
+    auth=JwtAuth(; jwt_path="/etc/nats/user.jwt", seed_path="/etc/nats/user.nk"),
 )
 ```
 
@@ -55,8 +53,18 @@ For HSM or external signer integrations, provide the public NKEY or JWT plus a c
 
 ```julia
 signed_client = connect("nats://nats.example.com:4222";
-    nkey=ENV["NATS_NKEY_PUBLIC"],
-    signature_cb=nonce -> sign_nonce_with_hsm(nonce),
+    auth=NKeyAuth(;
+        nkey=ENV["NATS_NKEY_PUBLIC"],
+        signature_cb=nonce -> sign_nonce_with_hsm(nonce),
+    ),
+)
+```
+
+Use `CallbackAuth` when credentials need to be chosen after server `INFO` is available:
+
+```julia
+client = connect("nats://nats.example.com:4222";
+    auth=CallbackAuth(req -> TokenAuth(token_for(req.url))),
 )
 ```
 

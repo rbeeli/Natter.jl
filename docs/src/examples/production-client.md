@@ -27,14 +27,14 @@ function make_client()
         tls_ca_path="/etc/nats/ca.pem",
         tls_cert_path="/etc/nats/client.pem",
         tls_key_path="/etc/nats/client-key.pem",
-        disconnected_cb=() -> begin
-            @warn "NATS disconnected"
-        end,
-        reconnected_cb=() -> begin
-            @info "NATS reconnected"
-        end,
-        closed_cb=() -> begin
-            @info "NATS connection closed"
+        event_cb=event -> begin
+            if event.kind == ConnectionEventKind.DISCONNECTED
+                @warn "NATS disconnected" error=event.error
+            elseif event.kind == ConnectionEventKind.RECONNECTED
+                @info "NATS reconnected" url=event.url attempt=event.attempt
+            elseif event.kind == ConnectionEventKind.CLOSED
+                @info "NATS connection closed"
+            end
         end,
         error_cb=err -> begin
             @error "NATS client error" exception=err

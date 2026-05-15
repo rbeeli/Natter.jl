@@ -10,7 +10,7 @@ Reconnect is enabled by default. After a transient disconnect, the client:
 - reconnects to known and discovered servers;
 - replays active subscriptions;
 - flushes buffered publish commands on a best-effort basis;
-- invokes `disconnected_cb` and `reconnected_cb` callbacks.
+- emits typed `ConnectionEvent` values through `event_cb`.
 
 ```julia
 client = connect([
@@ -22,11 +22,12 @@ client = connect([
     reconnect_jitter=0.2,
     max_reconnect_attempts=-1,
     pending_size=8 * 1024 * 1024,
-    disconnected_cb=() -> begin
-        @warn "NATS disconnected"
-    end,
-    reconnected_cb=() -> begin
-        @info "NATS reconnected"
+    event_cb=event -> begin
+        if event.kind == ConnectionEventKind.DISCONNECTED
+            @warn "NATS disconnected" error=event.error
+        elseif event.kind == ConnectionEventKind.RECONNECTED
+            @info "NATS reconnected" url=event.url attempt=event.attempt
+        end
     end,
     error_cb=err -> begin
         @error "NATS client error" exception=err
@@ -35,6 +36,14 @@ client = connect([
 ```
 
 `max_reconnect_attempts=-1` means unlimited reconnect attempts.
+
+Use `reconnect_delay_cb` to adjust the next reconnect sleep without replacing the reconnect loop:
+
+```julia
+client = connect("nats://nats.internal:4222";
+    reconnect_delay_cb=event -> min(30.0, 0.25 * event.attempt),
+)
+```
 
 Reconnect coverage currently includes same-server reconnect and multi-URL failover in real-server tests. `INFO` `connect_urls` updates add new discovered routes and prune stale discovered routes from the reconnect pool. Multi-node cluster chaos and auth failover are still tracked as partial hardening work in the feature coverage matrix.
 

@@ -7,8 +7,12 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | Type | Purpose |
 | :--- | :--- |
 | `Client` | Active client connection with background reader, ping, and reconnect tasks. |
-| `ConnectOptions` | Immutable keyword-backed connection configuration, including authentication, TLS verification and server-name control, reconnect, buffering, write timeout, parser, subscription, and close callback limits. |
+| `ConnectOptions` | Immutable keyword-backed connection configuration, including typed authentication, TLS verification and server-name control, reconnect, buffering, write timeout, parser, subscription, and close callback limits. |
 | `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
+| `ConnectionEventKind` | EnumX event namespace: `CONNECTED`, `DISCONNECTED`, `RECONNECT_ATTEMPT`, `RECONNECT_DELAY`, `RECONNECTED`, `DISCOVERED_SERVERS`, `TERMINAL_DISCONNECT`, `CLOSED`. |
+| `ConnectionEvent` | Lifecycle event passed to `event_cb`, with status, server, URL, attempt, delay, error, and generation fields. |
+| `NoAuth`, `TokenAuth`, `UserPassAuth`, `NKeyAuth`, `JwtAuth`, `CredentialsAuth`, `CallbackAuth` | Typed connection authentication values passed as `auth=...` to `connect` or `ConnectOptions`. |
+| `AuthRequest` | Context passed to `CallbackAuth`, including server, URL, nonce, INFO, attempt, and reconnect flag. |
 | `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. Failed handles throw the same operation error that the synchronous API would throw. |
 | `Msg` | Core received message data with `subject`, `reply`, and byte-vector `data`; use `header(msg, key)` or `headers(msg)` for headers. |
 | `Headers` | Case-insensitive dictionary of header names to `Vector{String}` values; publish and request APIs also accept dictionaries with string or vector values and pair iterators. Outbound header names must be valid NATS/HTTP token field names. Mixed-case duplicates are merged under one entry, with the first inserted field spelling used for iteration and serialization. |

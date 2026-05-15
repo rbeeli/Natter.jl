@@ -6,13 +6,13 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
-| Connect handshake | Supported | Includes token, user/password, NKEY, JWT, and `.creds` authentication fields, client name, no echo, TLS requirements, and server INFO parsing. |
+| Connect handshake | Supported | Includes typed token, user/password, NKEY, JWT, `.creds`, and callback authentication, client name, no echo, TLS requirements, and server INFO parsing. |
 | Publish and subscribe | Supported | Includes wildcards, queue groups, INFO-negotiated headers, max payload checks, size- and latency-bound buffered outbound writes, and per-subscription pending limits. |
 | Request reply | Supported | Uses a shared request inbox mux and maps negotiated no-responder status to `NoRespondersError`. |
 | Direct APIs and task handles | Supported | Direct calls are task-friendly; `_async` helpers return `NatterTask` for explicit handle-oriented code, and `fetch(handle)` returns the sync result or throws the same operation error that the synchronous API would throw. |
 | Flush and ping | Supported | Drains buffered outbound writes and uses PING/PONG synchronization. |
 | Drain and close | Supported | Drains subscriptions and reports cleanup failures. |
-| Automatic reconnect | Partial | Reconnects in the background, replays subscriptions, and flushes bounded pending publishes on a best-effort basis. Retained publishes can be delivered more than once after ambiguous transport failures; large direct-write frames are not retained after a successful socket write. Use JetStream `msg_id` deduplication or idempotent handlers for duplicate-sensitive effects. Real-server coverage includes same-server reconnect and multi-URL failover; multi-node cluster chaos and auth failover need more coverage before treating this as fully hardened cluster behavior. |
+| Automatic reconnect | Partial | Reconnects in the background, emits typed connection events, allows reconnect-delay callback overrides, replays subscriptions, and flushes bounded pending publishes on a best-effort basis. Retained publishes can be delivered more than once after ambiguous transport failures; large direct-write frames are not retained after a successful socket write. Use JetStream `msg_id` deduplication or idempotent handlers for duplicate-sensitive effects. Real-server coverage includes same-server reconnect and multi-URL failover; multi-node cluster chaos and auth failover need more coverage before treating this as fully hardened cluster behavior. |
 | Discovered servers | Supported | Server-discovered URLs are retained for reconnects, and stale discovered routes are pruned on subsequent INFO updates. |
 | Server errors | Supported | Permission violations are reported without reconnecting; repeated auth failures abort reconnect with auth-specific errors. |
 | Slow consumer handling | Supported | Drops over-limit messages and reports `SlowConsumerError`. |
@@ -27,10 +27,11 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | CA and client certificates | Supported | `tls_ca_path`, `tls_cert_path`, and `tls_key_path`. |
 | Server-name and IP SAN verification | Supported | The URL host is verified by default; IP-literal hosts match `iPAddress` subject alternative names, and `tls_server_name` overrides SNI and certificate-name validation. |
 | Disable certificate verification | Supported | `tls_verify=false`; intended only for trusted environments. |
-| Token auth | Supported | URL or option tokens. Option tokens are stored in redacted wipeable buffers, and token values are redacted from `ConnectOptions` display including URL userinfo. |
-| Username/password auth | Supported | URL or options. Option passwords are stored in redacted wipeable buffers, and users/passwords are redacted from `ConnectOptions` display including URL userinfo. |
-| NKEY auth | Supported | Supports public user NKEY plus signing callback and user seed-backed NKEY auth. NKEY seeds are stored in redacted wipeable buffers, path-loaded seed input buffers are wiped after CONNECT fields are derived, non-user NKEY prefixes are rejected locally, and unit plus CI real-server coverage are available. |
-| JWT and `.creds` auth | Supported | Supports user JWT plus seed/callback and `.creds` content or file parsing. JWT and inline credentials are stored in redacted wipeable buffers, path-loaded auth input buffers are wiped after CONNECT fields are derived, CONNECT serialization and parsing are unit-tested, and CI real-server coverage runs with generated NSC credentials. |
+| Token auth | Supported | `TokenAuth` or URL userinfo when `auth=NoAuth()`. Option tokens are stored in redacted wipeable buffers, and token values are redacted from `ConnectOptions` display including URL userinfo. |
+| Username/password auth | Supported | `UserPassAuth` or URL userinfo when `auth=NoAuth()`. Option passwords are stored in redacted wipeable buffers, and users/passwords are redacted from `ConnectOptions` display including URL userinfo. |
+| NKEY auth | Supported | `NKeyAuth` supports public user NKEY plus signing callback and user seed-backed NKEY auth. NKEY seeds are stored in redacted wipeable buffers, path-loaded seed input buffers are wiped after CONNECT fields are derived, non-user NKEY prefixes are rejected locally, and unit plus CI real-server coverage are available. |
+| JWT and `.creds` auth | Supported | `JwtAuth` and `CredentialsAuth` support user JWT plus seed/callback and `.creds` content or file parsing. JWT and inline credentials are stored in redacted wipeable buffers, path-loaded auth input buffers are wiped after CONNECT fields are derived, CONNECT serialization and parsing are unit-tested, and CI real-server coverage runs with generated NSC credentials. |
+| Dynamic auth callback | Supported | `CallbackAuth` receives `AuthRequest` after server `INFO` on initial connect and reconnect and returns a concrete static auth value. |
 
 ## JetStream
 

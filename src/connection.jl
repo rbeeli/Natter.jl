@@ -1077,10 +1077,14 @@ end
 function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     subs = Subscription[]
     request_mux = nothing
+    terminal_server = nothing
+    terminal_url = nothing
     terminal = @lock client.lock begin
         if client.generation == generation &&
            client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.RECONNECTING, ConnectionStatus.DISCONNECTED)
             _store_status_locked!(client, ConnectionStatus.DISCONNECTED)
+            terminal_server = client.current_server
+            terminal_url = client.connected_url
             client.current_server = nothing
             client.connected_url = nothing
             client.flusher_task = nothing
@@ -1142,6 +1146,8 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     _close_transport_report_errors!(client)
     _clear_pending_buffer!(client)
     _report_error(client, err)
+    _emit_connection_event(client, ConnectionEventKind.TERMINAL_DISCONNECT;
+                           server=terminal_server, url=terminal_url, err, generation)
     true
 end
 
@@ -1189,35 +1195,8 @@ function _stop_client_tasks!(client::Client; timeout::Real=0.5, deadline=nothing
     errors
 end
 
-function _connect_auth_fields(opts::ConnectOptions, url_user, url_pass)
-    option_has_token = !isnothing(opts.token)
-    option_has_userpass = !isnothing(opts.user) || !isnothing(opts.password)
-    option_has_nkey_jwt = _connect_option_has_nkey_jwt(opts)
-    option_has_auth = option_has_token || option_has_userpass || option_has_nkey_jwt
-    url_has_token = !isnothing(url_user) && isnothing(url_pass)
-    url_has_userpass = !isnothing(url_pass)
-    url_has_auth = url_has_token || url_has_userpass
-    has_token = option_has_token || url_has_token
-    has_userpass = option_has_userpass || url_has_userpass
-    if has_token && has_userpass
-        throw(ArgumentError("token authentication cannot be combined with user/password authentication"))
-    end
-    if option_has_auth && url_has_auth
-        throw(ArgumentError("authentication credentials must be provided either in options or URL userinfo, not both"))
-    end
-    !isnothing(opts.nkey) && _nkey_decode_user_public(opts.nkey)
-    !isnothing(opts.nkey_seed) && _validate_user_nkey_seed(opts.nkey_seed)
-
-    token = !isnothing(opts.token) ? opts.token : (isnothing(url_user) || !isnothing(url_pass) ? nothing : url_user)
-    user = !isnothing(opts.user) ? opts.user : (!isnothing(url_pass) ? url_user : nothing)
-    password = !isnothing(opts.password) ? opts.password : url_pass
-    if isnothing(user) != isnothing(password)
-        throw(ArgumentError("user and password must be provided together"))
-    end
-    (token=token, user=user, password=password)
-end
-
-function _connect_command(client::Client, info::ServerInfo, url_user, url_pass)
+function _connect_command(client::Client, server::Server, info::ServerInfo, url_user, url_pass;
+                          attempt::Int, reconnect::Bool)
     opts = client.options
     hdrs = info.headers === true
     body = Dict{String,Any}(
@@ -1231,23 +1210,24 @@ function _connect_command(client::Client, info::ServerInfo, url_user, url_pass)
         "echo" => !opts.no_echo,
     )
     isnothing(opts.name) || (body["name"] = opts.name)
-    auth = _connect_auth_fields(opts, url_user, url_pass)
+    request = AuthRequest(server, server.url, info.nonce, info, attempt, reconnect)
+    auth = _resolve_connect_auth(opts, request, url_user, url_pass)
     isnothing(auth.token) || (body["auth_token"] = _secret_to_string(auth.token))
     if !isnothing(auth.user)
         body["user"] = auth.user
         body["pass"] = _secret_to_string(auth.password)
     end
-    nkey_jwt_auth = _connect_nkey_jwt_fields(opts, info)
-    isnothing(nkey_jwt_auth.jwt) || (body["jwt"] = nkey_jwt_auth.jwt)
-    isnothing(nkey_jwt_auth.nkey) || (body["nkey"] = nkey_jwt_auth.nkey)
-    isnothing(nkey_jwt_auth.sig) || (body["sig"] = nkey_jwt_auth.sig)
+    isnothing(auth.jwt) || (body["jwt"] = auth.jwt)
+    isnothing(auth.nkey) || (body["nkey"] = auth.nkey)
+    isnothing(auth.sig) || (body["sig"] = auth.sig)
     "CONNECT $(JSON3.write(body))$CRLF"
 end
 
-function _connect_once!(client::Client, server::Server; mark_connected::Bool=true, generation::Union{Nothing,Int}=nothing)
+function _connect_once!(client::Client, server::Server; mark_connected::Bool=true,
+                        generation::Union{Nothing,Int}=nothing, attempt::Int=1,
+                        reconnect::Bool=!isnothing(generation))
     scheme, host, port, url_user, url_pass = _server_parts(server.url)
     tls_host = _tls_server_name(client.options, server, host)
-    _connect_auth_fields(client.options, url_user, url_pass)
     deadline::Float64 = time() + client.options.connect_timeout
     sock = _connect_tcp(host, port, _remaining_timeout(deadline))
     read_io = sock
@@ -1284,7 +1264,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             tls_active = true
         end
         _run_interruptible_io_with_timeout("connect command write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
-            write(write_io, _connect_command(client, info, url_user, url_pass))
+            write(write_io, _connect_command(client, server, info, url_user, url_pass; attempt, reconnect))
             write(write_io, "PING$CRLF")
             flush(write_io)
         end
@@ -1337,6 +1317,8 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             throw(ConnectionClosedError("connection state changed while connecting"))
         end
         _merge_discovered_servers!(client, info)
+        mark_connected && _emit_connection_event(client, ConnectionEventKind.CONNECTED; server,
+                                                 url=server.url, attempt)
         return nothing
     catch err
         err isa TimeoutError || _close_transport_report_errors!(client, read_io, write_io, sock)
@@ -1350,9 +1332,9 @@ function _connect_initial!(client::Client)
         _bump_generation_locked!(client)
     end
     last_err = nothing
-    for server in client.servers
+    for (attempt, server) in pairs(client.servers)
         try
-            _connect_once!(client, server; generation)
+            _connect_once!(client, server; generation, attempt, reconnect=false)
             _start_background_tasks!(client, generation)
             return client
         catch err
@@ -1444,6 +1426,55 @@ function _report_error(client::Client, err)
     catch callback_err
         @warn "Natter error callback failed" exception=(callback_err, catch_backtrace())
     end
+end
+
+function _connection_event(client::Client, kind::ConnectionEventKind.T; server=nothing,
+                           url=nothing, attempt::Int=0, delay=nothing, err=nothing,
+                           generation=nothing)::ConnectionEvent
+    st, current_server, current_url, current_generation = @lock client.lock begin
+        (client.status, client.current_server, client.connected_url, client.generation)
+    end
+    event_server = isnothing(server) ? current_server : server
+    event_url = isnothing(url) ? current_url : String(url)
+    event_delay = isnothing(delay) ? nothing : Float64(delay)
+    event_error =
+        if isnothing(err)
+            nothing
+        elseif err isa Exception
+            err
+        else
+            ErrorException(string(err))
+        end
+    event_generation = isnothing(generation) ? current_generation : Int(generation)
+    ConnectionEvent(kind, st, event_server, event_url, attempt, event_delay,
+                    event_error, event_generation)
+end
+
+function _emit_connection_event(client::Client, kind::ConnectionEventKind.T; kwargs...)::ConnectionEvent
+    event = _connection_event(client, kind; kwargs...)
+    try
+        client.options.event_cb(event)
+    catch err
+        _report_error(client, err)
+    end
+    event
+end
+
+function _resolve_reconnect_delay(client::Client, event::ConnectionEvent,
+                                  default_delay::Float64)::Float64
+    value = try
+        client.options.reconnect_delay_cb(event)
+    catch err
+        _report_error(client, err)
+        return default_delay
+    end
+    isnothing(value) && return default_delay
+    if value isa Real && !(value isa Bool)
+        seconds = Float64(value)
+        isfinite(seconds) && seconds >= 0 && return seconds
+    end
+    _report_error(client, ArgumentError("reconnect_delay_cb must return nothing or a non-negative finite number of seconds"))
+    default_delay
 end
 
 function _server_err(message::AbstractString)::NatterError
@@ -1542,7 +1573,7 @@ function _merge_discovered_servers!(client::Client, info::ServerInfo)
         end
     end
     if added
-        try client.options.discovered_server_cb() catch err _report_error(client, err) end
+        _emit_connection_event(client, ConnectionEventKind.DISCOVERED_SERVERS)
     end
 end
 
@@ -1679,7 +1710,8 @@ function _trigger_reconnect(client::Client, reason)
         _report_cleanup_errors(client, _notify_request_waiters!(client, ConnectionReconnectingError()))
         _report_cleanup_errors(client, _notify_pong_waiters!(client, false))
         _close_transport_report_errors!(client; preserve_replayable=true)
-        try opts.disconnected_cb() catch err _report_error(client, err) end
+        _emit_connection_event(client, ConnectionEventKind.DISCONNECTED; err=reason,
+                               generation)
         should_spawn = @lock client.lock client.generation == generation && client.status == ConnectionStatus.RECONNECTING
         should_spawn || return nothing
         reconnect_task = @async _reconnect_loop(client, generation)
@@ -1743,8 +1775,12 @@ function _reconnect_loop(client::Client, generation::Int)
         end
         for server in servers
             _generation_matches(client, generation) && status(client) == ConnectionStatus.RECONNECTING || return
+            _emit_connection_event(client, ConnectionEventKind.RECONNECT_ATTEMPT;
+                                   server, url=server.url, attempt=attempts,
+                                   generation)
             try
-                _connect_once!(client, server; mark_connected=false, generation)
+                _connect_once!(client, server; mark_connected=false, generation,
+                               attempt=attempts, reconnect=true)
                 _start_flusher_task!(client, generation)
                 _record_reconnect!(client)
                 _replay_subscriptions(client; reconnect_replay=true)
@@ -1765,7 +1801,9 @@ function _reconnect_loop(client::Client, generation::Int)
                 _flush_pending_buffer(client; generation=generation)
                 _flush_buffered_writes(client)
                 _start_background_tasks!(client, generation)
-                try opts.reconnected_cb() catch err _report_error(client, err) end
+                _emit_connection_event(client, ConnectionEventKind.RECONNECTED;
+                                       server, url=server.url, attempt=attempts,
+                                       generation)
                 return
             catch err
                 if err isa AuthenticationError && _record_auth_error!(client, server, err)
@@ -1789,7 +1827,13 @@ function _reconnect_loop(client::Client, generation::Int)
                 _report_error(client, err)
             end
         end
-        wait_time = @lock client.lock max(0.0, delay + rand(client.rng) * opts.reconnect_jitter)
+        default_wait = @lock client.lock max(0.0, delay + rand(client.rng) * opts.reconnect_jitter)
+        delay_event = _connection_event(client, ConnectionEventKind.RECONNECT_DELAY;
+                                        attempt=attempts, delay=default_wait,
+                                        generation)
+        wait_time = _resolve_reconnect_delay(client, delay_event, default_wait)
+        _emit_connection_event(client, ConnectionEventKind.RECONNECT_DELAY;
+                               attempt=attempts, delay=wait_time, generation)
         _sleep_interruptibly(client, generation, wait_time) || return
         delay = min(opts.reconnect_max_wait, delay * 2)
     end

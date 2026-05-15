@@ -237,25 +237,24 @@ end
         seed,
         "------END USER NKEY SEED------",
     ], "\n")
-    seed_opts = N.ConnectOptions(; nkey_seed=seed)
-    @test seed_opts.nkey_seed isa N.SecretBytes
-    jwt_opts = N.ConnectOptions(; jwt="header.payload.signature", nkey_seed=seed)
-    @test jwt_opts.jwt isa N.SecretBytes
-    token_opts = N.ConnectOptions(; token="token-secret-123")
-    @test token_opts.token isa N.SecretBytes
+    seed_opts = N.ConnectOptions(; auth=N.NKeyAuth(; seed))
+    @test seed_opts.auth.seed isa N.SecretBytes
+    jwt_opts = N.ConnectOptions(; auth=N.JwtAuth(; jwt="header.payload.signature", seed))
+    @test jwt_opts.auth.jwt isa N.SecretBytes
+    token_opts = N.ConnectOptions(; auth=N.TokenAuth("token-secret-123"))
+    @test token_opts.auth.token isa N.SecretBytes
     @test !hasfield(N.SecretBytes, :bytes)
-    @test_throws CanonicalIndexError setindex!(token_opts.token, UInt8('x'), 1)
-    @test N._secret_to_string(token_opts.token) == "token-secret-123"
+    @test_throws CanonicalIndexError setindex!(token_opts.auth.token, UInt8('x'), 1)
+    @test N._secret_to_string(token_opts.auth.token) == "token-secret-123"
     @test !occursin("token-secret-123", sprint(show, token_opts))
-    @test occursin("token=<redacted>", sprint(show, token_opts))
+    @test occursin("auth=TokenAuth(<redacted>)", sprint(show, token_opts))
     @test !occursin("token-secret-123", sprint(show, MIME("text/plain"), token_opts))
-    userpass_opts = N.ConnectOptions(; user="auth-user-123", password="password-secret-123")
-    @test userpass_opts.password isa N.SecretBytes
+    userpass_opts = N.ConnectOptions(; auth=N.UserPassAuth("auth-user-123", "password-secret-123"))
+    @test userpass_opts.auth.password isa N.SecretBytes
     userpass_show = sprint(show, userpass_opts)
     @test !occursin("auth-user-123", userpass_show)
     @test !occursin("password-secret-123", userpass_show)
-    @test occursin("user=<redacted>", userpass_show)
-    @test occursin("password=<redacted>", userpass_show)
+    @test occursin("auth=UserPassAuth(<redacted>)", userpass_show)
     url_auth_opts = N.ConnectOptions(; servers=(
         "nats://url-token-123@nats.example:4222",
         "tls://url-user-123:url-pass-123@nats.example:4223",
@@ -271,11 +270,11 @@ end
     @test occursin("nats://<redacted>@nats.example:4222", url_auth_show)
     @test occursin("tls://<redacted>@nats.example:4223", url_auth_show)
     @test occursin("nats://<redacted>@nats.example:4224", url_auth_show)
-    secret_opts = N.ConnectOptions(; credentials=creds)
-    @test secret_opts.credentials isa N.SecretBytes
+    secret_opts = N.ConnectOptions(; auth=N.CredentialsAuth(creds))
+    @test secret_opts.auth.credentials isa N.SecretBytes
     @test !occursin(seed, sprint(show, secret_opts))
     @test !occursin("header.payload.signature", sprint(show, secret_opts))
-    @test occursin("SecretBytes(<redacted>", sprint(show, secret_opts))
+    @test occursin("auth=CredentialsAuth(<redacted>)", sprint(show, secret_opts))
 
     function rejects(; kwargs...)
         @test_throws ArgumentError N.ConnectOptions(; kwargs...)
@@ -292,28 +291,31 @@ end
         @test occursin(message, sprint(showerror, err))
     end
 
+    function rejects_expr(message, f)
+        err = try
+            f()
+            nothing
+        catch err
+            err
+        end
+        @test err isa ArgumentError
+        @test occursin(message, sprint(showerror, err))
+    end
+
     rejects(servers=String[])
     rejects(servers=[""])
     rejects_with("tls_cert_path and tls_key_path must be provided together"; tls_cert_path="client.pem")
     rejects_with("tls_cert_path and tls_key_path must be provided together"; tls_key_path="client-key.pem")
-    rejects_with("token authentication cannot be combined with user/password authentication";
-                 token="secret", user="user", password="pass")
-    rejects_with("user and password must be provided together"; user="user")
-    rejects_with("user and password must be provided together"; password="pass")
-    rejects_with("JWT authentication requires a signature source"; jwt="jwt")
-    rejects_with("nkey authentication requires nkey_seed, nkey_seed_path, or signature_cb"; nkey="UABC")
-    rejects_with("JWT authentication cannot be combined with nkey authentication"; jwt="jwt", nkey="UABC",
-                 signature_cb=nonce -> fill(UInt8(0), 64))
-    rejects_with("nkey seed authentication must use either nkey_seed or nkey_seed_path, not both";
-                 nkey_seed="seed", nkey_seed_path="seed.nk")
-    rejects_with("JWT authentication must use only one of jwt, jwt_path, credentials, or credentials_path";
-                 jwt="jwt", credentials="creds")
-    rejects_with("JWT authentication must use only one signature source";
-                 credentials="creds", signature_cb=nonce -> fill(UInt8(0), 64))
-    rejects_with("signature_cb requires nkey or JWT authentication";
-                 signature_cb=nonce -> fill(UInt8(0), 64))
-    rejects_with("token authentication cannot be combined with nkey or JWT authentication";
-                 token="secret", nkey_seed="seed")
+    rejects_with("auth must be an AbstractAuth"; auth="secret")
+    rejects_expr("user is required", () -> N.UserPassAuth(nothing, "pass"))
+    rejects_expr("password is required", () -> N.UserPassAuth("user", nothing))
+    rejects_expr("JwtAuth requires exactly one of jwt or jwt_path", () -> N.JwtAuth(; seed))
+    rejects_expr("JwtAuth requires exactly one of seed, seed_path, or signature_cb", () -> N.JwtAuth(; jwt="jwt"))
+    rejects_expr("NKeyAuth requires exactly one of seed, seed_path, or signature_cb", () -> N.NKeyAuth(; nkey="UABC"))
+    rejects_expr("NKeyAuth with signature_cb requires nkey", () -> N.NKeyAuth(; signature_cb=nonce -> fill(UInt8(0), 64)))
+    rejects_expr("NKeyAuth must use either seed or seed_path, not both", () -> N.NKeyAuth(; seed="seed", seed_path="seed.nk"))
+    rejects_expr("JwtAuth requires exactly one of jwt or jwt_path", () -> N.JwtAuth(; jwt="jwt", jwt_path="user.jwt", seed))
+    rejects_expr("CredentialsAuth requires exactly one of credentials or path", () -> N.CredentialsAuth(; credentials="creds", path="user.creds"))
     rejects(connect_timeout=0)
     rejects(connect_timeout=Inf)
     rejects(ping_interval=0)
@@ -358,17 +360,18 @@ end
     )
 end
 
-@testitem "connect rejects mixed URL and option authentication before transport IO" setup=[TestHelpers] begin
+@testitem "connect rejects mixed URL and option authentication" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
 
-    client = TestHelpers.fake_client(; opts=N.ConnectOptions(token="secret"))
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(auth=N.TokenAuth("secret")))
+    server = N.Server("nats://user:pass@example.invalid:4222")
     err = TestHelpers.thrown_exception() do
-        N._connect_once!(client, N.Server("nats://user:pass@example.invalid:4222"))
+        N._connect_command(client, server, N.ServerInfo(), "user", "pass"; attempt=1, reconnect=false)
     end
     @test err isa ArgumentError
-    @test occursin("token authentication cannot be combined with user/password authentication",
+    @test occursin("URL userinfo cannot be combined with TokenAuth",
                    sprint(showerror, err))
 end
 
@@ -1318,7 +1321,11 @@ end
 
     disconnected_ref = Ref{Any}()
     disconnected_opts = N.ConnectOptions(error_cb=err -> nothing,
-                                         disconnected_cb=() -> close(disconnected_ref[]))
+                                         event_cb=event -> begin
+                                             if event.kind == N.ConnectionEventKind.DISCONNECTED
+                                                 close(disconnected_ref[])
+                                             end
+                                         end)
     disconnected_transport = CallbackCloseTransport()
     disconnected_client = TestHelpers.fake_client(; opts=disconnected_opts, status=N.ConnectionStatus.CONNECTED,
                                                   read_io=disconnected_transport, write_io=disconnected_transport)
@@ -2560,7 +2567,9 @@ end
     const N = Natter
 
     callbacks = Ref(0)
-    opts = N.ConnectOptions(; discovered_server_cb=() -> (callbacks[] += 1))
+    opts = N.ConnectOptions(; event_cb=event -> begin
+        event.kind == N.ConnectionEventKind.DISCOVERED_SERVERS && (callbacks[] += 1)
+    end)
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED)
 
     seed = N.Server("nats://seed.test:4222")
@@ -2586,6 +2595,49 @@ end
         "nats://current.test:4222",
     ]
     @test callbacks[] == 1
+end
+
+@testitem "connection events and reconnect delay callbacks are typed" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    events = N.ConnectionEvent[]
+    errors = Any[]
+    opts = N.ConnectOptions(;
+        error_cb=err -> push!(errors, err),
+        event_cb=event -> push!(events, event),
+        reconnect_delay_cb=event -> event.kind == N.ConnectionEventKind.RECONNECT_DELAY ? 0.25 : nothing,
+    )
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
+    server = N.Server("nats://reconnect.test:4222")
+    @lock client.lock begin
+        client.current_server = server
+        client.connected_url = server.url
+    end
+
+    event = N._emit_connection_event(client, N.ConnectionEventKind.RECONNECT_ATTEMPT;
+                                     server, url=server.url, attempt=3, generation=client.generation)
+    @test event.kind == N.ConnectionEventKind.RECONNECT_ATTEMPT
+    @test event.status == N.ConnectionStatus.RECONNECTING
+    @test event.server === server
+    @test event.url == server.url
+    @test event.attempt == 3
+    @test event.generation == client.generation
+    @test only(events) === event
+
+    delay_event = N._connection_event(client, N.ConnectionEventKind.RECONNECT_DELAY;
+                                      attempt=3, delay=1.0, generation=client.generation)
+    @test N._resolve_reconnect_delay(client, delay_event, 1.0) == 0.25
+    @test isempty(errors)
+
+    bad_opts = N.ConnectOptions(;
+        error_cb=err -> push!(errors, err),
+        reconnect_delay_cb=_ -> -1,
+    )
+    bad_client = TestHelpers.fake_client(; opts=bad_opts, status=N.ConnectionStatus.RECONNECTING)
+    @test N._resolve_reconnect_delay(bad_client, delay_event, 1.0) == 1.0
+    @test last(errors) isa ArgumentError
 end
 
 @testitem "TLS first handshake mode is explicit and overridable" begin

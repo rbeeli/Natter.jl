@@ -440,78 +440,141 @@ end
 _connect_option_present(value)::Bool = !isnothing(value)
 _connect_option_count_present(values...)::Int = count(_connect_option_present, values)
 
-function _validate_connect_option_security(token, user, password, nkey, nkey_seed,
-                                           nkey_seed_path, jwt, jwt_path, credentials,
-                                           credentials_path, signature_cb,
-                                           tls_cert_path, tls_key_path)
+function _connect_option_required_secret(name::AbstractString, value)::SecretBytes
+    secret = _secret_bytes(value)
+    isnothing(secret) && throw(ArgumentError("$name is required"))
+    isempty(secret) && throw(ArgumentError("$name cannot be empty"))
+    secret
+end
+
+function _validate_connect_option_tls(tls_cert_path, tls_key_path)
     if isnothing(tls_cert_path) != isnothing(tls_key_path)
         throw(ArgumentError("tls_cert_path and tls_key_path must be provided together"))
-    end
-    if isnothing(user) != isnothing(password)
-        throw(ArgumentError("user and password must be provided together"))
-    end
-    jwt_source_count = _connect_option_count_present(jwt, jwt_path, credentials, credentials_path)
-    jwt_source_count <= 1 ||
-        throw(ArgumentError("JWT authentication must use only one of jwt, jwt_path, credentials, or credentials_path"))
-    seed_source_count = _connect_option_count_present(nkey_seed, nkey_seed_path)
-    seed_source_count <= 1 ||
-        throw(ArgumentError("nkey seed authentication must use either nkey_seed or nkey_seed_path, not both"))
-
-    has_userpass = !isnothing(user) || !isnothing(password)
-    has_jwt = jwt_source_count > 0
-    has_credentials = !isnothing(credentials) || !isnothing(credentials_path)
-    has_nkey = !isnothing(nkey) || (!has_jwt && seed_source_count > 0)
-    has_signature_cb = !isnothing(signature_cb)
-    has_nkey_jwt = has_jwt || has_nkey || has_signature_cb
-
-    if !isnothing(token) && has_userpass
-        throw(ArgumentError("token authentication cannot be combined with user/password authentication"))
-    end
-    if !isnothing(token) && has_nkey_jwt
-        throw(ArgumentError("token authentication cannot be combined with nkey or JWT authentication"))
-    end
-    if has_userpass && has_nkey_jwt
-        throw(ArgumentError("user/password authentication cannot be combined with nkey or JWT authentication"))
-    end
-    if has_jwt && !isnothing(nkey)
-        throw(ArgumentError("JWT authentication cannot be combined with nkey authentication"))
-    end
-    if !has_jwt && isnothing(nkey) && has_signature_cb
-        throw(ArgumentError("signature_cb requires nkey or JWT authentication"))
-    end
-
-    signature_source_count = seed_source_count + (has_signature_cb ? 1 : 0)
-    if has_jwt
-        jwt_signature_sources = signature_source_count + (has_credentials ? 1 : 0)
-        jwt_signature_sources > 0 ||
-            throw(ArgumentError("JWT authentication requires a signature source"))
-        jwt_signature_sources == 1 ||
-            throw(ArgumentError("JWT authentication must use only one signature source"))
-    elseif !isnothing(nkey)
-        signature_source_count > 0 ||
-            throw(ArgumentError("nkey authentication requires nkey_seed, nkey_seed_path, or signature_cb"))
-        signature_source_count == 1 ||
-            throw(ArgumentError("nkey authentication must use only one signature source"))
     end
     nothing
 end
 
-struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCallback,DisconnectedCallback,ReconnectedCallback,ClosedCallback,DiscoveredServerCallback}
+abstract type AbstractAuth end
+
+struct NoAuth <: AbstractAuth end
+
+struct TokenAuth <: AbstractAuth
+    token::SecretBytes
+    function TokenAuth(token)
+        new(_connect_option_required_secret("token", token))
+    end
+end
+
+struct UserPassAuth <: AbstractAuth
+    user::String
+    password::SecretBytes
+    function UserPassAuth(user, password)
+        normalized_user = _connect_option_optional_string("user", user)
+        isnothing(normalized_user) && throw(ArgumentError("user is required"))
+        new(normalized_user, _connect_option_required_secret("password", password))
+    end
+end
+
+struct NKeyAuth{SignatureCallback} <: AbstractAuth
+    nkey::Union{String,Nothing}
+    seed::Union{SecretBytes,Nothing}
+    seed_path::Union{String,Nothing}
+    signature_cb::SignatureCallback
+    function NKeyAuth{SignatureCallback}(nkey, seed, seed_path,
+                                         signature_cb) where {SignatureCallback}
+        normalized_nkey = _connect_option_optional_string("nkey", nkey)
+        normalized_seed = _secret_bytes(seed)
+        normalized_seed_path = _connect_option_optional_string("seed_path", seed_path)
+        seed_sources = _connect_option_count_present(normalized_seed, normalized_seed_path)
+        seed_sources <= 1 ||
+            throw(ArgumentError("NKeyAuth must use either seed or seed_path, not both"))
+        signature_sources = seed_sources + (isnothing(signature_cb) ? 0 : 1)
+        signature_sources == 1 ||
+            throw(ArgumentError("NKeyAuth requires exactly one of seed, seed_path, or signature_cb"))
+        if !isnothing(signature_cb) && isnothing(normalized_nkey)
+            throw(ArgumentError("NKeyAuth with signature_cb requires nkey"))
+        end
+        new{SignatureCallback}(normalized_nkey, normalized_seed, normalized_seed_path,
+                               signature_cb)
+    end
+end
+function NKeyAuth(; nkey=nothing, seed=nothing, seed_path=nothing, signature_cb=nothing)
+    NKeyAuth{typeof(signature_cb)}(nkey, seed, seed_path, signature_cb)
+end
+
+struct JwtAuth{SignatureCallback} <: AbstractAuth
+    jwt::Union{SecretBytes,Nothing}
+    jwt_path::Union{String,Nothing}
+    nkey::Union{String,Nothing}
+    seed::Union{SecretBytes,Nothing}
+    seed_path::Union{String,Nothing}
+    signature_cb::SignatureCallback
+    function JwtAuth{SignatureCallback}(jwt, jwt_path, nkey, seed, seed_path,
+                                        signature_cb) where {SignatureCallback}
+        normalized_jwt = _secret_bytes(jwt)
+        normalized_jwt_path = _connect_option_optional_string("jwt_path", jwt_path)
+        jwt_sources = _connect_option_count_present(normalized_jwt, normalized_jwt_path)
+        jwt_sources == 1 ||
+            throw(ArgumentError("JwtAuth requires exactly one of jwt or jwt_path"))
+
+        normalized_nkey = _connect_option_optional_string("nkey", nkey)
+        normalized_seed = _secret_bytes(seed)
+        normalized_seed_path = _connect_option_optional_string("seed_path", seed_path)
+        seed_sources = _connect_option_count_present(normalized_seed, normalized_seed_path)
+        seed_sources <= 1 ||
+            throw(ArgumentError("JwtAuth must use either seed or seed_path, not both"))
+        signature_sources = seed_sources + (isnothing(signature_cb) ? 0 : 1)
+        signature_sources == 1 ||
+            throw(ArgumentError("JwtAuth requires exactly one of seed, seed_path, or signature_cb"))
+        new{SignatureCallback}(normalized_jwt, normalized_jwt_path, normalized_nkey,
+                               normalized_seed, normalized_seed_path, signature_cb)
+    end
+end
+function JwtAuth(; jwt=nothing, jwt_path=nothing, nkey=nothing, seed=nothing,
+                 seed_path=nothing, signature_cb=nothing)
+    JwtAuth{typeof(signature_cb)}(jwt, jwt_path, nkey, seed, seed_path, signature_cb)
+end
+
+struct CredentialsAuth <: AbstractAuth
+    credentials::Union{SecretBytes,Nothing}
+    path::Union{String,Nothing}
+    function CredentialsAuth(credentials, path)
+        normalized_credentials = _secret_bytes(credentials)
+        normalized_path = _connect_option_optional_string("path", path)
+        sources = _connect_option_count_present(normalized_credentials, normalized_path)
+        sources == 1 ||
+            throw(ArgumentError("CredentialsAuth requires exactly one of credentials or path"))
+        new(normalized_credentials, normalized_path)
+    end
+end
+CredentialsAuth(; credentials=nothing, path=nothing) = CredentialsAuth(credentials, path)
+CredentialsAuth(credentials) = CredentialsAuth(; credentials)
+
+struct CallbackAuth{Callback} <: AbstractAuth
+    callback::Callback
+    function CallbackAuth(callback)
+        isnothing(callback) && throw(ArgumentError("CallbackAuth requires a callback"))
+        new{typeof(callback)}(callback)
+    end
+end
+
+Base.show(io::IO, ::NoAuth) = print(io, "NoAuth()")
+Base.show(io::IO, ::TokenAuth) = print(io, "TokenAuth(<redacted>)")
+Base.show(io::IO, ::UserPassAuth) = print(io, "UserPassAuth(<redacted>)")
+Base.show(io::IO, ::NKeyAuth) = print(io, "NKeyAuth(<redacted>)")
+Base.show(io::IO, ::JwtAuth) = print(io, "JwtAuth(<redacted>)")
+Base.show(io::IO, ::CredentialsAuth) = print(io, "CredentialsAuth(<redacted>)")
+Base.show(io::IO, ::CallbackAuth) = print(io, "CallbackAuth(...)")
+
+_default_noop_event_cb(_event) = nothing
+_default_reconnect_delay_cb(_event) = nothing
+
+struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCallback,EventCallback,ReconnectDelayCallback}
     servers::Servers
     name::Union{String,Nothing}
     verbose::Bool
     pedantic::Bool
-    token::Union{SecretBytes,Nothing}
-    user::Union{String,Nothing}
-    password::Union{SecretBytes,Nothing}
-    nkey::Union{String,Nothing}
-    nkey_seed::Union{SecretBytes,Nothing}
-    nkey_seed_path::Union{String,Nothing}
-    jwt::Union{SecretBytes,Nothing}
-    jwt_path::Union{String,Nothing}
-    credentials::Union{SecretBytes,Nothing}
-    credentials_path::Union{String,Nothing}
-    signature_cb::SignatureCallback
+    auth::Auth
     no_echo::Bool
     tls_required::Bool
     tls_first::Union{Bool,Nothing}
@@ -542,33 +605,24 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
     close_callback_timeout::Float64
     inbox_prefix::String
     error_cb::ErrorCallback
-    disconnected_cb::DisconnectedCallback
-    reconnected_cb::ReconnectedCallback
-    closed_cb::ClosedCallback
-    discovered_server_cb::DiscoveredServerCallback
+    event_cb::EventCallback
+    reconnect_delay_cb::ReconnectDelayCallback
 
     function ConnectOptions(
-        servers, name, verbose, pedantic, token, user, password, nkey, nkey_seed,
-        nkey_seed_path, jwt, jwt_path, credentials, credentials_path, signature_cb,
-        no_echo, tls_required, tls_first,
+        servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
         tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
         max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
         sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
         inbox_prefix,
-        error_cb, disconnected_cb, reconnected_cb, closed_cb,
-        discovered_server_cb,
+        error_cb, event_cb, reconnect_delay_cb,
     )
         servers = _connect_option_servers(servers)
-        token = _secret_bytes(token)
-        password = _secret_bytes(password)
-        nkey_seed = _secret_bytes(nkey_seed)
-        jwt = _secret_bytes(jwt)
-        credentials = _secret_bytes(credentials)
-        _validate_connect_option_security(token, user, password, nkey, nkey_seed, nkey_seed_path,
-                                          jwt, jwt_path, credentials, credentials_path,
-                                          signature_cb, tls_cert_path, tls_key_path)
+        auth isa AbstractAuth || throw(ArgumentError("auth must be an AbstractAuth"))
+        event_cb = isnothing(event_cb) ? _default_noop_event_cb : event_cb
+        reconnect_delay_cb = isnothing(reconnect_delay_cb) ? _default_reconnect_delay_cb : reconnect_delay_cb
+        _validate_connect_option_tls(tls_cert_path, tls_key_path)
         tls_server_name = _connect_option_optional_string("tls_server_name", tls_server_name)
         connect_timeout = _connect_option_positive_float("connect_timeout", connect_timeout)
         ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
@@ -592,24 +646,16 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
         drain_timeout = _connect_option_positive_float("drain_timeout", drain_timeout)
         close_callback_timeout = _connect_option_nonnegative_float("close_callback_timeout", close_callback_timeout)
 
-        new{typeof(servers),typeof(signature_cb),typeof(error_cb),typeof(disconnected_cb),typeof(reconnected_cb),typeof(closed_cb),
-            typeof(discovered_server_cb)}(
-            servers, name, verbose, pedantic, token, user, password, nkey, nkey_seed,
-            nkey_seed_path, jwt, jwt_path, credentials, credentials_path, signature_cb,
-            no_echo, tls_required, tls_first,
+        new{typeof(servers),typeof(auth),typeof(error_cb),typeof(event_cb),typeof(reconnect_delay_cb)}(
+            servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
             tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
             max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
             max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
             sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
             inbox_prefix,
-            error_cb, disconnected_cb, reconnected_cb, closed_cb,
-            discovered_server_cb)
+            error_cb, event_cb, reconnect_delay_cb)
     end
-end
-
-function _connect_option_show_redacted(name::Symbol)::Bool
-    name === :token || name === :user || name === :password
 end
 
 function _redacted_server_url(url::AbstractString)::String
@@ -638,9 +684,7 @@ function _redacted_server_url(url::AbstractString)::String
 end
 
 function _show_connect_option_value(io::IO, name::Symbol, value)
-    if _connect_option_show_redacted(name) && !isnothing(value)
-        print(io, "<redacted>")
-    elseif name === :servers
+    if name === :servers
         show(io, map(_redacted_server_url, value))
     else
         show(io, value)
@@ -664,10 +708,7 @@ function Base.show(io::IO, ::MIME"text/plain", opts::ConnectOptions)
 end
 
 function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, pedantic=false,
-                        token=nothing, user=nothing, password=nothing, nkey=nothing,
-                        nkey_seed=nothing, nkey_seed_path=nothing, jwt=nothing,
-                        jwt_path=nothing, credentials=nothing, credentials_path=nothing,
-                        signature_cb=nothing, no_echo=false, tls_required=false,
+                        auth=NoAuth(), no_echo=false, tls_required=false,
                         tls_first=nothing, tls_verify=true,
                         tls_server_name=nothing, tls_ca_path=nothing,
                         tls_cert_path=nothing, tls_key_path=nothing,
@@ -682,12 +723,10 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                         max_stale_pong_waiters=1024, sub_pending_msgs_limit=1024,
                         sub_pending_bytes_limit=128 * 1024 * 1024, drain_timeout=30.0,
                         close_callback_timeout=5.0, inbox_prefix=DEFAULT_INBOX_PREFIX,
-                        error_cb=_default_error_cb, disconnected_cb=_default_noop_cb,
-                        reconnected_cb=_default_noop_cb, closed_cb=_default_noop_cb,
-                        discovered_server_cb=_default_noop_cb)
-    ConnectOptions(servers, name, verbose, pedantic, token, user, password, nkey, nkey_seed,
-                   nkey_seed_path, jwt, jwt_path, credentials, credentials_path, signature_cb,
-                   no_echo, tls_required, tls_first, tls_verify, tls_server_name, tls_ca_path,
+                        error_cb=_default_error_cb, event_cb=_default_noop_event_cb,
+                        reconnect_delay_cb=_default_reconnect_delay_cb)
+    ConnectOptions(servers, name, verbose, pedantic, auth, no_echo, tls_required,
+                   tls_first, tls_verify, tls_server_name, tls_ca_path,
                    tls_cert_path, tls_key_path, connect_timeout,
                    ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
                    reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
@@ -695,8 +734,7 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                    max_control_line, max_inbound_payload,
                    max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
                    sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
-                   inbox_prefix, error_cb, disconnected_cb, reconnected_cb, closed_cb,
-                   discovered_server_cb)
+                   inbox_prefix, error_cb, event_cb, reconnect_delay_cb)
 end
 
 mutable struct Server
@@ -712,6 +750,28 @@ function Server(url::String; discovered=false, tls_name=nothing)
     Server(url, 0, 0.0, discovered, normalized_tls_name, nothing)
 end
 
+EnumX.@enumx ConnectionEventKind begin
+    CONNECTED
+    DISCONNECTED
+    RECONNECT_ATTEMPT
+    RECONNECT_DELAY
+    RECONNECTED
+    DISCOVERED_SERVERS
+    TERMINAL_DISCONNECT
+    CLOSED
+end
+
+struct ConnectionEvent
+    kind::ConnectionEventKind.T
+    status::ConnectionStatus.T
+    server::Union{Server,Nothing}
+    url::Union{String,Nothing}
+    attempt::Int
+    delay::Union{Float64,Nothing}
+    error::Union{Exception,Nothing}
+    generation::Int
+end
+
 Base.@kwdef mutable struct ServerInfo
     max_payload::Union{Int,Nothing} = nothing
     tls_required::Union{Bool,Nothing} = nothing
@@ -721,6 +781,15 @@ Base.@kwdef mutable struct ServerInfo
     headers::Union{Bool,Nothing} = nothing
     nonce::Union{String,Nothing} = nothing
     ldm::Bool = false
+end
+
+struct AuthRequest
+    server::Server
+    url::String
+    nonce::Union{String,Nothing}
+    info::ServerInfo
+    attempt::Int
+    reconnect::Bool
 end
 
 function _merge_server_info!(dest::ServerInfo, src::ServerInfo)

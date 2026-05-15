@@ -409,39 +409,66 @@ function _extract_nkey_seed(text)::SecretBytes
     end
 end
 
-function _with_resolved_credentials(f, opts::ConnectOptions)
+struct ResolvedAuth
+    token::Union{SecretBytes,Nothing}
+    user::Union{String,Nothing}
+    password::Union{SecretBytes,Nothing}
+    jwt::Union{String,Nothing}
+    nkey::Union{String,Nothing}
+    sig::Union{String,Nothing}
+end
+
+const NO_RESOLVED_AUTH = ResolvedAuth(nothing, nothing, nothing, nothing, nothing, nothing)
+
+_url_has_auth(url_user, url_pass)::Bool = !isnothing(url_user) || !isnothing(url_pass)
+
+function _resolved_url_auth(url_user, url_pass)::ResolvedAuth
+    _url_has_auth(url_user, url_pass) || return NO_RESOLVED_AUTH
+    if isnothing(url_pass)
+        return ResolvedAuth(TokenAuth(url_user).token, nothing, nothing, nothing, nothing, nothing)
+    end
+    auth = UserPassAuth(url_user, url_pass)
+    ResolvedAuth(nothing, auth.user, auth.password, nothing, nothing, nothing)
+end
+
+function _reject_url_auth(auth::AbstractAuth, url_user, url_pass)
+    _url_has_auth(url_user, url_pass) || return nothing
+    throw(ArgumentError("URL userinfo cannot be combined with $(nameof(typeof(auth)))"))
+end
+
+function _with_resolved_credentials(f, auth::CredentialsAuth)
     text = nothing
     jwt = nothing
     seed = nothing
     try
-        if !isnothing(opts.credentials)
-            text = opts.credentials
-        elseif !isnothing(opts.credentials_path)
-            text = _read_auth_secret(opts.credentials_path)
+        if !isnothing(auth.credentials)
+            text = auth.credentials
+        elseif !isnothing(auth.path)
+            text = _read_auth_secret(auth.path)
         else
-            return f(nothing)
+            throw(ArgumentError("CredentialsAuth requires credentials or path"))
         end
         jwt = _extract_jwt(text)
         seed = _extract_nkey_seed(text)
-        return f((jwt=jwt, seed=seed))
+        return f(jwt, seed)
     finally
         _wipe_secret!(jwt)
         _wipe_secret!(seed)
-        opts.credentials === text || _wipe_secret!(text)
+        auth.credentials === text || _wipe_secret!(text)
     end
 end
 
-function _with_resolved_jwt(f, opts::ConnectOptions)
+function _with_resolved_jwt(f, auth::JwtAuth)
     jwt = nothing
     text = nothing
     try
-        if !isnothing(opts.jwt)
-            jwt = SecretBytes(_stripped_bytes(opts.jwt))
-        elseif !isnothing(opts.jwt_path)
-            text = _read_auth_secret(opts.jwt_path)
+        if !isnothing(auth.jwt)
+            jwt = SecretBytes(_stripped_bytes(auth.jwt))
+        elseif !isnothing(auth.jwt_path)
+            text = _read_auth_secret(auth.jwt_path)
             jwt = _extract_jwt(text)
         else
-            throw(ArgumentError("JWT authentication requires jwt, jwt_path, credentials, or credentials_path"))
+            throw(ArgumentError("JwtAuth requires jwt or jwt_path"))
         end
         isempty(jwt) && throw(ArgumentError("JWT cannot be empty"))
         return f(jwt)
@@ -451,56 +478,48 @@ function _with_resolved_jwt(f, opts::ConnectOptions)
     end
 end
 
-function _resolve_jwt(opts::ConnectOptions)::String
-    _with_resolved_credentials(opts) do credentials
-        if !isnothing(credentials)
-            return _secret_to_string(credentials.jwt)
-        end
-        _with_resolved_jwt(opts) do jwt
-            _secret_to_string(jwt)
-        end
-    end
-end
-
-function _with_signature_seed(f, opts::ConnectOptions, credential_seed=nothing)
+function _with_signature_seed(f, seed::Union{SecretBytes,Nothing},
+                              seed_path::Union{String,Nothing}, credential_seed=nothing)
     text = nothing
-    seed = nothing
+    resolved_seed = nothing
     try
         if !isnothing(credential_seed)
-            seed = credential_seed
-        elseif !isnothing(opts.nkey_seed)
-            seed = opts.nkey_seed
-        elseif !isnothing(opts.nkey_seed_path)
-            text = _read_auth_secret(opts.nkey_seed_path)
-            seed = _extract_nkey_seed(text)
+            resolved_seed = credential_seed
+        elseif !isnothing(seed)
+            resolved_seed = seed
+        elseif !isnothing(seed_path)
+            text = _read_auth_secret(seed_path)
+            resolved_seed = _extract_nkey_seed(text)
         else
-            throw(ArgumentError("nkey/JWT authentication requires a signature source"))
+            throw(ArgumentError("NKey/JWT authentication requires a signature source"))
         end
-        isempty(seed) && throw(ArgumentError("nkey seed cannot be empty"))
-        return f(seed)
+        isempty(resolved_seed) && throw(ArgumentError("nkey seed cannot be empty"))
+        return f(resolved_seed)
     finally
-        seed === credential_seed || seed === opts.nkey_seed || _wipe_secret!(seed)
+        resolved_seed === credential_seed || resolved_seed === seed || _wipe_secret!(resolved_seed)
         _wipe_secret!(text)
     end
 end
 
 function _signature_bytes(signature)::Vector{UInt8}
     signature isa AbstractVector{UInt8} ||
-        throw(ArgumentError("signature_cb must return a 64-byte Vector{UInt8} signature"))
+        throw(ArgumentError("signature callback must return a 64-byte Vector{UInt8} signature"))
     bytes = Vector{UInt8}(signature)
     length(bytes) == 64 ||
-        throw(ArgumentError("signature_cb must return a 64-byte Ed25519 signature"))
+        throw(ArgumentError("signature callback must return a 64-byte Ed25519 signature"))
     bytes
 end
 
-function _resolve_signature(opts::ConnectOptions, nonce::String; credential_seed=nothing)::String
+function _resolve_signature(signature_cb, seed::Union{SecretBytes,Nothing},
+                            seed_path::Union{String,Nothing}, nonce::String;
+                            credential_seed=nothing)::String
     nonce_bytes = Vector{UInt8}(codeunits(nonce))
     raw = UInt8[]
-    if !isnothing(opts.signature_cb)
-        raw = _signature_bytes(opts.signature_cb(nonce_bytes))
+    if !isnothing(signature_cb)
+        raw = _signature_bytes(signature_cb(nonce_bytes))
     else
-        raw = _with_signature_seed(opts, credential_seed) do seed
-            _nkey_sign(seed, nonce_bytes)
+        raw = _with_signature_seed(seed, seed_path, credential_seed) do resolved_seed
+            _nkey_sign(resolved_seed, nonce_bytes)
         end
     end
     try
@@ -511,33 +530,21 @@ function _resolve_signature(opts::ConnectOptions, nonce::String; credential_seed
     end
 end
 
-function _resolve_nkey(opts::ConnectOptions)::String
-    if !isnothing(opts.nkey)
-        nkey = strip(String(opts.nkey))
-        _nkey_decode_user_public(nkey)
-        if isnothing(opts.signature_cb) &&
-           (!isnothing(opts.nkey_seed) || !isnothing(opts.nkey_seed_path))
-            derived = _with_signature_seed(opts) do seed
-                _nkey_public_from_seed(seed)
-            end
-            derived == nkey || throw(ArgumentError("nkey does not match nkey seed"))
-        end
+function _normalize_user_nkey(nkey)::String
+    normalized = strip(String(nkey))
+    isempty(normalized) && throw(ArgumentError("nkey cannot be empty"))
+    _nkey_decode_user_public(normalized)
+    normalized
+end
+
+function _resolve_seed_nkey(nkey::Union{String,Nothing}, seed::SecretBytes)::String
+    derived = _nkey_public_from_seed(seed)
+    if !isnothing(nkey)
+        nkey = _normalize_user_nkey(nkey)
+        derived == nkey || throw(ArgumentError("nkey does not match nkey seed"))
         return nkey
     end
-    _with_signature_seed(opts) do seed
-        _nkey_public_from_seed(seed)
-    end
-end
-
-function _connect_option_has_jwt(opts::ConnectOptions)::Bool
-    !isnothing(opts.jwt) || !isnothing(opts.jwt_path) ||
-        !isnothing(opts.credentials) || !isnothing(opts.credentials_path)
-end
-
-function _connect_option_has_nkey_jwt(opts::ConnectOptions)::Bool
-    _connect_option_has_jwt(opts) || !isnothing(opts.nkey) ||
-        !isnothing(opts.nkey_seed) || !isnothing(opts.nkey_seed_path) ||
-        !isnothing(opts.signature_cb)
+    derived
 end
 
 function _connect_nonce(info::ServerInfo)::String
@@ -548,26 +555,73 @@ function _connect_nonce(info::ServerInfo)::String
     nonce
 end
 
-function _with_connect_nkey_jwt_fields(f, opts::ConnectOptions, info::ServerInfo)
-    _connect_option_has_nkey_jwt(opts) || return f((jwt=nothing, nkey=nothing, sig=nothing))
-    nonce = _connect_nonce(info)
-    if _connect_option_has_jwt(opts)
-        return _with_resolved_credentials(opts) do credentials
-            if isnothing(credentials)
-                return _with_resolved_jwt(opts) do jwt
-                    f((jwt=_secret_to_string(jwt),
-                       nkey=nothing,
-                       sig=_resolve_signature(opts, nonce)))
-                end
-            end
-            f((jwt=_secret_to_string(credentials.jwt),
-               nkey=nothing,
-               sig=_resolve_signature(opts, nonce; credential_seed=credentials.seed)))
-        end
-    end
-    f((jwt=nothing, nkey=_resolve_nkey(opts), sig=_resolve_signature(opts, nonce)))
+function _resolve_auth(auth::NoAuth, _request::AuthRequest, url_user, url_pass)::ResolvedAuth
+    _resolved_url_auth(url_user, url_pass)
 end
 
-function _connect_nkey_jwt_fields(opts::ConnectOptions, info::ServerInfo)
-    _with_connect_nkey_jwt_fields(identity, opts, info)
+function _resolve_auth(auth::TokenAuth, _request::AuthRequest, url_user, url_pass)::ResolvedAuth
+    _reject_url_auth(auth, url_user, url_pass)
+    ResolvedAuth(auth.token, nothing, nothing, nothing, nothing, nothing)
+end
+
+function _resolve_auth(auth::UserPassAuth, _request::AuthRequest, url_user, url_pass)::ResolvedAuth
+    _reject_url_auth(auth, url_user, url_pass)
+    ResolvedAuth(nothing, auth.user, auth.password, nothing, nothing, nothing)
+end
+
+function _resolve_auth(auth::NKeyAuth, request::AuthRequest, url_user, url_pass)::ResolvedAuth
+    _reject_url_auth(auth, url_user, url_pass)
+    nonce = _connect_nonce(request.info)
+    if !isnothing(auth.signature_cb)
+        nkey = _normalize_user_nkey(auth.nkey)
+        sig = _resolve_signature(auth.signature_cb, nothing, nothing, nonce)
+        return ResolvedAuth(nothing, nothing, nothing, nothing, nkey, sig)
+    end
+    _with_signature_seed(auth.seed, auth.seed_path) do seed
+        nkey = _resolve_seed_nkey(auth.nkey, seed)
+        sig = _resolve_signature(nothing, seed, nothing, nonce)
+        ResolvedAuth(nothing, nothing, nothing, nothing, nkey, sig)
+    end
+end
+
+function _resolve_auth(auth::JwtAuth, request::AuthRequest, url_user, url_pass)::ResolvedAuth
+    _reject_url_auth(auth, url_user, url_pass)
+    nonce = _connect_nonce(request.info)
+    if !isnothing(auth.signature_cb)
+        isnothing(auth.nkey) || _normalize_user_nkey(auth.nkey)
+        sig = _resolve_signature(auth.signature_cb, nothing, nothing, nonce)
+        return _with_resolved_jwt(auth) do jwt
+            ResolvedAuth(nothing, nothing, nothing, _secret_to_string(jwt), nothing, sig)
+        end
+    end
+    _with_signature_seed(auth.seed, auth.seed_path) do seed
+        isnothing(auth.nkey) || _resolve_seed_nkey(auth.nkey, seed)
+        sig = _resolve_signature(nothing, seed, nothing, nonce)
+        _with_resolved_jwt(auth) do jwt
+            ResolvedAuth(nothing, nothing, nothing, _secret_to_string(jwt), nothing, sig)
+        end
+    end
+end
+
+function _resolve_auth(auth::CredentialsAuth, request::AuthRequest, url_user, url_pass)::ResolvedAuth
+    _reject_url_auth(auth, url_user, url_pass)
+    nonce = _connect_nonce(request.info)
+    _with_resolved_credentials(auth) do jwt, seed
+        sig = _resolve_signature(nothing, nothing, nothing, nonce; credential_seed=seed)
+        ResolvedAuth(nothing, nothing, nothing, _secret_to_string(jwt), nothing, sig)
+    end
+end
+
+function _resolve_auth(auth::CallbackAuth, request::AuthRequest, url_user, url_pass)::ResolvedAuth
+    _reject_url_auth(auth, url_user, url_pass)
+    resolved = auth.callback(request)
+    resolved isa CallbackAuth &&
+        throw(ArgumentError("CallbackAuth must return a concrete static auth value, not CallbackAuth"))
+    resolved isa AbstractAuth ||
+        throw(ArgumentError("CallbackAuth must return an AbstractAuth value"))
+    _resolve_auth(resolved, request, nothing, nothing)
+end
+
+function _resolve_connect_auth(opts::ConnectOptions, request::AuthRequest, url_user, url_pass)::ResolvedAuth
+    _resolve_auth(opts.auth, request, url_user, url_pass)
 end

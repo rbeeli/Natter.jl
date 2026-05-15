@@ -9,10 +9,7 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | Option | Default | Purpose |
 | :--- | :--- | :--- |
 | `name` | `nothing` | Human-readable connection name sent to the server. |
-| `token`, `user`, `password` | `nothing` | Token or user/password authentication credentials. |
-| `nkey`, `nkey_seed`, `nkey_seed_path` | `nothing` | NKEY authentication. A seed can derive the public NKEY and sign the server nonce. |
-| `jwt`, `jwt_path`, `credentials`, `credentials_path` | `nothing` | User JWT and `.creds` authentication. |
-| `signature_cb` | `nothing` | Callback for custom nonce signing; return the raw 64-byte Ed25519 signature. |
+| `auth` | `NoAuth()` | One typed authentication value, such as `TokenAuth`, `UserPassAuth`, `NKeyAuth`, `JwtAuth`, `CredentialsAuth`, or `CallbackAuth`. |
 | `no_echo` | `false` | Prevent this connection from receiving its own publishes. |
 | `connect_timeout` | `2.0` | Socket and handshake timeout in seconds. |
 | `ping_interval` | `120.0` | Background keepalive interval in seconds. |
@@ -32,14 +29,18 @@ Core messaging covers the NATS protocol without JetStream persistence.
 | `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit, including NATS header blocks. |
 | `close_callback_timeout` | `5.0` | Seconds `close(client)` waits for subscription callback tasks before reporting a cleanup timeout. User callbacks are not interrupted. |
 | `error_cb` | warning callback | Receives asynchronous callback, cleanup, and background task errors. |
+| `event_cb` | no-op | Receives typed `ConnectionEvent` values for connect, disconnect, reconnect, discovery, terminal disconnect, and close lifecycle events. |
+| `reconnect_delay_cb` | no-op | Receives the `RECONNECT_DELAY` event and may return a non-negative delay override or `nothing` for the normal backoff. |
 
 Durations and production limits are validated when `ConnectOptions` is built. Timeouts, keepalive intervals, pending limits, parser limits, stale waiter limits, and subscription pending limits must be positive. `reconnect_jitter`, `write_buffer_latency`, `write_buffer_size`, and `close_callback_timeout` can be zero, and `max_reconnect_attempts` must be `-1` or non-negative.
 
-Authentication must use one scheme: token, complete `user`/`password`, NKEY, or user JWT credentials. Provide credentials either in options or URL userinfo, not both.
+Authentication uses one typed `auth` value. Use `TokenAuth(token)`, `UserPassAuth(user, password)`, `NKeyAuth(; seed=...)`, `NKeyAuth(; seed_path=...)`, `NKeyAuth(; nkey=..., signature_cb=...)`, `JwtAuth(; jwt=..., seed=...)`, `JwtAuth(; jwt_path=..., seed_path=...)`, or `CredentialsAuth(; path=...)`. URL userinfo remains supported for token and user/password connections when `auth=NoAuth()`, but it cannot be mixed with an explicit `auth` value.
 
-For NKEY auth, pass a user `nkey_seed` or `nkey_seed_path` to derive the public key, or pass a public user `nkey` with `signature_cb` when signing is managed externally. Non-user NKEY prefixes are rejected locally. For user JWT auth, pass a `.creds` file with `credentials_path`, inline `.creds` content with `credentials`, or pair `jwt`/`jwt_path` with a seed or signing callback. NKEY/JWT auth requires a server nonce, which nats-server 2.x provides.
+`CallbackAuth(f)` runs after server `INFO` is read on initial connect and reconnect. The callback receives an `AuthRequest` with the server, URL, nonce, server info, attempt, and reconnect flag, and must return a concrete static auth value such as `TokenAuth`, `UserPassAuth`, `NKeyAuth`, `JwtAuth`, `CredentialsAuth`, or `NoAuth`.
 
-Token, password, NKEY seeds, JWTs, and inline `.creds` content are stored inside redacted wipeable buffers in `ConnectOptions`; user names and URL userinfo are redacted when options are displayed. Path-loaded auth files are parsed from byte buffers that are wiped after CONNECT fields are derived. The CONNECT frame necessarily contains the auth fields until it is written. When possible, prefer `*_path` options or `signature_cb` so Natter can own the input buffer lifecycle. A Julia `String` passed by the caller may still remain in caller-owned memory outside Natter's control.
+For NKEY auth, a user seed can derive the public key and sign the server nonce, or a public user NKEY can be paired with `signature_cb` when signing is managed externally. Non-user NKEY prefixes are rejected locally. For user JWT auth, pass a `.creds` file, inline `.creds` content, or a JWT paired with a seed or signing callback. NKEY/JWT auth requires a server nonce, which nats-server 2.x provides.
+
+Token, password, NKEY seeds, JWTs, and inline `.creds` content are stored inside redacted wipeable buffers in `ConnectOptions`; URL userinfo is redacted when options are displayed. Path-loaded auth files are parsed from byte buffers that are wiped after CONNECT fields are derived. The CONNECT frame necessarily contains the auth fields until it is written. When possible, prefer path-based auth or `signature_cb` so Natter can own the input buffer lifecycle. A Julia `String` passed by the caller may still remain in caller-owned memory outside Natter's control.
 
 For short connection security snippets, see [Connection Auth And TLS](examples/connection-auth-tls.md).
 

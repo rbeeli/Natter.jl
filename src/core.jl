@@ -852,10 +852,11 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
         _wait_task!(errors, "stop subscription processor $(sub.sid)", sub.processor;
                     timeout=callback_wait, deadline=deadline)
     end
+    event = _connection_event(client, ConnectionEventKind.CLOSED)
     try
-        client.options.closed_cb()
+        client.options.event_cb(event)
     catch err
-        callback_err = CleanupError("closed callback", err)
+        callback_err = CleanupError("closed event callback", err)
         push!(errors, callback_err)
     end
     if throw_errors

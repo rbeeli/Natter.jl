@@ -309,8 +309,12 @@ end
     end
     @test_throws ArgumentError N._headers_bytes(Headers("Good" => ["bad\r\nvalue"]))
 
+    server = N.Server("nats://example.test:4222")
+    connect_command(client, info=N.ServerInfo(), url_user=nothing, url_pass=nothing) =
+        N._connect_command(client, server, info, url_user, url_pass; attempt=1, reconnect=false)
+
     client = TestHelpers.fake_client()
-    connect_cmd = N._connect_command(client, N.ServerInfo(), nothing, nothing)
+    connect_cmd = connect_command(client)
     m = match(r"^CONNECT (.*)\r\n$", connect_cmd)
     @test m !== nothing
     body = JSON3.read(only(m.captures))
@@ -318,36 +322,57 @@ end
     @test body.no_responders == false
     @test body.lang == "julia"
 
-    headers_cmd = N._connect_command(client, N.ServerInfo(; headers=true), nothing, nothing)
+    headers_cmd = connect_command(client, N.ServerInfo(; headers=true))
     headers_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", headers_cmd).captures))
     @test headers_body.headers == true
     @test headers_body.no_responders == true
 
     token_client = TestHelpers.fake_client()
-    token_cmd = N._connect_command(token_client, N.ServerInfo(), "secret", nothing)
+    token_cmd = connect_command(token_client, N.ServerInfo(), "secret", nothing)
     token_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", token_cmd).captures))
     @test token_body.auth_token == "secret"
 
-    userpass_cmd = N._connect_command(client, N.ServerInfo(), "user", "pass")
+    userpass_cmd = connect_command(client, N.ServerInfo(), "user", "pass")
     userpass_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", userpass_cmd).captures))
     @test userpass_body.user == "user"
     @test userpass_body.pass == "pass"
     @test !haskey(userpass_body, :auth_token)
 
-    option_token_client = TestHelpers.fake_client(; opts=N.ConnectOptions(token="secret"))
-    option_token_cmd = N._connect_command(option_token_client, N.ServerInfo(), nothing, nothing)
+    option_token_client = TestHelpers.fake_client(; opts=N.ConnectOptions(auth=N.TokenAuth("secret")))
+    option_token_cmd = connect_command(option_token_client)
     option_token_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", option_token_cmd).captures))
     @test option_token_body.auth_token == "secret"
-    @test_throws ArgumentError N._connect_command(option_token_client, N.ServerInfo(), "user", "pass")
-    @test_throws ArgumentError N._connect_command(option_token_client, N.ServerInfo(), "url-token", nothing)
+    @test_throws ArgumentError connect_command(option_token_client, N.ServerInfo(), "user", "pass")
+    @test_throws ArgumentError connect_command(option_token_client, N.ServerInfo(), "url-token", nothing)
 
-    option_userpass_client = TestHelpers.fake_client(; opts=N.ConnectOptions(user="user", password="pass"))
-    option_userpass_cmd = N._connect_command(option_userpass_client, N.ServerInfo(), nothing, nothing)
+    option_userpass_client = TestHelpers.fake_client(; opts=N.ConnectOptions(auth=N.UserPassAuth("user", "pass")))
+    option_userpass_cmd = connect_command(option_userpass_client)
     option_userpass_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", option_userpass_cmd).captures))
     @test option_userpass_body.user == "user"
     @test option_userpass_body.pass == "pass"
-    @test_throws ArgumentError N._connect_command(option_userpass_client, N.ServerInfo(), "secret", nothing)
-    @test_throws ArgumentError N._connect_command(option_userpass_client, N.ServerInfo(), "url-user", "url-pass")
+    @test_throws ArgumentError connect_command(option_userpass_client, N.ServerInfo(), "secret", nothing)
+    @test_throws ArgumentError connect_command(option_userpass_client, N.ServerInfo(), "url-user", "url-pass")
+
+    auth_request = Ref{Union{N.AuthRequest,Nothing}}(nothing)
+    dynamic_auth_client = TestHelpers.fake_client(; opts=N.ConnectOptions(
+        auth=N.CallbackAuth(req -> begin
+            auth_request[] = req
+            N.TokenAuth("dynamic")
+        end),
+    ))
+    dynamic_auth_cmd = connect_command(dynamic_auth_client, N.ServerInfo(; nonce="nonce"))
+    dynamic_auth_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", dynamic_auth_cmd).captures))
+    @test dynamic_auth_body.auth_token == "dynamic"
+    @test auth_request[].server === server
+    @test auth_request[].url == server.url
+    @test auth_request[].nonce == "nonce"
+    @test auth_request[].attempt == 1
+    @test !auth_request[].reconnect
+
+    invalid_callback_client = TestHelpers.fake_client(; opts=N.ConnectOptions(
+        auth=N.CallbackAuth(_ -> "bad"),
+    ))
+    @test_throws ArgumentError connect_command(invalid_callback_client, N.ServerInfo())
 
     function encoded_seed(public_prefix::UInt8)
         data = Vector{UInt8}(undef, 34)
@@ -365,35 +390,43 @@ end
     public_nkey = "UAT6BWCSCWLUKJT6K6MBJJOEOTXZ5AJDOYKNEVRFC7VNO6OA43N4TRNO"
     expected_sig = "m50It12aTgfbJwsQhucujqhXbsq7tLM-Mf_hSjBQsG_4onm8y2Vkw6JG1bbcDkdxXe-Ng0K-7X9ov4rZ4wFcDg"
 
-    nkey_client = TestHelpers.fake_client(; opts=N.ConnectOptions(nkey_seed=seed))
-    nkey_cmd = N._connect_command(nkey_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+    nkey_client = TestHelpers.fake_client(; opts=N.ConnectOptions(auth=N.NKeyAuth(; seed)))
+    nkey_cmd = connect_command(nkey_client, N.ServerInfo(; nonce="nonce"))
     nkey_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", nkey_cmd).captures))
     @test nkey_body.nkey == public_nkey
     @test nkey_body.sig == expected_sig
     @test !haskey(nkey_body, :jwt)
     @test !haskey(nkey_body, :auth_token)
-    @test_throws UnsupportedFeatureError N._connect_command(nkey_client, N.ServerInfo(), nothing, nothing)
+    @test_throws UnsupportedFeatureError connect_command(nkey_client)
 
     mktemp() do path, io
         write(io, seed)
         close(io)
-        nkey_path_client = TestHelpers.fake_client(; opts=N.ConnectOptions(nkey_seed_path=path))
-        nkey_path_cmd = N._connect_command(nkey_path_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+        nkey_path_client = TestHelpers.fake_client(; opts=N.ConnectOptions(auth=N.NKeyAuth(; seed_path=path)))
+        nkey_path_cmd = connect_command(nkey_path_client, N.ServerInfo(; nonce="nonce"))
         nkey_path_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", nkey_path_cmd).captures))
         @test nkey_path_body.nkey == public_nkey
         @test nkey_path_body.sig == expected_sig
     end
 
     callback_client = TestHelpers.fake_client(; opts=N.ConnectOptions(
-        nkey=public_nkey,
-        signature_cb=nonce -> fill(UInt8(0x01), 64),
+        auth=N.NKeyAuth(; nkey=public_nkey, signature_cb=nonce -> fill(UInt8(0x01), 64)),
     ))
-    callback_cmd = N._connect_command(callback_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+    callback_cmd = connect_command(callback_client, N.ServerInfo(; nonce="nonce"))
     callback_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", callback_cmd).captures))
     callback_sig = replace(base64encode(fill(UInt8(0x01), 64)), '+' => '-', '/' => '_')
     callback_sig = replace(callback_sig, r"=+$" => "")
     @test callback_body.nkey == public_nkey
     @test callback_body.sig == callback_sig
+
+    jwt_client = TestHelpers.fake_client(; opts=N.ConnectOptions(
+        auth=N.JwtAuth(; jwt="header.payload.signature", seed),
+    ))
+    jwt_cmd = connect_command(jwt_client, N.ServerInfo(; nonce="nonce"))
+    jwt_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", jwt_cmd).captures))
+    @test jwt_body.jwt == "header.payload.signature"
+    @test jwt_body.sig == expected_sig
+    @test !haskey(jwt_body, :nkey)
 
     for public_prefix in (
         N._NKEY_PREFIX_OPERATOR,
@@ -405,19 +438,16 @@ end
         non_user_seed = encoded_seed(public_prefix)
 
         non_user_public_client = TestHelpers.fake_client(; opts=N.ConnectOptions(
-            nkey=non_user_public,
-            signature_cb=nonce -> fill(UInt8(0x01), 64),
+            auth=N.NKeyAuth(; nkey=non_user_public, signature_cb=nonce -> fill(UInt8(0x01), 64)),
         ))
-        @test_throws ArgumentError N._connect_command(non_user_public_client,
-                                                       N.ServerInfo(; nonce="nonce"),
-                                                       nothing, nothing)
+        @test_throws ArgumentError connect_command(non_user_public_client,
+                                                   N.ServerInfo(; nonce="nonce"))
 
         non_user_seed_client = TestHelpers.fake_client(;
-            opts=N.ConnectOptions(nkey_seed=non_user_seed),
+            opts=N.ConnectOptions(auth=N.NKeyAuth(; seed=non_user_seed)),
         )
-        @test_throws ArgumentError N._connect_command(non_user_seed_client,
-                                                       N.ServerInfo(; nonce="nonce"),
-                                                       nothing, nothing)
+        @test_throws ArgumentError connect_command(non_user_seed_client,
+                                                   N.ServerInfo(; nonce="nonce"))
     end
 
     creds = join([
@@ -429,8 +459,8 @@ end
         seed,
         "------END USER NKEY SEED------",
     ], "\n")
-    creds_client = TestHelpers.fake_client(; opts=N.ConnectOptions(credentials=creds))
-    creds_cmd = N._connect_command(creds_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+    creds_client = TestHelpers.fake_client(; opts=N.ConnectOptions(auth=N.CredentialsAuth(creds)))
+    creds_cmd = connect_command(creds_client, N.ServerInfo(; nonce="nonce"))
     creds_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", creds_cmd).captures))
     @test creds_body.jwt == "header.payload.signature"
     @test creds_body.sig == expected_sig
@@ -439,8 +469,8 @@ end
     mktemp() do path, io
         write(io, creds)
         close(io)
-        creds_path_client = TestHelpers.fake_client(; opts=N.ConnectOptions(credentials_path=path))
-        creds_path_cmd = N._connect_command(creds_path_client, N.ServerInfo(; nonce="nonce"), nothing, nothing)
+        creds_path_client = TestHelpers.fake_client(; opts=N.ConnectOptions(auth=N.CredentialsAuth(; path)))
+        creds_path_cmd = connect_command(creds_path_client, N.ServerInfo(; nonce="nonce"))
         creds_path_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", creds_path_cmd).captures))
         @test creds_path_body.jwt == "header.payload.signature"
         @test creds_path_body.sig == expected_sig
@@ -456,10 +486,9 @@ end
             encoded_seed(public_prefix),
         ], "\n")
         non_user_creds_client = TestHelpers.fake_client(;
-            opts=N.ConnectOptions(credentials=non_user_creds),
+            opts=N.ConnectOptions(auth=N.CredentialsAuth(non_user_creds)),
         )
-        @test_throws ArgumentError N._connect_command(non_user_creds_client,
-                                                       N.ServerInfo(; nonce="nonce"),
-                                                       nothing, nothing)
+        @test_throws ArgumentError connect_command(non_user_creds_client,
+                                                   N.ServerInfo(; nonce="nonce"))
     end
 end

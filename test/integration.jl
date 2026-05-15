@@ -29,7 +29,9 @@ end
         client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
                          connect_timeout,
                          reconnect_wait=0.05, max_reconnect_attempts=20,
-                         reconnected_cb=() -> (reconnected[] = true))
+                         event_cb=event -> begin
+                             event.kind == N.ConnectionEventKind.RECONNECTED && (reconnected[] = true)
+                         end)
         try
             subject = "natter.test.$(randstring(10))"
             sub = subscribe(client, subject)
@@ -148,7 +150,7 @@ end
         io_timeout = IntegrationHelpers.integration_timeout()
         client = connect(ENV["NATTER_NKEY_AUTH_URL"];
                          connect_timeout=IntegrationHelpers.integration_connect_timeout(),
-                         nkey_seed=ENV["NATTER_NKEY_AUTH_SEED"])
+                         auth=NKeyAuth(; seed=ENV["NATTER_NKEY_AUTH_SEED"]))
         try
             subject = "natter.auth.$(randstring(10))"
             sub = subscribe(client, subject)
@@ -173,10 +175,10 @@ end
        haskey(ENV, "NATTER_JWT_AUTH_URL") &&
        (!isempty(credentials_path) || !isempty(credentials))
         io_timeout = IntegrationHelpers.integration_timeout()
-        auth_kwargs = !isempty(credentials_path) ? (; credentials_path) : (; credentials)
+        auth = !isempty(credentials_path) ? CredentialsAuth(; path=credentials_path) : CredentialsAuth(credentials)
         client = connect(ENV["NATTER_JWT_AUTH_URL"];
                          connect_timeout=IntegrationHelpers.integration_connect_timeout(),
-                         auth_kwargs...)
+                         auth)
         try
             subject = "natter.auth.jwt.$(randstring(10))"
             sub = subscribe(client, subject)
@@ -323,8 +325,10 @@ end
                                reconnect_wait=0.05,
                                reconnect_jitter=0.0,
                                max_reconnect_attempts=40,
-                               disconnected_cb=() -> (disconnected[] = true),
-                               reconnected_cb=() -> (reconnected[] = true))
+                               event_cb=event -> begin
+                                   event.kind == N.ConnectionEventKind.DISCONNECTED && (disconnected[] = true)
+                                   event.kind == N.ConnectionEventKind.RECONNECTED && (reconnected[] = true)
+                               end)
             try
                 @test connected_url(client) == primary.url
 
@@ -801,7 +805,9 @@ end
         client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
                          connect_timeout=IntegrationHelpers.integration_connect_timeout(),
                          reconnect_wait=0.05, max_reconnect_attempts=20,
-                         reconnected_cb=() -> (reconnected[] = true))
+                         event_cb=event -> begin
+                             event.kind == N.ConnectionEventKind.RECONNECTED && (reconnected[] = true)
+                         end)
         js = jetstream(client)
         stream = "NATTER_FETCH_$(randstring(8))"
         subject = "natter.fetch.$(randstring(8))"
