@@ -148,6 +148,45 @@ end
 
 Fetch requests use a unique reply subject under the pull subscription inbox, so late terminal status messages from an older request are ignored by the next request. The server-side request expiration defaults to a value shorter than the caller `timeout` (10% shorter, capped at a 5 second margin), so a timed-out local wait does not leave a live server request that can deliver data into a later fetch. Fetch requests are not replayed after reconnect. If the connection is lost before any messages arrive, `fetch` throws `FetchDisconnectedError`; retry the fetch after reconnect. JetStream delivery remains at-least-once until messages are acknowledged, so handlers should be idempotent when duplicate effects matter. For fetches with effective `expires >= 10`, Natter requests JetStream idle heartbeats and reports missed heartbeats as `JetStreamError`. Use `heartbeat=0` to disable heartbeat monitoring or set a shorter positive heartbeat explicitly; `expires` must be shorter than `timeout` and at least twice the heartbeat.
 
+Bounded fetches also support byte-limited and no-wait pull requests:
+
+```julia
+msgs = fetch(sub, 100; timeout=2.0, max_bytes=256 * 1024)
+available = fetch(sub, 10; timeout=1.0, no_wait=true)
+```
+
+For long-running pull consumers, `messages` starts a threshold-refilled message stream. The returned `PullMessageStream` is iterable, supports `take!`, and should be closed when the worker exits. Only one active fetch or message stream may use a pull subscription at a time.
+
+```julia
+stream = messages(sub;
+    batch=100,
+    max_bytes=1024 * 1024,
+    threshold_messages=50,
+    threshold_bytes=512 * 1024,
+    expires=30.0,
+)
+
+try
+    for msg in stream
+        process(String(msg))
+        ack(msg)
+    end
+finally
+    close(stream)
+end
+```
+
+Use `consume` when a callback-oriented worker is a better fit:
+
+```julia
+worker = consume(sub; batch=100, expires=30.0) do msg
+    process(String(msg))
+    ack(msg)
+end
+
+close(worker)
+```
+
 To process a fetched batch concurrently, use a structured `@sync` boundary:
 
 ```julia

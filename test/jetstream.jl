@@ -1579,6 +1579,12 @@ end
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=0.9, heartbeat=0.6)
     @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, max_bytes=0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, max_bytes=true)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, no_wait=1)
+    @test client.pending_bytes == 0
 
     close(psub)
     @test_throws ConnectionClosedError fetch(psub, 1; timeout=1.0)
@@ -1589,6 +1595,44 @@ end
     close(underlying)
     @test_throws ConnectionClosedError fetch(underlying_psub, 1; timeout=1.0)
     @test client.pending_bytes == 0
+end
+
+@testitem "JetStream pull fetch serializes max bytes and no wait" setup=[TestHelpers] begin
+    using Natter
+    using JSON3
+
+    const N = Natter
+
+    function pull_request_payload(frame::AbstractString)
+        header, rest = split(frame, "\r\n"; limit=2)
+        parts = split(header)
+        @test parts[1] == "PUB"
+        len = parse(Int, parts[end])
+        payload, trailer = split(rest, "\r\n"; limit=2)
+        @test ncodeunits(payload) == len
+        @test trailer == ""
+        JSON3.read(payload)
+    end
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull")
+    take!(client.write_io)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+
+    try
+        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+                                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
+                                    sid=core_sub.sid))
+        @test isempty(fetch(psub, 10; timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true))
+        payload = pull_request_payload(String(take!(client.write_io)))
+        @test payload["batch"] == 10
+        @test payload["max_bytes"] == 256
+        @test payload["no_wait"] == true
+        @test payload["expires"] == 9_000_000_000
+    finally
+        close(psub)
+    end
 end
 
 @testitem "JetStream pull fetch expires server request before local timeout" setup=[TestHelpers] begin
@@ -1631,6 +1675,121 @@ end
         explicit_payload = pull_request_payload(String(take!(client.write_io)))
         @test explicit_payload["expires"] == 2_500_000_000
     finally
+        close(psub)
+    end
+end
+
+@testitem "JetStream continuous pull validates inputs and excludes fetch" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull.*")
+    TestHelpers.clear_capture!(capture)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+
+    @test_throws ArgumentError messages(psub; batch=0)
+    @test_throws ArgumentError messages(psub; batch=1, max_bytes=0)
+    @test_throws ArgumentError messages(psub; batch=1, max_bytes=true)
+    @test_throws ArgumentError messages(psub; batch=2, threshold_messages=3)
+    @test_throws ArgumentError messages(psub; batch=2, threshold_bytes=1)
+    @test_throws ArgumentError messages(psub; batch=2, max_bytes=10, threshold_bytes=11)
+    @test_throws ArgumentError messages(psub; batch=1, channel_size=0)
+    @test_throws ArgumentError messages(psub; batch=1, stop_after=0)
+
+    stream = messages(psub; batch=1, expires=1.0, heartbeat=0, stop_after=1)
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))
+        end != :timed_out
+        @test_throws ArgumentError fetch(psub, 1; timeout=0.1, heartbeat=0)
+    finally
+        close(stream)
+        wait(stream)
+        close(psub)
+    end
+end
+
+@testitem "JetStream continuous pull refills at message thresholds" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function request_count(capture)
+        length(collect(eachmatch(r"CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))))
+    end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull.*")
+    TestHelpers.clear_capture!(capture)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+
+    stream = messages(psub; batch=2, expires=1.0, heartbeat=0, threshold_messages=1,
+                      channel_size=4, stop_after=3)
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            request_count(capture) >= 1
+        end != :timed_out
+        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one");
+                                    sid=core_sub.sid))
+        @test String(take!(stream)) == "one"
+        @test timedwait(1.0; pollint=0.001) do
+            request_count(capture) >= 2
+        end != :timed_out
+
+        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.2.2.0.0", TestHelpers.bytes("two");
+                                    sid=core_sub.sid))
+        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.3.3.0.0", TestHelpers.bytes("three");
+                                    sid=core_sub.sid))
+        @test String(take!(stream)) == "two"
+        @test String(take!(stream)) == "three"
+        wait(stream)
+        @test !psub.active_stream
+    finally
+        close(stream)
+        close(psub)
+    end
+end
+
+@testitem "JetStream consume callback drains continuous pull stream" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull.*")
+    TestHelpers.clear_capture!(capture)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+    received = Channel{String}(2)
+
+    stream = consume(msg -> put!(received, String(msg)), psub;
+                     batch=2, expires=1.0, heartbeat=0, channel_size=2, stop_after=2)
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))
+        end != :timed_out
+        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one");
+                                    sid=core_sub.sid))
+        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.2.2.0.0", TestHelpers.bytes("two");
+                                    sid=core_sub.sid))
+        @test timedwait(1.0; pollint=0.001) do
+            isready(received)
+        end != :timed_out
+        @test take!(received) == "one"
+        @test timedwait(1.0; pollint=0.001) do
+            isready(received)
+        end != :timed_out
+        @test take!(received) == "two"
+        wait(stream)
+    finally
+        close(stream)
         close(psub)
     end
 end

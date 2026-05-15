@@ -453,6 +453,83 @@ end
             fetch(ack_async(first(async_msgs)))
             fetch(close_async(async_psub))
 
+            no_wait_subject = "$subject_root.no-wait"
+            no_wait_durable = "NOWAIT_$(randstring(6))"
+            no_wait_psub = pull_subscribe(js, no_wait_subject; stream, durable=no_wait_durable)
+            try
+                @test isempty(fetch(no_wait_psub, 2; timeout=2.0, heartbeat=0, no_wait=true))
+                js_publish(js, no_wait_subject, "nowait-one"; stream)
+                js_publish(js, no_wait_subject, "nowait-two"; stream)
+                no_wait_msgs = fetch(no_wait_psub, 2; timeout=2.0, heartbeat=0, no_wait=true)
+                @test length(no_wait_msgs) == 2
+                @test String(no_wait_msgs[1]) == "nowait-one"
+                @test String(no_wait_msgs[2]) == "nowait-two"
+                foreach(ack, no_wait_msgs)
+            finally
+                close(no_wait_psub)
+            end
+
+            max_bytes_subject = "$subject_root.max-bytes"
+            js_publish(js, max_bytes_subject, "bytes-one"; stream)
+            js_publish(js, max_bytes_subject, "bytes-two"; stream)
+            max_bytes_psub = pull_subscribe(js, max_bytes_subject; stream)
+            try
+                max_bytes_msgs = fetch(max_bytes_psub, 10; timeout=2.0, heartbeat=0, max_bytes=4096)
+                @test length(max_bytes_msgs) == 2
+                foreach(ack, max_bytes_msgs)
+            finally
+                close(max_bytes_psub)
+            end
+
+            continuous_subject = "$subject_root.continuous"
+            for i in 1:5
+                js_publish(js, continuous_subject, "continuous-$i"; stream)
+            end
+            continuous_psub = pull_subscribe(js, continuous_subject; stream)
+            continuous_stream = messages(continuous_psub; batch=2, expires=1.0, heartbeat=0,
+                                         threshold_messages=1, channel_size=5, stop_after=5)
+            try
+                continuous_payloads = String[]
+                for _ in 1:5
+                    @test timedwait(2.0; pollint=0.01) do
+                        isready(continuous_stream.messages)
+                    end != :timed_out
+                    msg = take!(continuous_stream)
+                    push!(continuous_payloads, String(msg))
+                    ack(msg)
+                end
+                wait(continuous_stream)
+                @test continuous_payloads == ["continuous-$i" for i in 1:5]
+            finally
+                close(continuous_stream)
+                close(continuous_psub)
+            end
+
+            consume_subject = "$subject_root.consume"
+            js_publish(js, consume_subject, "consume-one"; stream)
+            js_publish(js, consume_subject, "consume-two"; stream)
+            consume_psub = pull_subscribe(js, consume_subject; stream)
+            consumed = Channel{String}(2)
+            consume_stream = consume(consume_psub; batch=2, expires=1.0, heartbeat=0,
+                                     channel_size=2, stop_after=2) do msg
+                put!(consumed, String(msg))
+                ack(msg)
+            end
+            try
+                @test timedwait(2.0; pollint=0.01) do
+                    isready(consumed)
+                end != :timed_out
+                @test take!(consumed) == "consume-one"
+                @test timedwait(2.0; pollint=0.01) do
+                    isready(consumed)
+                end != :timed_out
+                @test take!(consumed) == "consume-two"
+                wait(consume_stream)
+            finally
+                close(consume_stream)
+                close(consume_psub)
+            end
+
             ack_none_subject = "$subject_root.ack-none"
             ack_none_errors = Channel{Any}(4)
             ack_none_client = connect(url; ping_interval=2.0, max_outstanding_pings=2,

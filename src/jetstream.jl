@@ -1030,20 +1030,29 @@ _pull_fetch_next_subject(js::JetStreamContext, stream::AbstractString, consumer:
     string(js.prefix, ".CONSUMER.MSG.NEXT.", stream, ".", consumer)
 
 function _pull_fetch_request_payload(batch::Int, expires_ns::Int, heartbeat_ns::Int,
+                                     max_bytes::Union{Int,Nothing}, no_wait::Bool,
                                      pin_id::Union{String,Nothing})::String
-    if heartbeat_ns > 0
-        if isnothing(pin_id)
-            return JSON3.write((batch=batch, expires=expires_ns, idle_heartbeat=heartbeat_ns))
-        else
-            return JSON3.write((batch=batch, expires=expires_ns,
-                                idle_heartbeat=heartbeat_ns, pin_id=pin_id))
-        end
-    elseif isnothing(pin_id)
-        return JSON3.write((batch=batch, expires=expires_ns))
-    else
-        return JSON3.write((batch=batch, expires=expires_ns, pin_id=pin_id))
+    io = IOBuffer()
+    print(io, "{\"batch\":", batch)
+    isnothing(max_bytes) || print(io, ",\"max_bytes\":", max_bytes)
+    expires_ns > 0 && print(io, ",\"expires\":", expires_ns)
+    heartbeat_ns > 0 && print(io, ",\"idle_heartbeat\":", heartbeat_ns)
+    no_wait && print(io, ",\"no_wait\":true")
+    if !isnothing(pin_id)
+        print(io, ",\"pin_id\":")
+        JSON3.write(io, pin_id)
     end
+    write(io, UInt8('}'))
+    String(take!(io))
 end
+
+mutable struct _PullMessageStreamState
+    lock::ReentrantLock
+    closed::Bool
+    error::Union{Exception,Nothing}
+end
+
+_PullMessageStreamState() = _PullMessageStreamState(ReentrantLock(), false, nothing)
 
 mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
     js::J
@@ -1058,6 +1067,16 @@ mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription
     closed::Bool
     server_deleted::Bool
     pin_id::Union{String,Nothing}
+    active_fetches::Int
+    active_stream::Bool
+end
+
+mutable struct PullMessageStream{C<:Client,P<:PullSubscription{C}}
+    subscription::P
+    messages::Channel{JetStreamMsg{C}}
+    task::Task
+    callback_task::Union{Task,Nothing}
+    state::_PullMessageStreamState
 end
 
 function PullSubscription(js::J, sub::S, stream::AbstractString, consumer::AbstractString,
@@ -1067,7 +1086,7 @@ function PullSubscription(js::J, sub::S, stream::AbstractString, consumer::Abstr
     consumer = String(consumer)
     PullSubscription{C,J,S}(js, sub, stream, consumer, _pull_fetch_next_subject(js, stream, consumer),
                             String(deliver), fetch_lock, close_lock,
-                            delete_on_close, closed, false, nothing)
+                            delete_on_close, closed, false, nothing, 0, false)
 end
 
 mutable struct PushSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
@@ -1345,15 +1364,72 @@ function _pull_fetch_default_expires(timeout::Real)::Float64
     ttl - min(ttl * 0.1, 5.0)
 end
 
+function _positive_int_option(name::AbstractString, value)::Int
+    value isa Bool && throw(ArgumentError("$name must be a positive integer"))
+    value isa Integer || throw(ArgumentError("$name must be a positive integer"))
+    1 <= value <= typemax(Int) || throw(ArgumentError("$name must be a positive integer"))
+    Int(value)
+end
+
+function _optional_positive_int_option(name::AbstractString, value)::Union{Int,Nothing}
+    isnothing(value) && return nothing
+    _positive_int_option(name, value)
+end
+
+function _bool_option(name::AbstractString, value)::Bool
+    value isa Bool || throw(ArgumentError("$name must be a Bool"))
+    value
+end
+
+function _check_pull_subscription_open(psub::PullSubscription)
+    (@lock psub.close_lock psub.closed) && throw(ConnectionClosedError("pull subscription is closed"))
+    (@lock psub.sub.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
+    nothing
+end
+
+function _begin_pull_fetch!(psub::PullSubscription)
+    (@lock psub.sub.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
+    @lock psub.close_lock begin
+        psub.closed && throw(ConnectionClosedError("pull subscription is closed"))
+        psub.active_stream && throw(ArgumentError("pull subscription already has an active message stream"))
+        psub.active_fetches += 1
+    end
+    nothing
+end
+
+function _end_pull_fetch!(psub::PullSubscription)
+    @lock psub.close_lock begin
+        psub.active_fetches = max(0, psub.active_fetches - 1)
+    end
+    nothing
+end
+
+function _begin_pull_stream!(psub::PullSubscription)
+    (@lock psub.sub.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
+    @lock psub.close_lock begin
+        psub.closed && throw(ConnectionClosedError("pull subscription is closed"))
+        (psub.active_stream || psub.active_fetches > 0) &&
+            throw(ArgumentError("pull subscription already has an active fetch or message stream"))
+        psub.active_stream = true
+    end
+    nothing
+end
+
+function _end_pull_stream!(psub::PullSubscription)
+    @lock psub.close_lock psub.active_stream = false
+    nothing
+end
+
 function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real, expires::Real,
-                              heartbeat::Union{Nothing,Real})
+                              heartbeat::Union{Nothing,Real}, max_bytes, no_wait)
     batch > 0 || throw(ArgumentError("fetch batch must be greater than zero"))
+    max_bytes = _optional_positive_int_option("fetch max_bytes", max_bytes)
+    no_wait = _bool_option("fetch no_wait", no_wait)
     timeout = _positive_timeout_seconds("fetch timeout", timeout)
     expires = _positive_timeout_seconds("fetch expires", expires)
     timeout > expires || throw(ArgumentError("fetch timeout must be greater than expires"))
-    (@lock psub.close_lock psub.closed) && throw(ConnectionClosedError("pull subscription is closed"))
-    (@lock psub.sub.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
-    timeout, expires, _pull_fetch_heartbeat(expires, heartbeat)
+    _check_pull_subscription_open(psub)
+    timeout, expires, _pull_fetch_heartbeat(expires, heartbeat), max_bytes, no_wait
 end
 
 function _throw_pull_fetch_wait_interrupted(closed::Bool, st::ConnectionStatus.T)
@@ -1426,56 +1502,405 @@ end
 
 function fetch(psub::PullSubscription{C}, batch::Int=1; timeout::Real=psub.js.timeout,
                expires::Real=_pull_fetch_default_expires(timeout),
-               heartbeat::Union{Nothing,Real}=nothing) where {C}
-    timeout_seconds, expires_seconds, heartbeat_seconds =
-        _validate_pull_fetch(psub, batch, timeout, expires, heartbeat)
-    @lock psub.fetch_lock begin
-        request_subject = psub.next_subject
-        heartbeat_ns = heartbeat_seconds > 0 ? _seconds_to_nanoseconds(heartbeat_seconds) : 0
-        payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(expires_seconds),
-                                              heartbeat_ns, psub.pin_id)
-        reply, reply_token = _pull_fetch_reply(psub)
-        _publish_pull_fetch_request(psub, request_subject, payload, reply)
-        msgs = JetStreamMsg{C}[]
-        sizehint!(msgs, batch)
-        deadline = time() + timeout_seconds
-        heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
-        while length(msgs) < batch && time() < deadline
-            wait_deadline = min(deadline, heartbeat_deadline)
-            remaining = max(0.001, wait_deadline - time())
-            try
-                msg = _next_pull_fetch_msg(psub, remaining)
-                action, err = _jetstream_status_action(msg; request_subject)
-                action != :message && !_pull_fetch_status_matches_request(msg.subject, reply_token) && continue
-                heartbeat_seconds > 0 && (heartbeat_deadline = time() + 2 * heartbeat_seconds)
+               heartbeat::Union{Nothing,Real}=nothing, max_bytes=nothing,
+               no_wait=false) where {C}
+    timeout_seconds, expires_seconds, heartbeat_seconds, max_bytes_int, no_wait_bool =
+        _validate_pull_fetch(psub, batch, timeout, expires, heartbeat, max_bytes, no_wait)
+    _begin_pull_fetch!(psub)
+    try
+        @lock psub.fetch_lock begin
+            _check_pull_subscription_open(psub)
+            request_subject = psub.next_subject
+            heartbeat_ns = heartbeat_seconds > 0 ? _seconds_to_nanoseconds(heartbeat_seconds) : 0
+            payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(expires_seconds),
+                                                  heartbeat_ns, max_bytes_int, no_wait_bool, psub.pin_id)
+            reply, reply_token = _pull_fetch_reply(psub)
+            _publish_pull_fetch_request(psub, request_subject, payload, reply)
+            msgs = JetStreamMsg{C}[]
+            sizehint!(msgs, batch)
+            deadline = time() + timeout_seconds
+            heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
+            while length(msgs) < batch && time() < deadline
+                wait_deadline = min(deadline, heartbeat_deadline)
+                remaining = max(0.001, wait_deadline - time())
+                try
+                    msg = _next_pull_fetch_msg(psub, remaining)
+                    action, err = _jetstream_status_action(msg; request_subject)
+                    action != :message && !_pull_fetch_status_matches_request(msg.subject, reply_token) && continue
+                    heartbeat_seconds > 0 && (heartbeat_deadline = time() + 2 * heartbeat_seconds)
+                    pin_id = header(msg, "Nats-Pin-Id")
+                    !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
+                    if action in (:idle_heartbeat, :flow_control, :control)
+                        continue
+                    elseif action in (:no_messages, :timeout, :batch_completed)
+                        break
+                    elseif action == :message
+                        push!(msgs, JetStreamMsg(msg, psub.js.client))
+                    else
+                        action == :consumer_deleted && (@lock psub.close_lock psub.server_deleted = true)
+                        action == :pin_id_mismatch && (psub.pin_id = nothing)
+                        throw(err)
+                    end
+                catch err
+                    if err isa TimeoutError
+                        if heartbeat_seconds > 0 && time() < deadline && time() >= heartbeat_deadline
+                            throw(_jetstream_heartbeat_error())
+                        end
+                        break
+                    elseif err isa FetchDisconnectedError
+                        isempty(msgs) || break
+                    end
+                    rethrow()
+                end
+            end
+            msgs
+        end
+    finally
+        _end_pull_fetch!(psub)
+    end
+end
+
+struct _PullStreamClosed <: Exception end
+
+mutable struct _PullStreamRequest
+    token::Union{String,Nothing}
+    remaining_messages::Int
+    remaining_bytes::Union{Int,Nothing}
+end
+
+struct _PullStreamConfig
+    batch::Int
+    max_bytes::Union{Int,Nothing}
+    expires::Float64
+    heartbeat::Float64
+    threshold_messages::Int
+    threshold_bytes::Union{Int,Nothing}
+    stop_after::Union{Int,Nothing}
+end
+
+function _pull_stream_closed(state::_PullMessageStreamState)::Bool
+    @lock state.lock state.closed
+end
+
+function _pull_stream_error(state::_PullMessageStreamState)
+    @lock state.lock state.error
+end
+
+function _pull_stream_set_error!(state::_PullMessageStreamState, err)
+    exception = err isa Exception ? err : ErrorException(string(err))
+    @lock state.lock begin
+        isnothing(state.error) && (state.error = exception)
+        state.closed = true
+    end
+    nothing
+end
+
+function _pull_stream_close_state!(state::_PullMessageStreamState)
+    @lock state.lock begin
+        was_closed = state.closed
+        state.closed = true
+        was_closed
+    end
+end
+
+function _pull_stream_threshold(name::AbstractString, value, limit::Int)::Int
+    threshold = _positive_int_option(name, value)
+    threshold <= limit || throw(ArgumentError("$name must not exceed its request limit"))
+    threshold
+end
+
+function _validate_pull_messages(psub::PullSubscription, batch::Int, max_bytes, expires::Real,
+                                 heartbeat::Union{Nothing,Real}, threshold_messages,
+                                 threshold_bytes, channel_size, stop_after)::Tuple{_PullStreamConfig,Int}
+    batch > 0 || throw(ArgumentError("messages batch must be greater than zero"))
+    max_bytes = _optional_positive_int_option("messages max_bytes", max_bytes)
+    expires = _positive_timeout_seconds("messages expires", expires)
+    heartbeat = _pull_fetch_heartbeat(expires, heartbeat)
+    threshold_messages =
+        isnothing(threshold_messages) ? max(1, batch ÷ 2) :
+        _pull_stream_threshold("messages threshold_messages", threshold_messages, batch)
+    if isnothing(max_bytes)
+        isnothing(threshold_bytes) ||
+            throw(ArgumentError("messages threshold_bytes requires max_bytes"))
+        threshold_bytes = nothing
+    else
+        threshold_bytes =
+            isnothing(threshold_bytes) ? max(1, max_bytes ÷ 2) :
+            _pull_stream_threshold("messages threshold_bytes", threshold_bytes, max_bytes)
+    end
+    channel_size = _positive_int_option("messages channel_size", channel_size)
+    stop_after = _optional_positive_int_option("messages stop_after", stop_after)
+    _check_pull_subscription_open(psub)
+    _PullStreamConfig(batch, max_bytes, expires, heartbeat, threshold_messages,
+                      threshold_bytes, stop_after), channel_size
+end
+
+function _next_pull_stream_msg(stream::PullMessageStream, timeout::Real)
+    sub = stream.subscription.sub
+    client = sub.client
+    deadline = time() + Float64(timeout)
+    while true
+        _pull_stream_closed(stream.state) && throw(_PullStreamClosed())
+        ready, msg = _take_subscription_msg_ready!(sub)
+        ready && return msg
+
+        closed, empty = @lock sub.lock (sub.closed, !isready(sub.messages))
+        st = status(client)
+        closed && empty && _throw_pull_fetch_wait_interrupted(closed, st)
+        ready = @lock sub.lock begin
+            _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
+                isready(sub.messages) || sub.closed || status(client) != ConnectionStatus.CONNECTED ||
+                    _pull_stream_closed(stream.state)
+            end
+        end
+        ready || throw(TimeoutError("next message timed out"))
+        _pull_stream_closed(stream.state) && throw(_PullStreamClosed())
+        ready, msg = _take_subscription_msg_ready!(sub)
+        ready && return msg
+        closed = @lock sub.lock sub.closed
+        st = status(client)
+        (closed || st != ConnectionStatus.CONNECTED) && _throw_pull_fetch_wait_interrupted(closed, st)
+    end
+end
+
+function _pull_stream_request_batch(config::_PullStreamConfig, delivered::Int)::Int
+    isnothing(config.stop_after) && return config.batch
+    remaining = config.stop_after - delivered
+    remaining <= 0 ? 0 : min(config.batch, remaining)
+end
+
+function _publish_pull_stream_request!(psub::PullSubscription, config::_PullStreamConfig,
+                                       requests::Vector{_PullStreamRequest}, delivered::Int)::Bool
+    batch = _pull_stream_request_batch(config, delivered)
+    batch > 0 || return false
+    heartbeat_ns = config.heartbeat > 0 ? _seconds_to_nanoseconds(config.heartbeat) : 0
+    payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(config.expires),
+                                          heartbeat_ns, config.max_bytes, false, psub.pin_id)
+    reply, token = _pull_fetch_reply(psub)
+    _publish_pull_fetch_request(psub, psub.next_subject, payload, reply)
+    push!(requests, _PullStreamRequest(token, batch, config.max_bytes))
+    true
+end
+
+function _pull_stream_pending_messages(requests::Vector{_PullStreamRequest})::Int
+    pending = 0
+    @inbounds for request in requests
+        pending += request.remaining_messages
+    end
+    pending
+end
+
+function _pull_stream_pending_bytes(requests::Vector{_PullStreamRequest})::Int
+    pending = 0
+    @inbounds for request in requests
+        bytes = request.remaining_bytes
+        isnothing(bytes) || (pending += bytes)
+    end
+    pending
+end
+
+function _pull_stream_should_refill(config::_PullStreamConfig,
+                                    requests::Vector{_PullStreamRequest})::Bool
+    isempty(requests) && return true
+    _pull_stream_pending_messages(requests) <= config.threshold_messages && return true
+    !isnothing(config.threshold_bytes) &&
+        _pull_stream_pending_bytes(requests) <= (config.threshold_bytes::Int)
+end
+
+function _pull_stream_find_request(requests::Vector{_PullStreamRequest}, subject::AbstractString)::Int
+    @inbounds for i in eachindex(requests)
+        _pull_fetch_status_matches_request(subject, requests[i].token) && return i
+    end
+    0
+end
+
+function _pull_stream_msg_bytes(msg::Msg)::Int
+    max(1, msg.header_bytes + length(msg.data))
+end
+
+function _pull_stream_decrement_request!(requests::Vector{_PullStreamRequest}, msg::Msg)
+    isempty(requests) && return nothing
+    request = first(requests)
+    request.remaining_messages = max(0, request.remaining_messages - 1)
+    bytes = request.remaining_bytes
+    if !isnothing(bytes)
+        request.remaining_bytes = max(0, bytes - _pull_stream_msg_bytes(msg))
+    end
+    if request.remaining_messages == 0 ||
+       (!isnothing(request.remaining_bytes) && (request.remaining_bytes::Int) == 0)
+        popfirst!(requests)
+    end
+    nothing
+end
+
+function _pull_stream_maybe_refill!(psub::PullSubscription, config::_PullStreamConfig,
+                                    requests::Vector{_PullStreamRequest}, delivered::Int)
+    _pull_stream_should_refill(config, requests) ||
+        return nothing
+    _publish_pull_stream_request!(psub, config, requests, delivered)
+    nothing
+end
+
+function _pull_stream_put!(stream::PullMessageStream{C}, msg::Msg)::Int where {C}
+    jsmsg = JetStreamMsg(msg, stream.subscription.js.client)
+    _pull_stream_closed(stream.state) && throw(_PullStreamClosed())
+    put!(stream.messages, jsmsg)
+    1
+end
+
+function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
+    psub = stream.subscription
+    requests = _PullStreamRequest[]
+    delivered = 0
+    local_timeout = config.expires + min(config.expires * 0.1, 5.0)
+    heartbeat_deadline = config.heartbeat > 0 ? time() + 2 * config.heartbeat : Inf
+    try
+        while !_pull_stream_closed(stream.state)
+            if !isnothing(config.stop_after) && delivered >= config.stop_after
+                break
+            end
+            isempty(requests) && _publish_pull_stream_request!(psub, config, requests, delivered)
+            wait_deadline = min(time() + local_timeout, heartbeat_deadline)
+            msg = try
+                _next_pull_stream_msg(stream, max(0.001, wait_deadline - time()))
+            catch err
+                if err isa TimeoutError
+                    if config.heartbeat > 0 && time() >= heartbeat_deadline
+                        throw(_jetstream_heartbeat_error())
+                    end
+                    empty!(requests)
+                    continue
+                elseif err isa _PullStreamClosed
+                    break
+                end
+                rethrow()
+            end
+
+            action, err = _jetstream_status_action(msg; request_subject=psub.next_subject)
+            if action != :message
+                request_index = _pull_stream_find_request(requests, msg.subject)
+                request_index == 0 && continue
+                config.heartbeat > 0 && (heartbeat_deadline = time() + 2 * config.heartbeat)
                 pin_id = header(msg, "Nats-Pin-Id")
                 !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
                 if action in (:idle_heartbeat, :flow_control, :control)
                     continue
                 elseif action in (:no_messages, :timeout, :batch_completed)
-                    break
-                elseif action == :message
-                    push!(msgs, JetStreamMsg(msg, psub.js.client))
+                    deleteat!(requests, request_index)
+                    _pull_stream_maybe_refill!(psub, config, requests, delivered)
+                    continue
                 else
                     action == :consumer_deleted && (@lock psub.close_lock psub.server_deleted = true)
                     action == :pin_id_mismatch && (psub.pin_id = nothing)
                     throw(err)
                 end
-            catch err
-                if err isa TimeoutError
-                    if heartbeat_seconds > 0 && time() < deadline && time() >= heartbeat_deadline
-                        throw(_jetstream_heartbeat_error())
-                    end
-                    break
-                elseif err isa FetchDisconnectedError
-                    isempty(msgs) || break
-                end
-                rethrow()
             end
+
+            config.heartbeat > 0 && (heartbeat_deadline = time() + 2 * config.heartbeat)
+            pin_id = header(msg, "Nats-Pin-Id")
+            !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
+            _pull_stream_decrement_request!(requests, msg)
+            delivered += _pull_stream_put!(stream, msg)
+            _pull_stream_maybe_refill!(psub, config, requests, delivered)
         end
-        msgs
+    catch err
+        if _pull_stream_closed(stream.state) && err isa InvalidStateException
+            return nothing
+        end
+        _pull_stream_set_error!(stream.state, err)
+        rethrow()
+    finally
+        _pull_stream_close_state!(stream.state)
+        isopen(stream.messages) && close(stream.messages)
+        _end_pull_stream!(psub)
+    end
+    nothing
+end
+
+function messages(psub::PullSubscription{C}; batch::Int=100, max_bytes=nothing,
+                  expires::Real=30.0, heartbeat::Union{Nothing,Real}=nothing,
+                  threshold_messages=nothing, threshold_bytes=nothing,
+                  channel_size=batch, stop_after=nothing) where {C}
+    config, channel_size = _validate_pull_messages(psub, batch, max_bytes, expires, heartbeat,
+                                                   threshold_messages, threshold_bytes,
+                                                   channel_size, stop_after)
+    _begin_pull_stream!(psub)
+    state = _PullMessageStreamState()
+    channel = Channel{JetStreamMsg{C}}(channel_size)
+    stream = PullMessageStream{C,typeof(psub)}(psub, channel, Task(() -> nothing), nothing, state)
+    task = @async _pull_stream_loop(stream, config)
+    stream.task = task
+    stream
+end
+
+function _pull_consume_callback_loop(stream::PullMessageStream, callback)
+    try
+        for msg in stream
+            callback(msg)
+        end
+    catch err
+        _pull_stream_set_error!(stream.state, err)
+        close(stream)
+        rethrow()
+    end
+    nothing
+end
+
+function consume(callback, psub::PullSubscription; kwargs...)
+    stream = messages(psub; kwargs...)
+    stream.callback_task = @async _pull_consume_callback_loop(stream, callback)
+    stream
+end
+
+function Base.close(stream::PullMessageStream)
+    already_closed = _pull_stream_close_state!(stream.state)
+    already_closed || _notify_subscription_waiters!(stream.subscription.sub; all=true)
+    isopen(stream.messages) && close(stream.messages)
+    nothing
+end
+
+function Base.take!(stream::PullMessageStream)
+    while true
+        isready(stream.messages) && return take!(stream.messages)
+        if !isopen(stream.messages)
+            err = _pull_stream_error(stream.state)
+            isnothing(err) || throw(err)
+            throw(InvalidStateException("pull message stream is closed", :closed))
+        end
+        wait(stream.messages)
     end
 end
+
+function Base.iterate(stream::PullMessageStream, state=nothing)
+    try
+        take!(stream), nothing
+    catch err
+        err isa InvalidStateException && !isopen(stream.messages) && return nothing
+        rethrow()
+    end
+end
+
+function Base.wait(stream::PullMessageStream)
+    try
+        wait(stream.task)
+    catch err
+        err isa TaskFailedException && err.task === stream.task || rethrow()
+    end
+    task = stream.callback_task
+    if !isnothing(task)
+        try
+            wait(task)
+        catch err
+            err isa TaskFailedException && err.task === task || rethrow()
+        end
+    end
+    err = _pull_stream_error(stream.state)
+    isnothing(err) || throw(err)
+    stream
+end
+
+Base.fetch(stream::PullMessageStream) = wait(stream)
+Base.isopen(stream::PullMessageStream) = isopen(stream.messages) && !_pull_stream_closed(stream.state)
 
 function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
                         queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
