@@ -21,7 +21,7 @@ kv = kv_create(js, "profiles";
 created = kv_create_key(kv, "users.42.name", "Ada")
 kv_update(kv, "users.42.name", "Ada Lovelace", created.seq)
 
-current = kv_get(kv, "users.42.name")
+current = kv_get(kv, "users.42.name"; timeout=2.0)
 @assert current.key == "users.42.name"
 @assert String(current.value) == "Ada Lovelace"
 

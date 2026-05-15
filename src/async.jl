@@ -164,6 +164,9 @@ close_async(psub::PullSubscription; kwargs...)::NatterTask =
 close_async(psub::PushSubscription; kwargs...)::NatterTask =
     _natter_async(close, psub; kwargs...)
 
+close_async(watcher::KeyValueWatcher; kwargs...)::NatterTask =
+    _natter_async(close, watcher; kwargs...)
+
 ack_async(msg::JetStreamMsg)::NatterTask =
     _natter_async(ack, msg)
 

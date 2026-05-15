@@ -1108,21 +1108,23 @@ function _schedule_or_reply_to_flow_control(sub::Subscription, handler::_JetStre
     nothing
 end
 
-function _stream_by_subject(js::JetStreamContext, subject::AbstractString)
+function _stream_by_subject(js::JetStreamContext, subject::AbstractString; timeout::Real=js.timeout)
     subject = _validate_subject(subject)
-    names = stream_names(js; subject)
+    names = stream_names(js; subject, timeout)
     isempty(names) && throw(JetStreamError(404, nothing, "no stream found for subject $subject"))
     first(names)
 end
 
 function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
-                        config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig())
+                        config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
+                        timeout::Real=js.timeout)
     subject = _validate_subject(subject)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     cfg = _js_config_payload(config)
     _validate_pull_consumer_config!(cfg)
     _validate_consumer_config_payload!(cfg)
 
-    stream = isnothing(stream) ? _stream_by_subject(js, subject) : _validate_api_name("stream", stream)
+    stream = isnothing(stream) ? _stream_by_subject(js, subject; timeout) : _validate_api_name("stream", stream)
     durable = isnothing(durable) ? nothing : _validate_api_name("consumer", durable)
     bind_fields = Set{String}(keys(cfg))
     if !_consumer_has_filter(cfg)
@@ -1139,9 +1141,9 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     info =
         if isnothing(bind_name)
             _set_config_default!(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
-            _consumer_create_payload_request(js, stream, cfg; action="create")
+            _consumer_create_payload_request(js, stream, cfg; timeout, action="create")
         else
-            consumer, _created = _bind_or_create_consumer(js, stream, bind_name, cfg, bind_fields)
+            consumer, _created = _bind_or_create_consumer(js, stream, bind_name, cfg, bind_fields; timeout)
             _validate_existing_pull_consumer(consumer)
         end
     if !haskey(cfg, "name") || isnothing(cfg["name"])
@@ -1154,7 +1156,7 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     catch err
         if delete_on_close
             try
-                consumer_delete(js, stream, info.name)
+                consumer_delete(js, stream, info.name; timeout)
             catch cleanup_err
                 throw(Base.CompositeException([err, CleanupError("delete pull consumer $(info.name)", cleanup_err)]))
             end
@@ -1316,8 +1318,10 @@ end
 
 function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
                         queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
-                        config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig())
+                        config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
+                        timeout::Real=js.timeout)
     subject = _validate_subject(subject)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     cfg = _js_config_payload(config)
     queue_explicit = !isnothing(queue)
     local_queue = _resolve_push_queue!(cfg, queue)
@@ -1327,7 +1331,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     bind_fields = Set{String}(keys(cfg))
     !isnothing(queue) && push!(bind_fields, "deliver_group")
 
-    stream = isnothing(stream) ? _stream_by_subject(js, subject) : _validate_api_name("stream", stream)
+    stream = isnothing(stream) ? _stream_by_subject(js, subject; timeout) : _validate_api_name("stream", stream)
     durable = isnothing(durable) ? nothing : _validate_api_name("consumer", durable)
     deliver = new_inbox(js.client)
     if !_consumer_has_filter(cfg)
@@ -1350,7 +1354,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         _set_config_default!(cfg, "deliver_subject", deliver)
         create_consumer = true
     else
-        existing = _consumer_info_or_nothing(js, stream, bind_name)
+        existing = _consumer_info_or_nothing(js, stream, bind_name; timeout)
         if isnothing(existing)
             _set_config_default!(cfg, "deliver_subject", deliver)
             create_consumer = true
@@ -1372,7 +1376,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     try
         if create_consumer
             try
-                info = _consumer_create_payload_request(js, stream, cfg; action="create")
+                info = _consumer_create_payload_request(js, stream, cfg; timeout, action="create")
                 consumer_created = true
             catch err
                 (!isnothing(bind_name) && _consumer_create_conflict(err)) || rethrow()
@@ -1381,7 +1385,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
                 catch cleanup_err
                     throw(Base.CompositeException([err, CleanupError("close provisional push subscription $deliver_subject", cleanup_err)]))
                 end
-                existing = consumer_info(js, stream, bind_name)
+                existing = consumer_info(js, stream, bind_name; timeout)
                 info = _bind_existing_push_consumer!(existing, cfg, bind_fields, local_queue, queue_explicit)
                 deliver_subject = String(cfg["deliver_subject"])
                 retry_auto_ack = _push_callback_auto_ack(manual_ack, callback, info)
@@ -1410,7 +1414,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         end
         if delete_on_close && consumer_created
             try
-                consumer_delete(js, stream, (info::ConsumerInfo).name)
+                consumer_delete(js, stream, (info::ConsumerInfo).name; timeout)
             catch cleanup_err
                 push!(cleanup_errors, CleanupError("delete push consumer $((info::ConsumerInfo).name)", cleanup_err))
             end

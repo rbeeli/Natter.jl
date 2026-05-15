@@ -58,6 +58,7 @@ stream_create(js, StreamConfig(
 worker = pull_subscribe(js, "billing.events.created";
     stream="BILLING",
     durable="billing-created-workers",
+    timeout=5.0,
     config=ConsumerConfig(
         ack_policy=AckPolicy.EXPLICIT,
         ack_wait=60.0,

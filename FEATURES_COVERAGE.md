@@ -46,7 +46,7 @@ executes JetStream and KeyValue tests.
 | JWT credentials | Supported | CONNECT nonce signing is implemented for user JWT plus seed/callback and user credentials, including standard decorated `.creds` content. JWT and inline credentials are stored in redacted wipeable buffers, path-loaded auth input buffers are wiped after CONNECT fields are derived, and CONNECT serialization and `.creds` parsing are unit-tested; CI real-server coverage runs with generated NSC credentials through `NATTER_JWT_AUTH_URL` and `NATTER_JWT_AUTH_CREDENTIALS_PATH`. |
 | `.creds` file parsing | Supported | `credentials` and `credentials_path` extract the user JWT and NKEY seed from standard decorated credentials content without retaining the whole file as an immutable string. |
 | TLS first handshake | Supported | `tls://` uses TLS before INFO by default. `tls_first=true` enables it for other URLs and `tls_first=false` preserves INFO-first TLS upgrade behavior when needed. |
-| TLS certificate verification control | Supported | Verification is enabled by default. Use `tls_verify=false` to intentionally disable peer certificate verification. |
+| TLS certificate verification control | Supported | Verification is enabled by default. IP-literal hosts match `iPAddress` subject alternative names, `tls_server_name` overrides SNI and certificate-name validation, and `tls_verify=false` intentionally disables peer certificate verification. |
 | WebSocket custom headers | Planned | Depends on WebSocket transport. |
 
 ## JetStream
@@ -76,12 +76,12 @@ executes JetStream and KeyValue tests.
 
 | Feature | Status | Notes |
 |---|---:|---|
-| Create/open/delete/status bucket | Supported | Built on stream APIs and covered by real-server tests. `kv_create` exposes history, bucket TTL, max bucket bytes, max value size, storage, replicas, direct reads, compression, metadata, and delete-marker TTL; history is locally limited to 1 through 64. `kv_status` exposes values, history, TTL, bytes, storage, replicas, direct-read support, and backing stream info. |
-| Get/put/create/update/delete/purge | Supported | `kv_get` returns typed entries with key, value, revision, created timestamp, delta, and operation, including server TTL marker reasons. Revision checks use expected-last-subject-sequence headers, including create after delete/purge markers and guarded delete/purge operations. Put/create/update support per-key TTL headers; purge supports purge-marker TTL and marker cleanup. Common paths are covered by real-server tests. Missing/deleted keys and optimistic-write conflicts raise KV-specific errors. |
-| Keys/history | Partial | Common paths implemented with temporary consumer cleanup and looped fetches; history returns typed entries including delete and purge operations. |
-| Watch/watchall | Supported | Callback and `KeyValueWatcher` channel APIs deliver typed entries through closable push consumers. Default watch delivers last value per subject plus updates and sends an initial-done sentinel on channel watchers. Watch supports multiple filters, updates-only, history, ignore-deletes, metadata-only delivery, and resume revision. |
+| Create/open/delete/status bucket | Supported | Built on stream APIs and covered by real-server tests. `kv_create` exposes history, bucket TTL, max bucket bytes, max value size, storage, replicas, direct reads, compression, metadata, and delete-marker TTL; history is locally limited to 1 through 64. `kv_status` exposes values, history, TTL, bytes, storage, replicas, direct-read support, and backing stream info. Bucket operations accept per-call timeouts. |
+| Get/put/create/update/delete/purge | Supported | `kv_get` returns typed entries with key, value, revision, created timestamp, delta, and operation, including server TTL marker reasons. Revision checks use expected-last-subject-sequence headers, including create after delete/purge markers and guarded delete/purge operations. Put/create/update support per-key TTL headers; purge supports purge-marker TTL and marker cleanup. Common paths are covered by real-server tests. Missing/deleted keys and optimistic-write conflicts raise KV-specific errors. Key operations accept per-call timeouts. |
+| Keys/history | Partial | Common paths implemented with temporary consumer cleanup and looped fetches; history returns typed entries including delete and purge operations. Keys and history operations accept per-call timeouts. |
+| Watch/watchall | Supported | Callback and `KeyValueWatcher` channel APIs deliver typed entries through closable push consumers. Default watch delivers last value per subject plus updates and sends an initial-done sentinel on channel watchers. Watch supports multiple filters, updates-only, history, ignore-deletes, metadata-only delivery, resume revision, and per-call setup timeout. |
 | Direct get | Supported | `kv_create(...; direct=true)` enables direct reads, `kv_open` detects existing direct buckets, and `kv_get` uses direct access by default when available. |
-| Task handle helpers | Supported | Bucket, status, key, history, keys, and watch operations have `_async` helpers returning `NatterTask`. |
+| Task handle helpers | Supported | Bucket, status, key, history, keys, watch, and watcher close operations have `_async` helpers returning `NatterTask`. |
 
 ## Services / Micro
 

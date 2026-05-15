@@ -87,6 +87,15 @@ upgrade_client = connect("nats://nats.example.com:4222"; tls_required=true)
 info_first_client = connect("tls://nats.example.com:4222"; tls_first=false)
 ```
 
+Certificate verification uses the URL host by default. IP-literal URLs must be covered by an IP subject alternative name in the server certificate. Use `tls_server_name` when connecting to an address but verifying a DNS certificate name:
+
+```julia
+named_cert_client = connect("tls://10.0.0.5:4222";
+    tls_ca_path="/etc/nats/ca.pem",
+    tls_server_name="nats.example.com",
+)
+```
+
 Certificate verification is enabled by default. Disable it only in controlled development or test environments:
 
 ```julia

@@ -73,19 +73,34 @@ const _KV_MARKER_REASON = "Nats-Marker-Reason"
 
 _kv_keys_consumer_config() = ConsumerConfig(deliver_policy=DeliverPolicy.LAST_PER_SUBJECT, headers_only=true)
 
+function _kv_int(name::AbstractString, value::Integer)::Int
+    value isa Bool && throw(ArgumentError("$name must be an integer"))
+    typemin(Int) <= value <= typemax(Int) || throw(ArgumentError("$name must fit in Int"))
+    Int(value)
+end
+
 function _validate_kv_history(history::Integer)::Int
+    history = _kv_int("key-value history", history)
     1 <= history <= _KV_MAX_HISTORY ||
         throw(ArgumentError("key-value history must be between 1 and $_KV_MAX_HISTORY"))
-    Int(history)
+    history
 end
 
 function _validate_kv_limit(name::AbstractString, value::Integer)::Int
+    value = _kv_int(name, value)
     value >= -1 || throw(ArgumentError("$name must be -1 or non-negative"))
-    Int(value)
+    value
+end
+
+function _validate_kv_replicas(replicas::Integer)::Int
+    replicas = _kv_int("replicas", replicas)
+    replicas >= 0 || throw(ArgumentError("replicas must be non-negative"))
+    replicas
 end
 
 function _kv_optional_seconds(name::AbstractString, value::Union{Real,Nothing}; allow_zero::Bool=true)
     isnothing(value) && return nothing
+    value isa Real && !(value isa Bool) || throw(ArgumentError("$name must be numeric"))
     seconds = Float64(value)
     isfinite(seconds) || throw(ArgumentError("$name must be finite"))
     if allow_zero
@@ -109,8 +124,9 @@ _kv_metadata(value) = _string_dict(value, "metadata")
 _kv_expected_revision(::Nothing) = nothing
 
 function _kv_expected_revision(revision::Integer)::Int
+    revision = _kv_int("revision", revision)
     revision >= 0 || throw(ArgumentError("revision must be non-negative"))
-    Int(revision)
+    revision
 end
 
 function _kv_add_expected_revision!(hdrs::Headers, revision::Union{Integer,Nothing})::Union{Int,Nothing}
@@ -315,7 +331,7 @@ function _kv_stream_config(bucket::AbstractString; history::Integer=1,
         max_age=_kv_optional_seconds("ttl", ttl),
         max_msg_size=_validate_kv_limit("max_value_size", max_value_size),
         storage=_parse_storage_type(storage),
-        num_replicas=Int(replicas),
+        num_replicas=_validate_kv_replicas(replicas),
         allow_rollup_hdrs=true,
         allow_direct=direct,
         deny_delete=true,
@@ -331,21 +347,22 @@ function kv_create(js::JetStreamContext, bucket::AbstractString; history::Intege
                    ttl::Union{Real,Nothing}=nothing, max_bytes::Integer=-1,
                    max_value_size::Integer=-1, storage::Union{AbstractString,StorageType.T}="file",
                    replicas::Integer=1, direct::Bool=false, compression=nothing,
-                   metadata=nothing, limit_marker_ttl::Union{Real,Nothing}=nothing)
+                   metadata=nothing, limit_marker_ttl::Union{Real,Nothing}=nothing,
+                   timeout::Real=js.timeout)
     bucket = _validate_kv_bucket(bucket)
     cfg = _kv_stream_config(bucket; history, ttl, max_bytes, max_value_size, storage,
                             replicas, direct, compression, metadata, limit_marker_ttl)
-    info = stream_create(js, cfg)
+    info = stream_create(js, cfg; timeout)
     KeyValue(js, bucket, _kv_stream(bucket), _kv_prefix(bucket), something(info.config.allow_direct, false))
 end
 
-function kv_open(js::JetStreamContext, bucket::AbstractString)
+function kv_open(js::JetStreamContext, bucket::AbstractString; timeout::Real=js.timeout)
     bucket = _validate_kv_bucket(bucket)
-    info = stream_info(js, _kv_stream(bucket))
+    info = stream_info(js, _kv_stream(bucket); timeout)
     KeyValue(js, bucket, info.name, _kv_prefix(bucket), something(info.config.allow_direct, false))
 end
 
-kv_delete_bucket(kv::KeyValue) = stream_delete(kv.js, kv.stream)
+kv_delete_bucket(kv::KeyValue; timeout::Real=kv.js.timeout) = stream_delete(kv.js, kv.stream; timeout)
 
 function kv_status(kv::KeyValue; timeout::Real=kv.js.timeout)
     _kv_status(kv, stream_info(kv.js, kv.stream; timeout))
@@ -353,15 +370,17 @@ end
 
 status(kv::KeyValue; kwargs...) = kv_status(kv; kwargs...)
 
-function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing, direct::Union{Bool,Nothing}=nothing)
+function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing,
+                direct::Union{Bool,Nothing}=nothing, timeout::Real=kv.js.timeout)
     key = _validate_kv_key(key)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     subject = "$(kv.prefix)$key"
     use_direct = isnothing(direct) ? kv.direct : direct
     msg, sequence, created = try
         req = isnothing(revision) ?
               _stream_message_get_request(nothing, subject, false) :
               _stream_message_get_request(revision, nothing, false)
-        _stream_message_get_info(kv.js, kv.stream, req; direct=use_direct, timeout=kv.js.timeout)
+        _stream_message_get_info(kv.js, kv.stream, req; direct=use_direct, timeout)
     catch err
         err isa JetStreamError && err.code == 404 ? throw(_kv_not_found_error(kv, key)) : rethrow()
     end
@@ -372,12 +391,13 @@ function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=
     entry
 end
 
-function kv_put(kv::KeyValue, key::AbstractString, value; revision::Union{Nothing,Int}=nothing, ttl=nothing)
+function kv_put(kv::KeyValue, key::AbstractString, value; revision::Union{Nothing,Int}=nothing,
+                ttl=nothing, timeout::Real=kv.js.timeout)
     key = _validate_kv_key(key)
     hdrs = Headers()
     expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
-        js_publish(kv.js, "$(kv.prefix)$key", value; headers=hdrs, ttl)
+        js_publish(kv.js, "$(kv.prefix)$key", value; headers=hdrs, ttl, timeout)
     catch err
         _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
         rethrow()
@@ -388,10 +408,10 @@ _kv_wrong_last_sequence(err) = err isa JetStreamError && err.err_code == 10071
 _kv_delete_marker_revision(msg::AbstractMsg, sequence::Int) =
     _kv_is_delete_marker(_kv_operation(msg)) ? sequence : nothing
 
-function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String)
+function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String; timeout::Real=kv.js.timeout)
     req = _stream_message_get_request(nothing, subject, false)
     msg, sequence, _created = try
-        _stream_message_get_api(kv.js, kv.stream, req; timeout=kv.js.timeout)
+        _stream_message_get_api(kv.js, kv.stream, req; timeout)
     catch err
         err isa JetStreamError && err.code == 404 && return nothing
         rethrow()
@@ -400,19 +420,21 @@ function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String)
     _kv_delete_marker_revision(msg, sequence)
 end
 
-function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing)
+function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,
+                       timeout::Real=kv.js.timeout)
     key = _validate_kv_key(key)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     subject = "$(kv.prefix)$key"
     hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => ["0"])
     try
-        return js_publish(kv.js, subject, value; headers=hdrs, ttl)
+        return js_publish(kv.js, subject, value; headers=hdrs, ttl, timeout)
     catch err
         _kv_wrong_last_sequence(err) || rethrow()
-        marker_revision = _kv_latest_delete_marker_revision(kv, subject)
+        marker_revision = _kv_latest_delete_marker_revision(kv, subject; timeout)
         isnothing(marker_revision) && throw(_kv_key_exists_error(kv, key, err))
         retry_hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => [string(marker_revision)])
         try
-            return js_publish(kv.js, subject, value; headers=retry_hdrs, ttl)
+            return js_publish(kv.js, subject, value; headers=retry_hdrs, ttl, timeout)
         catch retry_err
             _kv_wrong_last_sequence(retry_err) &&
                 throw(_kv_wrong_revision_error(kv, key, marker_revision, retry_err))
@@ -421,41 +443,45 @@ function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing)
     end
 end
 
-kv_update(kv::KeyValue, key::AbstractString, value, revision::Int; ttl=nothing) =
-    kv_put(kv, key, value; revision, ttl)
+kv_update(kv::KeyValue, key::AbstractString, value, revision::Int; ttl=nothing,
+          timeout::Real=kv.js.timeout) =
+    kv_put(kv, key, value; revision, ttl, timeout)
 
-function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing)
+function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing,
+                   timeout::Real=kv.js.timeout)
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["DEL"])
     expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
-        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs)
+        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs, timeout)
     catch err
         _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
         rethrow()
     end
 end
 
-function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing, ttl=nothing)
+function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing,
+                  ttl=nothing, timeout::Real=kv.js.timeout)
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["PURGE"], "Nats-Rollup" => ["sub"])
     expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
-        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs, ttl)
+        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs, ttl, timeout)
     catch err
         _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
         rethrow()
     end
 end
 
-function kv_history(kv::KeyValue, key::AbstractString; batch::Int=256)
+function kv_history(kv::KeyValue, key::AbstractString; batch::Int=256, timeout::Real=kv.js.timeout)
     key = _validate_kv_key(key)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     sub = pull_subscribe(kv.js, "$(kv.prefix)$key"; stream=kv.stream,
-                         config=ConsumerConfig(deliver_policy=DeliverPolicy.ALL))
+                         config=ConsumerConfig(deliver_policy=DeliverPolicy.ALL), timeout)
     entries = KeyValueEntry[]
     try
         while true
-            chunk = fetch(sub, batch; timeout=kv.js.timeout)
+            chunk = fetch(sub, batch; timeout)
             isempty(chunk) && break
             for msg in chunk
                 push!(entries, _kv_entry_from_consumer_msg(kv, msg))
@@ -474,13 +500,14 @@ function kv_history(kv::KeyValue, key::AbstractString; batch::Int=256)
     entries
 end
 
-function kv_keys(kv::KeyValue)
+function kv_keys(kv::KeyValue; timeout::Real=kv.js.timeout)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     sub = pull_subscribe(kv.js, "$(kv.prefix)>"; stream=kv.stream,
-                         config=_kv_keys_consumer_config())
+                         config=_kv_keys_consumer_config(), timeout)
     latest = Dict{String,Tuple{Int,Bool}}()
     try
         while true
-            chunk = fetch(sub, 256; timeout=kv.js.timeout)
+            chunk = fetch(sub, 256; timeout)
             isempty(chunk) && break
             for msg in chunk
                 _kv_record_key!(latest, kv.prefix, msg)
@@ -580,13 +607,15 @@ function _kv_watch(callback, kv::KeyValue; key::AbstractString=">",
                    keys=nothing, history::Bool=false, updates_only::Bool=false,
                    ignore_deletes::Bool=false, meta_only::Bool=false,
                    resume_revision::Union{Integer,Nothing}=nothing,
-                   channel_size::Integer=256, notify_initial_done::Bool=false)
+                   channel_size::Integer=256, notify_initial_done::Bool=false,
+                   timeout::Real=kv.js.timeout)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     filters = _kv_watch_filters(key, keys)
     cfg = _kv_watch_consumer_config(kv, filters; history, updates_only, meta_only, resume_revision)
     state = _kv_watcher_state(callback, _kv_watch_channel_size(channel_size), notify_initial_done)
     entry_callback = _kv_watch_callback(kv, state, ignore_deletes)
     sub = push_subscribe(kv.js, "$(kv.prefix)$(first(filters))"; stream=kv.stream,
-                         callback=entry_callback, manual_ack=true, config=cfg)
+                         callback=entry_callback, manual_ack=true, config=cfg, timeout)
     watcher = KeyValueWatcher(sub, state.updates, state)
     _kv_watcher_set_initial_pending!(state, _consumer_num_pending(sub.info), updates_only)
     watcher
@@ -607,9 +636,11 @@ function _kv_purge_deletes_threshold(older_than::Real)::Float64
     seconds == 0 ? _KV_DEFAULT_PURGE_DELETES_OLDER_THAN : seconds
 end
 
-function kv_purge_deletes(kv::KeyValue; older_than::Real=_KV_DEFAULT_PURGE_DELETES_OLDER_THAN)
+function kv_purge_deletes(kv::KeyValue; older_than::Real=_KV_DEFAULT_PURGE_DELETES_OLDER_THAN,
+                          timeout::Real=kv.js.timeout)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     threshold = _kv_purge_deletes_threshold(older_than)
-    watcher = kv_watch(kv; key=">", meta_only=true)
+    watcher = kv_watch(kv; key=">", meta_only=true, timeout)
     markers = KeyValueEntry[]
     try
         while true
@@ -626,7 +657,7 @@ function kv_purge_deletes(kv::KeyValue; older_than::Real=_KV_DEFAULT_PURGE_DELET
     limit = threshold > 0 ? current - Millisecond(round(Int, threshold * 1000)) : nothing
     for entry in markers
         keep = !isnothing(limit) && entry.created > limit ? 1 : nothing
-        stream_purge(kv.js, kv.stream; filter_subject="$(kv.prefix)$(entry.key)", keep)
+        stream_purge(kv.js, kv.stream; filter_subject="$(kv.prefix)$(entry.key)", keep, timeout)
     end
     nothing
 end

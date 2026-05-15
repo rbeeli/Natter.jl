@@ -308,6 +308,11 @@ end
         @test TestHelpers.capture_text(capture) == ""
         @test isempty(client.subscriptions)
 
+        @test_throws ArgumentError pull_subscribe(js, "orders.created"; stream="ORDERS", timeout=invalid_timeout)
+        @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS", timeout=invalid_timeout)
+        @test TestHelpers.capture_text(capture) == ""
+        @test isempty(client.subscriptions)
+
         msg = N.JetStreamMsg(
             Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0", UInt8[]),
             client,

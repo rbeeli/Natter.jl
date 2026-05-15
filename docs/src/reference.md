@@ -7,7 +7,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | Type | Purpose |
 | :--- | :--- |
 | `Client` | Active client connection with background reader, ping, and reconnect tasks. |
-| `ConnectOptions` | Immutable keyword-backed connection configuration, including authentication, TLS, reconnect, buffering, write timeout, parser, subscription, and close callback limits. |
+| `ConnectOptions` | Immutable keyword-backed connection configuration, including authentication, TLS verification and server-name control, reconnect, buffering, write timeout, parser, subscription, and close callback limits. |
 | `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
 | `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. Failed handles throw the same operation error that the synchronous API would throw. |
 | `Msg` | Core received message data with `subject`, `reply`, and byte-vector `data`; use `header(msg, key)` or `headers(msg)` for headers. |
@@ -54,7 +54,7 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `ping_async(client; timeout=10.0)` | Start `ping` and return `NatterTask`. |
 | `unsubscribe_async(sub; max_msgs=0)` | Start `unsubscribe` and return `NatterTask`. |
 | `drain_async(client_or_sub; timeout=...)` | Start `drain` and return `NatterTask`. |
-| `close_async(client_or_sub; kwargs...)` | Start `close` and return `NatterTask`. |
+| `close_async(client_or_sub_or_watcher; kwargs...)` | Start `close` and return `NatterTask`. |
 
 ## JetStream Types
 
@@ -107,8 +107,8 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `consumer_info(js, stream, consumer)` | Fetch consumer info. |
 | `consumer_list(js, stream; offset=0)` | List consumers for a stream. |
 | `consumer_delete(js, stream, consumer)` | Delete a consumer. |
-| `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig())` | Create or bind a pull subscription without mutating existing consumers. Configs with `deliver_subject` or `deliver_group` are rejected because they describe push delivery. |
-| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig())` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions receive `JetStreamMsg` and auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`; channel-backed subscriptions use `next(psub)` for `JetStreamMsg` delivery. |
+| `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig(), timeout=...)` | Create or bind a pull subscription without mutating existing consumers. Configs with `deliver_subject` or `deliver_group` are rejected because they describe push delivery. |
+| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=...)` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions receive `JetStreamMsg` and auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`; channel-backed subscriptions use `next(psub)` for `JetStreamMsg` delivery. |
 | `fetch(psub, batch=1; timeout=..., expires=<shorter than timeout>, heartbeat=nothing)` | Fetch a batch of `JetStreamMsg` values from a pull subscription; fetches on one subscription are serialized. Each request uses a unique reply subject and ignores stale terminal statuses from older requests. The default server expiration is shorter than the local timeout; explicit `expires` values must also be shorter than `timeout`. Pull requests are not replayed after reconnect; `FetchDisconnectedError` is thrown if the connection drops before any messages arrive, and callers should retry after reconnect. Long fetches request and monitor idle heartbeats by default; pass `heartbeat=0` to disable them. |
 | `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for `JetStreamMsg` values. Terminal acks are not queued during reconnect and remain retryable if the send fails. |
 | `metadata(msg)` | Parse JetStream delivery metadata. |
@@ -146,20 +146,20 @@ This page summarizes the public API. Optional keyword defaults are documented in
 
 | Function | Purpose |
 | :--- | :--- |
-| `kv_create(js, bucket; history=1, ttl=nothing, max_bytes=-1, max_value_size=-1, storage="file", replicas=1, direct=false, compression=nothing, metadata=nothing, limit_marker_ttl=nothing)` | Create a bucket. Durations are seconds; `history` is limited to 1 through 64. |
-| `kv_open(js, bucket)` | Open an existing bucket. |
-| `kv_delete_bucket(kv)` | Delete a bucket. |
-| `kv_status(kv)` | Return bucket status and stream-backed configuration. |
-| `kv_get(kv, key; revision=nothing, direct=nothing)` | Get the latest value or a revision as `KeyValueEntry`. |
-| `kv_put(kv, key, value; revision=nothing, ttl=nothing)` | Put a value, optionally expecting a revision or setting a per-key TTL. |
-| `kv_create_key(kv, key, value; ttl=nothing)` | Put a value only if the key is absent or currently deleted. |
-| `kv_update(kv, key, value, revision; ttl=nothing)` | Put a value only if the key is at `revision`. |
-| `kv_delete(kv, key; revision=nothing)` | Mark a key deleted, optionally only if the key is at `revision`. |
-| `kv_purge(kv, key; revision=nothing, ttl=nothing)` | Purge a key with rollup, optionally only if the key is at `revision`; `ttl` expires the purge marker. |
-| `kv_purge_deletes(kv; older_than=1800.0)` | Remove delete and purge markers, keeping recent markers when `older_than` is positive. |
-| `kv_history(kv, key; batch=256)` | Return historical `KeyValueEntry` values for a key. |
-| `kv_keys(kv)` | Return active keys. |
-| `kv_watch(kv; key=">", keys=nothing, history=false, updates_only=false, ignore_deletes=false, meta_only=false, resume_revision=nothing)` | Watch bucket updates with a `KeyValueWatcher` and sentinel channel. |
+| `kv_create(js, bucket; history=1, ttl=nothing, max_bytes=-1, max_value_size=-1, storage="file", replicas=1, direct=false, compression=nothing, metadata=nothing, limit_marker_ttl=nothing, timeout=...)` | Create a bucket. Durations are seconds; `history` is limited to 1 through 64. |
+| `kv_open(js, bucket; timeout=...)` | Open an existing bucket. |
+| `kv_delete_bucket(kv; timeout=...)` | Delete a bucket. |
+| `kv_status(kv; timeout=...)` | Return bucket status and stream-backed configuration. |
+| `kv_get(kv, key; revision=nothing, direct=nothing, timeout=...)` | Get the latest value or a revision as `KeyValueEntry`. |
+| `kv_put(kv, key, value; revision=nothing, ttl=nothing, timeout=...)` | Put a value, optionally expecting a revision or setting a per-key TTL. |
+| `kv_create_key(kv, key, value; ttl=nothing, timeout=...)` | Put a value only if the key is absent or currently deleted. |
+| `kv_update(kv, key, value, revision; ttl=nothing, timeout=...)` | Put a value only if the key is at `revision`. |
+| `kv_delete(kv, key; revision=nothing, timeout=...)` | Mark a key deleted, optionally only if the key is at `revision`. |
+| `kv_purge(kv, key; revision=nothing, ttl=nothing, timeout=...)` | Purge a key with rollup, optionally only if the key is at `revision`; `ttl` expires the purge marker. |
+| `kv_purge_deletes(kv; older_than=1800.0, timeout=...)` | Remove delete and purge markers, keeping recent markers when `older_than` is positive. |
+| `kv_history(kv, key; batch=256, timeout=...)` | Return historical `KeyValueEntry` values for a key. |
+| `kv_keys(kv; timeout=...)` | Return active keys. |
+| `kv_watch(kv; key=">", keys=nothing, history=false, updates_only=false, ignore_deletes=false, meta_only=false, resume_revision=nothing, timeout=...)` | Watch bucket updates with a `KeyValueWatcher` and sentinel channel. |
 | `kv_watch(callback, kv; kwargs...)` | Watch bucket updates with a callback. |
 
 ## KeyValue Task Handle Helpers
@@ -167,19 +167,20 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | Function | Purpose |
 | :--- | :--- |
 | `kv_create_async(js, bucket; kwargs...)` | Start `kv_create` and return `NatterTask`. |
-| `kv_open_async(js, bucket)` | Start `kv_open` and return `NatterTask`. |
-| `kv_delete_bucket_async(kv)` | Start `kv_delete_bucket` and return `NatterTask`. |
-| `kv_status_async(kv)` | Start `kv_status` and return `NatterTask`. |
+| `kv_open_async(js, bucket; kwargs...)` | Start `kv_open` and return `NatterTask`. |
+| `kv_delete_bucket_async(kv; kwargs...)` | Start `kv_delete_bucket` and return `NatterTask`. |
+| `kv_status_async(kv; kwargs...)` | Start `kv_status` and return `NatterTask`. |
 | `kv_get_async(kv, key; kwargs...)` | Start `kv_get` and return `NatterTask`. |
 | `kv_put_async(kv, key, value; kwargs...)` | Start `kv_put` and return `NatterTask`. |
-| `kv_create_key_async(kv, key, value)` | Start `kv_create_key` and return `NatterTask`. |
-| `kv_update_async(kv, key, value, revision)` | Start `kv_update` and return `NatterTask`. |
+| `kv_create_key_async(kv, key, value; kwargs...)` | Start `kv_create_key` and return `NatterTask`. |
+| `kv_update_async(kv, key, value, revision; kwargs...)` | Start `kv_update` and return `NatterTask`. |
 | `kv_delete_async(kv, key; kwargs...)` | Start `kv_delete` and return `NatterTask`. |
 | `kv_purge_async(kv, key; kwargs...)` | Start `kv_purge` and return `NatterTask`. |
 | `kv_purge_deletes_async(kv; kwargs...)` | Start `kv_purge_deletes` and return `NatterTask`. |
-| `kv_history_async(kv, key; batch=256)` | Start `kv_history` and return `NatterTask`. |
-| `kv_keys_async(kv)` | Start `kv_keys` and return `NatterTask`. |
+| `kv_history_async(kv, key; kwargs...)` | Start `kv_history` and return `NatterTask`. |
+| `kv_keys_async(kv; kwargs...)` | Start `kv_keys` and return `NatterTask`. |
 | `kv_watch_async(kv; kwargs...)`, `kv_watch_async(callback, kv; kwargs...)` | Start `kv_watch` and return `NatterTask`. |
+| `close_async(watcher::KeyValueWatcher)` | Close a key-value watcher in a `NatterTask`. |
 
 ## Errors
 

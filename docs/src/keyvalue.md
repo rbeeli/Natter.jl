@@ -34,6 +34,8 @@ kv = kv_open(js, "settings")
 
 When a bucket is created or opened with direct access enabled on its backing stream, `kv_get` uses direct reads by default. Override that per call with `direct=false` or `direct=true`.
 
+All networked KeyValue operations accept `timeout=...` in seconds and default to the timeout configured on the `JetStreamContext`.
+
 Inspect bucket state with `kv_status`:
 
 ```julia
@@ -46,7 +48,7 @@ st = kv_status(kv)
 
 ```julia
 ack = kv_put(kv, "theme", "dark"; ttl=3600.0)
-entry = kv_get(kv, "theme")
+entry = kv_get(kv, "theme"; timeout=2.0)
 
 @assert entry.key == "theme"
 @assert entry.revision == ack.seq
@@ -122,6 +124,8 @@ end
 
 close(watcher)
 ```
+
+Use `close_async(watcher)` when watcher cleanup should be joined through a `NatterTask`.
 
 Use `updates_only=true` for changes after watcher creation, `history=true` to include historical revisions, `ignore_deletes=true` to skip delete and purge markers, and `resume_revision=rev` to resume from a stream revision.
 

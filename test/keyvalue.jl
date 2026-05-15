@@ -96,6 +96,57 @@ end
     @test_throws ArgumentError N._kv_stream_config("bucket"; metadata=Dict("owner" => 1))
 end
 
+@testitem "KeyValue numeric validators reject Bool" begin
+    using Natter
+
+    const N = Natter
+
+    @test_throws ArgumentError N._validate_kv_history(true)
+    @test_throws ArgumentError N._validate_kv_limit("max_bytes", true)
+    @test_throws ArgumentError N._kv_optional_seconds("ttl", true)
+    @test_throws ArgumentError N._kv_expected_revision(true)
+    @test_throws ArgumentError N._kv_add_expected_revision!(Headers(), true)
+
+    @test_throws ArgumentError N._kv_stream_config("bucket"; history=true)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; ttl=true)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; max_bytes=true)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; max_value_size=true)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; replicas=true)
+    @test_throws ArgumentError N._kv_stream_config("bucket"; limit_marker_ttl=true)
+end
+
+@testitem "KeyValue timeout arguments are positive finite before protocol writes" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    for invalid_timeout in (-1.0, 0.0, Inf, NaN, true)
+        capture = TestHelpers.WriteCapture()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+        js = jetstream(client)
+        kv = KeyValue(js, "bucket", "KV_bucket", "\$KV.bucket.")
+
+        @test_throws ArgumentError kv_create(js, "newbucket"; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_open(js, "bucket"; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_delete_bucket(kv; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_status(kv; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_get(kv, "alpha"; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_put(kv, "alpha", "value"; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_create_key(kv, "alpha", "value"; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_update(kv, "alpha", "value", 1; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_delete(kv, "alpha"; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_purge(kv, "alpha"; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_history(kv, "alpha"; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_keys(kv; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_watch(kv; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_watch(_ -> nothing, kv; timeout=invalid_timeout)
+        @test_throws ArgumentError kv_purge_deletes(kv; timeout=invalid_timeout)
+
+        @test TestHelpers.capture_text(capture) == ""
+        @test isempty(client.subscriptions)
+    end
+end
+
 @testitem "KeyValue status summarizes stream state" setup=[TestHelpers] begin
     using Natter
 

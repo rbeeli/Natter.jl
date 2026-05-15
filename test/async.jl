@@ -32,6 +32,28 @@ using TestItems
     @test subscribe_err isa ConnectionClosedError
 end
 
+@testitem "KeyValue watcher async close returns task and closes watcher" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    push_sub = subscribe(client, "_INBOX.kv")
+    push = N.PushSubscription(js, push_sub, "KV_bucket", "watcher", ReentrantLock(), false, false)
+    watcher_state = N._kv_watcher_state(nothing, 1, true)
+    watcher = KeyValueWatcher(push, watcher_state.updates, watcher_state)
+
+    close_task = close_async(watcher)
+
+    @test close_task isa NatterTask
+    @test isnothing(fetch(close_task))
+    @test push.closed
+    @test push_sub.closed
+    @test N._kv_watcher_closed(watcher_state)
+    @test !isopen(watcher.updates)
+end
+
 @testitem "async wrappers preserve synchronous validation failures" setup=[TestHelpers] begin
     using Natter
 

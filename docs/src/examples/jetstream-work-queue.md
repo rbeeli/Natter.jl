@@ -31,6 +31,7 @@ stored = stream_message_get(js, "JOBS"; seq=1)
 worker = pull_subscribe(js, "jobs.ready";
     stream="JOBS",
     durable="job-workers",
+    timeout=2.0,
     config=ConsumerConfig(
         ack_policy=AckPolicy.EXPLICIT,
         ack_wait=30.0,

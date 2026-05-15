@@ -2416,6 +2416,110 @@ end
     @test N._tls_first_for_connection(ConnectOptions(tls_first=false), "tls") == false
 end
 
+@testitem "TLS server name override and IP SAN matching" begin
+    using Base64
+    using MbedTLS
+    using Natter
+    using Sockets
+
+    const N = Natter
+
+    opts = ConnectOptions(tls_server_name="nats.internal")
+    @test opts.tls_server_name == "nats.internal"
+    @test_throws ArgumentError ConnectOptions(tls_server_name="")
+    @test_throws ArgumentError ConnectOptions(tls_server_name=:nats)
+
+    server = N.Server("tls://127.0.0.1:4222"; tls_name="discovered.example")
+    @test N._tls_server_name(ConnectOptions(), server, "127.0.0.1") == "discovered.example"
+    @test N._tls_server_name(opts, server, "127.0.0.1") == "nats.internal"
+
+    cert_der = base64decode(join((
+        "MIIDLDCCAhSgAwIBAgIUFd4E14pGmodfCwBFy7FGLd6cYSowDQYJKoZIhvcNAQEL",
+        "BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDUxNTEyNDg0NVoXDTI3",
+        "MDUxNTEyNDg0NVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG",
+        "9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtCHx7n802x9FJkzVrHLaFLkDOMZPWrg/",
+        "fnaUDaht5rO9/XgH5/aVR6bmGnqUgfDpQJgGPaBgB0shUhJfCAZpPTyxfnk",
+        "QzYL5V2X4MWSkwURcap1+40f5AK6DsCsa6LOm+gDCdeuEs3Xy+U1OVD03fo",
+        "eXXpZtNyznSbQWoh6w5L1sRnqovmx+m1zlFmiPCLi3TmIeZgJ6+hOWmK2W18",
+        "DeCU9ImpJCXSi5A39m7ePwwpqHmbnCMhBub2ihUVMmJ6uipxBdhmBQ4lJBZ",
+        "3UxW65VYmZyCXg5NU+aKbR5wDLg2mcR+pwKrghcPNbbkJfNeUviYK86Aazwg",
+        "sU2yIzdJZp0TQIDAQABo3YwdDAdBgNVHQ4EFgQUlocppOpVmJZpI4XBtPJW",
+        "6oYUXbowHwYDVR0jBBgwFoAUlocppOpVmJZpI4XBtPJW6oYUXbowDwYDVR0T",
+        "AQH/BAUwAwEB/zAhBgNVHREEGjAYhwR/AAABhxAAAAAAAAAAAAAAAAAAAAAB",
+        "MA0GCSqGSIb3DQEBCwUAA4IBAQAfNoBAjn6f6SDSBlMAsyD48LExw+GapZr",
+        "OGk/Iell8tj+PjmDyueybQDW4H6T7nBX/fvAt1iiD2sh42+qviT1MtAYif9",
+        "+lujVZEzbUDm9kUW0iApGQVc2fixqaqYEvAaWG589oVbExAa5vAC1EP5zww",
+        "OXj5+hqDdjRr6US5qECwAN0DlnPCkJRM7zxRAr01UadQD54rcP6uZeoA3qZ",
+        "kiUL7nvClIn/RcPCJtIIr+yfs8R3o7k3PdayZNnLEUChDhNRFCiE73ul4fK",
+        "vgT3zeDyZBU6lL3ElFLfzaUfCNLz0mpfonXdNXtJ21JoqblmtI4W/olUz6R",
+        "NtON28U4mpyRzQ",
+    )))
+    @test N._tls_certificate_has_ip_san(cert_der, "127.0.0.1")
+    @test N._tls_certificate_has_ip_san(cert_der, "::1")
+    @test N._tls_certificate_has_ip_san(cert_der, "[::1]")
+    @test !N._tls_certificate_has_ip_san(cert_der, "127.0.0.2")
+    @test !N._tls_certificate_has_ip_san(cert_der, "localhost")
+
+    openssl = Sys.which("openssl")
+    if isnothing(openssl)
+        @test_skip "openssl unavailable for local TLS handshake check"
+    else
+        mktempdir() do dir
+            cert_path = joinpath(dir, "cert.pem")
+            key_path = joinpath(dir, "key.pem")
+            generated = success(pipeline(
+                `$openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -keyout $key_path -out $cert_path -addext subjectAltName=IP:127.0.0.1`;
+                stdout=devnull, stderr=devnull,
+            ))
+            if !generated
+                @test_skip "openssl could not generate an IP SAN certificate"
+                return
+            end
+
+            listener = listen(ip"127.0.0.1", 0)
+            _ip, port = getsockname(listener)
+            server_task = @async begin
+                sock = accept(listener)
+                ctx = nothing
+                try
+                    entropy = MbedTLS.Entropy()
+                    rng = MbedTLS.CtrDrbg()
+                    MbedTLS.seed!(rng, entropy)
+                    conf = MbedTLS.SSLConfig()
+                    MbedTLS.config_defaults!(conf; endpoint=MbedTLS.MBEDTLS_SSL_IS_SERVER)
+                    MbedTLS.rng!(conf, rng)
+                    MbedTLS.own_cert!(conf, MbedTLS.crt_parse_file(cert_path), MbedTLS.parse_keyfile(key_path))
+                    ctx = MbedTLS.SSLContext()
+                    MbedTLS.setup!(ctx, conf)
+                    MbedTLS.set_bio!(ctx, sock)
+                    MbedTLS.handshake(ctx)
+                    nothing
+                catch err
+                    err
+                finally
+                    isnothing(ctx) ? close(sock) : close(ctx)
+                end
+            end
+
+            client_sock = Sockets.connect(ip"127.0.0.1", port)
+            client_ctx = nothing
+            client_err = nothing
+            try
+                client_ctx = N._tls_wrap(client_sock, ConnectOptions(tls_ca_path=cert_path), "127.0.0.1")
+                @test client_ctx isa MbedTLS.SSLContext
+            catch err
+                client_err = err
+            finally
+                close(listener)
+                isnothing(client_ctx) ? close(client_sock) : close(client_ctx)
+            end
+            server_err = fetch(server_task)
+            isnothing(client_err) || throw(client_err)
+            @test isnothing(server_err)
+        end
+    end
+end
+
 @testitem "TLS verification is enabled by default and can be disabled" begin
     using MbedTLS
     using Natter
@@ -2423,6 +2527,7 @@ end
     const N = Natter
 
     @test ConnectOptions().tls_verify == true
+    @test isnothing(ConnectOptions().tls_server_name)
     @test N._tls_authmode(ConnectOptions()) == MbedTLS.MBEDTLS_SSL_VERIFY_REQUIRED
     @test N._tls_authmode(ConnectOptions(tls_verify=false)) == MbedTLS.MBEDTLS_SSL_VERIFY_NONE
 

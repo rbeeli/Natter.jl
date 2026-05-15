@@ -375,6 +375,14 @@ function _connect_option_reconnect_attempts(value)::Int
     result
 end
 
+function _connect_option_optional_string(name::AbstractString, value)::Union{String,Nothing}
+    isnothing(value) && return nothing
+    value isa AbstractString || throw(ArgumentError("$name must be a string"))
+    result = String(value)
+    isempty(result) && throw(ArgumentError("$name cannot be empty"))
+    result
+end
+
 _connect_option_present(value)::Bool = !isnothing(value)
 _connect_option_count_present(values...)::Int = count(_connect_option_present, values)
 
@@ -454,6 +462,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
     tls_required::Bool
     tls_first::Union{Bool,Nothing}
     tls_verify::Bool
+    tls_server_name::Union{String,Nothing}
     tls_ca_path::Union{String,Nothing}
     tls_cert_path::Union{String,Nothing}
     tls_key_path::Union{String,Nothing}
@@ -488,7 +497,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
         servers, name, verbose, pedantic, token, user, password, nkey, nkey_seed,
         nkey_seed_path, jwt, jwt_path, credentials, credentials_path, signature_cb,
         no_echo, tls_required, tls_first,
-        tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
+        tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
         max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
@@ -506,6 +515,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
         _validate_connect_option_security(token, user, password, nkey, nkey_seed, nkey_seed_path,
                                           jwt, jwt_path, credentials, credentials_path,
                                           signature_cb, tls_cert_path, tls_key_path)
+        tls_server_name = _connect_option_optional_string("tls_server_name", tls_server_name)
         connect_timeout = _connect_option_positive_float("connect_timeout", connect_timeout)
         ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
         max_outstanding_pings = _connect_option_positive_int("max_outstanding_pings", max_outstanding_pings)
@@ -533,7 +543,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
             servers, name, verbose, pedantic, token, user, password, nkey, nkey_seed,
             nkey_seed_path, jwt, jwt_path, credentials, credentials_path, signature_cb,
             no_echo, tls_required, tls_first,
-            tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
+            tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
             max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
             max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
@@ -605,7 +615,8 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                         jwt_path=nothing, credentials=nothing, credentials_path=nothing,
                         signature_cb=nothing, no_echo=false, tls_required=false,
                         tls_first=nothing, tls_verify=true,
-                        tls_ca_path=nothing, tls_cert_path=nothing, tls_key_path=nothing,
+                        tls_server_name=nothing, tls_ca_path=nothing,
+                        tls_cert_path=nothing, tls_key_path=nothing,
                         connect_timeout=2.0, ping_interval=120.0, max_outstanding_pings=2,
                         allow_reconnect=true, reconnect_wait=0.5, reconnect_max_wait=5.0,
                         reconnect_jitter=0.1, max_reconnect_attempts=-1,
@@ -622,7 +633,8 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                         discovered_server_cb=_default_noop_cb)
     ConnectOptions(servers, name, verbose, pedantic, token, user, password, nkey, nkey_seed,
                    nkey_seed_path, jwt, jwt_path, credentials, credentials_path, signature_cb,
-                   no_echo, tls_required, tls_first, tls_verify, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout,
+                   no_echo, tls_required, tls_first, tls_verify, tls_server_name, tls_ca_path,
+                   tls_cert_path, tls_key_path, connect_timeout,
                    ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
                    reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
                    write_buffer_size, write_buffer_latency, write_timeout,

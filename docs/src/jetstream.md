@@ -123,12 +123,13 @@ deleted = stream_message_delete(js, "ORDERS", 42)
 
 ## Pull Consumers
 
-Pull subscriptions create or bind a consumer and fetch batches on demand. Fetch calls on the same pull subscription are serialized. Durable or named consumers are bound when they already exist; any supplied config fields must match the existing consumer config. Pull subscription configs cannot set push delivery fields such as `deliver_subject` or `deliver_group`. Missing durable or named consumers are created strictly, and random ephemeral consumers are created strictly and deleted on close. Pull fetches return `JetStreamMsg` values, which carry the acknowledgement state needed by `ack`, `nak`, `in_progress`, and `term`.
+Pull subscriptions create or bind a consumer and fetch batches on demand. Fetch calls on the same pull subscription are serialized. Durable or named consumers are bound when they already exist; any supplied config fields must match the existing consumer config. Pull subscription configs cannot set push delivery fields such as `deliver_subject` or `deliver_group`. Missing durable or named consumers are created strictly, and random ephemeral consumers are created strictly and deleted on close. Subscription setup accepts `timeout=...` for its JetStream API calls. Pull fetches return `JetStreamMsg` values, which carry the acknowledgement state needed by `ack`, `nak`, `in_progress`, and `term`.
 
 ```julia
 sub = pull_subscribe(js, "orders.created";
     stream="ORDERS",
     durable="orders-workers",
+    timeout=2.0,
     config=ConsumerConfig(
         ack_policy=AckPolicy.EXPLICIT,
         max_ack_pending=200,
@@ -172,12 +173,13 @@ close(sub)
 
 ## Push Consumers
 
-Push subscriptions deliver messages to a normal NATS subscription. Durable or named push consumers bind to existing consumers without updating server-side config; supplied config fields must match. Queue groups can be set with `queue` or `ConsumerConfig(deliver_group=...)`; when both are present, they must match. Binding an existing queue push consumer requires the `queue` keyword to match the consumer deliver group. If no durable or name is supplied for a queue push subscription, the queue group is used as the durable consumer name so additional subscribers join the same server-side consumer. Existing non-queue push consumers cannot be bound by a second subscription while the server reports them as push-bound; use a queue group when multiple subscribers should share one push consumer. Non-queue push consumers with idle heartbeats report missed heartbeats through `error_cb`, ignore heartbeat control messages, and reply only to flow-control requests. Push callbacks and channel-backed `next(sub)` calls receive `JetStreamMsg` values; callback-backed push subscriptions are callback-only. Callback push subscriptions auto-ack by default for acking consumers; `AckPolicy.NONE` consumers are not auto-acked. Set `manual_ack=true` when the callback will acknowledge messages itself.
+Push subscriptions deliver messages to a normal NATS subscription. Durable or named push consumers bind to existing consumers without updating server-side config; supplied config fields must match. Queue groups can be set with `queue` or `ConsumerConfig(deliver_group=...)`; when both are present, they must match. Binding an existing queue push consumer requires the `queue` keyword to match the consumer deliver group. If no durable or name is supplied for a queue push subscription, the queue group is used as the durable consumer name so additional subscribers join the same server-side consumer. Existing non-queue push consumers cannot be bound by a second subscription while the server reports them as push-bound; use a queue group when multiple subscribers should share one push consumer. Subscription setup accepts `timeout=...` for its JetStream API calls. Non-queue push consumers with idle heartbeats report missed heartbeats through `error_cb`, ignore heartbeat control messages, and reply only to flow-control requests. Push callbacks and channel-backed `next(sub)` calls receive `JetStreamMsg` values; callback-backed push subscriptions are callback-only. Callback push subscriptions auto-ack by default for acking consumers; `AckPolicy.NONE` consumers are not auto-acked. Set `manual_ack=true` when the callback will acknowledge messages itself.
 
 ```julia
 sub = push_subscribe(js, "orders.created";
     stream="ORDERS",
     durable="orders-push",
+    timeout=2.0,
     manual_ack=true,
     callback=msg -> begin
         handle_order(String(msg.data))

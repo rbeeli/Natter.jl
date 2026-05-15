@@ -79,6 +79,15 @@ For deployments that require the server `INFO` line before upgrading to TLS, pas
 client = connect("tls://nats.example.com:4222"; tls_first=false)
 ```
 
+Certificate verification uses the URL host by default, including IP subject alternative names for IP-literal URLs. Pass `tls_server_name` when dialing one address while verifying a DNS certificate name.
+
+```julia
+client = connect("tls://10.0.0.5:4222";
+    tls_ca_path="/etc/ssl/certs/ca.pem",
+    tls_server_name="nats.example.com",
+)
+```
+
 Certificate verification is enabled by default. Disable it only for trusted environments where verification is intentionally handled elsewhere:
 
 ```julia
