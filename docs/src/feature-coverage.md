@@ -55,7 +55,7 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
 | Bucket create/open/delete/status | Supported | Backed by JetStream streams; `kv_create` exposes history, bucket TTL, max bucket bytes, max value size, storage, replicas, direct reads, compression, metadata, and delete-marker TTL. History is locally limited to 1 through 64. Bucket operations accept per-call timeouts. |
-| Put/create/update | Supported | Includes optimistic revision checks, create after delete/purge markers, per-key TTL headers, KV-specific conflict errors, and per-call timeouts. |
+| Put/create/update | Supported | Return the new KV revision and include optimistic revision checks, create after delete/purge markers, per-key TTL headers, KV-specific conflict errors, and per-call timeouts. |
 | Get by latest or revision | Supported | Returns typed entries with key, value, revision, created timestamp, delta, and operation. Direct reads are used when bucket direct access is enabled; missing and deleted keys raise KV-specific errors. Gets accept per-call timeouts. |
 | Delete and purge | Supported | Uses KeyValue operation headers, optional expected-revision checks, purge marker TTL, delete-marker cleanup, and per-call timeouts. |
 | History and keys | Supported | Implemented through pull consumers; history returns typed entries. History and key listing accept per-call timeouts. |

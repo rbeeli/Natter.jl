@@ -784,8 +784,6 @@ function _headers_bytes(headers::Headers)
     out
 end
 
-abstract type _AbstractPublishFrame end
-
 struct PublishFrame <: _AbstractPublishFrame
     _subject::String
     _reply::Union{String,Nothing}
@@ -828,6 +826,19 @@ function _publish_frame(subject::AbstractString, reply::Union{AbstractString,Not
     subject = _validate_publish_subject(subject)
     reply = isnothing(reply) ? nothing : _validate_publish_subject(reply)
     _PublishFrame(subject, reply, _payload_bytes(data), _publish_header_bytes(headers))
+end
+
+function _copy_publish_bytes(bytes::AbstractVector{UInt8})::Vector{UInt8}
+    isempty(bytes) && return EMPTY_BYTES
+    out = Vector{UInt8}(undef, length(bytes))
+    copyto!(out, 1, bytes, firstindex(bytes), length(bytes))
+    out
+end
+
+function _snapshot_publish_frame(frame::_AbstractPublishFrame)
+    _PublishFrame(frame.subject, frame.reply,
+                  _copy_publish_bytes(frame.payload),
+                  _copy_publish_bytes(frame.headers))
 end
 
 _pub_payload_size(payload::AbstractVector{UInt8}, hdr::AbstractVector{UInt8}) = length(hdr) + length(payload)

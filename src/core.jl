@@ -9,8 +9,9 @@ function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; bu
                    force_flush::Bool=false, deadline=nothing)
     st = status(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
+        write_mode = st == ConnectionStatus.DRAINING ? _RAW_WRITE_DRAIN : _RAW_WRITE_CONNECTED
         try
-            _write_raw(client, data; force_flush, deadline)
+            _write_raw(client, data; force_flush, deadline, write_mode)
         catch err
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
                 if buffer_on_reconnect
@@ -29,8 +30,6 @@ function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; bu
         end
     elseif st == ConnectionStatus.DISCONNECTED
         throw(ConnectionClosedError("connection is disconnected"))
-    elseif st == ConnectionStatus.DRAINING
-        throw(ConnectionDrainingError())
     else
         throw(ConnectionClosedError())
     end
@@ -57,31 +56,29 @@ function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::_Abstr
     end
 
     start = position(io.buffer) + 1
-    range_count = length(io.replayable_ranges)
+    entry_count = length(io.replayable_entries)
     bytes = frame_size
+    write_frame = frame
     if replayable
         _reserve_pending_bytes!(client, bytes)
         try
-            push!(io.replayable_ranges, (start, start - 1))
+            write_frame = _snapshot_publish_frame(frame)
+            push!(io.replayable_entries, _PendingPublish(write_frame, bytes))
         catch
             _release_pending_bytes!(client, bytes)
             rethrow()
         end
     end
     try
-        _write_pub_frame(io, frame)
+        _write_pub_frame(io, write_frame)
     catch
         truncate(io.buffer, start - 1)
         seekend(io.buffer)
-        resize!(io.replayable_ranges, range_count)
+        resize!(io.replayable_entries, entry_count)
         replayable && _release_pending_bytes!(client, bytes)
         rethrow()
     end
-    if replayable
-        io.replayable_ranges[end] = (start, position(io.buffer))
-        return true
-    end
-    false
+    replayable
 end
 
 function _write_pub_frame_direct_timed(client::Client, io::IO, frame::_AbstractPublishFrame; force_flush::Bool=false)
@@ -241,7 +238,8 @@ function _pending_chunk(data::AbstractString)
     copyto!(bytes, 1, codeunits(data), 1, length(bytes))
     bytes
 end
-_pending_chunk(frame::_AbstractPublishFrame) = _pub_cmd(frame)
+_pending_chunk(frame::_AbstractPublishFrame) =
+    _PendingPublish(_snapshot_publish_frame(frame), _serialized_size(frame))
 
 function _ensure_pending_enqueue_allowed_locked(client::Client)
     st = client.status
@@ -280,6 +278,17 @@ function _validate_publish_frame_for_client(client::Client, frame::_AbstractPubl
     headers_supported = _client_headers_supported(client)
     !isempty(frame.headers) && !headers_supported && throw(UnsupportedFeatureError("headers are not supported by the connected server"))
     total > max_payload && throw(MaxPayloadError(max_payload, total))
+    nothing
+end
+
+_validate_pending_entry_for_client(client::Client, entry::_PendingBytes) = nothing
+_validate_pending_entry_for_client(client::Client, entry::_PendingPublish) =
+    _validate_publish_frame_for_client(client, entry.frame)
+
+function _validate_pending_replay_for_client(client::Client, entries::AbstractVector{<:_PendingEntry})
+    for entry in entries
+        _validate_pending_entry_for_client(client, entry)
+    end
     nothing
 end
 
@@ -647,7 +656,7 @@ function _drain(sub::Subscription, deadline::Float64)
     status(sub.client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING) || throw(ConnectionReconnectingError())
     if active
         try
-            _write_raw(sub.client, _unsub_cmd(sid); deadline=deadline)
+            _write_raw(sub.client, _unsub_cmd(sid); deadline=deadline, write_mode=_RAW_WRITE_DRAIN)
         catch err
             _drain_timed_out(err) && rethrow()
             _recover_after_write_failure!(sub.client, err) || rethrow()

@@ -391,13 +391,17 @@ function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=
     entry
 end
 
+_kv_publish_revision(kv::KeyValue, subject::AbstractString, value; headers=nothing,
+                     ttl=nothing, timeout::Real=kv.js.timeout)::Int =
+    js_publish(kv.js, subject, value; headers, ttl, timeout).seq
+
 function kv_put(kv::KeyValue, key::AbstractString, value; revision::Union{Nothing,Int}=nothing,
-                ttl=nothing, timeout::Real=kv.js.timeout)
+                ttl=nothing, timeout::Real=kv.js.timeout)::Int
     key = _validate_kv_key(key)
     hdrs = Headers()
     expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
-        js_publish(kv.js, "$(kv.prefix)$key", value; headers=hdrs, ttl, timeout)
+        _kv_publish_revision(kv, "$(kv.prefix)$key", value; headers=hdrs, ttl, timeout)
     catch err
         _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
         rethrow()
@@ -421,20 +425,20 @@ function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String; timeou
 end
 
 function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,
-                       timeout::Real=kv.js.timeout)
+                       timeout::Real=kv.js.timeout)::Int
     key = _validate_kv_key(key)
     timeout = _positive_timeout_seconds("timeout", timeout)
     subject = "$(kv.prefix)$key"
     hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => ["0"])
     try
-        return js_publish(kv.js, subject, value; headers=hdrs, ttl, timeout)
+        return _kv_publish_revision(kv, subject, value; headers=hdrs, ttl, timeout)
     catch err
         _kv_wrong_last_sequence(err) || rethrow()
         marker_revision = _kv_latest_delete_marker_revision(kv, subject; timeout)
         isnothing(marker_revision) && throw(_kv_key_exists_error(kv, key, err))
         retry_hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => [string(marker_revision)])
         try
-            return js_publish(kv.js, subject, value; headers=retry_hdrs, ttl, timeout)
+            return _kv_publish_revision(kv, subject, value; headers=retry_hdrs, ttl, timeout)
         catch retry_err
             _kv_wrong_last_sequence(retry_err) &&
                 throw(_kv_wrong_revision_error(kv, key, marker_revision, retry_err))
@@ -444,16 +448,17 @@ function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,
 end
 
 kv_update(kv::KeyValue, key::AbstractString, value, revision::Int; ttl=nothing,
-          timeout::Real=kv.js.timeout) =
+          timeout::Real=kv.js.timeout)::Int =
     kv_put(kv, key, value; revision, ttl, timeout)
 
 function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing,
-                   timeout::Real=kv.js.timeout)
+                   timeout::Real=kv.js.timeout)::Nothing
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["DEL"])
     expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
         js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs, timeout)
+        nothing
     catch err
         _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
         rethrow()
@@ -461,12 +466,13 @@ function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,In
 end
 
 function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing,
-                  ttl=nothing, timeout::Real=kv.js.timeout)
+                  ttl=nothing, timeout::Real=kv.js.timeout)::Nothing
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["PURGE"], "Nats-Rollup" => ["sub"])
     expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
         js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs, ttl, timeout)
+        nothing
     catch err
         _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
         rethrow()

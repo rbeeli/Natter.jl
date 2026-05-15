@@ -601,23 +601,24 @@ end
                 @test empty_status.direct
                 @test fetch(kv_status_async(kv[])).bucket == bucket
                 @test_throws KeyValueKeyNotFoundError kv_get(kv[], "missing")
-                pa2 = kv_put(kv[], "alpha", "one")
-                @test pa2.seq >= 1
+                alpha_revision = kv_put(kv[], "alpha", "one")
+                @test alpha_revision >= 1
                 alpha = kv_get(kv[], "alpha")
                 @test alpha isa KeyValueEntry
                 @test alpha.bucket == bucket
                 @test alpha.key == "alpha"
-                @test alpha.revision == pa2.seq
+                @test alpha.revision == alpha_revision
                 @test alpha.created isa Dates.DateTime
                 @test alpha.delta == 0
                 @test alpha.operation == KeyValueOperation.PUT
                 @test String(alpha) == "one"
-                revision_alpha = kv_get(kv[], "alpha"; revision=pa2.seq)
-                @test revision_alpha.revision == pa2.seq
+                revision_alpha = kv_get(kv[], "alpha"; revision=alpha_revision)
+                @test revision_alpha.revision == alpha_revision
                 @test String(revision_alpha) == "one"
-                kv_update(kv[], "alpha", "two", pa2.seq)
+                updated_revision = kv_update(kv[], "alpha", "two", alpha_revision)
                 updated_alpha = kv_get(kv[], "alpha")
-                @test updated_alpha.revision > pa2.seq
+                @test updated_alpha.revision == updated_revision
+                @test updated_alpha.revision > alpha_revision
                 @test String(updated_alpha) == "two"
                 alpha_history = kv_history(kv[], "alpha"; batch=2)
                 @test length(alpha_history) >= 2
@@ -679,11 +680,11 @@ end
                 finally
                     close(updates_only_watcher)
                 end
-                pa3 = fetch(kv_put_async(kv[], "beta", "async-one"))
-                @test pa3.seq >= 1
+                beta_revision = fetch(kv_put_async(kv[], "beta", "async-one"))
+                @test beta_revision >= 1
                 @test String(fetch(kv_get_async(kv[], "beta"))) == "async-one"
-                @test_throws KeyValueWrongRevisionError kv_update(kv[], "beta", "wrong-revision", pa3.seq + 100)
-                @test_throws KeyValueWrongRevisionError kv_delete(kv[], "beta"; revision=pa3.seq + 100)
+                @test_throws KeyValueWrongRevisionError kv_update(kv[], "beta", "wrong-revision", beta_revision + 100)
+                @test_throws KeyValueWrongRevisionError kv_delete(kv[], "beta"; revision=beta_revision + 100)
                 updates = Channel{KeyValueEntry}(4)
                 watcher = kv_watch(kv[]; key="gamma") do entry
                     put!(updates, entry)
@@ -716,13 +717,13 @@ end
                 finally
                     close(ignore_delete_watcher)
                 end
-                resume_first = kv_put(kv[], "resume", "one")
+                kv_put(kv[], "resume", "one")
                 resume_second = kv_put(kv[], "resume", "two")
-                resume_watcher = kv_watch(kv[]; key="resume", resume_revision=resume_second.seq, meta_only=true)
+                resume_watcher = kv_watch(kv[]; key="resume", resume_revision=resume_second, meta_only=true)
                 try
                     resumed = take!(resume_watcher)
                     @test resumed isa KeyValueEntry
-                    @test resumed.revision == resume_second.seq
+                    @test resumed.revision == resume_second
                     @test resumed.key == "resume"
                     @test take!(resume_watcher) isa KeyValueWatchInitialDone
                 finally
@@ -745,21 +746,21 @@ end
                 finally
                     close(ttl_watcher)
                 end
-                fetch(kv_delete_async(kv[], "beta"; revision=pa3.seq))
+                @test isnothing(fetch(kv_delete_async(kv[], "beta"; revision=beta_revision)))
                 async_deleted = TestHelpers.thrown_exception() do
                     fetch(kv_get_async(kv[], "beta"))
                 end
                 @test async_deleted isa KeyValueKeyDeletedError
-                purge_ack = kv_put(kv[], "purge-me", "value")
-                @test_throws KeyValueWrongRevisionError kv_purge(kv[], "purge-me"; revision=purge_ack.seq + 100)
-                fetch(kv_purge_async(kv[], "purge-me"; revision=purge_ack.seq))
+                purge_revision = kv_put(kv[], "purge-me", "value")
+                @test_throws KeyValueWrongRevisionError kv_purge(kv[], "purge-me"; revision=purge_revision + 100)
+                @test isnothing(fetch(kv_purge_async(kv[], "purge-me"; revision=purge_revision)))
                 @test_throws KeyValueKeyDeletedError kv_get(kv[], "purge-me")
                 kv_delete(kv[], "alpha")
                 @test_throws KeyValueKeyDeletedError kv_get(kv[], "alpha")
                 @test !("alpha" in kv_keys(kv[]))
                 kv_purge_deletes(kv[]; older_than=-1)
                 recreated = kv_create_key(kv[], "alpha", "three")
-                @test recreated.seq > pa2.seq
+                @test recreated > alpha_revision
                 @test String(kv_get(kv[], "alpha")) == "three"
                 @test "alpha" in kv_keys(kv[])
                 @test_throws KeyValueKeyExistsError kv_create_key(kv[], "alpha", "duplicate")

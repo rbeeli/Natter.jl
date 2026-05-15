@@ -47,11 +47,11 @@ st = kv_status(kv)
 ## Put And Get
 
 ```julia
-ack = kv_put(kv, "theme", "dark"; ttl=3600.0)
+revision = kv_put(kv, "theme", "dark"; ttl=3600.0)
 entry = kv_get(kv, "theme"; timeout=2.0)
 
 @assert entry.key == "theme"
-@assert entry.revision == ack.seq
+@assert entry.revision == revision
 @assert entry.operation == KeyValueOperation.PUT
 @assert String(entry.value) == "dark"
 ```
@@ -65,8 +65,8 @@ kv_create_key(kv, "first-run", "complete"; ttl=3600.0)
 Update only if the key is still at a known revision:
 
 ```julia
-ack = kv_put(kv, "theme", "dark")
-kv_update(kv, "theme", "light", ack.seq)
+revision = kv_put(kv, "theme", "dark")
+kv_update(kv, "theme", "light", revision)
 ```
 
 ## Delete And Purge

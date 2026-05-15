@@ -445,7 +445,7 @@ end
                                             read_io=replay_transport, write_io=replay_transport)
     replay_sub = subscribe(replay_client, "replay"; max_msgs=5)
     replay_sub.received = 3
-    N._replay_subscriptions(replay_client)
+    N._replay_subscriptions(replay_client; reconnect_replay=true)
     @test TestHelpers.capture_text(replay_transport) ==
           "SUB replay $(replay_sub.sid)\r\nUNSUB $(replay_sub.sid) 2\r\n"
     @test replay_sub.server_active
@@ -453,7 +453,7 @@ end
     exhausted = subscribe(replay_client, "done"; max_msgs=2)
     exhausted.received = 2
     TestHelpers.clear_capture!(replay_transport)
-    N._replay_subscriptions(replay_client)
+    N._replay_subscriptions(replay_client; reconnect_replay=true)
     @test TestHelpers.capture_text(replay_transport) == ""
     @test exhausted.closed
     @test !(exhausted.sid in keys(replay_client.subscriptions))
@@ -730,6 +730,59 @@ end
     @test isempty(N._take_replayable_writes!(write_io))
 
     close(client)
+end
+
+@testitem "raw writes recheck connection status after write lock" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function queued_raw_result(new_status)
+        transport = TestHelpers.WriteCapture()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                         read_io=transport, write_io=transport)
+        lock(client.write_lock)
+        task = @async try
+            N._write_raw(client, TestHelpers.bytes("PING\r\n"))
+            nothing
+        catch err
+            err
+        end
+        try
+            for _ in 1:10
+                yield()
+            end
+            @lock client.lock N._store_status_locked!(client, new_status)
+        finally
+            unlock(client.write_lock)
+        end
+        fetch(task), TestHelpers.capture_text(transport)
+    end
+
+    err, written = queued_raw_result(N.ConnectionStatus.RECONNECTING)
+    @test err isa ConnectionReconnectingError
+    @test written == ""
+
+    err, written = queued_raw_result(N.ConnectionStatus.DRAINING)
+    @test err isa ConnectionDrainingError
+    @test written == ""
+
+    err, written = queued_raw_result(N.ConnectionStatus.CLOSED)
+    @test err isa ConnectionClosedError
+    @test written == ""
+
+    drain_transport = TestHelpers.WriteCapture()
+    drain_client = TestHelpers.fake_client(; status=N.ConnectionStatus.DRAINING,
+                                           read_io=drain_transport, write_io=drain_transport)
+    N._write_raw(drain_client, TestHelpers.bytes("PONG\r\n"); write_mode=N._RAW_WRITE_DRAIN)
+    @test TestHelpers.capture_text(drain_transport) == "PONG\r\n"
+
+    replay_transport = TestHelpers.WriteCapture()
+    replay_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+                                            read_io=replay_transport, write_io=replay_transport)
+    N._write_raw(replay_client, TestHelpers.bytes("SUB foo 1\r\n");
+                 write_mode=N._RAW_WRITE_RECONNECT_REPLAY)
+    @test TestHelpers.capture_text(replay_transport) == "SUB foo 1\r\n"
 end
 
 @testitem "raw transport writes time out and close active transport" setup=[TestHelpers] begin
@@ -1025,8 +1078,75 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING, write_io=BadWriteIO())
     data = TestHelpers.bytes("PUB foo 3\r\nbar\r\n")
     N._enqueue_pending(client, data)
-    @test_throws ErrorException N._flush_pending_buffer(client)
+    @test_throws ErrorException N._flush_pending_buffer(client; reconnect_replay=true)
     @test client.pending_bytes == length(data)
+end
+
+@testitem "pending publish replay revalidates server capabilities" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function set_info!(client, info)
+        @lock client.lock begin
+            client.info = info
+            N._sync_server_info_cache_locked!(client)
+        end
+    end
+
+    header_transport = TestHelpers.WriteCapture()
+    header_client = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.RECONNECTING,
+        info=N.ServerInfo(; headers=true, max_payload=1024),
+        write_io=header_transport,
+    )
+    publish(header_client, "foo", "bar"; headers=Headers("Trace" => "abc"))
+    header_pending_bytes = header_client.pending_bytes
+
+    set_info!(header_client, N.ServerInfo(; headers=false, max_payload=1024))
+    header_err = TestHelpers.thrown_exception() do
+        N._flush_pending_buffer(header_client; reconnect_replay=true)
+    end
+    @test header_err isa UnsupportedFeatureError
+    @test TestHelpers.capture_text(header_transport) == ""
+    @test header_client.pending_bytes == header_pending_bytes
+    restored_header = String(take!(header_client.pending))
+    @test startswith(restored_header, "HPUB foo ")
+    @test occursin("Trace: abc", restored_header)
+
+    payload = repeat("x", 8)
+    opts = N.ConnectOptions(write_buffer_size=1024 * 1024)
+    original_transport = TestHelpers.WriteCapture()
+    write_io = N.BufferedWriteIO(original_transport)
+    payload_client = TestHelpers.fake_client(;
+        opts,
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, max_payload=1024),
+        read_io=original_transport,
+        write_io,
+    )
+    publish(payload_client, "foo", payload)
+    payload_pending_bytes = payload_client.pending_bytes
+    @test N._buffered_bytes(write_io) > 0
+
+    N._take_transport!(payload_client; preserve_replayable=true)
+    replay_transport = TestHelpers.WriteCapture()
+    @lock payload_client.lock begin
+        N._store_status_locked!(payload_client, N.ConnectionStatus.RECONNECTING)
+        payload_client.write_io = N.BufferedWriteIO(replay_transport)
+        payload_client.info = N.ServerInfo(; headers=true, max_payload=4)
+        N._sync_server_info_cache_locked!(payload_client)
+    end
+
+    payload_err = TestHelpers.thrown_exception() do
+        N._flush_pending_buffer(payload_client; reconnect_replay=true)
+    end
+    @test payload_err isa MaxPayloadError
+    @test payload_err.limit == 4
+    @test payload_err.actual == ncodeunits(payload)
+    @test TestHelpers.capture_text(replay_transport) == ""
+    @test payload_client.pending_bytes == payload_pending_bytes
+    @test String(take!(payload_client.pending)) == "PUB foo 8\r\n$payload\r\n"
 end
 
 @testitem "pending replay writes bounded batches" setup=[TestHelpers] begin
@@ -1053,7 +1173,7 @@ end
     N._enqueue_pending(client, first)
     N._enqueue_pending(client, second)
 
-    N._flush_pending_buffer(client)
+    N._flush_pending_buffer(client; reconnect_replay=true)
 
     @test transport.writes == [String(copy(first)) * String(copy(second))]
     @test transport.flushes == 1
@@ -1087,7 +1207,7 @@ end
     N._enqueue_pending(client, data)
 
     replay_task = @async try
-        N._flush_pending_buffer(client)
+        N._flush_pending_buffer(client; reconnect_replay=true)
         nothing
     catch err
         err
@@ -1458,7 +1578,7 @@ end
     TestHelpers.clear_capture!(replay_transport)
     N._store_status_locked!(replay_client, N.ConnectionStatus.RECONNECTING)
     @lock replay_mux.sub.lock replay_mux.sub.server_active = false
-    N._replay_subscriptions(replay_client)
+    N._replay_subscriptions(replay_client; reconnect_replay=true)
     replayed = TestHelpers.capture_text(replay_transport)
     @test replayed == N._sub_cmd(replay_mux.sub.subject, nothing, replay_mux.sub.sid)
     @test !occursin("PUB svc", replayed)

@@ -271,6 +271,65 @@ end
     @test isnothing(N._kv_delete_marker_revision(live, 4))
 end
 
+@testitem "KeyValue write APIs return revisions without exposing PubAck" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function reply_next_puback!(client, stream::String, seq::Int)
+        deadline = time() + 1.0
+        while time() < deadline
+            mux = @atomic client.request_mux
+            if !isnothing(mux)
+                token = begin
+                    lock(mux.condition)
+                    try
+                        isempty(mux.waiters) ? nothing : first(keys(mux.waiters))
+                    finally
+                        unlock(mux.condition)
+                    end
+                end
+                if !isnothing(token)
+                    payload = "{\"stream\":\"$stream\",\"seq\":$seq}"
+                    N._dispatch_msg(
+                        client,
+                        Msg("$(mux.prefix).$token", nothing, TestHelpers.bytes(payload); sid=mux.sub.sid),
+                    )
+                    return nothing
+                end
+            end
+            sleep(0.001)
+        end
+        error("request waiter not registered")
+    end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    kv = KeyValue(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
+
+    put_task = @async kv_put(kv, "alpha", "one"; timeout=1.0)
+    reply_next_puback!(client, "KV_bucket", 10)
+    put_revision = fetch(put_task)
+    @test put_revision == 10
+    @test put_revision isa Int
+
+    create_task = @async kv_create_key(kv, "beta", "one"; timeout=1.0)
+    reply_next_puback!(client, "KV_bucket", 11)
+    @test fetch(create_task) == 11
+
+    update_task = @async kv_update(kv, "beta", "two", 11; timeout=1.0)
+    reply_next_puback!(client, "KV_bucket", 12)
+    @test fetch(update_task) == 12
+
+    delete_task = @async kv_delete(kv, "beta"; revision=12, timeout=1.0)
+    reply_next_puback!(client, "KV_bucket", 13)
+    @test isnothing(fetch(delete_task))
+
+    purge_task = @async kv_purge(kv, "alpha"; timeout=1.0)
+    reply_next_puback!(client, "KV_bucket", 14)
+    @test isnothing(fetch(purge_task))
+end
+
 @testitem "KeyValue delete and purge include expected revision headers" setup=[TestHelpers] begin
     using Natter
 

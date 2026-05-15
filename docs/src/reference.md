@@ -151,9 +151,9 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `kv_delete_bucket(kv; timeout=...)` | Delete a bucket. |
 | `kv_status(kv; timeout=...)` | Return bucket status and stream-backed configuration. |
 | `kv_get(kv, key; revision=nothing, direct=nothing, timeout=...)` | Get the latest value or a revision as `KeyValueEntry`. |
-| `kv_put(kv, key, value; revision=nothing, ttl=nothing, timeout=...)` | Put a value, optionally expecting a revision or setting a per-key TTL. |
-| `kv_create_key(kv, key, value; ttl=nothing, timeout=...)` | Put a value only if the key is absent or currently deleted. |
-| `kv_update(kv, key, value, revision; ttl=nothing, timeout=...)` | Put a value only if the key is at `revision`. |
+| `kv_put(kv, key, value; revision=nothing, ttl=nothing, timeout=...)` | Put a value, optionally expecting a revision or setting a per-key TTL; returns the new revision. |
+| `kv_create_key(kv, key, value; ttl=nothing, timeout=...)` | Put a value only if the key is absent or currently deleted; returns the new revision. |
+| `kv_update(kv, key, value, revision; ttl=nothing, timeout=...)` | Put a value only if the key is at `revision`; returns the new revision. |
 | `kv_delete(kv, key; revision=nothing, timeout=...)` | Mark a key deleted, optionally only if the key is at `revision`. |
 | `kv_purge(kv, key; revision=nothing, ttl=nothing, timeout=...)` | Purge a key with rollup, optionally only if the key is at `revision`; `ttl` expires the purge marker. |
 | `kv_purge_deletes(kv; older_than=1800.0, timeout=...)` | Remove delete and purge markers, keeping recent markers when `older_than` is positive. |
@@ -171,9 +171,9 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `kv_delete_bucket_async(kv; kwargs...)` | Start `kv_delete_bucket` and return `NatterTask`. |
 | `kv_status_async(kv; kwargs...)` | Start `kv_status` and return `NatterTask`. |
 | `kv_get_async(kv, key; kwargs...)` | Start `kv_get` and return `NatterTask`. |
-| `kv_put_async(kv, key, value; kwargs...)` | Start `kv_put` and return `NatterTask`. |
-| `kv_create_key_async(kv, key, value; kwargs...)` | Start `kv_create_key` and return `NatterTask`. |
-| `kv_update_async(kv, key, value, revision; kwargs...)` | Start `kv_update` and return `NatterTask`. |
+| `kv_put_async(kv, key, value; kwargs...)` | Start `kv_put` and return `NatterTask`; `fetch` returns the new revision. |
+| `kv_create_key_async(kv, key, value; kwargs...)` | Start `kv_create_key` and return `NatterTask`; `fetch` returns the new revision. |
+| `kv_update_async(kv, key, value, revision; kwargs...)` | Start `kv_update` and return `NatterTask`; `fetch` returns the new revision. |
 | `kv_delete_async(kv, key; kwargs...)` | Start `kv_delete` and return `NatterTask`. |
 | `kv_purge_async(kv, key; kwargs...)` | Start `kv_purge` and return `NatterTask`. |
 | `kv_purge_deletes_async(kv; kwargs...)` | Start `kv_purge_deletes` and return `NatterTask`. |

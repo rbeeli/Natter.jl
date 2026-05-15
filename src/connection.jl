@@ -847,11 +847,7 @@ end
 
 _replayable_bytes(::IO) = 0
 function _replayable_bytes(io::BufferedWriteIO)
-    bytes = 0
-    for (first, last) in io.replayable_ranges
-        bytes += last - first + 1
-    end
-    bytes
+    _pending_entries_size(io.replayable_entries)
 end
 
 function _flush_write_io(client::Client, io)
@@ -874,7 +870,7 @@ function _flush_write_io(client::Client, io::BufferedWriteIO)
     end
     truncate(io.buffer, 0)
     seekstart(io.buffer)
-    empty!(io.replayable_ranges)
+    empty!(io.replayable_entries)
     _release_pending_bytes!(client, replayed)
     nothing
 end
@@ -890,10 +886,35 @@ function _flush_or_signal_locked(client::Client, io; force_flush::Bool=false)
     nothing
 end
 
+@enum _RawWriteMode begin
+    _RAW_WRITE_CONNECTED
+    _RAW_WRITE_DRAIN
+    _RAW_WRITE_RECONNECT_REPLAY
+end
+
+function _throw_raw_write_status(st::ConnectionStatus.T)
+    st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
+    st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
+    st == ConnectionStatus.DRAINING && throw(ConnectionDrainingError())
+    throw(ConnectionReconnectingError())
+end
+
+function _ensure_raw_write_status(st::ConnectionStatus.T, mode::_RawWriteMode)
+    if mode == _RAW_WRITE_CONNECTED
+        st == ConnectionStatus.CONNECTED && return nothing
+    elseif mode == _RAW_WRITE_DRAIN
+        (st == ConnectionStatus.CONNECTED || st == ConnectionStatus.DRAINING) && return nothing
+    elseif mode == _RAW_WRITE_RECONNECT_REPLAY
+        st == ConnectionStatus.RECONNECTING && return nothing
+    end
+    _throw_raw_write_status(st)
+end
+
 function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; force_flush::Bool=false,
-                    deadline=nothing)
+                    deadline=nothing, write_mode::_RawWriteMode=_RAW_WRITE_CONNECTED)
     _with_write_lock(client, "write protocol command"; deadline) do
-        io = @lock client.lock client.write_io
+        st, io = @lock client.lock (client.status, client.write_io)
+        _ensure_raw_write_status(st, write_mode)
         isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
         _write_raw_to_io(client, io, data; force_flush)
     end
@@ -954,7 +975,7 @@ function _take_transport_fields_locked!(client::Client)
 end
 
 function _take_transport!(client::Client; preserve_replayable::Bool=false, deadline=nothing)
-    replayable = UInt8[]
+    replayable = _PendingEntry[]
     dropped_replayable = 0
     transports = _with_write_lock(client, "close transport"; deadline) do
         read_io, write_io, sock, preserve = @lock client.lock begin
@@ -965,7 +986,7 @@ function _take_transport!(client::Client; preserve_replayable::Bool=false, deadl
         if preserve && !isnothing(write_io)
             replayable = _take_replayable_writes!(write_io)
         elseif !isnothing(write_io)
-            dropped_replayable = length(_take_replayable_writes!(write_io))
+            dropped_replayable = _pending_entries_size(_take_replayable_writes!(write_io))
         end
         read_io, write_io, sock
     end
@@ -1726,8 +1747,8 @@ function _reconnect_loop(client::Client, generation::Int)
                 _connect_once!(client, server; mark_connected=false, generation)
                 _start_flusher_task!(client, generation)
                 _record_reconnect!(client)
-                _replay_subscriptions(client)
-                _flush_pending_buffer(client; generation=generation)
+                _replay_subscriptions(client; reconnect_replay=true)
+                _flush_pending_buffer(client; generation=generation, reconnect_replay=true)
                 committed = @lock client.lock begin
                     if client.generation == generation && client.status == ConnectionStatus.RECONNECTING
                         _store_status_locked!(client, ConnectionStatus.CONNECTED)
@@ -1774,7 +1795,8 @@ function _reconnect_loop(client::Client, generation::Int)
     end
 end
 
-function _replay_subscriptions(client::Client)
+function _replay_subscriptions(client::Client; reconnect_replay::Bool=false)
+    write_mode = reconnect_replay ? _RAW_WRITE_RECONNECT_REPLAY : _RAW_WRITE_CONNECTED
     subs = @lock client.lock collect(values(client.subscriptions))
     for sub in subs
         present = @lock client.lock get(client.subscriptions, sub.sid, nothing) === sub
@@ -1792,8 +1814,8 @@ function _replay_subscriptions(client::Client)
             continue
         end
         sid, subject, queue, remaining = state
-        _write_raw(client, _sub_cmd(subject, queue, sid))
-        isnothing(remaining) || _write_raw(client, _unsub_cmd(sid, remaining))
+        _write_raw(client, _sub_cmd(subject, queue, sid); write_mode)
+        isnothing(remaining) || _write_raw(client, _unsub_cmd(sid, remaining); write_mode)
         present = @lock client.lock get(client.subscriptions, sid, nothing) === sub
         active = @lock sub.lock begin
             if present && !sub.closed
@@ -1803,7 +1825,7 @@ function _replay_subscriptions(client::Client)
                 false
             end
         end
-        active || _write_raw(client, _unsub_cmd(sid))
+        active || _write_raw(client, _unsub_cmd(sid); write_mode)
     end
 end
 
@@ -1814,17 +1836,30 @@ function _prepend_pending_locked!(client::Client, data::Vector{UInt8}; already_c
     nothing
 end
 
+function _prepend_pending_locked!(client::Client, entries::Vector{_PendingEntry}; already_counted::Bool=false)
+    bytes = _pending_entries_size(entries)
+    already_counted || _reserve_pending_bytes_locked!(client, bytes)
+    _prepend_pending_chunks!(client.pending, entries)
+    nothing
+end
+
 function _prepend_pending!(client::Client, data::Vector{UInt8}; already_counted::Bool=false)
     @lock client.lock _prepend_pending_locked!(client, data; already_counted=already_counted)
     nothing
 end
 
-function _restore_pending_after_replay_failure!(client::Client, data::Vector{UInt8}, generation::Int)
+function _prepend_pending!(client::Client, entries::Vector{_PendingEntry}; already_counted::Bool=false)
+    @lock client.lock _prepend_pending_locked!(client, entries; already_counted=already_counted)
+    nothing
+end
+
+function _restore_pending_after_replay_failure!(client::Client, entries::Vector{_PendingEntry}, generation::Int)
+    bytes = _pending_entries_size(entries)
     @lock client.lock begin
         if client.generation == generation && client.status in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTED)
-            _prepend_pending_locked!(client, data; already_counted=true)
+            _prepend_pending_locked!(client, entries; already_counted=true)
         else
-            client.pending_bytes = max(0, client.pending_bytes - length(data))
+            client.pending_bytes = max(0, client.pending_bytes - bytes)
         end
     end
     nothing
@@ -1835,20 +1870,24 @@ function _pending_replay_batch_size(client::Client)::Int
     threshold > 0 ? threshold : DEFAULT_WRITE_BUFFER_SIZE
 end
 
-function _flush_pending_buffer(client::Client; generation::Union{Int,Nothing}=nothing)
+function _flush_pending_buffer(client::Client; generation::Union{Int,Nothing}=nothing,
+                               reconnect_replay::Bool=false)
+    write_mode = reconnect_replay ? _RAW_WRITE_RECONNECT_REPLAY : _RAW_WRITE_CONNECTED
     while true
-        data = UInt8[]
+        entries = _PendingEntry[]
         replay_generation = 0
         @lock client.lock begin
             replay_generation = isnothing(generation) ? client.generation : generation
-            data = _pop_pending_batch!(client.pending, _pending_replay_batch_size(client))
+            entries = _pop_pending_batch!(client.pending, _pending_replay_batch_size(client))
         end
-        isempty(data) && return
+        isempty(entries) && return
         try
-            _write_raw(client, data; force_flush=true)
-            _release_pending_bytes!(client, length(data))
+            _validate_pending_replay_for_client(client, entries)
+            data = _pending_entries_bytes(entries)
+            _write_raw(client, data; force_flush=true, write_mode)
+            _release_pending_bytes!(client, _pending_entries_size(entries))
         catch err
-            _restore_pending_after_replay_failure!(client, data, replay_generation)
+            _restore_pending_after_replay_failure!(client, entries, replay_generation)
             rethrow()
         end
     end

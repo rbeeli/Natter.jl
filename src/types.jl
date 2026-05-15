@@ -170,6 +170,53 @@ const HeaderStorage = Union{Headers,LazyHeaders,Nothing}
 
 abstract type AbstractNatterClient end
 abstract type AbstractMsg end
+abstract type _AbstractPublishFrame end
+abstract type _PendingEntry end
+
+struct _PendingBytes <: _PendingEntry
+    data::Vector{UInt8}
+    bytes::Int
+end
+_PendingBytes(data::Vector{UInt8}) = _PendingBytes(data, length(data))
+
+struct _PendingPublish{F<:_AbstractPublishFrame} <: _PendingEntry
+    frame::F
+    bytes::Int
+end
+
+const EMPTY_PENDING_ENTRY = _PendingBytes(EMPTY_BYTES)
+
+_pending_entry_size(entry::_PendingBytes)::Int = entry.bytes
+_pending_entry_size(entry::_PendingPublish)::Int = entry.bytes
+
+function _pending_entries_size(entries::AbstractVector{<:_PendingEntry})::Int
+    bytes = 0
+    for entry in entries
+        bytes += _pending_entry_size(entry)
+    end
+    bytes
+end
+
+function _copy_pending_entry_bytes!(out::Vector{UInt8}, pos::Int, entry::_PendingBytes)::Int
+    copyto!(out, pos, entry.data, 1, entry.bytes)
+    pos + entry.bytes
+end
+
+function _copy_pending_entry_bytes!(out::Vector{UInt8}, pos::Int, entry::_PendingPublish)::Int
+    bytes = _pub_cmd(entry.frame)
+    copyto!(out, pos, bytes, 1, length(bytes))
+    pos + length(bytes)
+end
+
+function _pending_entries_bytes(entries::AbstractVector{<:_PendingEntry})::Vector{UInt8}
+    out = Vector{UInt8}(undef, _pending_entries_size(entries))
+    pos = 1
+    for entry in entries
+        pos = _copy_pending_entry_bytes!(out, pos, entry)
+    end
+    pos == length(out) + 1 || throw(AssertionError("pending replay size mismatch"))
+    out
+end
 
 function _append_header_value!(values::Vector{String}, value)
     push!(values, String(value))
@@ -715,11 +762,11 @@ end
 mutable struct BufferedWriteIO{I} <: IO
     io::I
     buffer::IOBuffer
-    replayable_ranges::Vector{Tuple{Int,Int}}
+    replayable_entries::Vector{_PendingEntry}
     closed::Bool
 end
 
-BufferedWriteIO(io::I) where {I} = BufferedWriteIO{I}(io, IOBuffer(), Tuple{Int,Int}[], false)
+BufferedWriteIO(io::I) where {I} = BufferedWriteIO{I}(io, IOBuffer(), _PendingEntry[], false)
 
 function _ensure_open(io::BufferedWriteIO)
     io.closed && throw(Base.IOError("buffered write transport is closed", 0))
@@ -789,7 +836,7 @@ function Base.flush(io::BufferedWriteIO)
     flush(io.io)
     truncate(io.buffer, 0)
     seekstart(io.buffer)
-    empty!(io.replayable_ranges)
+    empty!(io.replayable_entries)
     nothing
 end
 
@@ -802,42 +849,23 @@ Base.isopen(io::BufferedWriteIO) = !io.closed && isopen(io.io)
 
 _buffered_bytes(::IO) = 0
 _buffered_bytes(io::BufferedWriteIO) = position(io.buffer)
-_take_replayable_writes!(::IO) = UInt8[]
+_take_replayable_writes!(::IO) = _PendingEntry[]
 function _take_replayable_writes!(io::BufferedWriteIO)
-    ranges = io.replayable_ranges
-    data = io.buffer.data
-    if isempty(ranges)
-        truncate(io.buffer, 0)
-        seekstart(io.buffer)
-        empty!(io.replayable_ranges)
-        return UInt8[]
-    end
-
-    bytes = 0
-    for (first, last) in ranges
-        bytes += last - first + 1
-    end
-    replayable = Vector{UInt8}(undef, bytes)
-    pos = 1
-    for (first, last) in ranges
-        n = last - first + 1
-        copyto!(replayable, pos, data, first, n)
-        pos += n
-    end
+    replayable = copy(io.replayable_entries)
     truncate(io.buffer, 0)
     seekstart(io.buffer)
-    empty!(io.replayable_ranges)
+    empty!(io.replayable_entries)
     replayable
 end
 _underlying_transport(io) = io
 _underlying_transport(io::BufferedWriteIO) = io.io
 
 mutable struct PendingBuffer
-    chunks::Vector{Vector{UInt8}}
+    chunks::Vector{_PendingEntry}
     head::Int
 end
 
-PendingBuffer() = PendingBuffer(Vector{UInt8}[], 1)
+PendingBuffer() = PendingBuffer(_PendingEntry[], 1)
 
 Base.isempty(buffer::PendingBuffer) = buffer.head > length(buffer.chunks)
 
@@ -855,47 +883,58 @@ function _compact_pending_buffer!(buffer::PendingBuffer)
     buffer
 end
 
-function _push_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8})
-    push!(buffer.chunks, data)
+function _push_pending_chunk!(buffer::PendingBuffer, entry::_PendingEntry)
+    push!(buffer.chunks, entry)
     buffer
 end
+_push_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8}) =
+    _push_pending_chunk!(buffer, _PendingBytes(data))
 
-function _prepend_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8})
+function _prepend_pending_chunk!(buffer::PendingBuffer, entry::_PendingEntry)
     if isempty(buffer)
         empty!(buffer)
-        push!(buffer.chunks, data)
+        push!(buffer.chunks, entry)
     elseif buffer.head > 1
         buffer.head -= 1
-        buffer.chunks[buffer.head] = data
+        buffer.chunks[buffer.head] = entry
     else
-        pushfirst!(buffer.chunks, data)
+        pushfirst!(buffer.chunks, entry)
+    end
+    buffer
+end
+_prepend_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8}) =
+    _prepend_pending_chunk!(buffer, _PendingBytes(data))
+
+function _prepend_pending_chunks!(buffer::PendingBuffer, entries::AbstractVector{<:_PendingEntry})
+    for i in length(entries):-1:1
+        _prepend_pending_chunk!(buffer, entries[i])
     end
     buffer
 end
 
-function _pop_pending_batch!(buffer::PendingBuffer, max_bytes::Int)::Vector{UInt8}
-    isempty(buffer) && return UInt8[]
+function _pop_pending_batch!(buffer::PendingBuffer, max_bytes::Int)::Vector{_PendingEntry}
+    isempty(buffer) && return _PendingEntry[]
     max_bytes = max(1, max_bytes)
     stop = buffer.head - 1
     total = 0
     while stop < length(buffer.chunks)
         chunk = buffer.chunks[stop + 1]
-        if total > 0 && total + length(chunk) > max_bytes
+        chunk_size = _pending_entry_size(chunk)
+        if total > 0 && total + chunk_size > max_bytes
             break
         end
         stop += 1
-        total += length(chunk)
+        total += chunk_size
         total >= max_bytes && break
     end
 
-    out = Vector{UInt8}(undef, total)
+    out = Vector{_PendingEntry}(undef, stop - buffer.head + 1)
     pos = 1
     for i in buffer.head:stop
         chunk = buffer.chunks[i]
-        n = length(chunk)
-        copyto!(out, pos, chunk, 1, n)
-        pos += n
-        buffer.chunks[i] = EMPTY_BYTES
+        out[pos] = chunk
+        pos += 1
+        buffer.chunks[i] = EMPTY_PENDING_ENTRY
     end
     buffer.head = stop + 1
     if buffer.head > length(buffer.chunks)
@@ -910,29 +949,27 @@ function Base.take!(buffer::PendingBuffer)
     isempty(buffer) && return UInt8[]
     total = 0
     for i in buffer.head:length(buffer.chunks)
-        total += length(buffer.chunks[i])
+        total += _pending_entry_size(buffer.chunks[i])
     end
     out = Vector{UInt8}(undef, total)
     pos = 1
     for i in buffer.head:length(buffer.chunks)
         chunk = buffer.chunks[i]
-        n = length(chunk)
-        copyto!(out, pos, chunk, 1, n)
-        pos += n
+        pos = _copy_pending_entry_bytes!(out, pos, chunk)
     end
     empty!(buffer)
     out
 end
 
 function Base.write(buffer::PendingBuffer, data::Vector{UInt8})
-    _push_pending_chunk!(buffer, copy(data))
+    _push_pending_chunk!(buffer, _PendingBytes(copy(data)))
     length(data)
 end
 
 function Base.write(buffer::PendingBuffer, data::AbstractString)
     bytes = Vector{UInt8}(undef, ncodeunits(data))
     copyto!(bytes, 1, codeunits(data), 1, length(bytes))
-    _push_pending_chunk!(buffer, bytes)
+    _push_pending_chunk!(buffer, _PendingBytes(bytes))
     length(bytes)
 end
 
@@ -943,7 +980,7 @@ end
 function _pending_buffer_from(buffer::IOBuffer)
     data = take!(buffer)
     pending = PendingBuffer()
-    isempty(data) || _push_pending_chunk!(pending, data)
+    isempty(data) || _push_pending_chunk!(pending, _PendingBytes(data))
     pending
 end
 
