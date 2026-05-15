@@ -1,6 +1,20 @@
 using TestItems
 
-@testitem "real nats-server core integration" setup=[TestHelpers] begin
+@testmodule IntegrationHelpers begin
+    using Natter
+
+    integration_timeout() = parse(Float64, get(ENV, "NATTER_INTEGRATION_TIMEOUT", "5.0"))
+    integration_connect_timeout() =
+        parse(Float64, get(ENV, "NATTER_INTEGRATION_CONNECT_TIMEOUT", "10.0"))
+
+    function publish_and_flush(client, subject::AbstractString, data=nothing; timeout::Real=integration_timeout(), kwargs...)
+        publish(client, subject, data; kwargs...)
+        flush(client; timeout)
+        nothing
+    end
+end
+
+@testitem "real nats-server core integration" setup=[TestHelpers, IntegrationHelpers] begin
     using Natter
     using Dates
     using Random
@@ -9,15 +23,18 @@ using TestItems
 
     if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true"
         url = get(ENV, "NATTER_URL", "nats://127.0.0.1:4222")
+        io_timeout = IntegrationHelpers.integration_timeout()
+        connect_timeout = IntegrationHelpers.integration_connect_timeout()
         reconnected = Ref(false)
         client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
+                         connect_timeout,
                          reconnect_wait=0.05, max_reconnect_attempts=20,
                          reconnected_cb=() -> (reconnected[] = true))
         try
             subject = "natter.test.$(randstring(10))"
             sub = subscribe(client, subject)
-            publish(client, subject, "hello")
-            msg = next(sub; timeout=2.0)
+            IntegrationHelpers.publish_and_flush(client, subject, "hello"; timeout=io_timeout)
+            msg = next(sub; timeout=io_timeout)
             @test String(msg) == "hello"
 
             service = subscribe(client, "$subject.req") do req
@@ -53,20 +70,20 @@ using TestItems
 
             async_sub = fetch(subscribe_async(client, "$subject.async"))
             fetch(publish_async(client, "$subject.async", "from task"))
-            fetch(flush_async(client; timeout=2.0))
-            @test String(fetch(next_async(async_sub; timeout=2.0))) == "from task"
+            fetch(flush_async(client; timeout=io_timeout))
+            @test String(fetch(next_async(async_sub; timeout=io_timeout))) == "from task"
             fetch(unsubscribe_async(async_sub))
 
             limited = subscribe(client, "$subject.limited")
-            publish(client, "$subject.limited", "first")
-            @test String(next(limited; timeout=2.0)) == "first"
+            IntegrationHelpers.publish_and_flush(client, "$subject.limited", "first"; timeout=io_timeout)
+            @test String(next(limited; timeout=io_timeout)) == "first"
             unsubscribe(limited; max_msgs=2)
-            flush(client; timeout=2.0)
+            flush(client; timeout=io_timeout)
             publish(client, "$subject.limited", "second")
             publish(client, "$subject.limited", "third")
-            publish(client, "$subject.limited", "fourth")
-            @test String(next(limited; timeout=2.0)) == "second"
-            @test String(next(limited; timeout=2.0)) == "third"
+            IntegrationHelpers.publish_and_flush(client, "$subject.limited", "fourth"; timeout=io_timeout)
+            @test String(next(limited; timeout=io_timeout)) == "second"
+            @test String(next(limited; timeout=io_timeout)) == "third"
             @test_throws ConnectionClosedError next(limited; timeout=0.5)
             @test limited.closed
 
@@ -75,10 +92,10 @@ using TestItems
                 reconnected[] && status(client) == N.ConnectionStatus.CONNECTED
             end
             @test result != :timed_out
-            publish(client, subject, "after reconnect")
-            @test String(next(sub; timeout=2.0)) == "after reconnect"
+            IntegrationHelpers.publish_and_flush(client, subject, "after reconnect"; timeout=io_timeout)
+            @test String(next(sub; timeout=io_timeout)) == "after reconnect"
 
-            drain(sub; timeout=2.0)
+            drain(sub; timeout=io_timeout)
             @test sub.closed
 
             started = Channel{Bool}(1)
@@ -88,14 +105,14 @@ using TestItems
                 put!(started, true)
                 take!(release)
             end
-            publish(client, "$subject.callback-drain", "work")
-            started_result = timedwait(2.0; pollint=0.01) do
+            IntegrationHelpers.publish_and_flush(client, "$subject.callback-drain", "work"; timeout=io_timeout)
+            started_result = timedwait(io_timeout; pollint=0.01) do
                 isready(started)
             end
             @test started_result != :timed_out
             @test take!(started) == true
             drain_task = @async begin
-                drain(callback_sub; timeout=2.0)
+                drain(callback_sub; timeout=io_timeout)
                 drained[] = true
             end
             sleep(0.1)
@@ -104,12 +121,12 @@ using TestItems
             wait(drain_task)
             @test drained[]
 
-            drain_client = connect(url; ping_interval=2.0, max_outstanding_pings=2)
+            drain_client = connect(url; ping_interval=2.0, max_outstanding_pings=2, connect_timeout)
             try
                 drain_sub = subscribe(drain_client, "$subject.drain")
-                publish(drain_client, "$subject.drain", "drain")
-                @test String(next(drain_sub; timeout=2.0)) == "drain"
-                drain(drain_client; timeout=2.0)
+                IntegrationHelpers.publish_and_flush(drain_client, "$subject.drain", "drain"; timeout=io_timeout)
+                @test String(next(drain_sub; timeout=io_timeout)) == "drain"
+                drain(drain_client; timeout=io_timeout)
                 @test status(drain_client) == N.ConnectionStatus.CLOSED
             finally
                 close(drain_client)
@@ -122,18 +139,21 @@ using TestItems
     end
 end
 
-@testitem "real nats-server NKEY auth integration" begin
+@testitem "real nats-server NKEY auth integration" setup=[IntegrationHelpers] begin
     using Natter
     using Random
 
     if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" &&
        haskey(ENV, "NATTER_NKEY_AUTH_URL") && haskey(ENV, "NATTER_NKEY_AUTH_SEED")
-        client = connect(ENV["NATTER_NKEY_AUTH_URL"]; nkey_seed=ENV["NATTER_NKEY_AUTH_SEED"])
+        io_timeout = IntegrationHelpers.integration_timeout()
+        client = connect(ENV["NATTER_NKEY_AUTH_URL"];
+                         connect_timeout=IntegrationHelpers.integration_connect_timeout(),
+                         nkey_seed=ENV["NATTER_NKEY_AUTH_SEED"])
         try
             subject = "natter.auth.$(randstring(10))"
             sub = subscribe(client, subject)
-            publish(client, subject, "nkey")
-            @test String(next(sub; timeout=2.0)) == "nkey"
+            IntegrationHelpers.publish_and_flush(client, subject, "nkey"; timeout=io_timeout)
+            @test String(next(sub; timeout=io_timeout)) == "nkey"
         finally
             close(client)
         end
@@ -142,7 +162,7 @@ end
     end
 end
 
-@testitem "real nats-server JWT credentials auth integration" begin
+@testitem "real nats-server JWT credentials auth integration" setup=[IntegrationHelpers] begin
     using Natter
     using Random
 
@@ -152,13 +172,16 @@ end
     if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" &&
        haskey(ENV, "NATTER_JWT_AUTH_URL") &&
        (!isempty(credentials_path) || !isempty(credentials))
+        io_timeout = IntegrationHelpers.integration_timeout()
         auth_kwargs = !isempty(credentials_path) ? (; credentials_path) : (; credentials)
-        client = connect(ENV["NATTER_JWT_AUTH_URL"]; auth_kwargs...)
+        client = connect(ENV["NATTER_JWT_AUTH_URL"];
+                         connect_timeout=IntegrationHelpers.integration_connect_timeout(),
+                         auth_kwargs...)
         try
             subject = "natter.auth.jwt.$(randstring(10))"
             sub = subscribe(client, subject)
-            publish(client, subject, "jwt")
-            @test String(next(sub; timeout=2.0)) == "jwt"
+            IntegrationHelpers.publish_and_flush(client, subject, "jwt"; timeout=io_timeout)
+            @test String(next(sub; timeout=io_timeout)) == "jwt"
         finally
             close(client)
         end
@@ -167,7 +190,7 @@ end
     end
 end
 
-@testitem "real nats-server reconnect server-pool failover" begin
+@testitem "real nats-server reconnect server-pool failover" setup=[IntegrationHelpers] begin
     using Natter
     using Random
     using Sockets
@@ -285,6 +308,7 @@ end
 
     if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true"
         url = get(ENV, "NATTER_URL", "nats://127.0.0.1:4222")
+        io_timeout = IntegrationHelpers.integration_timeout()
         scheme, host, port, _, _ = N._server_parts(url)
 
         if scheme == "nats"
@@ -293,7 +317,7 @@ end
             disconnected = Ref(false)
             reconnected = Ref(false)
             client = N.connect([primary.url, secondary.url];
-                               connect_timeout=2.0,
+                               connect_timeout=IntegrationHelpers.integration_connect_timeout(),
                                ping_interval=2.0,
                                max_outstanding_pings=2,
                                reconnect_wait=0.05,
@@ -306,8 +330,8 @@ end
 
                 subject = "natter.failover.$(randstring(10))"
                 sub = subscribe(client, subject)
-                publish(client, subject, "before failover")
-                @test String(next(sub; timeout=2.0)) == "before failover"
+                IntegrationHelpers.publish_and_flush(client, subject, "before failover"; timeout=io_timeout)
+                @test String(next(sub; timeout=io_timeout)) == "before failover"
 
                 primary.stop()
                 result = timedwait(2.0; pollint=0.01) do
@@ -324,7 +348,8 @@ end
                         connected_url(client) == secondary.url
                 end
                 @test result != :timed_out
-                @test String(next(sub; timeout=2.0)) == "during failover"
+                flush(client; timeout=io_timeout)
+                @test String(next(sub; timeout=io_timeout)) == "during failover"
                 @test stats(client).reconnects >= 1
             finally
                 close(client)
@@ -339,14 +364,15 @@ end
     end
 end
 
-@testitem "real nats-server JetStream integration" setup=[TestHelpers] begin
+@testitem "real nats-server JetStream integration" setup=[TestHelpers, IntegrationHelpers] begin
     using Natter
     using Dates
     using Random
 
     if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" && get(ENV, "NATTER_RUN_JETSTREAM", "false") == "true"
         url = get(ENV, "NATTER_URL", "nats://127.0.0.1:4222")
-        client = connect(url; ping_interval=2.0, max_outstanding_pings=2)
+        connect_timeout = IntegrationHelpers.integration_connect_timeout()
+        client = connect(url; ping_interval=2.0, max_outstanding_pings=2, connect_timeout)
         js = jetstream(client)
         stream = "NATTER_$(randstring(8))"
         subject_root = "natter.js.$(randstring(8))"
@@ -426,6 +452,7 @@ end
             ack_none_subject = "$subject_root.ack-none"
             ack_none_errors = Channel{Any}(4)
             ack_none_client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
+                                      connect_timeout,
                                       error_cb=err -> put!(ack_none_errors, err))
             try
                 ack_none_js = jetstream(ack_none_client)
@@ -738,7 +765,8 @@ end
                 @test_throws KeyValueKeyExistsError kv_create_key(kv[], "alpha", "duplicate")
                 large_key = "large"
                 kv_put(kv[], large_key, repeat("x", 8192))
-                limited_client = connect(url; ping_interval=2.0, max_outstanding_pings=2, max_inbound_payload=4096)
+                limited_client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
+                                         connect_timeout, max_inbound_payload=4096)
                 try
                     limited_kv = kv_open(jetstream(limited_client), bucket)
                     @test large_key in kv_keys(limited_kv)
@@ -760,7 +788,7 @@ end
     end
 end
 
-@testitem "real nats-server JetStream fetch disconnect integration" begin
+@testitem "real nats-server JetStream fetch disconnect integration" setup=[IntegrationHelpers] begin
     using Natter
     using Random
 
@@ -770,6 +798,7 @@ end
         url = get(ENV, "NATTER_URL", "nats://127.0.0.1:4222")
         reconnected = Ref(false)
         client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
+                         connect_timeout=IntegrationHelpers.integration_connect_timeout(),
                          reconnect_wait=0.05, max_reconnect_attempts=20,
                          reconnected_cb=() -> (reconnected[] = true))
         js = jetstream(client)
@@ -811,7 +840,7 @@ end
     end
 end
 
-@testitem "real nats-server TLS first integration" begin
+@testitem "real nats-server TLS first integration" setup=[IntegrationHelpers] begin
     using Natter
     using Random
 
@@ -821,13 +850,15 @@ end
         tls_verify = lowercase(get(ENV, "NATTER_TLS_VERIFY", "true")) != "false"
         tls_verify && isempty(ca_path) && error("NATTER_TLS_CA must point to a CA certificate when NATTER_RUN_TLS=true and NATTER_TLS_VERIFY is not false")
 
-        client = connect(url; tls_verify, tls_ca_path=isempty(ca_path) ? nothing : ca_path, connect_timeout=5.0,
+        io_timeout = IntegrationHelpers.integration_timeout()
+        client = connect(url; tls_verify, tls_ca_path=isempty(ca_path) ? nothing : ca_path,
+                         connect_timeout=IntegrationHelpers.integration_connect_timeout(),
                          ping_interval=2.0, max_outstanding_pings=2)
         try
             subject = "natter.tls.$(randstring(10))"
             sub = subscribe(client, subject)
-            publish(client, subject, "secure")
-            @test String(next(sub; timeout=2.0)) == "secure"
+            IntegrationHelpers.publish_and_flush(client, subject, "secure"; timeout=io_timeout)
+            @test String(next(sub; timeout=io_timeout)) == "secure"
         finally
             close(client)
         end

@@ -347,6 +347,42 @@ function _run_with_timeout(f::Function, operation::String, timeout::Real, cleanu
     value
 end
 
+function _run_interruptible_io_with_timeout(f::Function, operation::String, timeout::Real, cleanup::Function,
+                                            report_cleanup_errors::Function=errors -> _warn_timeout_cleanup_errors(operation, errors))
+    if timeout <= 0
+        _schedule_timeout_cleanup(operation, cleanup, report_cleanup_errors)
+        throw(TimeoutError("$operation timed out"))
+    end
+
+    timed_out = Threads.Atomic{Bool}(false)
+    timer = Timer(Float64(timeout)) do _
+        timed_out[] = true
+        errors = Any[]
+        try
+            append!(errors, _cleanup_errors(cleanup()))
+        catch err
+            push!(errors, CleanupError("timeout cleanup after $operation", err))
+        end
+        if !isempty(errors)
+            try
+                report_cleanup_errors(errors)
+            catch err
+                @warn "Natter timeout cleanup error reporter failed" operation exception=(err, catch_backtrace())
+            end
+        end
+    end
+    try
+        value = f()
+        timed_out[] && throw(TimeoutError("$operation timed out"))
+        value
+    catch err
+        timed_out[] && throw(TimeoutError("$operation timed out"))
+        rethrow()
+    finally
+        close(timer)
+    end
+end
+
 _remaining_timeout(deadline::Float64)::Float64 = max(0.0, deadline - time())
 
 function _lock_write!(client::Client, operation::String, deadline)
@@ -979,7 +1015,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     try
         tls_active::Bool = false
         if _tls_first_for_connection(client.options, scheme)
-            tls = _run_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
+            tls = _run_interruptible_io_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                 _tls_wrap(sock, client.options, tls_host)
             end
             read_io = tls
@@ -987,7 +1023,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             reader = ProtocolReader(read_io)
             tls_active = true
         end
-        frame = _run_with_timeout("connect INFO read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
+        frame = _run_interruptible_io_with_timeout("connect INFO read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
             _read_control_or_msg(reader, client.options)
         end
         frame.op == :INFO || throw(ProtocolError("expected INFO during connect"))
@@ -996,7 +1032,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
         if wants_tls
             available = something(info.tls_available, info.tls_required === true)
             available == true || throw(ProtocolError("TLS requested but server did not advertise TLS availability"))
-            tls = _run_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
+            tls = _run_interruptible_io_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                 _tls_wrap(sock, client.options, tls_host)
             end
             read_io = tls
@@ -1004,20 +1040,20 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             reader = ProtocolReader(read_io)
             tls_active = true
         end
-        _run_with_timeout("connect command write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
+        _run_interruptible_io_with_timeout("connect command write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
             write(write_io, _connect_command(client, info, url_user, url_pass))
             write(write_io, "PING$CRLF")
             flush(write_io)
         end
         while true
-            frame = _run_with_timeout("connect PONG read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
+            frame = _run_interruptible_io_with_timeout("connect PONG read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                 _read_control_or_msg(reader, client.options)
             end
             op = frame.op
             if op == :PONG
                 break
             elseif op == :PING
-                _run_with_timeout("connect PONG write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
+                _run_interruptible_io_with_timeout("connect PONG write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                     write(write_io, "PONG$CRLF")
                     flush(write_io)
                 end

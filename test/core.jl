@@ -1653,6 +1653,25 @@ end
     @test thrown_error.cause === cleanup_exception
 end
 
+@testitem "interruptible IO timeout runs operation in caller task" begin
+    using Natter
+
+    const N = Natter
+
+    caller = current_task()
+    ran_inline = Ref(false)
+    cleanup_called = Ref(false)
+
+    result = N._run_interruptible_io_with_timeout("inline operation", 1.0, () -> (cleanup_called[] = true)) do
+        ran_inline[] = current_task() === caller
+        :ok
+    end
+
+    @test result == :ok
+    @test ran_inline[]
+    @test !cleanup_called[]
+end
+
 @testitem "timed operation timeout interrupts worker task" begin
     using Natter
 
