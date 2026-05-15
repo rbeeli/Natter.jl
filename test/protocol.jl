@@ -189,6 +189,42 @@ end
     @test reader.last == 0
 end
 
+@testitem "protocol reader fills TCP buffer tail directly" setup=[TestHelpers] begin
+    using Natter
+    using Sockets
+
+    const N = Natter
+
+    listener = listen(ip"127.0.0.1", 0)
+    _, port = Sockets.getsockname(listener)
+    server_task = @async begin
+        accepted = accept(listener)
+        try
+            write(accepted, TestHelpers.bytes("PING\r\nPONG\r\n"))
+            flush(accepted)
+        finally
+            close(accepted)
+        end
+    end
+
+    let client_sock = nothing
+        try
+            client_sock = Sockets.connect(ip"127.0.0.1", Int(port))
+            reader = N.ProtocolReader(client_sock; read_size=16)
+            fill!(reader.scratch, 0xaa)
+
+            @test N._read_control_or_msg(reader).op == :PING
+            @test all(==(0xaa), reader.scratch)
+            @test N._read_control_or_msg(reader).op == :PONG
+            @test all(==(0xaa), reader.scratch)
+        finally
+            isnothing(client_sock) || close(client_sock)
+            close(listener)
+            wait(server_task)
+        end
+    end
+end
+
 @testitem "protocol payload trailer is read in one chunk" setup=[TestHelpers] begin
     using Natter
 

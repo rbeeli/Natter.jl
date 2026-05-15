@@ -839,10 +839,11 @@ mutable struct BufferedWriteIO{I} <: IO
     io::I
     buffer::IOBuffer
     replayable_entries::Vector{_PendingEntry}
+    replayable_bytes::Int
     closed::Bool
 end
 
-BufferedWriteIO(io::I) where {I} = BufferedWriteIO{I}(io, IOBuffer(), _PendingEntry[], false)
+BufferedWriteIO(io::I) where {I} = BufferedWriteIO{I}(io, IOBuffer(), _PendingEntry[], 0, false)
 
 function _ensure_open(io::BufferedWriteIO)
     io.closed && throw(Base.IOError("buffered write transport is closed", 0))
@@ -913,6 +914,7 @@ function Base.flush(io::BufferedWriteIO)
     truncate(io.buffer, 0)
     seekstart(io.buffer)
     empty!(io.replayable_entries)
+    io.replayable_bytes = 0
     nothing
 end
 
@@ -931,10 +933,59 @@ function _take_replayable_writes!(io::BufferedWriteIO)
     truncate(io.buffer, 0)
     seekstart(io.buffer)
     empty!(io.replayable_entries)
+    io.replayable_bytes = 0
     replayable
 end
 _underlying_transport(io) = io
 _underlying_transport(io::BufferedWriteIO) = io.io
+
+mutable struct FlushSignal
+    event::Base.Event
+    pending::Threads.Atomic{Bool}
+    closed::Threads.Atomic{Bool}
+end
+
+FlushSignal() = FlushSignal(Base.Event(true), Threads.Atomic{Bool}(false), Threads.Atomic{Bool}(false))
+
+Base.isopen(signal::FlushSignal) = !signal.closed[]
+Base.isready(signal::FlushSignal) = signal.pending[]
+
+function Base.close(signal::FlushSignal)
+    Threads.atomic_xchg!(signal.closed, true)
+    notify(signal.event)
+    nothing
+end
+
+function _notify_flush_signal(signal::FlushSignal)::Bool
+    signal.closed[] && return false
+    was_pending = Threads.atomic_xchg!(signal.pending, true)
+    was_pending || notify(signal.event)
+    true
+end
+
+function _throw_closed_flush_signal()
+    throw(InvalidStateException("flush signal is closed", :closed))
+end
+
+function _wait_flush_signal(signal::FlushSignal)
+    while true
+        signal.closed[] && _throw_closed_flush_signal()
+        signal.pending[] && return nothing
+        wait(signal.event)
+    end
+end
+
+function _consume_flush_signal!(signal::FlushSignal)
+    signal.closed[] && _throw_closed_flush_signal()
+    Threads.atomic_xchg!(signal.pending, false)
+    nothing
+end
+
+function Base.take!(signal::FlushSignal)
+    _wait_flush_signal(signal)
+    _consume_flush_signal!(signal)
+    true
+end
 
 mutable struct PendingBuffer
     chunks::Vector{_PendingEntry}
@@ -1284,7 +1335,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     socket::Union{Sockets.TCPSocket,Nothing}
     read_io::Union{ReadIO,Nothing}
     reader::Union{ProtocolReader{<:ReadIO},Nothing}
-    write_io::Union{WriteIO,Nothing}
+    @atomic write_io::Union{WriteIO,Nothing}
     lock::ReentrantLock
     write_lock::ReentrantLock
     write_scratch::Vector{UInt8}
@@ -1294,7 +1345,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     write_timeout_io::Base.RefValue{Any}
     write_timeout_operation::Base.RefValue{String}
     write_timeout_task::Union{Task,Nothing}
-    flush_signal::Channel{Bool}
+    @atomic flush_signal::FlushSignal
     flusher_task::Union{Task,Nothing}
     sid::Int
     subscriptions::Dict{Int,Subscription{Client{Options,ReadIO,WriteIO}}}
@@ -1302,7 +1353,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     @atomic request_mux::Union{RequestMux{Client{Options,ReadIO,WriteIO}},Nothing}
     request_mux_lock::ReentrantLock
     pending::PendingBuffer
-    pending_bytes::Int
+    @atomic pending_bytes::Int
     pongs::PongWaiterQueue
     reader_task::Union{Task,Nothing}
     ping_task::Union{Task,Nothing}
@@ -1317,7 +1368,7 @@ end
 function Client(options::Options, servers::Vector{Server}, current_server::Union{Server,Nothing},
                 connected_url::Union{String,Nothing}, status::ConnectionStatus.T,
                 info::ServerInfo, socket::Union{Sockets.TCPSocket,Nothing}, read_io, write_io,
-                lock::ReentrantLock, write_lock::ReentrantLock, flush_signal::Channel{Bool},
+                lock::ReentrantLock, write_lock::ReentrantLock, flush_signal::FlushSignal,
                 flusher_task::Union{Task,Nothing}, sid::Int, subscriptions,
                 request_mux::Union{RequestMux,Nothing}, request_mux_lock::ReentrantLock,
                 pending, pending_bytes::Int, pongs::PongWaiterQueue,
@@ -1479,10 +1530,10 @@ end
 @inline _load_generation(client::Client)::Int = client.generation_value[]
 
 @inline function _replace_flush_signal_locked!(client::Client)
-    old = client.flush_signal
-    client.flush_signal = Channel{Bool}(1)
+    old = @atomic client.flush_signal
+    @atomic client.flush_signal = FlushSignal()
     isopen(old) && close(old)
-    client.flush_signal
+    @atomic client.flush_signal
 end
 
 @inline function _store_generation_locked!(client::Client, value::Int)

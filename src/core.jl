@@ -9,9 +9,8 @@ function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; bu
                    force_flush::Bool=false, deadline=nothing)
     st = status(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
-        write_mode = st == ConnectionStatus.DRAINING ? _RAW_WRITE_DRAIN : _RAW_WRITE_CONNECTED
         try
-            _write_raw(client, data; force_flush, deadline, write_mode)
+            _write_raw(client, data; force_flush, deadline, write_mode=_RAW_WRITE_DRAIN)
         catch err
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
                 if buffer_on_reconnect
@@ -64,6 +63,7 @@ function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::_Abstr
         try
             write_frame = _snapshot_publish_frame(frame)
             push!(io.replayable_entries, _PendingPublish(write_frame, bytes))
+            io.replayable_bytes += bytes
         catch
             _release_pending_bytes!(client, bytes)
             rethrow()
@@ -75,6 +75,7 @@ function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::_Abstr
         truncate(io.buffer, start - 1)
         seekend(io.buffer)
         resize!(io.replayable_entries, entry_count)
+        replayable && (io.replayable_bytes = max(0, io.replayable_bytes - bytes))
         replayable && _release_pending_bytes!(client, bytes)
         rethrow()
     end
@@ -93,16 +94,42 @@ function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flus
                         replayable::Bool=false, frame_size::Int=_serialized_size(frame))::Bool
     captured = false
     @lock client.write_lock begin
-        st, io = @lock client.lock (client.status, client.write_io)
+        st = status(client)
+        io = @atomic client.write_io
         if !(st == ConnectionStatus.CONNECTED || st == ConnectionStatus.DRAINING)
             st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
             st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
             throw(ConnectionReconnectingError())
         end
-        isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
-        captured = _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size)
+        captured = _write_publish_to_active_io(client, io, frame, force_flush, replayable, frame_size)
     end
     captured
+end
+
+@noinline function _write_publish_to_active_io(client::Client, io::Union{Nothing,DefaultWriteTransportIO},
+                                               frame::_AbstractPublishFrame, force_flush::Bool,
+                                               replayable::Bool, frame_size::Int)::Bool
+    io === nothing && throw(ConnectionClosedError("connection transport is closed"))
+
+    # connect() clients keep a union-typed field so reconnect can swap plain,
+    # TLS, and buffered transports. Split that small default union here so the
+    # hot frame writer below is compiled for concrete IO types.
+    if io isa Sockets.TCPSocket
+        return _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size)
+    elseif io isa MbedTLS.SSLContext
+        return _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size)
+    elseif io isa BufferedWriteIO{Sockets.TCPSocket}
+        return _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size)
+    else
+        return _write_publish_to_io(client, io::BufferedWriteIO{MbedTLS.SSLContext},
+                                    frame, force_flush, replayable, frame_size)
+    end
+end
+
+function _write_publish_to_active_io(client::Client, io, frame::_AbstractPublishFrame,
+                                     force_flush::Bool, replayable::Bool, frame_size::Int)::Bool
+    io === nothing && throw(ConnectionClosedError("connection transport is closed"))
+    _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size)
 end
 
 function _write_publish_to_io(client::Client, io::WriteIO, frame::_AbstractPublishFrame, force_flush::Bool,
@@ -258,7 +285,7 @@ function _enqueue_pending(client::Client, data)
         try
             _push_pending_chunk!(client.pending, _pending_chunk(data))
         catch
-            client.pending_bytes = max(0, client.pending_bytes - bytes)
+            _release_pending_bytes!(client, bytes)
             rethrow()
         end
     end

@@ -606,6 +606,34 @@ end
     end
 end
 
+@testitem "buffered publish does not wait for client lock" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    transport = TestHelpers.WriteCapture()
+    write_io = N.BufferedWriteIO(transport)
+    opts = N.ConnectOptions(write_buffer_size=1024 * 1024)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io)
+
+    lock(client.lock)
+    task = @async publish(client, "foo", "bar")
+    try
+        @test timedwait(0.2; pollint=0.001) do
+            istaskdone(task)
+        end != :timed_out
+    finally
+        unlock(client.lock)
+    end
+    fetch(task)
+    @test N._buffered_bytes(write_io) > 0
+    @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
+    @test isready(client.flush_signal)
+
+    close(client)
+end
+
 @testitem "flusher signals are scoped to connection generation" setup=[TestHelpers] begin
     using Natter
 
@@ -1136,7 +1164,7 @@ end
     replay_transport = TestHelpers.WriteCapture()
     @lock payload_client.lock begin
         N._store_status_locked!(payload_client, N.ConnectionStatus.RECONNECTING)
-        payload_client.write_io = N.BufferedWriteIO(replay_transport)
+        @atomic payload_client.write_io = N.BufferedWriteIO(replay_transport)
         payload_client.info = N.ServerInfo(; headers=true, max_payload=4)
         N._sync_server_info_cache_locked!(payload_client)
     end
@@ -2201,7 +2229,15 @@ end
     put!(sub2.messages, N.Msg("foo.2", nothing, UInt8[]; sid=sub2.sid))
     empty!(transport.writes)
 
-    @test_throws TimeoutError drain(client; timeout=0.12)
+    err = TestHelpers.thrown_exception() do
+        drain(client; timeout=0.12)
+    end
+    @test N._drain_timed_out(err)
+    if err isa CompositeException
+        @test any(e -> e isa TimeoutError, err.exceptions)
+    else
+        @test err isa TimeoutError
+    end
     @test count(startswith("UNSUB "), transport.writes) == 1
     @test count(==("PING\r\n"), transport.writes) == 1
     @test length(reported) == 1

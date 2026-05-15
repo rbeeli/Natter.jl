@@ -49,7 +49,7 @@ using TestItems
             write_io,
             ReentrantLock(),
             ReentrantLock(),
-            Channel{Bool}(1),
+            N.FlushSignal(),
             nothing,
             0,
             Dict{Int,N.Subscription}(),

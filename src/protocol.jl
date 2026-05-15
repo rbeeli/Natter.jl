@@ -158,18 +158,70 @@ function _read_some!(io, scratch::Vector{UInt8})::Int
     end
 end
 
+function _read_some_to_buffer!(io, buffer::Vector{UInt8}, offset::Int, max_bytes::Int,
+                               scratch::Vector{UInt8})::Int
+    n = _read_some!(io, scratch)
+    n == 0 && return 0
+    resize!(buffer, offset + n - 1)
+    copyto!(buffer, offset, scratch, 1, n)
+    n
+end
+
+function _read_some_to_buffer!(io::Base.LibuvStream, buffer::Vector{UInt8}, offset::Int,
+                               max_bytes::Int, scratch::Vector{UInt8})::Int
+    max_bytes > 0 || return 0
+    old = offset - 1
+    resize!(buffer, old + max_bytes)
+    n = 0
+    try
+        Base.wait_readnb(io, 1)
+        n = min(bytesavailable(io), max_bytes)
+        if n > 0
+            GC.@preserve buffer unsafe_read(io, pointer(buffer, offset), UInt(n))
+        end
+    catch
+        resize!(buffer, old)
+        rethrow()
+    end
+    resize!(buffer, old + n)
+    n
+end
+
+function _read_some_to_buffer!(io::MbedTLS.SSLContext, buffer::Vector{UInt8}, offset::Int,
+                               max_bytes::Int, scratch::Vector{UInt8})::Int
+    max_bytes > 0 || return 0
+    old = offset - 1
+    resize!(buffer, old + max_bytes)
+    n = 0
+    try
+        GC.@preserve buffer begin
+            unsafe_read(io, pointer(buffer, offset), UInt(1))
+            n = 1
+            pending = min(bytesavailable(io), max_bytes - n)
+            if pending > 0
+                unsafe_read(io, pointer(buffer, offset + n), UInt(pending))
+                n += pending
+            end
+        end
+    catch
+        resize!(buffer, old)
+        rethrow()
+    end
+    resize!(buffer, old + n)
+    n
+end
+
 function _fill_reader!(reader::ProtocolReader)
     _drop_consumed!(reader)
+    old = length(reader.buffer)
     n = try
-        _read_some!(reader.io, reader.scratch)
+        _read_some_to_buffer!(reader.io, reader.buffer, old + 1, length(reader.scratch),
+                              reader.scratch)
     catch err
         err isa EOFError || rethrow()
         throw(err)
     end
     n == 0 && throw(EOFError())
-    old = length(reader.buffer)
-    resize!(reader.buffer, old + n)
-    copyto!(reader.buffer, old + 1, reader.scratch, 1, n)
     reader.last = length(reader.buffer)
     nothing
 end

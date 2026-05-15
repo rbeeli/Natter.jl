@@ -43,7 +43,7 @@ function connect(url_or_urls=nothing; kwargs...)
         nothing,
         ReentrantLock(),
         ReentrantLock(),
-        Channel{Bool}(1),
+        FlushSignal(),
         nothing,
         0,
         Dict{Int,Subscription}(),
@@ -635,7 +635,7 @@ end
 
 function _write_timeout_transports(client::Client, io)
     @lock client.lock begin
-        write_io = client.write_io
+        write_io = @atomic client.write_io
         _write_timeout_matches(write_io, io) || return nothing, nothing, nothing
         client.read_io, write_io, client.socket
     end
@@ -784,22 +784,19 @@ function _record_reconnect!(client::Client)
     nothing
 end
 
-function _signal_flusher_locked(client::Client)
-    @lock client.lock begin
-        ch = client.flush_signal
-        isready(ch) || put!(ch, true)
-    end
+function _signal_flusher(client::Client)
+    _notify_flush_signal(@atomic client.flush_signal)
     nothing
 end
 
 function _wake_flusher(client::Client)
-    _signal_flusher_locked(client)
+    _signal_flusher(client)
     nothing
 end
 
 function _flush_buffered_writes(client::Client; allow_missing::Bool=false, deadline=nothing)
     _with_write_lock(client, "flush buffered writes"; deadline) do
-        io = @lock client.lock client.write_io
+        io = @atomic client.write_io
         if isnothing(io)
             allow_missing && return false
             throw(ConnectionClosedError("connection transport is closed"))
@@ -815,28 +812,35 @@ function _flush_buffered_writes_to_io(client::Client, io::WriteIO) where {WriteI
 end
 
 function _reserve_pending_bytes_locked!(client::Client, bytes::Int)
-    projected = client.pending_bytes + bytes
-    if projected > client.options.pending_size
-        throw(OutboundBufferLimitError(client.options.pending_size, projected))
+    bytes <= 0 && return nothing
+    limit = client.options.pending_size
+    while true
+        current = @atomic client.pending_bytes
+        projected = current + bytes
+        projected > limit && throw(OutboundBufferLimitError(limit, projected))
+        replaced = @atomicreplace client.pending_bytes current => projected
+        replaced.success && return nothing
     end
-    client.pending_bytes = projected
-    nothing
 end
 
 function _reserve_pending_bytes!(client::Client, bytes::Int)
-    @lock client.lock _reserve_pending_bytes_locked!(client, bytes)
+    _reserve_pending_bytes_locked!(client, bytes)
     nothing
 end
 
 function _release_pending_bytes!(client::Client, bytes::Int)
     bytes <= 0 && return nothing
-    @lock client.lock client.pending_bytes = max(0, client.pending_bytes - bytes)
-    nothing
+    while true
+        current = @atomic client.pending_bytes
+        updated = max(0, current - bytes)
+        replaced = @atomicreplace client.pending_bytes current => updated
+        replaced.success && return nothing
+    end
 end
 
 function _clear_pending_buffer_locked!(client::Client)
     empty!(client.pending)
-    client.pending_bytes = 0
+    @atomic client.pending_bytes = 0
     nothing
 end
 
@@ -846,9 +850,7 @@ function _clear_pending_buffer!(client::Client)
 end
 
 _replayable_bytes(::IO) = 0
-function _replayable_bytes(io::BufferedWriteIO)
-    _pending_entries_size(io.replayable_entries)
-end
+_replayable_bytes(io::BufferedWriteIO) = io.replayable_bytes
 
 function _flush_write_io(client::Client, io)
     replayed = _replayable_bytes(io)
@@ -871,6 +873,7 @@ function _flush_write_io(client::Client, io::BufferedWriteIO)
     truncate(io.buffer, 0)
     seekstart(io.buffer)
     empty!(io.replayable_entries)
+    io.replayable_bytes = 0
     _release_pending_bytes!(client, replayed)
     nothing
 end
@@ -881,7 +884,7 @@ function _flush_or_signal_locked(client::Client, io; force_flush::Bool=false)
     if force_flush || (buffered > 0 && threshold == 0) || (threshold > 0 && buffered >= threshold)
         _flush_write_io(client, io)
     elseif buffered > 0
-        _signal_flusher_locked(client)
+        _signal_flusher(client)
     end
     nothing
 end
@@ -913,7 +916,8 @@ end
 function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; force_flush::Bool=false,
                     deadline=nothing, write_mode::_RawWriteMode=_RAW_WRITE_CONNECTED)
     _with_write_lock(client, "write protocol command"; deadline) do
-        st, io = @lock client.lock (client.status, client.write_io)
+        st = @lock client.lock client.status
+        io = @atomic client.write_io
         _ensure_raw_write_status(st, write_mode)
         isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
         _write_raw_to_io(client, io, data; force_flush)
@@ -965,11 +969,11 @@ end
 
 function _take_transport_fields_locked!(client::Client)
     read_io = client.read_io
-    write_io = client.write_io
+    write_io = @atomic client.write_io
     sock = client.socket
     client.read_io = nothing
     client.reader = nothing
-    client.write_io = nothing
+    @atomic client.write_io = nothing
     client.socket = nothing
     read_io, write_io, sock
 end
@@ -1300,7 +1304,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
                     client.socket = sock
                     client.read_io = read_io
                     client.reader = reader
-                    client.write_io = _write_transport_for_options(write_io, client.options)
+                    @atomic client.write_io = _write_transport_for_options(write_io, client.options)
                     mark_connected && _store_status_locked!(client, ConnectionStatus.CONNECTED)
                     client.pings_out = 0
                     server.last_auth_error = nothing
@@ -1352,7 +1356,7 @@ function _start_flusher_task!(client::Client, generation::Int=(@lock client.lock
         if client.generation == generation &&
            client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING) &&
            (isnothing(existing) || istaskdone(existing))
-            (:start, client.flush_signal)
+            (:start, @atomic client.flush_signal)
         else
             (:skip, nothing)
         end
@@ -1385,11 +1389,11 @@ function _start_background_tasks!(client::Client, generation::Int=(@lock client.
     nothing
 end
 
-function _flusher_loop(client::Client, generation::Int, ch::Channel{Bool})
+function _flusher_loop(client::Client, generation::Int, signal::FlushSignal)
     while _generation_matches(client, generation) &&
           status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING)
         try
-            take!(ch)
+            _wait_flush_signal(signal)
         catch err
             err isa InvalidStateException && return
             _report_error(client, err)
@@ -1397,14 +1401,12 @@ function _flusher_loop(client::Client, generation::Int, ch::Channel{Bool})
         end
         latency = max(0.0, client.options.write_buffer_latency)
         latency > 0 ? sleep(latency) : yield()
-        while isready(ch)
-            try
-                take!(ch)
-            catch err
-                err isa InvalidStateException && return
-                _report_error(client, err)
-                return
-            end
+        try
+            _consume_flush_signal!(signal)
+        catch err
+            err isa InvalidStateException && return
+            _report_error(client, err)
+            return
         end
         _generation_matches(client, generation) &&
             status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING) || return
@@ -1903,7 +1905,7 @@ function _restore_pending_after_replay_failure!(client::Client, entries::Vector{
         if client.generation == generation && client.status in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTED)
             _prepend_pending_locked!(client, entries; already_counted=true)
         else
-            client.pending_bytes = max(0, client.pending_bytes - bytes)
+            _release_pending_bytes!(client, bytes)
         end
     end
     nothing
