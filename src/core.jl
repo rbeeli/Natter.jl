@@ -652,7 +652,7 @@ function _drain(sub::Subscription, deadline::Float64)
             throw(ConnectionReconnectingError())
         end
     end
-    flush(sub.client; timeout=_remaining_timeout(deadline))
+    _flush(sub.client; timeout=_remaining_timeout(deadline), deadline=deadline)
     ready = @lock sub.lock begin
         _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
             !isready(sub.messages) && sub.processing == 0
@@ -698,7 +698,7 @@ function _wait_pong_waiter!(waiter::PongWaiter, timeout::Real)
     end
 end
 
-function flush(client::Client; timeout::Real=10.0, deadline=nothing)
+function _flush(client::Client; timeout::Real=10.0, deadline=nothing)
     st = status(client)
     st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
     st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING, ConnectionStatus.DISCONNECTED) && throw(ConnectionReconnectingError())
@@ -723,6 +723,8 @@ function flush(client::Client; timeout::Real=10.0, deadline=nothing)
     result || throw(status(client) == ConnectionStatus.CLOSED ? ConnectionClosedError() : ConnectionReconnectingError())
     nothing
 end
+
+flush(client::Client; timeout::Real=10.0) = _flush(client; timeout)
 
 ping(client::Client; timeout::Real=10.0) = flush(client; timeout)
 
@@ -751,7 +753,7 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout)
     end
     if !_drain_timed_out(errors)
         try
-            flush(client; timeout=_remaining_timeout(deadline), deadline=deadline)
+            _flush(client; timeout=_remaining_timeout(deadline), deadline=deadline)
         catch err
             push!(errors, err)
             _report_error(client, err)
@@ -801,7 +803,7 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
     end
     errors = Any[]
     try
-        _wake_flusher(client; deadline)
+        _wake_flusher(client)
     catch err
         push!(errors, CleanupError("wake flusher", err))
     end
@@ -816,7 +818,6 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
         push!(errors, err)
         if _drain_timed_out(err)
             _abort_transport_for_blocked_write_lock!(client)
-            _schedule_transport_cleanup_after_lock_timeout(client)
         end
     end
     _clear_pending_buffer!(client)

@@ -43,7 +43,7 @@ Token, password, NKEY seeds, JWTs, and inline `.creds` content are stored inside
 
 For short connection security snippets, see [Connection Auth And TLS](examples/connection-auth-tls.md).
 
-`ConnectOptions` is immutable. Connection settings are frozen when options are built and the client reads them concurrently from background tasks; create a new client to change connection behavior.
+`ConnectOptions` is immutable with the exception of wipeable credentials fields. Connection settings are frozen when options are built and the client reads them concurrently from background tasks; create a new client to change connection behavior.
 
 Use `status(client)`, `stats(client)`, and `connected_url(client)` for runtime inspection.
 

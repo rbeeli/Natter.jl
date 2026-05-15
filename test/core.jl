@@ -529,6 +529,38 @@ end
     close(sub)
 end
 
+@testitem "wake flusher does not wait for write lock" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED)
+    entered = Channel{Bool}(1)
+    release = Channel{Bool}(1)
+    holder = @async begin
+        lock(client.write_lock)
+        put!(entered, true)
+        try
+            take!(release)
+        finally
+            unlock(client.write_lock)
+        end
+    end
+    take!(entered)
+
+    wake_task = @async N._wake_flusher(client)
+    try
+        @test timedwait(0.2; pollint=0.001) do
+            istaskdone(wake_task)
+        end != :timed_out
+        @test isready(client.flush_signal)
+    finally
+        put!(release, true)
+        wait(holder)
+        wait(wake_task)
+    end
+end
+
 @testitem "publish writes use buffered flusher" setup=[TestHelpers] begin
     using Natter
 
@@ -1814,6 +1846,17 @@ end
     @test count(waiter -> !waiter.active && !waiter.ready, client.pongs) == 2
 end
 
+@testitem "public flush does not expose internal deadline keyword" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED)
+
+    err = TestHelpers.thrown_exception(() -> flush(client; deadline=time() + 1.0))
+    @test err isa MethodError
+end
+
 @testitem "drain uses one timeout budget" setup=[TestHelpers] begin
     using Natter
 
@@ -2013,9 +2056,10 @@ end
     Base.flush(t::DrainWriteLockTransport) = (N._notify_pong(t.client[]); nothing)
     Base.close(::DrainWriteLockTransport) = nothing
 
+    opts = N.ConnectOptions(error_cb=err -> nothing)
     client_ref = Ref{Any}(nothing)
     transport = DrainWriteLockTransport(client_ref)
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=transport)
     client_ref[] = client
 
     entered = Channel{Bool}(1)
@@ -2031,19 +2075,29 @@ end
     end
     take!(entered)
 
-    start = time()
-    err = TestHelpers.thrown_exception(() -> drain(client; timeout=0.02))
-    elapsed = time() - start
-
-    @test N._drain_timed_out(err)
-    @test elapsed < 1.0
-    @test status(client) == N.ConnectionStatus.CLOSED
-
-    put!(release, true)
-    wait(holder)
-    @test timedwait(1.0; pollint=0.01) do
-        @lock client.lock isnothing(client.write_io)
-    end != :timed_out
+    drain_task = @async TestHelpers.thrown_exception(() -> drain(client; timeout=0.02))
+    try
+        finished = timedwait(2.0; pollint=0.01) do
+            istaskdone(drain_task)
+        end
+        @test finished != :timed_out
+        if finished != :timed_out
+            err = fetch(drain_task)
+            @test N._drain_timed_out(err)
+            @test status(client) == N.ConnectionStatus.CLOSED
+            detached = @lock client.lock begin
+                isnothing(client.read_io) &&
+                    isnothing(client.reader) &&
+                    isnothing(client.write_io) &&
+                    isnothing(client.socket)
+            end
+            @test detached
+        end
+    finally
+        put!(release, true)
+        wait(holder)
+        istaskdone(drain_task) || wait(drain_task)
+    end
 end
 
 @testitem "transport close waits for in-flight writes" setup=[TestHelpers] begin

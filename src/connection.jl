@@ -527,15 +527,15 @@ function _record_reconnect!(client::Client)
 end
 
 function _signal_flusher_locked(client::Client)
-    ch = @lock client.lock client.flush_signal
-    isready(ch) || put!(ch, true)
+    @lock client.lock begin
+        ch = client.flush_signal
+        isready(ch) || put!(ch, true)
+    end
     nothing
 end
 
-function _wake_flusher(client::Client; deadline=nothing)
-    _with_write_lock(client, "wake flusher"; deadline) do
-        _signal_flusher_locked(client)
-    end
+function _wake_flusher(client::Client)
+    _signal_flusher_locked(client)
     nothing
 end
 
@@ -684,19 +684,24 @@ function _close_transport(read_io, write_io, sock)
     errors
 end
 
+function _take_transport_fields_locked!(client::Client)
+    read_io = client.read_io
+    write_io = client.write_io
+    sock = client.socket
+    client.read_io = nothing
+    client.reader = nothing
+    client.write_io = nothing
+    client.socket = nothing
+    read_io, write_io, sock
+end
+
 function _take_transport!(client::Client; preserve_replayable::Bool=false, deadline=nothing)
     replayable = UInt8[]
     dropped_replayable = 0
     transports = _with_write_lock(client, "close transport"; deadline) do
         read_io, write_io, sock, preserve = @lock client.lock begin
-            read_io = client.read_io
-            write_io = client.write_io
-            sock = client.socket
+            read_io, write_io, sock = _take_transport_fields_locked!(client)
             preserve = preserve_replayable && client.status != ConnectionStatus.CLOSED
-            client.read_io = nothing
-            client.reader = nothing
-            client.write_io = nothing
-            client.socket = nothing
             read_io, write_io, sock, preserve
         end
         if preserve && !isnothing(write_io)
@@ -712,16 +717,9 @@ function _take_transport!(client::Client; preserve_replayable::Bool=false, deadl
 end
 
 function _abort_transport_for_blocked_write_lock!(client::Client)
-    read_io, write_io, sock = @lock client.lock (client.read_io, client.write_io, client.socket)
+    read_io, write_io, sock = @lock client.lock _take_transport_fields_locked!(client)
     errors = _close_transport(read_io, write_io, sock)
     _report_cleanup_errors(client, errors)
-    nothing
-end
-
-function _schedule_transport_cleanup_after_lock_timeout(client::Client)
-    _schedule_timeout_cleanup("close transport after write lock timeout",
-                              () -> _close_transport(_take_transport!(client)...),
-                              errors -> _report_cleanup_errors(client, errors))
     nothing
 end
 
