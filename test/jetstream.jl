@@ -293,6 +293,32 @@ end
     @test config["backoff"] == [100_000_000, 200_000_000]
 end
 
+@testitem "JetStream timeout arguments are positive finite before protocol writes" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    for invalid_timeout in (-1.0, 0.0, Inf, NaN, true)
+        capture = TestHelpers.WriteCapture()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+
+        @test_throws ArgumentError jetstream(client; timeout=invalid_timeout)
+        js = jetstream(client)
+        @test_throws ArgumentError js_publish(js, "orders.created", "payload"; timeout=invalid_timeout)
+        @test TestHelpers.capture_text(capture) == ""
+        @test isempty(client.subscriptions)
+
+        msg = N.JetStreamMsg(
+            Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0", UInt8[]),
+            client,
+        )
+        @test_throws ArgumentError ack_sync(msg; timeout=invalid_timeout)
+        @test TestHelpers.capture_text(capture) == ""
+        @test isempty(client.subscriptions)
+        @test !N._acknowledged(msg)
+    end
+end
+
 @testitem "JetStream publish options serialize supported headers" setup=[TestHelpers] begin
     using Dates
     using Natter
@@ -1500,6 +1526,12 @@ end
     @test_throws ArgumentError fetch(psub, 1; timeout=0.0)
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=-1.0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=Inf)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=NaN)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=true)
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, expires=0.0)
     @test client.pending_bytes == 0

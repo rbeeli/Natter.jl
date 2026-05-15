@@ -75,7 +75,7 @@ ConsumerInfo(stream_name::AbstractString, name::AbstractString, config::Consumer
     ConsumerInfo(String(stream_name), String(name), config, _consumer_info_push_bound(raw), raw)
 
 jetstream(client::Client; prefix::AbstractString="\$JS.API", timeout::Real=5.0) =
-    JetStreamContext(client, String(prefix), Float64(timeout))
+    JetStreamContext(client, String(prefix), _positive_timeout_seconds("timeout", timeout))
 
 const _JS_STATUS_CONTROL = 100
 const _JS_STATUS_BAD_REQUEST = 400
@@ -313,13 +313,14 @@ function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing;
                     schedule=nothing, schedule_at=nothing, schedule_every=nothing,
                     schedule_target=nothing, schedule_source=nothing, schedule_ttl=nothing,
                     schedule_timezone=nothing, retry_attempts::Integer=0, retry_wait::Real=0.25)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     hdrs = _js_publish_headers(headers; stream, expected_stream, msg_id, expected_last_sequence,
                                expected_last_subject_sequence, expected_last_subject,
                                expected_last_msg_id, ttl, schedule, schedule_at, schedule_every,
                                schedule_target, schedule_source, schedule_ttl, schedule_timezone)
     attempts = _js_publish_retry_attempts(retry_attempts)
     wait_seconds = _js_publish_retry_wait(retry_wait)
-    deadline = time() + Float64(timeout)
+    deadline = time() + timeout
     attempt = 0
     while true
         remaining = deadline - time()
@@ -1184,12 +1185,12 @@ end
 function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real, expires::Real,
                               heartbeat::Union{Nothing,Real})
     batch > 0 || throw(ArgumentError("fetch batch must be greater than zero"))
-    timeout > 0 || throw(ArgumentError("fetch timeout must be greater than zero"))
-    expires > 0 || throw(ArgumentError("fetch expires must be greater than zero"))
+    timeout = _positive_timeout_seconds("fetch timeout", timeout)
+    expires = _positive_timeout_seconds("fetch expires", expires)
     timeout > expires || throw(ArgumentError("fetch timeout must be greater than expires"))
     (@lock psub.close_lock psub.closed) && throw(ConnectionClosedError("pull subscription is closed"))
     (@lock psub.sub.lock psub.sub.closed) && throw(ConnectionClosedError("subscription is closed"))
-    _pull_fetch_heartbeat(expires, heartbeat)
+    timeout, expires, _pull_fetch_heartbeat(expires, heartbeat)
 end
 
 function _throw_pull_fetch_wait_interrupted(closed::Bool, st::ConnectionStatus.T)
@@ -1263,17 +1264,18 @@ end
 function fetch(psub::PullSubscription{C}, batch::Int=1; timeout::Real=psub.js.timeout,
                expires::Real=_pull_fetch_default_expires(timeout),
                heartbeat::Union{Nothing,Real}=nothing) where {C}
-    heartbeat_seconds = _validate_pull_fetch(psub, batch, timeout, expires, heartbeat)
+    timeout_seconds, expires_seconds, heartbeat_seconds =
+        _validate_pull_fetch(psub, batch, timeout, expires, heartbeat)
     @lock psub.fetch_lock begin
         request_subject = psub.next_subject
         heartbeat_ns = heartbeat_seconds > 0 ? _seconds_to_nanoseconds(heartbeat_seconds) : 0
-        payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(expires),
+        payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(expires_seconds),
                                               heartbeat_ns, psub.pin_id)
         reply, reply_token = _pull_fetch_reply(psub)
         _publish_pull_fetch_request(psub, request_subject, payload, reply)
         msgs = JetStreamMsg{C}[]
         sizehint!(msgs, batch)
-        deadline = time() + timeout
+        deadline = time() + timeout_seconds
         heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
         while length(msgs) < batch && time() < deadline
             wait_deadline = min(deadline, heartbeat_deadline)
@@ -1743,6 +1745,7 @@ function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing)::Nothing
 end
 
 function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::Real=1.0)::Msg
+    timeout = _positive_timeout_seconds("timeout", timeout)
     reply = _ack_reply_subject(msg)
     payload = _ack_payload(kind; delay)
     terminal = _ack_terminal(kind)

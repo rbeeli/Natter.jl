@@ -331,6 +331,15 @@ function _connect_option_positive_float(name::String, value)::Float64
     result
 end
 
+function _positive_timeout_seconds(name::AbstractString, value)::Float64
+    value isa Real && !(value isa Bool) ||
+        throw(ArgumentError("$name must be a positive finite number of seconds"))
+    seconds = Float64(value)
+    isfinite(seconds) && seconds > 0 ||
+        throw(ArgumentError("$name must be a positive finite number of seconds"))
+    seconds
+end
+
 function _connect_option_nonnegative_float(name::String, value)::Float64
     result = _connect_option_float(name, value)
     result >= 0 || throw(ArgumentError("$name must be non-negative"))

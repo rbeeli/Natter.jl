@@ -161,7 +161,7 @@ publish(client, "events.created", "payload")
 flush(client; timeout=2.0)
 ```
 
-`drain(sub)` unsubscribes and waits for queued callback work to finish. Its `timeout` is one overall deadline for the unsubscribe flush and callback work. `drain(client)` shares the same deadline across all subscriptions and the final flush, then closes the client.
+`drain(sub)` unsubscribes and waits for queued callback work to finish. Its `timeout` is one overall deadline for the unsubscribe flush and callback work. `drain(client)` shares the same deadline across all subscriptions and the final flush, then closes the client. Timeout values are positive finite seconds and are validated before protocol commands are sent.
 
 ```julia
 drain(client; timeout=10.0)

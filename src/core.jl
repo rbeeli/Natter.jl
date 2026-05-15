@@ -558,7 +558,8 @@ end
 
 function next(sub::Subscription; timeout::Real=1.0)
     _ensure_sync_subscription(sub)
-    deadline = time() + Float64(timeout)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     while true
         msg = _take_subscription_msg_if_ready!(sub)
         !isnothing(msg) && return msg
@@ -633,7 +634,7 @@ end
 
 close(sub::Subscription) = unsubscribe(sub)
 
-_drain_deadline(timeout::Real)::Float64 = time() + Float64(timeout)
+_drain_deadline(timeout::Real)::Float64 = time() + _positive_timeout_seconds("timeout", timeout)
 _drain_timed_out(err)::Bool =
     err isa TimeoutError ||
     (err isa CleanupError && _drain_timed_out(err.cause)) ||
@@ -646,8 +647,9 @@ function _drain(sub::Subscription, deadline::Float64)
     status(sub.client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING) || throw(ConnectionReconnectingError())
     if active
         try
-            _write_raw(sub.client, _unsub_cmd(sid))
+            _write_raw(sub.client, _unsub_cmd(sid); deadline=deadline)
         catch err
+            _drain_timed_out(err) && rethrow()
             _recover_after_write_failure!(sub.client, err) || rethrow()
             throw(ConnectionReconnectingError())
         end
@@ -699,10 +701,11 @@ function _wait_pong_waiter!(waiter::PongWaiter, timeout::Real)
 end
 
 function _flush(client::Client; timeout::Real=10.0, deadline=nothing)
+    wait_timeout = isnothing(deadline) ? _positive_timeout_seconds("timeout", timeout) :
+                   min(Float64(timeout), _remaining_timeout(deadline))
     st = status(client)
     st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
     st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING, ConnectionStatus.DISCONNECTED) && throw(ConnectionReconnectingError())
-    wait_timeout = isnothing(deadline) ? timeout : min(Float64(timeout), _remaining_timeout(deadline))
     waiter = PongWaiter(Base.Threads.Condition(client.lock))
     @lock client.lock push!(client.pongs, waiter)
     try
@@ -976,6 +979,7 @@ function _ensure_request_timeout_task_locked!(client::C, mux::RequestMux{C}) whe
 end
 
 function _register_request_waiter!(client::C, mux::RequestMux{C}, timeout::Real) where {C<:Client}
+    timeout = _positive_timeout_seconds("timeout", timeout)
     st = status(client)
     st == ConnectionStatus.CONNECTED || _throw_not_connected_for_request(st)
     sub_active = @lock mux.sub.lock !mux.sub.closed && mux.sub.server_active
@@ -1036,6 +1040,7 @@ function _wait_request_reply(mux::RequestMux, waiter::RequestWaiter, timeout::Re
 end
 
 function _request_raw(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0, headers=nothing)
+    timeout = _positive_timeout_seconds("timeout", timeout)
     request_frame = _prepare_publish_frame(subject, data, nothing, headers)
     _ensure_connected_for_request(client)
     _validate_publish_frame_for_client(client, request_frame)

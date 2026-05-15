@@ -1,6 +1,6 @@
 # Reference
 
-This page summarizes the public API. Optional keyword defaults are documented in the guide pages when behavior matters.
+This page summarizes the public API. Optional keyword defaults are documented in the guide pages when behavior matters. Timeout keyword values are positive finite seconds.
 
 ## Core Types
 

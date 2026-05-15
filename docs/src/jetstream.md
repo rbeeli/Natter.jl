@@ -1,6 +1,6 @@
 # JetStream
 
-JetStream support is exposed through a `JetStreamContext` created from a connected client.
+JetStream support is exposed through a `JetStreamContext` created from a connected client. Timeout values are positive finite seconds.
 
 ```julia
 client = connect("nats://127.0.0.1:4222")

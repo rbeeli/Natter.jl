@@ -106,6 +106,48 @@ using TestItems
     @test_throws ConnectionClosedError subscribe(closed, "foo")
 end
 
+@testitem "core timeout arguments are validated before protocol writes" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    for invalid_timeout in (-1.0, 0.0, Inf, NaN, true)
+        request_capture = TestHelpers.WriteCapture()
+        request_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                                 write_io=request_capture)
+        @test_throws ArgumentError request(request_client, "svc", "body"; timeout=invalid_timeout)
+        @test TestHelpers.capture_text(request_capture) == ""
+        @test isempty(request_client.subscriptions)
+        @test request_client.pending_bytes == 0
+
+        flush_capture = TestHelpers.WriteCapture()
+        flush_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                               write_io=flush_capture)
+        @test_throws ArgumentError flush(flush_client; timeout=invalid_timeout)
+        @test TestHelpers.capture_text(flush_capture) == ""
+        @test isempty(flush_client.pongs)
+
+        sub_drain_capture = TestHelpers.WriteCapture()
+        sub_drain_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                                   write_io=sub_drain_capture)
+        sub = subscribe(sub_drain_client, "foo")
+        TestHelpers.clear_capture!(sub_drain_capture)
+        @test_throws ArgumentError drain(sub; timeout=invalid_timeout)
+        @test TestHelpers.capture_text(sub_drain_capture) == ""
+        close(sub_drain_client)
+
+        client_drain_capture = TestHelpers.WriteCapture()
+        client_drain_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                                      write_io=client_drain_capture)
+        subscribe(client_drain_client, "bar")
+        TestHelpers.clear_capture!(client_drain_capture)
+        @test_throws ArgumentError drain(client_drain_client; timeout=invalid_timeout)
+        @test TestHelpers.capture_text(client_drain_capture) == ""
+        @test status(client_drain_client) == N.ConnectionStatus.CONNECTED
+        close(client_drain_client)
+    end
+end
+
 @testitem "core APIs accept abstract strings and callable objects" setup=[TestHelpers] begin
     using Natter
 
@@ -2060,6 +2102,107 @@ end
     @test timedwait(1.0; pollint=0.01) do
         isready(stopped)
     end != :timed_out
+end
+
+@testitem "subscription drain deadline covers active UNSUB write lock wait" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct ActiveDrainWriteLockTransport <: IO
+        writes::Vector{String}
+    end
+    Base.write(t::ActiveDrainWriteLockTransport, data::Vector{UInt8}) = (push!(t.writes, String(copy(data))); length(data))
+    Base.write(t::ActiveDrainWriteLockTransport, data::String) = (push!(t.writes, data); ncodeunits(data))
+    Base.flush(::ActiveDrainWriteLockTransport) = nothing
+    Base.close(::ActiveDrainWriteLockTransport) = nothing
+
+    opts = N.ConnectOptions(error_cb=err -> nothing)
+    transport = ActiveDrainWriteLockTransport(String[])
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    sub = subscribe(client, "drain.active")
+    @test (@lock sub.lock sub.server_active)
+
+    entered = Channel{Bool}(1)
+    release = Channel{Bool}(1)
+    holder = @async begin
+        lock(client.write_lock)
+        put!(entered, true)
+        try
+            take!(release)
+        finally
+            unlock(client.write_lock)
+        end
+    end
+    take!(entered)
+
+    drain_task = @async TestHelpers.thrown_exception(() -> drain(sub; timeout=0.02))
+    try
+        finished = timedwait(2.0; pollint=0.01) do
+            istaskdone(drain_task)
+        end
+        @test finished != :timed_out
+        if finished != :timed_out
+            err = fetch(drain_task)
+            @test err isa TimeoutError
+            @test status(client) == N.ConnectionStatus.CONNECTED
+        end
+    finally
+        put!(release, true)
+        wait(holder)
+        istaskdone(drain_task) || wait(drain_task)
+        close(client)
+    end
+end
+
+@testitem "client drain deadline covers active subscription UNSUB write lock wait" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct ActiveClientDrainWriteLockTransport <: IO
+        writes::Vector{String}
+    end
+    Base.write(t::ActiveClientDrainWriteLockTransport, data::Vector{UInt8}) = (push!(t.writes, String(copy(data))); length(data))
+    Base.write(t::ActiveClientDrainWriteLockTransport, data::String) = (push!(t.writes, data); ncodeunits(data))
+    Base.flush(::ActiveClientDrainWriteLockTransport) = nothing
+    Base.close(::ActiveClientDrainWriteLockTransport) = nothing
+
+    opts = N.ConnectOptions(error_cb=err -> nothing)
+    transport = ActiveClientDrainWriteLockTransport(String[])
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    sub = subscribe(client, "drain.client.active")
+    @test (@lock sub.lock sub.server_active)
+
+    entered = Channel{Bool}(1)
+    release = Channel{Bool}(1)
+    holder = @async begin
+        lock(client.write_lock)
+        put!(entered, true)
+        try
+            take!(release)
+        finally
+            unlock(client.write_lock)
+        end
+    end
+    take!(entered)
+
+    drain_task = @async TestHelpers.thrown_exception(() -> drain(client; timeout=0.02))
+    try
+        finished = timedwait(2.0; pollint=0.01) do
+            istaskdone(drain_task)
+        end
+        @test finished != :timed_out
+        if finished != :timed_out
+            err = fetch(drain_task)
+            @test N._drain_timed_out(err)
+            @test status(client) == N.ConnectionStatus.CLOSED
+        end
+    finally
+        put!(release, true)
+        wait(holder)
+        istaskdone(drain_task) || wait(drain_task)
+    end
 end
 
 @testitem "client drain deadline covers write lock waits" setup=[TestHelpers] begin
