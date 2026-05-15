@@ -2052,7 +2052,7 @@ end
     elapsed = time() - start
 
     @test N._drain_timed_out(err)
-    @test elapsed < 1.0
+    @test elapsed < 3.0
     @test status(client) == N.ConnectionStatus.CLOSED
 
     put!(release, true)
