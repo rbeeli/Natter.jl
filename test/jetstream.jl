@@ -328,6 +328,14 @@ end
         @test isempty(client.subscriptions)
         @test !N._acknowledged(msg)
     end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    @test_throws ArgumentError stream_list(js; offset=-1)
+    @test_throws ArgumentError consumer_list(js, "ORDERS"; offset=-1)
+    @test TestHelpers.capture_text(capture) == ""
+    @test isempty(client.subscriptions)
 end
 
 @testitem "JetStream publish options serialize supported headers" setup=[TestHelpers] begin
@@ -1585,6 +1593,16 @@ end
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, no_wait=1)
     @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, min_pending=0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, min_ack_pending=true)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, priority_group="")
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, priority=10, priority_group="workers")
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, min_pending=1)
+    @test client.pending_bytes == 0
 
     close(psub)
     @test_throws ConnectionClosedError fetch(psub, 1; timeout=1.0)
@@ -1624,12 +1642,18 @@ end
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
                                     sid=core_sub.sid))
-        @test isempty(fetch(psub, 10; timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true))
+        @test isempty(fetch(psub, 10; timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true,
+                            min_pending=4, min_ack_pending=5, priority_group="workers",
+                            priority=2))
         payload = pull_request_payload(String(take!(client.write_io)))
         @test payload["batch"] == 10
         @test payload["max_bytes"] == 256
         @test payload["no_wait"] == true
         @test payload["expires"] == 9_000_000_000
+        @test payload["min_pending"] == 4
+        @test payload["min_ack_pending"] == 5
+        @test payload["group"] == "workers"
+        @test payload["priority"] == 2
     finally
         close(psub)
     end
@@ -1699,6 +1723,9 @@ end
     @test_throws ArgumentError messages(psub; batch=2, max_bytes=10, threshold_bytes=11)
     @test_throws ArgumentError messages(psub; batch=1, channel_size=0)
     @test_throws ArgumentError messages(psub; batch=1, stop_after=0)
+    @test_throws ArgumentError messages(psub; batch=1, min_pending=1)
+    @test_throws ArgumentError messages(psub; batch=1, priority_group="bad group")
+    @test_throws ArgumentError messages(psub; batch=1, priority=-1, priority_group="workers")
 
     stream = messages(psub; batch=1, expires=1.0, heartbeat=0, stop_after=1)
     try
@@ -1750,6 +1777,57 @@ end
         @test String(take!(stream)) == "three"
         wait(stream)
         @test !psub.active_stream
+    finally
+        close(stream)
+        close(psub)
+    end
+end
+
+@testitem "JetStream continuous pull refills from buffered capacity" setup=[TestHelpers] begin
+    using Natter
+    using JSON3
+
+    const N = Natter
+
+    function request_payloads(capture)
+        [JSON3.read(m.match) for m in eachmatch(r"\{[^\r\n]+\}", TestHelpers.capture_text(capture))]
+    end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull.*")
+    TestHelpers.clear_capture!(capture)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+
+    stream = messages(psub; batch=2, expires=1.0, heartbeat=0, threshold_messages=1,
+                      channel_size=1, stop_after=2, min_pending=3,
+                      min_ack_pending=4, priority_group="workers", priority=1)
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            length(request_payloads(capture)) >= 1
+        end != :timed_out
+        first_payload = first(request_payloads(capture))
+        @test first_payload["batch"] == 1
+        @test first_payload["min_pending"] == 3
+        @test first_payload["min_ack_pending"] == 4
+        @test first_payload["group"] == "workers"
+        @test first_payload["priority"] == 1
+
+        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one");
+                                    sid=core_sub.sid))
+        @test timedwait(1.0; pollint=0.001) do
+            isready(stream.messages)
+        end != :timed_out
+        @test timedwait(0.1; pollint=0.001) do
+            length(request_payloads(capture)) >= 2
+        end == :timed_out
+
+        @test String(take!(stream)) == "one"
+        @test timedwait(1.0; pollint=0.001) do
+            length(request_payloads(capture)) >= 2
+        end != :timed_out
+        @test last(request_payloads(capture))["batch"] == 1
     finally
         close(stream)
         close(psub)

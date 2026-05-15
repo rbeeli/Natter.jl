@@ -469,6 +469,7 @@ stream_info(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout
     _stream_info(_api_request(js, "$(js.prefix).STREAM.INFO.$(_validate_api_name("stream", name))", ""; timeout))
 
 function stream_list(js::JetStreamContext; offset::Int=0, timeout::Real=js.timeout)
+    offset = _nonnegative_int_option("stream list offset", offset)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     streams = StreamInfo[]
@@ -775,6 +776,7 @@ consumer_info(js::JetStreamContext, stream::AbstractString, consumer::AbstractSt
 
 function consumer_list(js::JetStreamContext, stream::AbstractString; offset::Int=0, timeout::Real=js.timeout)
     stream = _validate_api_name("stream", stream)
+    offset = _nonnegative_int_option("consumer list offset", offset)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     consumers = ConsumerInfo[]
@@ -1029,15 +1031,47 @@ end
 _pull_fetch_next_subject(js::JetStreamContext, stream::AbstractString, consumer::AbstractString)::String =
     string(js.prefix, ".CONSUMER.MSG.NEXT.", stream, ".", consumer)
 
+mutable struct _PullStreamRequest
+    token::Union{String,Nothing}
+    remaining_messages::Int
+    remaining_bytes::Union{Int,Nothing}
+end
+
+struct _PullStreamConfig
+    batch::Int
+    max_bytes::Union{Int,Nothing}
+    expires::Float64
+    heartbeat::Float64
+    threshold_messages::Int
+    threshold_bytes::Union{Int,Nothing}
+    min_pending::Union{Int,Nothing}
+    min_ack_pending::Union{Int,Nothing}
+    priority_group::Union{String,Nothing}
+    priority::Union{Int,Nothing}
+    stop_after::Union{Int,Nothing}
+    channel_size::Int
+end
+
 function _pull_fetch_request_payload(batch::Int, expires_ns::Int, heartbeat_ns::Int,
                                      max_bytes::Union{Int,Nothing}, no_wait::Bool,
-                                     pin_id::Union{String,Nothing})::String
+                                     pin_id::Union{String,Nothing},
+                                     min_pending::Union{Int,Nothing},
+                                     min_ack_pending::Union{Int,Nothing},
+                                     priority_group::Union{String,Nothing},
+                                     priority::Union{Int,Nothing})::String
     io = IOBuffer()
     print(io, "{\"batch\":", batch)
     isnothing(max_bytes) || print(io, ",\"max_bytes\":", max_bytes)
     expires_ns > 0 && print(io, ",\"expires\":", expires_ns)
     heartbeat_ns > 0 && print(io, ",\"idle_heartbeat\":", heartbeat_ns)
     no_wait && print(io, ",\"no_wait\":true")
+    isnothing(min_pending) || print(io, ",\"min_pending\":", min_pending)
+    isnothing(min_ack_pending) || print(io, ",\"min_ack_pending\":", min_ack_pending)
+    if !isnothing(priority_group)
+        print(io, ",\"group\":")
+        JSON3.write(io, priority_group)
+    end
+    isnothing(priority) || print(io, ",\"priority\":", priority)
     if !isnothing(pin_id)
         print(io, ",\"pin_id\":")
         JSON3.write(io, pin_id)
@@ -1050,9 +1084,14 @@ mutable struct _PullMessageStreamState
     lock::ReentrantLock
     closed::Bool
     error::Union{Exception,Nothing}
+    requests::Vector{_PullStreamRequest}
+    delivered::Int
+    buffered_messages::Int
+    buffered_bytes::Int
 end
 
-_PullMessageStreamState() = _PullMessageStreamState(ReentrantLock(), false, nothing)
+_PullMessageStreamState() = _PullMessageStreamState(ReentrantLock(), false, nothing,
+                                                    _PullStreamRequest[], 0, 0, 0)
 
 mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
     js::J
@@ -1074,6 +1113,7 @@ end
 mutable struct PullMessageStream{C<:Client,P<:PullSubscription{C}}
     subscription::P
     messages::Channel{JetStreamMsg{C}}
+    config::_PullStreamConfig
     task::Task
     callback_task::Union{Task,Nothing}
     state::_PullMessageStreamState
@@ -1371,9 +1411,43 @@ function _positive_int_option(name::AbstractString, value)::Int
     Int(value)
 end
 
+function _nonnegative_int_option(name::AbstractString, value)::Int
+    value isa Bool && throw(ArgumentError("$name must be a non-negative integer"))
+    value isa Integer || throw(ArgumentError("$name must be a non-negative integer"))
+    0 <= value <= typemax(Int) || throw(ArgumentError("$name must be a non-negative integer"))
+    Int(value)
+end
+
 function _optional_positive_int_option(name::AbstractString, value)::Union{Int,Nothing}
     isnothing(value) && return nothing
     _positive_int_option(name, value)
+end
+
+function _optional_pull_priority(value)::Union{Int,Nothing}
+    isnothing(value) && return nothing
+    value isa Bool && throw(ArgumentError("pull priority must be an integer from 0 to 9"))
+    value isa Integer || throw(ArgumentError("pull priority must be an integer from 0 to 9"))
+    0 <= value <= 9 || throw(ArgumentError("pull priority must be an integer from 0 to 9"))
+    Int(value)
+end
+
+function _validate_pull_priority_group(value)::Union{String,Nothing}
+    isnothing(value) && return nothing
+    group = _validate_queue(value)
+    group
+end
+
+function _validate_pull_request_scheduling(prefix::AbstractString, min_pending, min_ack_pending,
+                                           priority_group, priority)
+    min_pending = _optional_positive_int_option("$prefix min_pending", min_pending)
+    min_ack_pending = _optional_positive_int_option("$prefix min_ack_pending", min_ack_pending)
+    priority_group = _validate_pull_priority_group(priority_group)
+    priority = _optional_pull_priority(priority)
+    if isnothing(priority_group) &&
+       (!isnothing(min_pending) || !isnothing(min_ack_pending) || !isnothing(priority))
+        throw(ArgumentError("$prefix priority_group is required with min_pending, min_ack_pending, or priority"))
+    end
+    min_pending, min_ack_pending, priority_group, priority
 end
 
 function _bool_option(name::AbstractString, value)::Bool
@@ -1421,15 +1495,20 @@ function _end_pull_stream!(psub::PullSubscription)
 end
 
 function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real, expires::Real,
-                              heartbeat::Union{Nothing,Real}, max_bytes, no_wait)
+                              heartbeat::Union{Nothing,Real}, max_bytes, no_wait,
+                              min_pending, min_ack_pending, priority_group, priority)
     batch > 0 || throw(ArgumentError("fetch batch must be greater than zero"))
     max_bytes = _optional_positive_int_option("fetch max_bytes", max_bytes)
     no_wait = _bool_option("fetch no_wait", no_wait)
     timeout = _positive_timeout_seconds("fetch timeout", timeout)
     expires = _positive_timeout_seconds("fetch expires", expires)
     timeout > expires || throw(ArgumentError("fetch timeout must be greater than expires"))
+    min_pending, min_ack_pending, priority_group, priority =
+        _validate_pull_request_scheduling("fetch", min_pending, min_ack_pending,
+                                          priority_group, priority)
     _check_pull_subscription_open(psub)
-    timeout, expires, _pull_fetch_heartbeat(expires, heartbeat), max_bytes, no_wait
+    timeout, expires, _pull_fetch_heartbeat(expires, heartbeat), max_bytes, no_wait,
+        min_pending, min_ack_pending, priority_group, priority
 end
 
 function _throw_pull_fetch_wait_interrupted(closed::Bool, st::ConnectionStatus.T)
@@ -1503,9 +1582,12 @@ end
 function fetch(psub::PullSubscription{C}, batch::Int=1; timeout::Real=psub.js.timeout,
                expires::Real=_pull_fetch_default_expires(timeout),
                heartbeat::Union{Nothing,Real}=nothing, max_bytes=nothing,
-               no_wait=false) where {C}
-    timeout_seconds, expires_seconds, heartbeat_seconds, max_bytes_int, no_wait_bool =
-        _validate_pull_fetch(psub, batch, timeout, expires, heartbeat, max_bytes, no_wait)
+               no_wait=false, min_pending=nothing, min_ack_pending=nothing,
+               priority_group=nothing, priority=nothing) where {C}
+    timeout_seconds, expires_seconds, heartbeat_seconds, max_bytes_int, no_wait_bool,
+        min_pending, min_ack_pending, priority_group, priority =
+        _validate_pull_fetch(psub, batch, timeout, expires, heartbeat, max_bytes, no_wait,
+                             min_pending, min_ack_pending, priority_group, priority)
     _begin_pull_fetch!(psub)
     try
         @lock psub.fetch_lock begin
@@ -1513,7 +1595,9 @@ function fetch(psub::PullSubscription{C}, batch::Int=1; timeout::Real=psub.js.ti
             request_subject = psub.next_subject
             heartbeat_ns = heartbeat_seconds > 0 ? _seconds_to_nanoseconds(heartbeat_seconds) : 0
             payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(expires_seconds),
-                                                  heartbeat_ns, max_bytes_int, no_wait_bool, psub.pin_id)
+                                                  heartbeat_ns, max_bytes_int, no_wait_bool, psub.pin_id,
+                                                  min_pending, min_ack_pending,
+                                                  priority_group, priority)
             reply, reply_token = _pull_fetch_reply(psub)
             _publish_pull_fetch_request(psub, request_subject, payload, reply)
             msgs = JetStreamMsg{C}[]
@@ -1562,22 +1646,6 @@ end
 
 struct _PullStreamClosed <: Exception end
 
-mutable struct _PullStreamRequest
-    token::Union{String,Nothing}
-    remaining_messages::Int
-    remaining_bytes::Union{Int,Nothing}
-end
-
-struct _PullStreamConfig
-    batch::Int
-    max_bytes::Union{Int,Nothing}
-    expires::Float64
-    heartbeat::Float64
-    threshold_messages::Int
-    threshold_bytes::Union{Int,Nothing}
-    stop_after::Union{Int,Nothing}
-end
-
 function _pull_stream_closed(state::_PullMessageStreamState)::Bool
     @lock state.lock state.closed
 end
@@ -1611,14 +1679,17 @@ end
 
 function _validate_pull_messages(psub::PullSubscription, batch::Int, max_bytes, expires::Real,
                                  heartbeat::Union{Nothing,Real}, threshold_messages,
-                                 threshold_bytes, channel_size, stop_after)::Tuple{_PullStreamConfig,Int}
+                                 threshold_bytes, channel_size, stop_after,
+                                 min_pending, min_ack_pending, priority_group,
+                                 priority)::Tuple{_PullStreamConfig,Int}
     batch > 0 || throw(ArgumentError("messages batch must be greater than zero"))
     max_bytes = _optional_positive_int_option("messages max_bytes", max_bytes)
     expires = _positive_timeout_seconds("messages expires", expires)
     heartbeat = _pull_fetch_heartbeat(expires, heartbeat)
+    channel_size = _positive_int_option("messages channel_size", channel_size)
     threshold_messages =
-        isnothing(threshold_messages) ? max(1, batch ÷ 2) :
-        _pull_stream_threshold("messages threshold_messages", threshold_messages, batch)
+        isnothing(threshold_messages) ? max(1, min(batch, channel_size) ÷ 2) :
+        _pull_stream_threshold("messages threshold_messages", threshold_messages, channel_size)
     if isnothing(max_bytes)
         isnothing(threshold_bytes) ||
             throw(ArgumentError("messages threshold_bytes requires max_bytes"))
@@ -1628,11 +1699,14 @@ function _validate_pull_messages(psub::PullSubscription, batch::Int, max_bytes, 
             isnothing(threshold_bytes) ? max(1, max_bytes ÷ 2) :
             _pull_stream_threshold("messages threshold_bytes", threshold_bytes, max_bytes)
     end
-    channel_size = _positive_int_option("messages channel_size", channel_size)
     stop_after = _optional_positive_int_option("messages stop_after", stop_after)
+    min_pending, min_ack_pending, priority_group, priority =
+        _validate_pull_request_scheduling("messages", min_pending, min_ack_pending,
+                                          priority_group, priority)
     _check_pull_subscription_open(psub)
     _PullStreamConfig(batch, max_bytes, expires, heartbeat, threshold_messages,
-                      threshold_bytes, stop_after), channel_size
+                      threshold_bytes, min_pending, min_ack_pending, priority_group,
+                      priority, stop_after, channel_size), channel_size
 end
 
 function _next_pull_stream_msg(stream::PullMessageStream, timeout::Real)
@@ -1663,26 +1737,7 @@ function _next_pull_stream_msg(stream::PullMessageStream, timeout::Real)
     end
 end
 
-function _pull_stream_request_batch(config::_PullStreamConfig, delivered::Int)::Int
-    isnothing(config.stop_after) && return config.batch
-    remaining = config.stop_after - delivered
-    remaining <= 0 ? 0 : min(config.batch, remaining)
-end
-
-function _publish_pull_stream_request!(psub::PullSubscription, config::_PullStreamConfig,
-                                       requests::Vector{_PullStreamRequest}, delivered::Int)::Bool
-    batch = _pull_stream_request_batch(config, delivered)
-    batch > 0 || return false
-    heartbeat_ns = config.heartbeat > 0 ? _seconds_to_nanoseconds(config.heartbeat) : 0
-    payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(config.expires),
-                                          heartbeat_ns, config.max_bytes, false, psub.pin_id)
-    reply, token = _pull_fetch_reply(psub)
-    _publish_pull_fetch_request(psub, psub.next_subject, payload, reply)
-    push!(requests, _PullStreamRequest(token, batch, config.max_bytes))
-    true
-end
-
-function _pull_stream_pending_messages(requests::Vector{_PullStreamRequest})::Int
+function _pull_stream_requested_messages(requests::Vector{_PullStreamRequest})::Int
     pending = 0
     @inbounds for request in requests
         pending += request.remaining_messages
@@ -1690,7 +1745,7 @@ function _pull_stream_pending_messages(requests::Vector{_PullStreamRequest})::In
     pending
 end
 
-function _pull_stream_pending_bytes(requests::Vector{_PullStreamRequest})::Int
+function _pull_stream_requested_bytes(requests::Vector{_PullStreamRequest})::Int
     pending = 0
     @inbounds for request in requests
         bytes = request.remaining_bytes
@@ -1699,12 +1754,61 @@ function _pull_stream_pending_bytes(requests::Vector{_PullStreamRequest})::Int
     pending
 end
 
+function _pull_stream_pending_messages(state::_PullMessageStreamState)::Int
+    state.buffered_messages + _pull_stream_requested_messages(state.requests)
+end
+
+function _pull_stream_pending_bytes(state::_PullMessageStreamState)::Int
+    state.buffered_bytes + _pull_stream_requested_bytes(state.requests)
+end
+
+function _pull_stream_request_batch(config::_PullStreamConfig,
+                                    state::_PullMessageStreamState)::Int
+    requested = _pull_stream_requested_messages(state.requests)
+    available = config.channel_size - state.buffered_messages - requested
+    available > 0 || return 0
+    batch = min(config.batch, available)
+    if !isnothing(config.stop_after)
+        remaining = (config.stop_after::Int) - state.delivered - requested
+        remaining > 0 || return 0
+        batch = min(batch, remaining)
+    end
+    batch
+end
+
+function _pull_stream_request_max_bytes(config::_PullStreamConfig,
+                                        state::_PullMessageStreamState)::Union{Int,Nothing}
+    isnothing(config.max_bytes) && return nothing
+    remaining = (config.max_bytes::Int) - _pull_stream_pending_bytes(state)
+    remaining > 0 ? remaining : 0
+end
+
 function _pull_stream_should_refill(config::_PullStreamConfig,
-                                    requests::Vector{_PullStreamRequest})::Bool
-    isempty(requests) && return true
-    _pull_stream_pending_messages(requests) <= config.threshold_messages && return true
+                                    state::_PullMessageStreamState)::Bool
+    _pull_stream_pending_messages(state) <= config.threshold_messages && return true
     !isnothing(config.threshold_bytes) &&
-        _pull_stream_pending_bytes(requests) <= (config.threshold_bytes::Int)
+        _pull_stream_pending_bytes(state) <= (config.threshold_bytes::Int)
+end
+
+function _publish_pull_stream_request!(psub::PullSubscription, config::_PullStreamConfig,
+                                       state::_PullMessageStreamState)::Bool
+    @lock state.lock begin
+        state.closed && return false
+        _pull_stream_should_refill(config, state) || return false
+        batch = _pull_stream_request_batch(config, state)
+        batch > 0 || return false
+        max_bytes = _pull_stream_request_max_bytes(config, state)
+        max_bytes === 0 && return false
+        heartbeat_ns = config.heartbeat > 0 ? _seconds_to_nanoseconds(config.heartbeat) : 0
+        payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(config.expires),
+                                              heartbeat_ns, max_bytes, false, psub.pin_id,
+                                              config.min_pending, config.min_ack_pending,
+                                              config.priority_group, config.priority)
+        reply, token = _pull_fetch_reply(psub)
+        _publish_pull_fetch_request(psub, psub.next_subject, payload, reply)
+        push!(state.requests, _PullStreamRequest(token, batch, max_bytes))
+        true
+    end
 end
 
 function _pull_stream_find_request(requests::Vector{_PullStreamRequest}, subject::AbstractString)::Int
@@ -1715,6 +1819,10 @@ function _pull_stream_find_request(requests::Vector{_PullStreamRequest}, subject
 end
 
 function _pull_stream_msg_bytes(msg::Msg)::Int
+    max(1, msg.header_bytes + length(msg.data))
+end
+
+function _pull_stream_msg_bytes(msg::JetStreamMsg)::Int
     max(1, msg.header_bytes + length(msg.data))
 end
 
@@ -1733,11 +1841,8 @@ function _pull_stream_decrement_request!(requests::Vector{_PullStreamRequest}, m
     nothing
 end
 
-function _pull_stream_maybe_refill!(psub::PullSubscription, config::_PullStreamConfig,
-                                    requests::Vector{_PullStreamRequest}, delivered::Int)
-    _pull_stream_should_refill(config, requests) ||
-        return nothing
-    _publish_pull_stream_request!(psub, config, requests, delivered)
+function _pull_stream_maybe_refill!(stream::PullMessageStream, config::_PullStreamConfig=stream.config)
+    _publish_pull_stream_request!(stream.subscription, config, stream.state)
     nothing
 end
 
@@ -1745,21 +1850,26 @@ function _pull_stream_put!(stream::PullMessageStream{C}, msg::Msg)::Int where {C
     jsmsg = JetStreamMsg(msg, stream.subscription.js.client)
     _pull_stream_closed(stream.state) && throw(_PullStreamClosed())
     put!(stream.messages, jsmsg)
+    bytes = _pull_stream_msg_bytes(msg)
+    @lock stream.state.lock begin
+        stream.state.buffered_messages += 1
+        stream.state.buffered_bytes += bytes
+        stream.state.delivered += 1
+    end
     1
 end
 
 function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
     psub = stream.subscription
-    requests = _PullStreamRequest[]
-    delivered = 0
     local_timeout = config.expires + min(config.expires * 0.1, 5.0)
     heartbeat_deadline = config.heartbeat > 0 ? time() + 2 * config.heartbeat : Inf
     try
         while !_pull_stream_closed(stream.state)
-            if !isnothing(config.stop_after) && delivered >= config.stop_after
+            if !isnothing(config.stop_after) &&
+               (@lock stream.state.lock stream.state.delivered >= (config.stop_after::Int))
                 break
             end
-            isempty(requests) && _publish_pull_stream_request!(psub, config, requests, delivered)
+            _pull_stream_maybe_refill!(stream, config)
             wait_deadline = min(time() + local_timeout, heartbeat_deadline)
             msg = try
                 _next_pull_stream_msg(stream, max(0.001, wait_deadline - time()))
@@ -1768,7 +1878,7 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
                     if config.heartbeat > 0 && time() >= heartbeat_deadline
                         throw(_jetstream_heartbeat_error())
                     end
-                    empty!(requests)
+                    @lock stream.state.lock empty!(stream.state.requests)
                     continue
                 elseif err isa _PullStreamClosed
                     break
@@ -1778,7 +1888,7 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
 
             action, err = _jetstream_status_action(msg; request_subject=psub.next_subject)
             if action != :message
-                request_index = _pull_stream_find_request(requests, msg.subject)
+                request_index = @lock stream.state.lock _pull_stream_find_request(stream.state.requests, msg.subject)
                 request_index == 0 && continue
                 config.heartbeat > 0 && (heartbeat_deadline = time() + 2 * config.heartbeat)
                 pin_id = header(msg, "Nats-Pin-Id")
@@ -1786,8 +1896,8 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
                 if action in (:idle_heartbeat, :flow_control, :control)
                     continue
                 elseif action in (:no_messages, :timeout, :batch_completed)
-                    deleteat!(requests, request_index)
-                    _pull_stream_maybe_refill!(psub, config, requests, delivered)
+                    @lock stream.state.lock deleteat!(stream.state.requests, request_index)
+                    _pull_stream_maybe_refill!(stream, config)
                     continue
                 else
                     action == :consumer_deleted && (@lock psub.close_lock psub.server_deleted = true)
@@ -1799,9 +1909,9 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
             config.heartbeat > 0 && (heartbeat_deadline = time() + 2 * config.heartbeat)
             pin_id = header(msg, "Nats-Pin-Id")
             !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
-            _pull_stream_decrement_request!(requests, msg)
-            delivered += _pull_stream_put!(stream, msg)
-            _pull_stream_maybe_refill!(psub, config, requests, delivered)
+            @lock stream.state.lock _pull_stream_decrement_request!(stream.state.requests, msg)
+            _pull_stream_put!(stream, msg)
+            _pull_stream_maybe_refill!(stream, config)
         end
     catch err
         if _pull_stream_closed(stream.state) && err isa InvalidStateException
@@ -1820,14 +1930,18 @@ end
 function messages(psub::PullSubscription{C}; batch::Int=100, max_bytes=nothing,
                   expires::Real=30.0, heartbeat::Union{Nothing,Real}=nothing,
                   threshold_messages=nothing, threshold_bytes=nothing,
-                  channel_size=batch, stop_after=nothing) where {C}
+                  channel_size=batch, stop_after=nothing,
+                  min_pending=nothing, min_ack_pending=nothing,
+                  priority_group=nothing, priority=nothing) where {C}
     config, channel_size = _validate_pull_messages(psub, batch, max_bytes, expires, heartbeat,
                                                    threshold_messages, threshold_bytes,
-                                                   channel_size, stop_after)
+                                                   channel_size, stop_after,
+                                                   min_pending, min_ack_pending,
+                                                   priority_group, priority)
     _begin_pull_stream!(psub)
     state = _PullMessageStreamState()
     channel = Channel{JetStreamMsg{C}}(channel_size)
-    stream = PullMessageStream{C,typeof(psub)}(psub, channel, Task(() -> nothing), nothing, state)
+    stream = PullMessageStream{C,typeof(psub)}(psub, channel, config, Task(() -> nothing), nothing, state)
     task = @async _pull_stream_loop(stream, config)
     stream.task = task
     stream
@@ -1861,7 +1975,21 @@ end
 
 function Base.take!(stream::PullMessageStream)
     while true
-        isready(stream.messages) && return take!(stream.messages)
+        if isready(stream.messages)
+            msg = take!(stream.messages)
+            @lock stream.state.lock begin
+                stream.state.buffered_messages = max(0, stream.state.buffered_messages - 1)
+                stream.state.buffered_bytes = max(0, stream.state.buffered_bytes - _pull_stream_msg_bytes(msg))
+            end
+            try
+                _pull_stream_maybe_refill!(stream)
+            catch err
+                _pull_stream_set_error!(stream.state, err)
+                _notify_subscription_waiters!(stream.subscription.sub; all=true)
+                isopen(stream.messages) && close(stream.messages)
+            end
+            return msg
+        end
         if !isopen(stream.messages)
             err = _pull_stream_error(stream.state)
             isnothing(err) || throw(err)

@@ -156,6 +156,7 @@ available = fetch(sub, 10; timeout=1.0, no_wait=true)
 ```
 
 For long-running pull consumers, `messages` starts a threshold-refilled message stream. The returned `PullMessageStream` is iterable, supports `take!`, and should be closed when the worker exits. Only one active fetch or message stream may use a pull subscription at a time.
+Refills are based on the messages and bytes still buffered or already requested for the client, so a slow worker does not cause requests beyond the configured `channel_size` and `max_bytes` capacity. Pull request scheduling fields for priority consumers are available with `priority_group`, `min_pending`, `min_ack_pending`, and `priority`.
 
 ```julia
 stream = messages(sub;
