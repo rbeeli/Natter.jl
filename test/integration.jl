@@ -293,7 +293,7 @@ end
             disconnected = Ref(false)
             reconnected = Ref(false)
             client = N.connect([primary.url, secondary.url];
-                               connect_timeout=0.5,
+                               connect_timeout=2.0,
                                ping_interval=2.0,
                                max_outstanding_pings=2,
                                reconnect_wait=0.05,

@@ -201,6 +201,9 @@ end
     @test jwt_opts.jwt isa N.SecretBytes
     token_opts = N.ConnectOptions(; token="token-secret-123")
     @test token_opts.token isa N.SecretBytes
+    @test !hasfield(N.SecretBytes, :bytes)
+    @test_throws CanonicalIndexError setindex!(token_opts.token, UInt8('x'), 1)
+    @test N._secret_to_string(token_opts.token) == "token-secret-123"
     @test !occursin("token-secret-123", sprint(show, token_opts))
     @test occursin("token=<redacted>", sprint(show, token_opts))
     @test !occursin("token-secret-123", sprint(show, MIME("text/plain"), token_opts))
@@ -1994,6 +1997,52 @@ end
     @test status(client) == N.ConnectionStatus.CLOSED
     @test timedwait(1.0; pollint=0.01) do
         isready(stopped)
+    end != :timed_out
+end
+
+@testitem "client drain deadline covers write lock waits" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct DrainWriteLockTransport <: IO
+        client::Base.RefValue{Any}
+    end
+    Base.write(::DrainWriteLockTransport, data::Vector{UInt8}) = length(data)
+    Base.write(::DrainWriteLockTransport, data::String) = ncodeunits(data)
+    Base.flush(t::DrainWriteLockTransport) = (N._notify_pong(t.client[]); nothing)
+    Base.close(::DrainWriteLockTransport) = nothing
+
+    client_ref = Ref{Any}(nothing)
+    transport = DrainWriteLockTransport(client_ref)
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    client_ref[] = client
+
+    entered = Channel{Bool}(1)
+    release = Channel{Bool}(1)
+    holder = @async begin
+        lock(client.write_lock)
+        put!(entered, true)
+        try
+            take!(release)
+        finally
+            unlock(client.write_lock)
+        end
+    end
+    take!(entered)
+
+    start = time()
+    err = TestHelpers.thrown_exception(() -> drain(client; timeout=0.02))
+    elapsed = time() - start
+
+    @test N._drain_timed_out(err)
+    @test elapsed < 1.0
+    @test status(client) == N.ConnectionStatus.CLOSED
+
+    put!(release, true)
+    wait(holder)
+    @test timedwait(1.0; pollint=0.01) do
+        @lock client.lock isnothing(client.write_io)
     end != :timed_out
 end
 

@@ -32,7 +32,6 @@ function _stripped_bytes(bytes::AbstractVector{UInt8})
     @view bytes[lo:hi]
 end
 
-_stripped_bytes(value::SecretBytes) = _stripped_bytes(value.bytes)
 _stripped_bytes(value::AbstractString) = _stripped_bytes(codeunits(value))
 
 function _nkey_base32_value(byte::UInt8)::UInt8
@@ -254,7 +253,7 @@ function _base64url_encode_raw(bytes::AbstractVector{UInt8})::String
 end
 
 function _secret_data(value::SecretBytes)
-    value.bytes
+    value
 end
 
 function _secret_data(value::AbstractVector{UInt8})
@@ -266,7 +265,7 @@ function _secret_data(value::AbstractString)
 end
 
 function _secret_to_string(secret::SecretBytes)::String
-    String(secret.bytes)
+    String(Vector{UInt8}(secret))
 end
 
 function _secret_to_string(value::AbstractString)::String

@@ -6,11 +6,11 @@ function _ensure_usable_status_for_publish(st::ConnectionStatus.T)
 end
 
 function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; buffer_on_reconnect::Bool=false,
-                   force_flush::Bool=false)
+                   force_flush::Bool=false, deadline=nothing)
     st = status(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
-            _write_raw(client, data; force_flush)
+            _write_raw(client, data; force_flush, deadline)
         catch err
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
                 if buffer_on_reconnect
@@ -698,19 +698,20 @@ function _wait_pong_waiter!(waiter::PongWaiter, timeout::Real)
     end
 end
 
-function flush(client::Client; timeout::Real=10.0)
+function flush(client::Client; timeout::Real=10.0, deadline=nothing)
     st = status(client)
     st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
     st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING, ConnectionStatus.DISCONNECTED) && throw(ConnectionReconnectingError())
+    wait_timeout = isnothing(deadline) ? timeout : min(Float64(timeout), _remaining_timeout(deadline))
     waiter = PongWaiter(Base.Threads.Condition(client.lock))
     @lock client.lock push!(client.pongs, waiter)
     try
-        _send_raw(client, "PING$CRLF"; force_flush=true)
+        _send_raw(client, "PING$CRLF"; force_flush=true, deadline)
     catch err
         @lock client.lock _remove_pong_waiter_locked!(client, waiter)
         rethrow()
     end
-    result = _wait_pong_waiter!(waiter, timeout)
+    result = _wait_pong_waiter!(waiter, wait_timeout)
     if result == :timed_out
         # Keep a bounded tombstone so a late PONG is consumed by its original
         # flush and cannot make a later flush appear complete.
@@ -750,7 +751,7 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout)
     end
     if !_drain_timed_out(errors)
         try
-            flush(client; timeout=_remaining_timeout(deadline))
+            flush(client; timeout=_remaining_timeout(deadline), deadline=deadline)
         catch err
             push!(errors, err)
             _report_error(client, err)
@@ -798,14 +799,26 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
             _notify_subscription_waiters_locked(sub; all=true)
         end
     end
-    _wake_flusher(client)
     errors = Any[]
+    try
+        _wake_flusher(client; deadline)
+    catch err
+        push!(errors, CleanupError("wake flusher", err))
+    end
     append!(errors, _notify_pong_waiters!(client, false))
     append!(errors, _notify_request_waiters!(client, ConnectionClosedError(); clear_mux=true))
     for sub in subs
         _close_subscription_channel!(errors, sub)
     end
-    append!(errors, _close_transport(_take_transport!(client)...))
+    try
+        append!(errors, _close_transport(_take_transport!(client; deadline)...))
+    catch err
+        push!(errors, err)
+        if _drain_timed_out(err)
+            _abort_transport_for_blocked_write_lock!(client)
+            _schedule_transport_cleanup_after_lock_timeout(client)
+        end
+    end
     _clear_pending_buffer!(client)
     append!(errors, _stop_client_tasks!(client; timeout=_client_task_close_timeout(client), deadline=deadline))
     for sub in subs

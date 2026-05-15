@@ -349,6 +349,29 @@ end
 
 _remaining_timeout(deadline::Float64)::Float64 = max(0.0, deadline - time())
 
+function _lock_write!(client::Client, operation::String, deadline)
+    if isnothing(deadline)
+        lock(client.write_lock)
+        return nothing
+    end
+
+    while true
+        trylock(client.write_lock) && return nothing
+        remaining = _remaining_timeout(deadline)
+        remaining <= 0 && throw(TimeoutError("$operation timed out"))
+        sleep(min(remaining, 0.005))
+    end
+end
+
+function _with_write_lock(f::Function, client::Client, operation::String; deadline=nothing)
+    _lock_write!(client, operation, deadline)
+    try
+        return f()
+    finally
+        unlock(client.write_lock)
+    end
+end
+
 function _write_timeout_error(operation::String)
     TimeoutError("$operation timed out")
 end
@@ -509,13 +532,15 @@ function _signal_flusher_locked(client::Client)
     nothing
 end
 
-function _wake_flusher(client::Client)
-    @lock client.write_lock _signal_flusher_locked(client)
+function _wake_flusher(client::Client; deadline=nothing)
+    _with_write_lock(client, "wake flusher"; deadline) do
+        _signal_flusher_locked(client)
+    end
     nothing
 end
 
-function _flush_buffered_writes(client::Client; allow_missing::Bool=false)
-    @lock client.write_lock begin
+function _flush_buffered_writes(client::Client; allow_missing::Bool=false, deadline=nothing)
+    _with_write_lock(client, "flush buffered writes"; deadline) do
         io = @lock client.lock client.write_io
         if isnothing(io)
             allow_missing && return false
@@ -607,8 +632,9 @@ function _flush_or_signal_locked(client::Client, io; force_flush::Bool=false)
     nothing
 end
 
-function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; force_flush::Bool=false)
-    @lock client.write_lock begin
+function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; force_flush::Bool=false,
+                    deadline=nothing)
+    _with_write_lock(client, "write protocol command"; deadline) do
         io = @lock client.lock client.write_io
         isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
         _write_raw_to_io(client, io, data; force_flush)
@@ -658,10 +684,10 @@ function _close_transport(read_io, write_io, sock)
     errors
 end
 
-function _take_transport!(client::Client; preserve_replayable::Bool=false)
+function _take_transport!(client::Client; preserve_replayable::Bool=false, deadline=nothing)
     replayable = UInt8[]
     dropped_replayable = 0
-    transports = @lock client.write_lock begin
+    transports = _with_write_lock(client, "close transport"; deadline) do
         read_io, write_io, sock, preserve = @lock client.lock begin
             read_io = client.read_io
             write_io = client.write_io
@@ -685,6 +711,20 @@ function _take_transport!(client::Client; preserve_replayable::Bool=false)
     transports
 end
 
+function _abort_transport_for_blocked_write_lock!(client::Client)
+    read_io, write_io, sock = @lock client.lock (client.read_io, client.write_io, client.socket)
+    errors = _close_transport(read_io, write_io, sock)
+    _report_cleanup_errors(client, errors)
+    nothing
+end
+
+function _schedule_transport_cleanup_after_lock_timeout(client::Client)
+    _schedule_timeout_cleanup("close transport after write lock timeout",
+                              () -> _close_transport(_take_transport!(client)...),
+                              errors -> _report_cleanup_errors(client, errors))
+    nothing
+end
+
 function _report_cleanup_errors(client::Client, errors::Vector)
     for err in errors
         _report_error(client, err)
@@ -697,14 +737,14 @@ function _report_cleanup_errors(client::Client, errors::Vector)
     nothing
 end
 
-function _close_transport!(client::Client)
-    errors = _close_transport(_take_transport!(client)...)
+function _close_transport!(client::Client; deadline=nothing)
+    errors = _close_transport(_take_transport!(client; deadline)...)
     _throw_errors(errors)
     nothing
 end
 
-function _close_transport_report_errors!(client::Client; preserve_replayable::Bool=false)
-    errors = _close_transport(_take_transport!(client; preserve_replayable)...)
+function _close_transport_report_errors!(client::Client; preserve_replayable::Bool=false, deadline=nothing)
+    errors = _close_transport(_take_transport!(client; preserve_replayable, deadline)...)
     _report_cleanup_errors(client, errors)
     nothing
 end
