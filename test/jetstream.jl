@@ -1466,9 +1466,11 @@ end
 
     @test N._stream_message_get_request(1, nothing, false) == Dict{String,Any}("seq" => 1)
     @test N._stream_message_get_request(nothing, "orders.created", false) == Dict{String,Any}("last_by_subj" => "orders.created")
-    @test N._stream_message_get_request(2, "orders.created", true) == Dict{String,Any}("seq" => 2, "next_by_subj" => "orders.created")
+    @test N._stream_message_get_request(big(2), "orders.created", true) == Dict{String,Any}("seq" => 2, "next_by_subj" => "orders.created")
     @test_throws ArgumentError N._stream_message_get_request(nothing, nothing, false)
     @test_throws ArgumentError N._stream_message_get_request(0, nothing, false)
+    @test_throws ArgumentError N._stream_message_get_request(true, nothing, false)
+    @test_throws ArgumentError N._stream_message_get_request(big(typemax(Int)) + 1, nothing, false)
     @test_throws ArgumentError N._stream_message_get_request(1, "orders.created", false)
     @test_throws ArgumentError N._stream_message_get_request(nothing, "orders.created", true)
     @test_throws ArgumentError N._stream_message_get_request(0, "orders.created", true)
@@ -1477,6 +1479,7 @@ end
     delete_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     delete_js = jetstream(delete_client)
     @test_throws ArgumentError stream_message_delete(delete_js, "ORDERS", 0)
+    @test_throws ArgumentError stream_message_delete(delete_js, "ORDERS", true)
     @test String(take!(delete_client.write_io)) == ""
     @test isempty(delete_client.subscriptions)
 
@@ -1565,6 +1568,10 @@ end
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, -1; timeout=1.0)
     @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, true; timeout=1.0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, big(typemax(Int)) + 1; timeout=1.0)
+    @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=0.0)
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=-1.0)
@@ -1642,7 +1649,7 @@ end
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
                                     sid=core_sub.sid))
-        @test isempty(fetch(psub, 10; timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true,
+        @test isempty(fetch(psub, big(10); timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true,
                             min_pending=4, min_ack_pending=5, priority_group="workers",
                             priority=2))
         payload = pull_request_payload(String(take!(client.write_io)))
@@ -1716,6 +1723,8 @@ end
     psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
 
     @test_throws ArgumentError messages(psub; batch=0)
+    @test_throws ArgumentError messages(psub; batch=true)
+    @test_throws ArgumentError messages(psub; batch=big(typemax(Int)) + 1)
     @test_throws ArgumentError messages(psub; batch=1, max_bytes=0)
     @test_throws ArgumentError messages(psub; batch=1, max_bytes=true)
     @test_throws ArgumentError messages(psub; batch=2, threshold_messages=3)
@@ -1726,6 +1735,12 @@ end
     @test_throws ArgumentError messages(psub; batch=1, min_pending=1)
     @test_throws ArgumentError messages(psub; batch=1, priority_group="bad group")
     @test_throws ArgumentError messages(psub; batch=1, priority=-1, priority_group="workers")
+
+    big_stream = messages(psub; batch=big(1), expires=1.0, heartbeat=0, stop_after=1)
+    close(big_stream)
+    @test timedwait(1.0; pollint=0.001) do
+        !(@lock psub.close_lock psub.active_stream)
+    end != :timed_out
 
     stream = messages(psub; batch=1, expires=1.0, heartbeat=0, stop_after=1)
     try

@@ -485,10 +485,16 @@ end
                                      read_io=transport, write_io=transport)
     invalid_kwargs = (
         (; max_msgs=-1),
+        (; max_msgs=true),
+        (; max_msgs=big(typemax(Int)) + 1),
         (; pending_msgs_limit=0),
         (; pending_msgs_limit=-1),
+        (; pending_msgs_limit=true),
+        (; pending_msgs_limit=big(typemax(Int)) + 1),
         (; pending_bytes_limit=0),
         (; pending_bytes_limit=-1),
+        (; pending_bytes_limit=true),
+        (; pending_bytes_limit=big(typemax(Int)) + 1),
     )
 
     for kwargs in invalid_kwargs
@@ -497,6 +503,13 @@ end
         @test isempty(client.subscriptions)
         @test client.sid == 0
     end
+
+    reconnecting = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(reconnecting, "events";
+                    max_msgs=big(2), pending_msgs_limit=big(3), pending_bytes_limit=big(128))
+    @test sub.max_msgs == 2
+    @test sub.pending_msgs_limit == 3
+    @test sub.pending_bytes_limit == 128
 end
 
 @testitem "unsubscribe max_msgs uses additional messages and closes exhausted replay state" setup=[TestHelpers] begin
@@ -526,6 +539,8 @@ end
     negative = subscribe(client, "negative")
     TestHelpers.clear_capture!(transport)
     @test_throws ArgumentError unsubscribe(negative; max_msgs=-1)
+    @test_throws ArgumentError unsubscribe(negative; max_msgs=true)
+    @test_throws ArgumentError unsubscribe(negative; max_msgs=big(typemax(Int)) + 1)
     @test TestHelpers.capture_text(transport) == ""
     @test !negative.closed
     @test negative.sid in keys(client.subscriptions)

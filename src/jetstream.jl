@@ -468,7 +468,7 @@ end
 stream_info(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout) =
     _stream_info(_api_request(js, "$(js.prefix).STREAM.INFO.$(_validate_api_name("stream", name))", ""; timeout))
 
-function stream_list(js::JetStreamContext; offset::Int=0, timeout::Real=js.timeout)
+function stream_list(js::JetStreamContext; offset=0, timeout::Real=js.timeout)
     offset = _nonnegative_int_option("stream list offset", offset)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
@@ -577,12 +577,14 @@ function _stream_info(obj)
     StreamInfo(name, cfg, state)
 end
 
-function _validate_stream_sequence(seq::Int)::Int
-    seq > 0 || throw(ArgumentError("stream sequence must be positive"))
-    seq
+function _validate_stream_sequence(seq)::Int
+    seq isa Bool && throw(ArgumentError("stream sequence must be a positive integer"))
+    seq isa Integer || throw(ArgumentError("stream sequence must be a positive integer"))
+    1 <= seq <= typemax(Int) || throw(ArgumentError("stream sequence must be a positive integer"))
+    Int(seq)
 end
 
-function _stream_message_get_request(seq::Union{Int,Nothing}, subject::Union{AbstractString,Nothing}, next_by_subject::Bool)::Dict{String,Any}
+function _stream_message_get_request(seq::Union{Integer,Nothing}, subject::Union{AbstractString,Nothing}, next_by_subject::Bool)::Dict{String,Any}
     if next_by_subject
         isnothing(seq) && throw(ArgumentError("seq is required when next_by_subject=true"))
         isnothing(subject) && throw(ArgumentError("subject is required when next_by_subject=true"))
@@ -682,7 +684,7 @@ function _stream_message_get_info(js::JetStreamContext, stream::AbstractString, 
     _stream_message_get_api(js, stream, req; timeout)
 end
 
-function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::Union{Int,Nothing}=nothing, subject::Union{AbstractString,Nothing}=nothing,
+function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::Union{Integer,Nothing}=nothing, subject::Union{AbstractString,Nothing}=nothing,
                             direct::Bool=false, next_by_subject::Bool=false, timeout::Real=js.timeout)
     stream = _validate_api_name("stream", stream)
     req = _stream_message_get_request(seq, subject, next_by_subject)
@@ -691,7 +693,7 @@ function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::U
     msg
 end
 
-function stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Int; timeout::Real=js.timeout)
+function stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Integer; timeout::Real=js.timeout)
     stream = _validate_api_name("stream", stream)
     seq = _validate_stream_sequence(seq)
     _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.MSG.DELETE.$stream", JSON3.write((seq=seq,)); timeout), :success))
@@ -774,7 +776,7 @@ consumer_update(js::JetStreamContext, stream::AbstractString, config::AbstractDi
 consumer_info(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; timeout::Real=js.timeout) =
     _consumer_info(_api_request(js, "$(js.prefix).CONSUMER.INFO.$(_validate_api_name("stream", stream)).$(_validate_api_name("consumer", consumer))", ""; timeout))
 
-function consumer_list(js::JetStreamContext, stream::AbstractString; offset::Int=0, timeout::Real=js.timeout)
+function consumer_list(js::JetStreamContext, stream::AbstractString; offset=0, timeout::Real=js.timeout)
     stream = _validate_api_name("stream", stream)
     offset = _nonnegative_int_option("consumer list offset", offset)
     timeout = _positive_timeout_seconds("timeout", timeout)
@@ -1494,10 +1496,10 @@ function _end_pull_stream!(psub::PullSubscription)
     nothing
 end
 
-function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real, expires::Real,
+function _validate_pull_fetch(psub::PullSubscription, batch, timeout::Real, expires::Real,
                               heartbeat::Union{Nothing,Real}, max_bytes, no_wait,
                               min_pending, min_ack_pending, priority_group, priority)
-    batch > 0 || throw(ArgumentError("fetch batch must be greater than zero"))
+    batch = _positive_int_option("fetch batch", batch)
     max_bytes = _optional_positive_int_option("fetch max_bytes", max_bytes)
     no_wait = _bool_option("fetch no_wait", no_wait)
     timeout = _positive_timeout_seconds("fetch timeout", timeout)
@@ -1507,7 +1509,7 @@ function _validate_pull_fetch(psub::PullSubscription, batch::Int, timeout::Real,
         _validate_pull_request_scheduling("fetch", min_pending, min_ack_pending,
                                           priority_group, priority)
     _check_pull_subscription_open(psub)
-    timeout, expires, _pull_fetch_heartbeat(expires, heartbeat), max_bytes, no_wait,
+    batch, timeout, expires, _pull_fetch_heartbeat(expires, heartbeat), max_bytes, no_wait,
         min_pending, min_ack_pending, priority_group, priority
 end
 
@@ -1579,12 +1581,12 @@ function _pull_fetch_status_matches_request(subject::AbstractString, token::Unio
     true
 end
 
-function fetch(psub::PullSubscription{C}, batch::Int=1; timeout::Real=psub.js.timeout,
+function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout,
                expires::Real=_pull_fetch_default_expires(timeout),
                heartbeat::Union{Nothing,Real}=nothing, max_bytes=nothing,
                no_wait=false, min_pending=nothing, min_ack_pending=nothing,
                priority_group=nothing, priority=nothing) where {C}
-    timeout_seconds, expires_seconds, heartbeat_seconds, max_bytes_int, no_wait_bool,
+    batch, timeout_seconds, expires_seconds, heartbeat_seconds, max_bytes_int, no_wait_bool,
         min_pending, min_ack_pending, priority_group, priority =
         _validate_pull_fetch(psub, batch, timeout, expires, heartbeat, max_bytes, no_wait,
                              min_pending, min_ack_pending, priority_group, priority)
@@ -1677,12 +1679,12 @@ function _pull_stream_threshold(name::AbstractString, value, limit::Int)::Int
     threshold
 end
 
-function _validate_pull_messages(psub::PullSubscription, batch::Int, max_bytes, expires::Real,
+function _validate_pull_messages(psub::PullSubscription, batch, max_bytes, expires::Real,
                                  heartbeat::Union{Nothing,Real}, threshold_messages,
                                  threshold_bytes, channel_size, stop_after,
                                  min_pending, min_ack_pending, priority_group,
                                  priority)::Tuple{_PullStreamConfig,Int}
-    batch > 0 || throw(ArgumentError("messages batch must be greater than zero"))
+    batch = _positive_int_option("messages batch", batch)
     max_bytes = _optional_positive_int_option("messages max_bytes", max_bytes)
     expires = _positive_timeout_seconds("messages expires", expires)
     heartbeat = _pull_fetch_heartbeat(expires, heartbeat)
@@ -1927,7 +1929,7 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
     nothing
 end
 
-function messages(psub::PullSubscription{C}; batch::Int=100, max_bytes=nothing,
+function messages(psub::PullSubscription{C}; batch=100, max_bytes=nothing,
                   expires::Real=30.0, heartbeat::Union{Nothing,Real}=nothing,
                   threshold_messages=nothing, threshold_bytes=nothing,
                   channel_size=batch, stop_after=nothing,

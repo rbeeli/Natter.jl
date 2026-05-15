@@ -106,6 +106,8 @@ end
     @test_throws ArgumentError N._kv_optional_seconds("ttl", true)
     @test_throws ArgumentError N._kv_expected_revision(true)
     @test_throws ArgumentError N._kv_add_expected_revision!(Headers(), true)
+    @test N._kv_expected_revision(big(1)) == 1
+    @test_throws ArgumentError N._kv_expected_revision(big(typemax(Int)) + 1)
 
     @test_throws ArgumentError N._kv_stream_config("bucket"; history=true)
     @test_throws ArgumentError N._kv_stream_config("bucket"; ttl=true)
@@ -145,6 +147,14 @@ end
         @test TestHelpers.capture_text(capture) == ""
         @test isempty(client.subscriptions)
     end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    kv = KeyValue(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
+    @test_throws ArgumentError kv_history(kv, "alpha"; batch=true)
+    @test_throws ArgumentError kv_history(kv, "alpha"; batch=big(typemax(Int)) + 1)
+    @test TestHelpers.capture_text(capture) == ""
+    @test isempty(client.subscriptions)
 end
 
 @testitem "KeyValue status summarizes stream state" setup=[TestHelpers] begin

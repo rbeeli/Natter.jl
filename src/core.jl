@@ -374,11 +374,18 @@ function publish(client::Client, frame::PublishFrame)
     _publish_prepared(client, frame)
 end
 
-function _validate_subscription_limits(max_msgs::Int, pending_msgs_limit::Int, pending_bytes_limit::Int)
-    _validate_core_max_msgs(max_msgs)
-    pending_msgs_limit > 0 || throw(ArgumentError("pending_msgs_limit must be positive"))
-    pending_bytes_limit > 0 || throw(ArgumentError("pending_bytes_limit must be positive"))
-    nothing
+function _validate_subscription_positive_limit(name::AbstractString, value)::Int
+    value isa Bool && throw(ArgumentError("$name must be a positive integer"))
+    value isa Integer || throw(ArgumentError("$name must be a positive integer"))
+    1 <= value <= typemax(Int) || throw(ArgumentError("$name must be a positive integer"))
+    Int(value)
+end
+
+function _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
+    max_msgs = _validate_core_max_msgs(max_msgs)
+    pending_msgs_limit = _validate_subscription_positive_limit("pending_msgs_limit", pending_msgs_limit)
+    pending_bytes_limit = _validate_subscription_positive_limit("pending_bytes_limit", pending_bytes_limit)
+    max_msgs, pending_msgs_limit, pending_bytes_limit
 end
 
 struct _SubscriptionProcessor{S<:Subscription,F}
@@ -396,13 +403,14 @@ function _start_subscription_processor!(sub::Subscription, callback::Callback) w
 end
 
 function _subscribe(client::Client, subject::AbstractString; queue::Union{AbstractString,Nothing}=nothing, callback=nothing,
-                    max_msgs::Int=0, pending_msgs_limit::Int=client.options.sub_pending_msgs_limit,
-                    pending_bytes_limit::Int=client.options.sub_pending_bytes_limit,
+                    max_msgs=0, pending_msgs_limit=client.options.sub_pending_msgs_limit,
+                    pending_bytes_limit=client.options.sub_pending_bytes_limit,
                     _control_handler::_SubscriptionControlHandler=_NoSubscriptionControlHandler(),
                     require_connected::Bool=false)
     subject = _validate_subject(subject)
     queue = _validate_queue(queue)
-    _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
+    max_msgs, pending_msgs_limit, pending_bytes_limit =
+        _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
     send_now = false
     sub = @lock client.lock begin
         st = client.status
@@ -654,8 +662,8 @@ function _unsubscribe_target(received::Int, additional::Int)
     received + additional
 end
 
-function unsubscribe(sub::Subscription; max_msgs::Int=0)
-    _validate_core_max_msgs(max_msgs)
+function unsubscribe(sub::Subscription; max_msgs=0)
+    max_msgs = _validate_core_max_msgs(max_msgs)
     st = status(sub.client)
     closed, active, sid, target, previous_max = @lock sub.lock begin
         if sub.closed

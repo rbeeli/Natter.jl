@@ -128,7 +128,7 @@ stream_delete_async(js::JetStreamContext, name::AbstractString; kwargs...)::Natt
 stream_message_get_async(js::JetStreamContext, stream::AbstractString; kwargs...)::NatterTask =
     _natter_async(stream_message_get, js, stream; kwargs...)
 
-stream_message_delete_async(js::JetStreamContext, stream::AbstractString, seq::Int; kwargs...)::NatterTask =
+stream_message_delete_async(js::JetStreamContext, stream::AbstractString, seq; kwargs...)::NatterTask =
     _natter_async(stream_message_delete, js, stream, seq; kwargs...)
 
 consumer_create_async(js::JetStreamContext, stream::AbstractString, config; kwargs...)::NatterTask =
@@ -155,7 +155,7 @@ pull_subscribe_async(js::JetStreamContext, subject::AbstractString; kwargs...)::
 push_subscribe_async(js::JetStreamContext, subject::AbstractString; kwargs...)::NatterTask =
     _natter_async(push_subscribe, js, subject; kwargs...)
 
-fetch_async(psub::PullSubscription, batch::Int=1; kwargs...)::NatterTask =
+fetch_async(psub::PullSubscription, batch=1; kwargs...)::NatterTask =
     _natter_async(fetch, psub, batch; kwargs...)
 
 close_async(psub::PullSubscription; kwargs...)::NatterTask =
@@ -203,7 +203,7 @@ kv_put_async(kv::KeyValue, key::AbstractString, value; kwargs...)::NatterTask =
 kv_create_key_async(kv::KeyValue, key::AbstractString, value; kwargs...)::NatterTask =
     _natter_async(kv_create_key, kv, key, value; kwargs...)
 
-kv_update_async(kv::KeyValue, key::AbstractString, value, revision::Int; kwargs...)::NatterTask =
+kv_update_async(kv::KeyValue, key::AbstractString, value, revision; kwargs...)::NatterTask =
     _natter_async(kv_update, kv, key, value, revision; kwargs...)
 
 kv_delete_async(kv::KeyValue, key::AbstractString; kwargs...)::NatterTask =

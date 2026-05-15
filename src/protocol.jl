@@ -1107,13 +1107,15 @@ function _sub_cmd(subject::String, queue::Union{String,Nothing}, sid::Int)
     isnothing(queue) || isempty(queue) ? "SUB $subject $sid$CRLF" : "SUB $subject $queue $sid$CRLF"
 end
 
-function _validate_core_max_msgs(max_msgs::Int)
-    max_msgs < 0 && throw(ArgumentError("max_msgs must be non-negative"))
-    max_msgs
+function _validate_core_max_msgs(max_msgs)::Int
+    max_msgs isa Bool && throw(ArgumentError("max_msgs must be a non-negative integer"))
+    max_msgs isa Integer || throw(ArgumentError("max_msgs must be a non-negative integer"))
+    0 <= max_msgs <= typemax(Int) || throw(ArgumentError("max_msgs must be a non-negative integer"))
+    Int(max_msgs)
 end
 
-function _unsub_cmd(sid::Int, max_msgs::Int=0)
-    _validate_core_max_msgs(max_msgs)
+function _unsub_cmd(sid::Int, max_msgs=0)
+    max_msgs = _validate_core_max_msgs(max_msgs)
     max_msgs > 0 ? "UNSUB $sid $max_msgs$CRLF" : "UNSUB $sid$CRLF"
 end
 

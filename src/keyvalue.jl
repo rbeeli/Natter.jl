@@ -396,7 +396,7 @@ end
 
 status(kv::KeyValue; kwargs...) = kv_status(kv; kwargs...)
 
-function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing,
+function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
                 direct::Union{Bool,Nothing}=nothing, timeout::Real=kv.js.timeout)
     key = _validate_kv_key(key)
     timeout = _positive_timeout_seconds("timeout", timeout)
@@ -421,7 +421,7 @@ _kv_publish_revision(kv::KeyValue, subject::AbstractString, value; headers=nothi
                      ttl=nothing, timeout::Real=kv.js.timeout)::Int =
     js_publish(kv.js, subject, value; headers, ttl, timeout).seq
 
-function kv_put(kv::KeyValue, key::AbstractString, value; revision::Union{Nothing,Int}=nothing,
+function kv_put(kv::KeyValue, key::AbstractString, value; revision::Union{Nothing,Integer}=nothing,
                 ttl=nothing, timeout::Real=kv.js.timeout)::Int
     key = _validate_kv_key(key)
     hdrs = Headers()
@@ -473,11 +473,11 @@ function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,
     end
 end
 
-kv_update(kv::KeyValue, key::AbstractString, value, revision::Int; ttl=nothing,
+kv_update(kv::KeyValue, key::AbstractString, value, revision::Integer; ttl=nothing,
           timeout::Real=kv.js.timeout)::Int =
     kv_put(kv, key, value; revision, ttl, timeout)
 
-function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing,
+function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
                    timeout::Real=kv.js.timeout)::Nothing
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["DEL"])
@@ -491,7 +491,7 @@ function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,In
     end
 end
 
-function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int}=nothing,
+function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
                   ttl=nothing, timeout::Real=kv.js.timeout)::Nothing
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["PURGE"], "Nats-Rollup" => ["sub"])
@@ -505,8 +505,9 @@ function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int
     end
 end
 
-function kv_history(kv::KeyValue, key::AbstractString; batch::Int=256, timeout::Real=kv.js.timeout)
+function kv_history(kv::KeyValue, key::AbstractString; batch=256, timeout::Real=kv.js.timeout)
     key = _validate_kv_key(key)
+    batch = _positive_int_option("key-value history batch", batch)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     sub = pull_subscribe(kv.js, "$(kv.prefix)$key"; stream=kv.stream,
