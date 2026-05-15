@@ -469,10 +469,13 @@ stream_info(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout
     _stream_info(_api_request(js, "$(js.prefix).STREAM.INFO.$(_validate_api_name("stream", name))", ""; timeout))
 
 function stream_list(js::JetStreamContext; offset::Int=0, timeout::Real=js.timeout)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     streams = StreamInfo[]
     next_offset = offset
     while true
-        obj = _api_request(js, "$(js.prefix).STREAM.LIST", JSON3.write((offset=next_offset,)); timeout)
+        obj = _api_request(js, "$(js.prefix).STREAM.LIST", JSON3.write((offset=next_offset,));
+                           timeout=_remaining_timeout_or_throw(deadline, "stream list"))
         items = _json_get(obj, :streams, ())
         append!(streams, (_stream_info(item) for item in items))
         total = _json_int(_json_get(obj, :total, offset + length(streams)))
@@ -485,11 +488,14 @@ end
 
 function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothing}=nothing, timeout::Real=js.timeout)
     subject = isnothing(subject) ? nothing : _validate_subject(subject)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     names = String[]
     next_offset = 0
     while true
         req = isnothing(subject) ? (offset=next_offset,) : (subject=subject, offset=next_offset)
-        obj = _api_request(js, "$(js.prefix).STREAM.NAMES", JSON3.write(req); timeout)
+        obj = _api_request(js, "$(js.prefix).STREAM.NAMES", JSON3.write(req);
+                           timeout=_remaining_timeout_or_throw(deadline, "stream names"))
         items = String.(_json_get(obj, :streams, String[]))
         append!(names, items)
         total = _json_int(_json_get(obj, :total, length(names)))
@@ -769,10 +775,13 @@ consumer_info(js::JetStreamContext, stream::AbstractString, consumer::AbstractSt
 
 function consumer_list(js::JetStreamContext, stream::AbstractString; offset::Int=0, timeout::Real=js.timeout)
     stream = _validate_api_name("stream", stream)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     consumers = ConsumerInfo[]
     next_offset = offset
     while true
-        obj = _api_request(js, "$(js.prefix).CONSUMER.LIST.$stream", JSON3.write((offset=next_offset,)); timeout)
+        obj = _api_request(js, "$(js.prefix).CONSUMER.LIST.$stream", JSON3.write((offset=next_offset,));
+                           timeout=_remaining_timeout_or_throw(deadline, "consumer list"))
         items = _json_get(obj, :consumers, ())
         append!(consumers, (_consumer_info(item) for item in items))
         total = _json_int(_json_get(obj, :total, offset + length(consumers)))
@@ -1575,7 +1584,9 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     end
 end
 
-function close(psub::PullSubscription)
+function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.timeout)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     already_closed = @lock psub.close_lock begin
         was_closed = psub.closed
         psub.closed = true
@@ -1591,7 +1602,8 @@ function close(psub::PullSubscription)
     server_deleted = @lock psub.close_lock psub.server_deleted
     if psub.delete_on_close && !server_deleted
         try
-            consumer_delete(psub.js, psub.stream, psub.consumer)
+            consumer_delete(psub.js, psub.stream, psub.consumer;
+                            timeout=_remaining_timeout_or_throw(deadline, "close pull subscription"))
         catch err
             push!(errors, CleanupError("delete pull consumer $(psub.consumer)", err))
         end
@@ -1600,7 +1612,11 @@ function close(psub::PullSubscription)
     nothing
 end
 
-function close(psub::PushSubscription)
+close(psub::PullSubscription) = _close_pull_subscription(psub)
+
+function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.timeout)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     already_closed = @lock psub.close_lock begin
         was_closed = psub.closed
         psub.closed = true
@@ -1614,12 +1630,13 @@ function close(psub::PushSubscription)
         push!(errors, err)
     end
     _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task;
-                interrupt=true)
+                interrupt=true, deadline)
     handler = psub.control_handler
     server_deleted = !isnothing(handler) && handler.consumer_deleted[]
     if psub.delete_on_close && !server_deleted
         try
-            consumer_delete(psub.js, psub.stream, psub.consumer)
+            consumer_delete(psub.js, psub.stream, psub.consumer;
+                            timeout=_remaining_timeout_or_throw(deadline, "close push subscription"))
         catch err
             push!(errors, CleanupError("delete push consumer $(psub.consumer)", err))
         end
@@ -1627,6 +1644,8 @@ function close(psub::PushSubscription)
     _throw_errors(errors)
     nothing
 end
+
+close(psub::PushSubscription) = _close_push_subscription(psub)
 
 const _JS_ACK_PREFIX = "\$JS.ACK."
 const _JS_ACK_NOT_MESSAGE = "message is not a JetStream message"

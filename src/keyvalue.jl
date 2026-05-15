@@ -256,11 +256,11 @@ function _kv_watcher_close_state!(state::_KeyValueWatcherState)
     nothing
 end
 
-function Base.close(watcher::KeyValueWatcher)
+function _close_keyvalue_watcher(watcher::KeyValueWatcher; timeout::Real=watcher.subscription.js.timeout)
     errors = Any[]
     _kv_watcher_close_state!(watcher.state)
     try
-        close(watcher.subscription)
+        _close_push_subscription(watcher.subscription; timeout)
     catch err
         push!(errors, err)
     end
@@ -268,10 +268,39 @@ function Base.close(watcher::KeyValueWatcher)
     nothing
 end
 
+Base.close(watcher::KeyValueWatcher) = _close_keyvalue_watcher(watcher)
+
 function Base.take!(watcher::KeyValueWatcher)
     isnothing(watcher.updates) &&
         throw(ArgumentError("callback key-value watchers do not buffer updates"))
     take!(watcher.updates)
+end
+
+function _kv_take!(watcher::KeyValueWatcher, timeout::Real)
+    updates = watcher.updates
+    isnothing(updates) &&
+        throw(ArgumentError("callback key-value watchers do not buffer updates"))
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    result = timedwait(timeout; pollint=min(0.01, timeout)) do
+        isready(updates) || !isopen(updates)
+    end
+    result == :timed_out && throw(TimeoutError("key-value watcher timed out"))
+    take!(updates)
+end
+
+const _KV_CLEANUP_TIMEOUT = 0.001
+
+_kv_cleanup_timeout(deadline::Float64)::Float64 =
+    max(_remaining_timeout(deadline), _KV_CLEANUP_TIMEOUT)
+
+function _kv_throw_if_deadline_expired(deadline::Float64, operation::String)
+    _remaining_timeout(deadline) <= 0 && throw(TimeoutError("$operation timed out"))
+    nothing
+end
+
+function _kv_report_cleanup_error(kv::KeyValue, operation::String, err)
+    _report_cleanup_errors(kv.js.client, Any[CleanupError(operation, err)])
+    nothing
 end
 
 function _kv_record_key!(latest::Dict{String,Tuple{Int,Bool}}, prefix::String, msg::AbstractMsg)
@@ -479,53 +508,71 @@ end
 function kv_history(kv::KeyValue, key::AbstractString; batch::Int=256, timeout::Real=kv.js.timeout)
     key = _validate_kv_key(key)
     timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     sub = pull_subscribe(kv.js, "$(kv.prefix)$key"; stream=kv.stream,
-                         config=ConsumerConfig(deliver_policy=DeliverPolicy.ALL), timeout)
+                         config=ConsumerConfig(deliver_policy=DeliverPolicy.ALL),
+                         timeout=_remaining_timeout_or_throw(deadline, "key-value history"))
     entries = KeyValueEntry[]
     try
         while true
-            chunk = fetch(sub, batch; timeout)
-            isempty(chunk) && break
+            chunk = fetch(sub, batch;
+                          timeout=_remaining_timeout_or_throw(deadline, "key-value history"))
+            if isempty(chunk)
+                _kv_throw_if_deadline_expired(deadline, "key-value history")
+                break
+            end
             for msg in chunk
                 push!(entries, _kv_entry_from_consumer_msg(kv, msg))
             end
-            length(chunk) < batch && break
+            if length(chunk) < batch
+                _kv_throw_if_deadline_expired(deadline, "key-value history")
+                break
+            end
         end
     catch err
         try
-            close(sub)
+            _close_pull_subscription(sub; timeout=_kv_cleanup_timeout(deadline))
         catch cleanup_err
-            throw(Base.CompositeException([err, CleanupError("close key-value history consumer", cleanup_err)]))
+            _kv_report_cleanup_error(kv, "close key-value history consumer", cleanup_err)
         end
         rethrow()
     end
-    close(sub)
+    _close_pull_subscription(sub; timeout=_kv_cleanup_timeout(deadline))
     entries
 end
 
 function kv_keys(kv::KeyValue; timeout::Real=kv.js.timeout)
     timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     sub = pull_subscribe(kv.js, "$(kv.prefix)>"; stream=kv.stream,
-                         config=_kv_keys_consumer_config(), timeout)
+                         config=_kv_keys_consumer_config(),
+                         timeout=_remaining_timeout_or_throw(deadline, "key-value keys"))
     latest = Dict{String,Tuple{Int,Bool}}()
     try
         while true
-            chunk = fetch(sub, 256; timeout)
-            isempty(chunk) && break
+            chunk = fetch(sub, 256;
+                          timeout=_remaining_timeout_or_throw(deadline, "key-value keys"))
+            if isempty(chunk)
+                _kv_throw_if_deadline_expired(deadline, "key-value keys")
+                break
+            end
             for msg in chunk
                 _kv_record_key!(latest, kv.prefix, msg)
             end
-            length(chunk) < 256 && break
+            if length(chunk) < 256
+                _kv_throw_if_deadline_expired(deadline, "key-value keys")
+                break
+            end
         end
     catch err
         try
-            close(sub)
+            _close_pull_subscription(sub; timeout=_kv_cleanup_timeout(deadline))
         catch cleanup_err
-            throw(Base.CompositeException([err, CleanupError("close key-value keys consumer", cleanup_err)]))
+            _kv_report_cleanup_error(kv, "close key-value keys consumer", cleanup_err)
         end
         rethrow()
     end
-    close(sub)
+    _close_pull_subscription(sub; timeout=_kv_cleanup_timeout(deadline))
     _kv_active_keys(latest)
 end
 
@@ -640,25 +687,34 @@ end
 function kv_purge_deletes(kv::KeyValue; older_than::Real=_KV_DEFAULT_PURGE_DELETES_OLDER_THAN,
                           timeout::Real=kv.js.timeout)
     timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     threshold = _kv_purge_deletes_threshold(older_than)
-    watcher = kv_watch(kv; key=">", meta_only=true, timeout)
+    watcher = kv_watch(kv; key=">", meta_only=true,
+                       timeout=_remaining_timeout_or_throw(deadline, "key-value delete marker purge"))
     markers = KeyValueEntry[]
     try
         while true
-            update = take!(watcher)
+            update = _kv_take!(watcher, _remaining_timeout_or_throw(deadline, "key-value delete marker purge"))
             update isa KeyValueWatchInitialDone && break
             entry = update::KeyValueEntry
             _kv_is_delete_marker(entry.operation) && push!(markers, entry)
         end
-    finally
-        close(watcher)
+    catch err
+        try
+            _close_keyvalue_watcher(watcher; timeout=_kv_cleanup_timeout(deadline))
+        catch cleanup_err
+            _kv_report_cleanup_error(kv, "close key-value delete marker watcher", cleanup_err)
+        end
+        rethrow()
     end
+    _close_keyvalue_watcher(watcher; timeout=_kv_cleanup_timeout(deadline))
 
     current = DateTime(1970, 1, 1) + Millisecond(round(Int, time() * 1000))
     limit = threshold > 0 ? current - Millisecond(round(Int, threshold * 1000)) : nothing
     for entry in markers
         keep = !isnothing(limit) && entry.created > limit ? 1 : nothing
-        stream_purge(kv.js, kv.stream; filter_subject="$(kv.prefix)$(entry.key)", keep, timeout)
+        stream_purge(kv.js, kv.stream; filter_subject="$(kv.prefix)$(entry.key)", keep,
+                     timeout=_remaining_timeout_or_throw(deadline, "key-value delete marker purge"))
     end
     nothing
 end

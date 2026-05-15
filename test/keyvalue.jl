@@ -447,6 +447,27 @@ end
     @test callback.updates == Any[entry, KV_WATCH_INITIAL_DONE]
 end
 
+@testitem "KeyValue watcher timed take respects timeout" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    sub = subscribe(client, "_INBOX.kvwatch")
+    psub = N.PushSubscription(js, sub, "KV_bucket", "watcher", ReentrantLock(), false, false)
+    state = N._kv_watcher_state(nothing, 1, false)
+    watcher = KeyValueWatcher(psub, state.updates, state)
+
+    try
+        @test_throws TimeoutError N._kv_take!(watcher, 0.01)
+        put!(state.updates, KV_WATCH_INITIAL_DONE)
+        @test N._kv_take!(watcher, 0.1) === KV_WATCH_INITIAL_DONE
+    finally
+        close(watcher)
+    end
+end
+
 @testitem "KeyValue entries expose typed metadata" setup=[TestHelpers] begin
     using Natter
     using Dates

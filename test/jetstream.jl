@@ -308,6 +308,12 @@ end
         @test TestHelpers.capture_text(capture) == ""
         @test isempty(client.subscriptions)
 
+        @test_throws ArgumentError stream_list(js; timeout=invalid_timeout)
+        @test_throws ArgumentError stream_names(js; timeout=invalid_timeout)
+        @test_throws ArgumentError consumer_list(js, "ORDERS"; timeout=invalid_timeout)
+        @test TestHelpers.capture_text(capture) == ""
+        @test isempty(client.subscriptions)
+
         @test_throws ArgumentError pull_subscribe(js, "orders.created"; stream="ORDERS", timeout=invalid_timeout)
         @test_throws ArgumentError push_subscribe(js, "orders.created"; stream="ORDERS", timeout=invalid_timeout)
         @test TestHelpers.capture_text(capture) == ""

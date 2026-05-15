@@ -600,6 +600,12 @@ end
 
 _remaining_timeout(deadline::Float64)::Float64 = max(0.0, deadline - time())
 
+function _remaining_timeout_or_throw(deadline::Float64, operation::AbstractString)::Float64
+    remaining = _remaining_timeout(deadline)
+    remaining > 0 || throw(TimeoutError("$operation timed out"))
+    remaining
+end
+
 function _lock_write!(client::Client, operation::String, deadline)
     if isnothing(deadline)
         lock(client.write_lock)
