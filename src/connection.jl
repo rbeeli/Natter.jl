@@ -1344,18 +1344,18 @@ function _connect_initial!(client::Client)
 end
 
 function _start_flusher_task!(client::Client, generation::Int=(@lock client.lock client.generation))
-    assigned = @lock client.lock begin
+    assigned, flush_signal = @lock client.lock begin
         existing = client.flusher_task
         if client.generation == generation &&
            client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING) &&
            (isnothing(existing) || istaskdone(existing))
-            :start
+            (:start, client.flush_signal)
         else
-            :skip
+            (:skip, nothing)
         end
     end
     assigned == :start || return nothing
-    flusher_task = @async _flusher_loop(client, generation)
+    flusher_task = @async _flusher_loop(client, generation, flush_signal)
     @lock client.lock begin
         if client.generation == generation &&
            client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING)
@@ -1382,10 +1382,9 @@ function _start_background_tasks!(client::Client, generation::Int=(@lock client.
     nothing
 end
 
-function _flusher_loop(client::Client, generation::Int)
+function _flusher_loop(client::Client, generation::Int, ch::Channel{Bool})
     while _generation_matches(client, generation) &&
           status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING)
-        ch = @lock client.lock client.flush_signal
         try
             take!(ch)
         catch err

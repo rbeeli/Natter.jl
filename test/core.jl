@@ -603,6 +603,69 @@ end
     end
 end
 
+@testitem "flusher signals are scoped to connection generation" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct FlushRaceTransport <: IO
+        bytes::Vector{UInt8}
+        flushes::Int
+        closed::Bool
+    end
+    FlushRaceTransport() = FlushRaceTransport(UInt8[], 0, false)
+
+    Base.write(t::FlushRaceTransport, data::Vector{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::FlushRaceTransport, data::Base.CodeUnits{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::FlushRaceTransport, data::AbstractString) = (append!(t.bytes, codeunits(data)); ncodeunits(data))
+    Base.flush(t::FlushRaceTransport) = (t.flushes += 1; nothing)
+    Base.close(t::FlushRaceTransport) = (t.closed = true; nothing)
+    Base.isopen(t::FlushRaceTransport) = !t.closed
+
+    transport = FlushRaceTransport()
+    write_io = N.BufferedWriteIO(transport)
+    opts = N.ConnectOptions(write_buffer_size=1024 * 1024, write_buffer_latency=0)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io)
+
+    old_signal = client.flush_signal
+    waiting = Channel{Bool}(1)
+    stale_result = Channel{Bool}(1)
+    stale_waiter = @async begin
+        put!(waiting, true)
+        try
+            take!(old_signal)
+            put!(stale_result, true)
+        catch err
+            err isa InvalidStateException || rethrow()
+            put!(stale_result, false)
+        end
+    end
+    take!(waiting)
+
+    @lock client.lock N._bump_generation_locked!(client)
+    @test client.flush_signal !== old_signal
+    @test !isopen(old_signal)
+    @test timedwait(1.0; pollint=0.001) do
+        isready(stale_result)
+    end != :timed_out
+    @test take!(stale_result) === false
+    wait(stale_waiter)
+
+    N._start_flusher_task!(client, client.generation)
+    publish(client, "foo", "bar")
+    @test N._buffered_bytes(write_io) > 0
+
+    result = timedwait(1.0; pollint=0.001) do
+        occursin("PUB foo 3\r\nbar\r\n", String(copy(transport.bytes))) &&
+            N._buffered_bytes(write_io) == 0
+    end
+    @test result != :timed_out
+    @test transport.flushes == 1
+
+    close(client)
+end
+
 @testitem "publish writes use buffered flusher" setup=[TestHelpers] begin
     using Natter
 

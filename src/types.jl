@@ -1364,8 +1364,20 @@ end
 @inline _store_status_locked!(client::Client, value::ConnectionStatus.T) =
     (client.status = value; client.status_code[] = Int(value); value)
 @inline _load_generation(client::Client)::Int = client.generation_value[]
-@inline _store_generation_locked!(client::Client, value::Int) =
-    (client.generation = value; client.generation_value[] = value; value)
+
+@inline function _replace_flush_signal_locked!(client::Client)
+    old = client.flush_signal
+    client.flush_signal = Channel{Bool}(1)
+    isopen(old) && close(old)
+    client.flush_signal
+end
+
+@inline function _store_generation_locked!(client::Client, value::Int)
+    client.generation == value || _replace_flush_signal_locked!(client)
+    client.generation = value
+    client.generation_value[] = value
+    value
+end
 @inline _bump_generation_locked!(client::Client)::Int =
     _store_generation_locked!(client, client.generation + 1)
 @inline _client_max_payload(client::Client)::Int = client.max_payload_value[]
