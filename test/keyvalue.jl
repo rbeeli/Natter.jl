@@ -433,6 +433,29 @@ end
     @test_throws ArgumentError N._kv_watch_channel_size(0)
 end
 
+@testitem "KeyValue watchers create ordered push consumers" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    kv = KeyValue(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
+
+    @test_throws TimeoutError kv_watch(kv; key="alpha", timeout=0.001)
+    written = TestHelpers.capture_text(capture)
+    @test occursin("SUB _INBOX.", written)
+    @test occursin("PUB \$JS.API.CONSUMER.CREATE.KV_bucket", written)
+    @test occursin("\"filter_subject\":\"\$KV.bucket.alpha\"", written)
+    @test occursin("\"deliver_policy\":\"last_per_subject\"", written)
+    @test occursin("\"ack_policy\":\"none\"", written)
+    @test occursin("\"flow_control\":true", written)
+    @test occursin("\"idle_heartbeat\":5000000000", written)
+    @test occursin("\"max_deliver\":1", written)
+    @test occursin("\"num_replicas\":1", written)
+    @test occursin("\"mem_storage\":true", written)
+end
+
 @testitem "KeyValue watchers accept callable objects" setup=[TestHelpers] begin
     using Dates
     using Natter

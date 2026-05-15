@@ -1554,6 +1554,29 @@ end
     @test meta3.pending == 9
 end
 
+@testitem "JetStream ordered push control detects sequence gaps" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED)
+    resets = Int[]
+    handler = N._JetStreamPushControlHandler()
+    @lock handler.lock begin
+        handler.ordered = true
+        handler.ordered_reset_callback = seq -> push!(resets, seq)
+    end
+
+    first_msg = Msg("orders.created", "\$JS.ACK.ORDERS.C1.1.10.1.123456789.2", UInt8[])
+    @test !N._handle_ordered_push_data!(handler, client, first_msg)
+    @test isempty(resets)
+
+    gap_msg = Msg("orders.created", "\$JS.ACK.ORDERS.C1.1.12.3.123456790.0", UInt8[])
+    @test N._handle_ordered_push_data!(handler, client, gap_msg)
+    @test resets == [11]
+    @test handler.ordered_resetting
+end
+
 @testitem "JetStream pull fetch validates inputs before publishing" setup=[TestHelpers] begin
     using Natter
 
@@ -1753,6 +1776,80 @@ end
         wait(stream)
         close(psub)
     end
+end
+
+@testitem "JetStream continuous pull publishes outside stream state lock" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct BlockingPullRequestTransport <: IO
+        capture::TestHelpers.WriteCapture
+        started::Channel{Nothing}
+        release::Channel{Nothing}
+        enabled::Bool
+        blocked::Bool
+    end
+
+    BlockingPullRequestTransport() =
+        BlockingPullRequestTransport(TestHelpers.WriteCapture(), Channel{Nothing}(1),
+                                     Channel{Nothing}(1), false, false)
+
+    function blocking_request_write(t::BlockingPullRequestTransport, data)
+        if t.enabled && !t.blocked
+            t.blocked = true
+            put!(t.started, nothing)
+            take!(t.release)
+        end
+        write(t.capture, data)
+    end
+
+    Base.write(t::BlockingPullRequestTransport, byte::UInt8) = blocking_request_write(t, byte)
+    Base.write(t::BlockingPullRequestTransport, data::Vector{UInt8}) = blocking_request_write(t, data)
+    Base.write(t::BlockingPullRequestTransport, data::Base.CodeUnits{UInt8}) = blocking_request_write(t, data)
+    Base.write(t::BlockingPullRequestTransport, data::Union{String,SubString{String}}) = blocking_request_write(t, data)
+    Base.write(t::BlockingPullRequestTransport, data::AbstractString) = blocking_request_write(t, data)
+    Base.write(t::BlockingPullRequestTransport, ch::Char) = blocking_request_write(t, ch)
+    Base.flush(t::BlockingPullRequestTransport) = flush(t.capture)
+    Base.close(t::BlockingPullRequestTransport) = close(t.capture)
+
+    function release_transport!(t::BlockingPullRequestTransport)
+        isready(t.release) || put!(t.release, nothing)
+        nothing
+    end
+
+    transport = BlockingPullRequestTransport()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull.*")
+    TestHelpers.clear_capture!(transport.capture)
+
+    transport.enabled = true
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*",
+                              ReentrantLock(), ReentrantLock(), false, false)
+
+    stream = messages(psub; batch=1, expires=1.0, heartbeat=0, stop_after=1)
+    stream_done = Ref(:timed_out)
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            isready(transport.started)
+        end != :timed_out
+
+        close_task = @async close(stream)
+        @test timedwait(0.2; pollint=0.001) do
+            istaskdone(close_task)
+        end != :timed_out
+        @test fetch(close_task) === nothing
+    finally
+        release_transport!(transport)
+        close(stream)
+        stream_done[] = timedwait(1.0; pollint=0.001) do
+            istaskdone(stream.task)
+        end
+        stream_done[] == :timed_out || wait(stream)
+        close(psub)
+    end
+    @test stream_done[] != :timed_out
 end
 
 @testitem "JetStream continuous pull refills at message thresholds" setup=[TestHelpers] begin
@@ -2122,7 +2219,9 @@ end
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
                                     sid=core_sub.sid))
         @test isempty(fetch(psub, 1; timeout=0.1, heartbeat=0))
-        @test occursin("\"pin_id\":\"pin-a\"", String(take!(client.write_io)))
+        request = String(take!(client.write_io))
+        @test occursin("\"id\":\"pin-a\"", request)
+        @test !occursin("pin_id", request)
 
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["423"], "Description" => ["Pin ID Mismatch"]),

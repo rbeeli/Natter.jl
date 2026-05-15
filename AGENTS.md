@@ -83,7 +83,7 @@ If a test container already exists, inspect it first instead of blindly replacin
 
 Documentation is built with DocumenterVitepress from the dedicated `docs/` Julia project. Keep pages organized by user-facing concepts, not internal source files. Prefer concise guides plus complete examples over API dumps.
 
-When changing public APIs, update the relevant guide, example, and `docs/src/reference.md`. When support status changes, update both `FEATURES_COVERAGE.md` and `docs/src/feature-coverage.md`.
+When changing public APIs, update the relevant guide, example, and `docs/src/reference.md`. When support status changes, update `docs/src/feature-coverage.md`.
 
 Do not push, deploy docs, or rebuild generated docs unless the user explicitly asks for that. Source-only documentation edits do not require running the docs build.
 
@@ -100,7 +100,7 @@ Set `DOCUMENTER_BUILD_VITEPRESS=true` only when explicitly asked to build the Vi
 
 ## Feature Tracking
 
-Update `FEATURES_COVERAGE.md` whenever support changes. Be explicit about:
+Update `docs/src/feature-coverage.md` whenever support changes. Be explicit about:
 
 - Supported production paths.
 - Partial support and remaining hardening work.

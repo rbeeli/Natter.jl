@@ -570,6 +570,10 @@ function _dispatch_msg(client::Client, msg::Msg)
         _record_in!(client, length(msg.data))
         return
     end
+    if _handle_ordered_push_data!(control_handler, client, msg)
+        _record_drop!(client)
+        return
+    end
 
     should_close = false
     report_slow = false

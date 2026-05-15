@@ -112,7 +112,7 @@ end
 ## Watch
 
 `kv_watch(kv)` returns a `KeyValueWatcher` with an `updates` channel. The channel yields `KeyValueEntry` values and then `KV_WATCH_INITIAL_DONE` after the initial snapshot has been delivered. Close the watcher when it is no longer needed.
-Current watchers use ordinary push consumers; ordered-consumer gap/reset behavior is not implemented yet.
+Watchers use ordered ephemeral push consumers with flow control, heartbeat monitoring, sequence-gap detection, and automatic reset from the next stream sequence.
 
 ```julia
 watcher = kv_watch(kv; keys=["users.*.name", "system.theme"], meta_only=true)

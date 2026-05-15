@@ -663,8 +663,9 @@ function _kv_watch(callback, kv::KeyValue; key::AbstractString=">",
     cfg = _kv_watch_consumer_config(kv, filters; history, updates_only, meta_only, resume_revision)
     state = _kv_watcher_state(callback, _kv_watch_channel_size(channel_size), notify_initial_done)
     entry_callback = _kv_watch_callback(kv, state, ignore_deletes)
-    sub = push_subscribe(kv.js, "$(kv.prefix)$(first(filters))"; stream=kv.stream,
-                         callback=entry_callback, manual_ack=true, config=cfg, timeout)
+    sub = _push_subscribe(kv.js, "$(kv.prefix)$(first(filters))"; stream=kv.stream,
+                          callback=entry_callback, manual_ack=true, config=cfg, timeout,
+                          ordered=true)
     watcher = KeyValueWatcher(sub, state.updates, state)
     _kv_watcher_set_initial_pending!(state, _consumer_num_pending(sub.info), updates_only)
     watcher

@@ -944,6 +944,37 @@ _push_config_has_idle_heartbeat(config::Dict{String,Any}) =
 _push_config_has_flow_control(config::Dict{String,Any}) =
     get(config, "flow_control", false) == true
 
+const _ORDERED_CONSUMER_HEARTBEAT_SECONDS = 5.0
+const _ORDERED_CONSUMER_ACK_WAIT_SECONDS = 22 * 60 * 60.0
+
+function _prepare_ordered_push_consumer_config!(config::Dict{String,Any},
+                                                queue::Union{String,Nothing})
+    isnothing(queue) || throw(ArgumentError("ordered push consumers do not support queue groups"))
+    for field in ("name", "durable_name", "deliver_subject", "deliver_group")
+        if haskey(config, field) && !isnothing(config[field])
+            throw(ArgumentError("ordered push consumers do not support $field"))
+        end
+    end
+    if haskey(config, "ack_policy") && !isnothing(config["ack_policy"]) && config["ack_policy"] != "none"
+        throw(ArgumentError("ordered push consumers require ack_policy=none"))
+    end
+    if haskey(config, "max_deliver") && !isnothing(config["max_deliver"]) && config["max_deliver"] != 1
+        throw(ArgumentError("ordered push consumers require max_deliver=1"))
+    end
+    config["ack_policy"] = "none"
+    config["flow_control"] = true
+    config["max_deliver"] = 1
+    _set_config_default!(config, "ack_wait", _seconds_to_nanoseconds(_ORDERED_CONSUMER_ACK_WAIT_SECONDS))
+    _set_config_default!(config, "idle_heartbeat", _seconds_to_nanoseconds(_ORDERED_CONSUMER_HEARTBEAT_SECONDS))
+    _set_config_default!(config, "num_replicas", 1)
+    _set_config_default!(config, "mem_storage", true)
+    config
+end
+
+function _copy_config_payload(config::Dict{String,Any})::Dict{String,Any}
+    Dict{String,Any}(k => _consumer_normalized_config_value(v) for (k, v) in config)
+end
+
 function _validate_push_queue_control_config!(config::Dict{String,Any}, queue::Union{String,Nothing})
     isnothing(queue) && return config
     _push_config_has_flow_control(config) &&
@@ -1039,6 +1070,12 @@ mutable struct _PullStreamRequest
     remaining_bytes::Union{Int,Nothing}
 end
 
+struct _PullStreamReservation
+    request::_PullStreamRequest
+    batch::Int
+    max_bytes::Union{Int,Nothing}
+end
+
 struct _PullStreamConfig
     batch::Int
     max_bytes::Union{Int,Nothing}
@@ -1075,7 +1112,7 @@ function _pull_fetch_request_payload(batch::Int, expires_ns::Int, heartbeat_ns::
     end
     isnothing(priority) || print(io, ",\"priority\":", priority)
     if !isnothing(pin_id)
-        print(io, ",\"pin_id\":")
+        print(io, ",\"id\":")
         JSON3.write(io, pin_id)
     end
     write(io, UInt8('}'))
@@ -1140,6 +1177,7 @@ mutable struct PushSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription
     delete_on_close::Bool
     closed::Bool
     heartbeat_task::Union{Task,Nothing}
+    ordered_reset_task::Union{Task,Nothing}
     control_handler::Union{_JetStreamPushControlHandler,Nothing}
     info::Union{ConsumerInfo,Nothing}
 end
@@ -1149,7 +1187,7 @@ function PushSubscription(js::J, sub::S, stream::AbstractString, consumer::Abstr
                           heartbeat_task::Union{Task,Nothing},
                           control_handler::Union{_JetStreamPushControlHandler,Nothing}) where {C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
     PushSubscription{C,J,S}(js, sub, String(stream), String(consumer), close_lock, delete_on_close, closed,
-                            heartbeat_task, control_handler, nothing)
+                            heartbeat_task, nothing, control_handler, nothing)
 end
 
 PushSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
@@ -1220,6 +1258,8 @@ function _handle_subscription_control(handler::_JetStreamPushControlHandler, sub
     action == :message && return false
     if action == :flow_control
         _schedule_or_reply_to_flow_control(sub, handler, msg)
+    elseif action == :idle_heartbeat
+        _handle_ordered_push_heartbeat!(handler, sub, msg)
     elseif !isnothing(err)
         _report_error(sub.client, err)
     end
@@ -1248,7 +1288,16 @@ function _push_heartbeat_monitor(psub::PushSubscription, handler::_JetStreamPush
         _maybe_reply_to_subscription_flow_control!(psub.sub, handler)
         missed = time() - handler.last_seen[] > 2 * interval
         if missed
-            _report_error(psub.js.client, _jetstream_heartbeat_error())
+            if handler.ordered
+                reset_seq = @lock handler.lock handler.ordered_last_stream_seq + 1
+                try
+                    _request_ordered_push_reset!(handler, reset_seq)
+                catch err
+                    _report_error(psub.js.client, CleanupError("reset ordered push consumer after missed heartbeat", err))
+                end
+            else
+                _report_error(psub.js.client, _jetstream_heartbeat_error())
+            end
             _touch_push_control_handler!(handler)
         end
     end
@@ -1327,6 +1376,179 @@ function _schedule_or_reply_to_flow_control(sub::Subscription, handler::_JetStre
         end
     end
     send_now && _publish_flow_control_reply(sub, reply)
+    nothing
+end
+
+_header_int(msg::Msg, key::AbstractString)::Union{Int,Nothing} = begin
+    value = header(msg, key)
+    isnothing(value) && return nothing
+    tryparse(Int, value)
+end
+
+function _request_ordered_push_reset!(handler::_JetStreamPushControlHandler, start_seq::Int)
+    callback = @lock handler.lock begin
+        handler.ordered || return nothing
+        handler.ordered_resetting && return nothing
+        handler.ordered_resetting = true
+        handler.ordered_next_consumer_seq = 1
+        handler.ordered_last_stream_seq = max(0, start_seq - 1)
+        handler.flow_incoming[] = UInt64(0)
+        handler.flow_delivered = UInt64(0)
+        handler.flow_reply = nothing
+        handler.flow_target = UInt64(0)
+        handler.ordered_reset_callback
+    end
+    if isnothing(callback)
+        @lock handler.lock handler.ordered_resetting = false
+    else
+        try
+            callback(max(1, start_seq))
+            return nothing
+        catch err
+            @lock handler.lock handler.ordered_resetting = false
+            rethrow()
+        end
+    end
+    nothing
+end
+
+function _handle_ordered_push_data!(handler::_JetStreamPushControlHandler, client::Client, msg::Msg)::Bool
+    handler.ordered || return false
+    reply = msg.reply
+    isnothing(reply) && return false
+    parsed = try
+        _parse_msg_metadata(reply)
+    catch err
+        err isa ProtocolError || rethrow()
+        return false
+    end
+    reset_seq = @lock handler.lock begin
+        handler.ordered || return 0
+        if parsed.consumer_sequence != handler.ordered_next_consumer_seq
+            handler.ordered_last_stream_seq + 1
+        else
+            handler.ordered_next_consumer_seq = parsed.consumer_sequence + 1
+            handler.ordered_last_stream_seq = parsed.stream_sequence
+            0
+        end
+    end
+    reset_seq == 0 && return false
+    try
+        _request_ordered_push_reset!(handler, reset_seq)
+    catch err
+        _report_error(client, CleanupError("reset ordered push consumer", err))
+    end
+    true
+end
+
+_handle_ordered_push_data!(::_SubscriptionControlHandler, ::Client, ::Msg)::Bool = false
+
+function _handle_ordered_push_heartbeat!(handler::_JetStreamPushControlHandler, sub::Subscription, msg::Msg)
+    handler.ordered || return nothing
+    last_consumer = _header_int(msg, "Nats-Last-Consumer")
+    isnothing(last_consumer) && return nothing
+    reset_seq = @lock handler.lock begin
+        handler.ordered || return 0
+        delivered = handler.ordered_next_consumer_seq - 1
+        last_consumer > delivered ? handler.ordered_last_stream_seq + 1 : 0
+    end
+    reset_seq == 0 && return nothing
+    try
+        _request_ordered_push_reset!(handler, reset_seq)
+    catch err
+        _report_error(sub.client, CleanupError("reset ordered push consumer after heartbeat gap", err))
+    end
+    nothing
+end
+
+function _remap_ordered_subscription!(sub::Subscription, deliver::String)::Tuple{Int,Int}
+    client = sub.client
+    @lock sub.lock begin
+        sub.closed && throw(ConnectionClosedError("subscription is closed"))
+        @lock client.lock begin
+            old_sid = sub.sid
+            _delete_subscription_locked!(client, old_sid, sub)
+            client.sid += 1
+            new_sid = client.sid
+            sub.sid = new_sid
+            sub.subject = deliver
+            sub.server_active = false
+            client.subscriptions[new_sid] = sub
+            _set_subscription_snapshot_locked!(client, new_sid, sub)
+            old_sid, new_sid
+        end
+    end
+end
+
+function _send_ordered_subscription_reset!(sub::Subscription, old_sid::Int, new_sid::Int, deliver::String)
+    _send_raw(sub.client, string(_unsub_cmd(old_sid), _sub_cmd(deliver, sub.queue, new_sid)); force_flush=true)
+    @lock sub.lock begin
+        if !sub.closed && sub.sid == new_sid
+            sub.server_active = true
+        end
+    end
+    nothing
+end
+
+function _finish_ordered_reset!(handler::Union{_JetStreamPushControlHandler,Nothing})
+    isnothing(handler) && return nothing
+    @lock handler.lock handler.ordered_resetting = false
+    nothing
+end
+
+function _ordered_delete_consumer_task(psub::PushSubscription, consumer::String)
+    isempty(consumer) && return nothing
+    try
+        consumer_delete(psub.js, psub.stream, consumer; timeout=psub.js.timeout)
+    catch err
+        _consumer_missing(err) || _report_error(psub.js.client, CleanupError("delete ordered push consumer $consumer", err))
+    end
+    nothing
+end
+
+function _ordered_push_reset_task(psub::PushSubscription, base_config::Dict{String,Any}, start_seq::Int)
+    handler = psub.control_handler
+    try
+        (@lock psub.close_lock psub.closed) && return nothing
+        old_consumer = psub.consumer
+        deliver = new_inbox(psub.js.client)
+        old_sid, new_sid = _remap_ordered_subscription!(psub.sub, deliver)
+        _send_ordered_subscription_reset!(psub.sub, old_sid, new_sid, deliver)
+
+        cfg = _copy_config_payload(base_config)
+        cfg["name"] = @lock psub.js.client.lock randstring(psub.js.client.rng, 16)
+        cfg["deliver_subject"] = deliver
+        cfg["deliver_policy"] = "by_start_sequence"
+        cfg["opt_start_seq"] = max(1, start_seq)
+        info = _consumer_create_payload_request(psub.js, psub.stream, cfg; timeout=psub.js.timeout, action="create")
+        closed = @lock psub.close_lock begin
+            if !psub.closed
+                psub.consumer = info.name
+                psub.info = info
+                false
+            else
+                true
+            end
+        end
+        if closed
+            try
+                consumer_delete(psub.js, psub.stream, info.name; timeout=psub.js.timeout)
+            catch err
+                _consumer_missing(err) || _report_error(psub.js.client, CleanupError("delete closed ordered push consumer $(info.name)", err))
+            end
+            return nothing
+        end
+        @async _ordered_delete_consumer_task(psub, old_consumer)
+    catch err
+        _report_error(psub.js.client, CleanupError("reset ordered push consumer", err))
+    finally
+        _finish_ordered_reset!(handler)
+    end
+    nothing
+end
+
+function _schedule_ordered_push_reset!(psub::PushSubscription, base_config::Dict{String,Any}, start_seq::Int)
+    psub.ordered_reset_task = @async _ordered_push_reset_task(psub, base_config, start_seq)
     nothing
 end
 
@@ -1792,25 +2014,54 @@ function _pull_stream_should_refill(config::_PullStreamConfig,
         _pull_stream_pending_bytes(state) <= (config.threshold_bytes::Int)
 end
 
+function _reserve_pull_stream_request!(config::_PullStreamConfig, state::_PullMessageStreamState,
+                                       token::Union{String,Nothing})::Union{_PullStreamReservation,Nothing}
+    @lock state.lock begin
+        state.closed && return nothing
+        _pull_stream_should_refill(config, state) || return nothing
+        batch = _pull_stream_request_batch(config, state)
+        batch > 0 || return nothing
+        max_bytes = _pull_stream_request_max_bytes(config, state)
+        max_bytes === 0 && return nothing
+        request = _PullStreamRequest(token, batch, max_bytes)
+        push!(state.requests, request)
+        _PullStreamReservation(request, batch, max_bytes)
+    end
+end
+
+function _pull_stream_request_index(requests::Vector{_PullStreamRequest},
+                                    request::_PullStreamRequest)::Int
+    @inbounds for i in eachindex(requests)
+        requests[i] === request && return i
+    end
+    0
+end
+
+function _unreserve_pull_stream_request!(state::_PullMessageStreamState, request::_PullStreamRequest)
+    @lock state.lock begin
+        index = _pull_stream_request_index(state.requests, request)
+        index == 0 || deleteat!(state.requests, index)
+    end
+    nothing
+end
+
 function _publish_pull_stream_request!(psub::PullSubscription, config::_PullStreamConfig,
                                        state::_PullMessageStreamState)::Bool
-    @lock state.lock begin
-        state.closed && return false
-        _pull_stream_should_refill(config, state) || return false
-        batch = _pull_stream_request_batch(config, state)
-        batch > 0 || return false
-        max_bytes = _pull_stream_request_max_bytes(config, state)
-        max_bytes === 0 && return false
-        heartbeat_ns = config.heartbeat > 0 ? _seconds_to_nanoseconds(config.heartbeat) : 0
-        payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(config.expires),
-                                              heartbeat_ns, max_bytes, false, psub.pin_id,
-                                              config.min_pending, config.min_ack_pending,
-                                              config.priority_group, config.priority)
-        reply, token = _pull_fetch_reply(psub)
+    reply, token = _pull_fetch_reply(psub)
+    reservation = _reserve_pull_stream_request!(config, state, token)
+    isnothing(reservation) && return false
+    heartbeat_ns = config.heartbeat > 0 ? _seconds_to_nanoseconds(config.heartbeat) : 0
+    payload = _pull_fetch_request_payload(reservation.batch, _seconds_to_nanoseconds(config.expires),
+                                          heartbeat_ns, reservation.max_bytes, false, psub.pin_id,
+                                          config.min_pending, config.min_ack_pending,
+                                          config.priority_group, config.priority)
+    try
         _publish_pull_fetch_request(psub, psub.next_subject, payload, reply)
-        push!(state.requests, _PullStreamRequest(token, batch, max_bytes))
-        true
+    catch
+        _unreserve_pull_stream_request!(state, reservation.request)
+        rethrow()
     end
+    true
 end
 
 function _pull_stream_find_request(requests::Vector{_PullStreamRequest}, subject::AbstractString)::Int
@@ -2032,15 +2283,16 @@ end
 Base.fetch(stream::PullMessageStream) = wait(stream)
 Base.isopen(stream::PullMessageStream) = isopen(stream.messages) && !_pull_stream_closed(stream.state)
 
-function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
-                        queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
-                        config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
-                        timeout::Real=js.timeout)
+function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
+                         queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
+                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
+                         timeout::Real=js.timeout, ordered::Bool=false)
     subject = _validate_subject(subject)
     timeout = _positive_timeout_seconds("timeout", timeout)
     cfg = _js_config_payload(config)
     queue_explicit = !isnothing(queue)
     local_queue = _resolve_push_queue!(cfg, queue)
+    ordered && _prepare_ordered_push_consumer_config!(cfg, local_queue)
     _validate_push_queue_control_config!(cfg, local_queue)
     _validate_push_consumer_control_config!(cfg)
     _validate_consumer_config_payload!(cfg)
@@ -2049,6 +2301,7 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
 
     stream = isnothing(stream) ? _stream_by_subject(js, subject; timeout) : _validate_api_name("stream", stream)
     durable = isnothing(durable) ? nothing : _validate_api_name("consumer", durable)
+    ordered && !isnothing(durable) && throw(ArgumentError("ordered push consumers do not support durable consumers"))
     deliver = new_inbox(js.client)
     if !_consumer_has_filter(cfg)
         cfg["filter_subject"] = String(subject)
@@ -2062,7 +2315,9 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     _default_push_queue_consumer!(cfg, bind_fields, local_queue)
     _validate_consumer_config_payload!(cfg)
     bind_name = _consumer_bind_name(cfg)
+    ordered && !isnothing(bind_name) && throw(ArgumentError("ordered push consumers cannot bind existing consumers"))
     delete_on_close = isnothing(bind_name)
+    ordered_base_config = ordered ? _copy_config_payload(cfg) : nothing
     info::Union{ConsumerInfo,Nothing} = nothing
     create_consumer = false
     if isnothing(bind_name)
@@ -2118,7 +2373,18 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         control_handler.flow_control[] = _push_flow_control_enabled(info)
         control_handler.last_seen[] = time()
         psub = PushSubscription(js, sub, String(stream), String(info.name), ReentrantLock(), delete_on_close, false,
-                                nothing, control_handler, info)
+                                nothing, nothing, control_handler, info)
+        if ordered
+            base_config = ordered_base_config::Dict{String,Any}
+            @lock control_handler.lock begin
+                control_handler.ordered = true
+                control_handler.ordered_next_consumer_seq = 1
+                control_handler.ordered_last_stream_seq = 0
+                control_handler.ordered_resetting = false
+                control_handler.ordered_reset_callback =
+                    start_seq -> _schedule_ordered_push_reset!(psub, base_config, start_seq)
+            end
+        end
         psub.heartbeat_task = _start_push_heartbeat_monitor(psub, control_handler)
         psub
     catch err
@@ -2137,6 +2403,13 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         end
         isempty(cleanup_errors) ? rethrow() : throw(Base.CompositeException(vcat(Any[err], cleanup_errors)))
     end
+end
+
+function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
+                        queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
+                        config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
+                        timeout::Real=js.timeout)
+    _push_subscribe(js, subject; stream, durable, queue, callback, manual_ack, config, timeout)
 end
 
 function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.timeout)
@@ -2185,6 +2458,8 @@ function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.
         push!(errors, err)
     end
     _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task;
+                interrupt=true, deadline)
+    _wait_task!(errors, "stop ordered push reset $(psub.consumer)", psub.ordered_reset_task;
                 interrupt=true, deadline)
     handler = psub.control_handler
     server_deleted = !isnothing(handler) && handler.consumer_deleted[]

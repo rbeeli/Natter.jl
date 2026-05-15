@@ -1146,6 +1146,11 @@ mutable struct _JetStreamPushControlHandler
     flow_delivered::UInt64
     flow_reply::Union{String,Nothing}
     flow_target::UInt64
+    ordered::Bool
+    ordered_next_consumer_seq::Int
+    ordered_last_stream_seq::Int
+    ordered_resetting::Bool
+    ordered_reset_callback::Union{Nothing,Function}
     lock::ReentrantLock
 end
 _JetStreamPushControlHandler(idle_heartbeat::Real=0.0; flow_control::Bool=true) =
@@ -1155,6 +1160,7 @@ _JetStreamPushControlHandler(idle_heartbeat::Real=0.0; flow_control::Bool=true) 
                                  Threads.Atomic{Bool}(false),
                                  Threads.Atomic{UInt64}(UInt64(0)),
                                  UInt64(0), nothing, UInt64(0),
+                                 false, 1, 0, false, nothing,
                                  ReentrantLock())
 struct _RequestMuxControlHandler end
 
