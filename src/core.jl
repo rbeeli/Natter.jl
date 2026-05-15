@@ -344,6 +344,20 @@ function _validate_subscription_limits(max_msgs::Int, pending_msgs_limit::Int, p
     nothing
 end
 
+struct _SubscriptionProcessor{S<:Subscription,F}
+    sub::S
+    callback::F
+end
+
+(processor::_SubscriptionProcessor)() =
+    _subscription_processor(processor.sub, processor.callback)
+
+function _start_subscription_processor!(sub::Subscription, callback::Callback) where {Callback}
+    processor = _SubscriptionProcessor(sub, callback)
+    sub.processor = @async processor()
+    nothing
+end
+
 function _subscribe(client::Client, subject::AbstractString; queue::Union{AbstractString,Nothing}=nothing, callback=nothing,
                     max_msgs::Int=0, pending_msgs_limit::Int=client.options.sub_pending_msgs_limit,
                     pending_bytes_limit::Int=client.options.sub_pending_bytes_limit,
@@ -387,7 +401,7 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
         end
     end
     if !isnothing(callback)
-        sub.processor = @async _subscription_processor(sub, callback)
+        _start_subscription_processor!(sub, callback)
     end
     sub
 end

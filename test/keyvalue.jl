@@ -163,8 +163,7 @@ end
             num_replicas=3,
             allow_direct=true,
         ),
-        Dict{String,Any}("messages" => 7, "bytes" => 128),
-        Dict{String,Any}(),
+        StreamState(messages=7, bytes=128),
     )
 
     status = N._kv_status(kv, info)

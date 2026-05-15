@@ -171,19 +171,26 @@ const HeaderStorage = Union{Headers,LazyHeaders,Nothing}
 abstract type AbstractNatterClient end
 abstract type AbstractMsg end
 abstract type _AbstractPublishFrame end
-abstract type _PendingEntry end
 
-struct _PendingBytes <: _PendingEntry
+struct _PendingBytes
     data::Vector{UInt8}
     bytes::Int
 end
 _PendingBytes(data::Vector{UInt8}) = _PendingBytes(data, length(data))
 
-struct _PendingPublish{F<:_AbstractPublishFrame} <: _PendingEntry
-    frame::F
+struct _PendingPublishFrame <: _AbstractPublishFrame
+    subject::String
+    reply::Union{String,Nothing}
+    payload::Vector{UInt8}
+    headers::Vector{UInt8}
+end
+
+struct _PendingPublish
+    frame::_PendingPublishFrame
     bytes::Int
 end
 
+const _PendingEntry = Union{_PendingBytes,_PendingPublish}
 const EMPTY_PENDING_ENTRY = _PendingBytes(EMPTY_BYTES)
 
 _pending_entry_size(entry::_PendingBytes)::Int = entry.bytes

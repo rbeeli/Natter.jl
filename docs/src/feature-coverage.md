@@ -39,8 +39,8 @@ This page summarizes the supported surface. The repository root `FEATURES_COVERA
 | Typed stream configs | Supported | Mirrors known stream schema fields with Julia structs and EnumX enums, plus local subject/name/numeric validation. |
 | Typed consumer configs | Supported | Mirrors known consumer schema fields with Julia structs and EnumX enums, plus local subject/name/queue/numeric validation. |
 | Raw config dictionaries | Supported | Escape hatch for newer server fields. |
-| Stream CRUD and list APIs | Supported | Includes pagination. |
-| Consumer CRUD and list APIs | Supported | Includes server-version-aware create subjects, strict create/update actions, and explicit create-or-update upsert. |
+| Stream CRUD and list APIs | Supported | Includes pagination and typed stream info state. |
+| Consumer CRUD and list APIs | Supported | Includes typed consumer info counters/cursors, server-version-aware create subjects, strict create/update actions, and explicit create-or-update upsert. |
 | Publish acknowledgements | Supported | `js_publish` returns `PubAck` and exposes first-class headers for msg-id, expected stream/sequence/msg-id/subject, per-message TTL, schedules, and no-responders retry. |
 | Task handle helpers | Supported | Management, publish, message get/delete, consumer, fetch, close, and ack operations have `_async` helpers. |
 | Pull consumers | Partial | Durable and named consumers bind without mutation and recover from concurrent matching strict-create conflicts; missing consumers and random ephemerals are strictly created. Batch fetch, per-request reply correlation, expiration handling, idle heartbeat monitoring, reconnect-disconnect reporting, and JetStream status/control error mapping are covered. Fetches on one pull subscription are serialized, and fetch requests are not replayed after reconnect; callers retry after `FetchDisconnectedError`. |

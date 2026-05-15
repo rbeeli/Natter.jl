@@ -43,9 +43,9 @@ struct KeyValueWatchInitialDone end
 const KV_WATCH_INITIAL_DONE = KeyValueWatchInitialDone()
 const _KeyValueWatchUpdate = Union{KeyValueEntry,KeyValueWatchInitialDone}
 
-mutable struct _KeyValueWatcherState
+mutable struct _KeyValueWatcherState{Callback}
     updates::Union{Channel{_KeyValueWatchUpdate},Nothing}
-    callback
+    callback::Callback
     notify_initial_done::Bool
     lock::ReentrantLock
     closed::Bool
@@ -54,10 +54,10 @@ mutable struct _KeyValueWatcherState
     initial_received::Int
 end
 
-mutable struct KeyValueWatcher{S<:PushSubscription}
+mutable struct KeyValueWatcher{S<:PushSubscription,State<:_KeyValueWatcherState}
     subscription::S
     updates::Union{Channel{_KeyValueWatchUpdate},Nothing}
-    state::_KeyValueWatcherState
+    state::State
 end
 
 _kv_stream(bucket) = "KV_$bucket"
@@ -189,7 +189,8 @@ end
 function _kv_watcher_state(callback, channel_size::Integer,
                            notify_initial_done::Bool)
     updates = isnothing(callback) ? Channel{_KeyValueWatchUpdate}(Int(channel_size)) : nothing
-    _KeyValueWatcherState(updates, callback, notify_initial_done, ReentrantLock(), false, false, -1, 0)
+    _KeyValueWatcherState{typeof(callback)}(updates, callback, notify_initial_done,
+                                            ReentrantLock(), false, false, -1, 0)
 end
 
 function _kv_watcher_closed(state::_KeyValueWatcherState)::Bool
@@ -295,18 +296,14 @@ _kv_wrong_revision_error(kv::KeyValue, key::AbstractString, expected_revision::U
 _kv_key_exists_error(kv::KeyValue, key::AbstractString, cause::JetStreamError) =
     KeyValueKeyExistsError(kv.bucket, String(key), cause)
 
-function _kv_state_int(info::StreamInfo, field::String)::Int
-    Int(get(info.state, field, 0))
-end
-
 function _kv_status(kv::KeyValue, info::StreamInfo)::KeyValueStatus
     KeyValueStatus(
         kv.bucket,
         info.name,
-        _kv_state_int(info, "messages"),
+        info.state.messages,
         something(info.config.max_msgs_per_subject, 0),
         info.config.max_age,
-        _kv_state_int(info, "bytes"),
+        info.state.bytes,
         info.config.storage,
         info.config.num_replicas,
         something(info.config.allow_direct, false),
@@ -591,9 +588,7 @@ end
 
 function _consumer_num_pending(info::Union{ConsumerInfo,Nothing})::Int
     isnothing(info) && return 0
-    value = get(info.raw, "num_pending", 0)
-    value isa Real && !(value isa Bool) || return 0
-    max(0, Int(value))
+    max(0, info.num_pending)
 end
 
 function _kv_watch_callback(kv::KeyValue, state::_KeyValueWatcherState, ignore_deletes::Bool)

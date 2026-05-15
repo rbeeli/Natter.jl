@@ -50,29 +50,69 @@ const _JS_SCHEDULE_SOURCE_HEADER = "Nats-Schedule-Source"
 const _JS_SCHEDULE_TTL_HEADER = "Nats-Schedule-TTL"
 const _JS_SCHEDULE_TIMEZONE_HEADER = "Nats-Schedule-Time-Zone"
 
+Base.@kwdef struct StreamLostData
+    msgs::Vector{Int} = Int[]
+    bytes::Int = 0
+end
+
+Base.@kwdef struct StreamState
+    messages::Int = 0
+    bytes::Int = 0
+    first_seq::Int = 0
+    first_ts::Union{DateTime,Nothing} = nothing
+    last_seq::Int = 0
+    last_ts::Union{DateTime,Nothing} = nothing
+    consumer_count::Int = 0
+    num_deleted::Int = 0
+    deleted::Vector{Int} = Int[]
+    num_subjects::Int = 0
+    subjects::Dict{String,Int} = Dict{String,Int}()
+    lost::Union{StreamLostData,Nothing} = nothing
+end
+
 struct StreamInfo
     name::String
     config::StreamConfig
-    state::Dict{String,Any}
-    raw::Dict{String,Any}
+    state::StreamState
+end
+
+Base.@kwdef struct ConsumerSequenceInfo
+    consumer_seq::Int = 0
+    stream_seq::Int = 0
+    last_active::Union{DateTime,Nothing} = nothing
 end
 
 struct ConsumerInfo
     stream_name::String
     name::String
     config::ConsumerConfig
+    created::Union{DateTime,Nothing}
+    delivered::ConsumerSequenceInfo
+    ack_floor::ConsumerSequenceInfo
+    num_ack_pending::Int
+    num_redelivered::Int
+    num_waiting::Int
+    num_pending::Int
     push_bound::Bool
-    raw::Dict{String,Any}
+    paused::Bool
+    pause_remaining::Float64
 end
 
-function _consumer_info_push_bound(raw::Dict{String,Any})::Bool
-    value = get(raw, "push_bound", false)
-    isnothing(value) && return false
-    Bool(value)
-end
+StreamInfo(name::AbstractString, config::StreamConfig, state::StreamState=StreamState()) =
+    StreamInfo(String(name), config, state)
 
-ConsumerInfo(stream_name::AbstractString, name::AbstractString, config::ConsumerConfig, raw::Dict{String,Any}) =
-    ConsumerInfo(String(stream_name), String(name), config, _consumer_info_push_bound(raw), raw)
+function ConsumerInfo(stream_name::AbstractString, name::AbstractString, config::ConsumerConfig;
+                      created::Union{DateTime,Nothing}=nothing,
+                      delivered::ConsumerSequenceInfo=ConsumerSequenceInfo(),
+                      ack_floor::ConsumerSequenceInfo=ConsumerSequenceInfo(),
+                      num_ack_pending::Integer=0, num_redelivered::Integer=0,
+                      num_waiting::Integer=0, num_pending::Integer=0,
+                      push_bound::Bool=false, paused::Bool=false,
+                      pause_remaining::Real=0.0)
+    ConsumerInfo(String(stream_name), String(name), config, created, delivered, ack_floor,
+                 Int(num_ack_pending), Int(num_redelivered), Int(num_waiting), Int(num_pending),
+                 push_bound, paused, Float64(pause_remaining))
+end
 
 jetstream(client::Client; prefix::AbstractString="\$JS.API", timeout::Real=5.0) =
     JetStreamContext(client, String(prefix), _positive_timeout_seconds("timeout", timeout))
@@ -157,7 +197,52 @@ end
 _jetstream_heartbeat_error() =
     JetStreamError(_JS_STATUS_TIMEOUT, nothing, "JetStream idle heartbeat timed out")
 
-_json_get(obj, key::Symbol, default) = haskey(obj, key) ? obj[key] : default
+function _json_haskey(obj, key::Symbol)::Bool
+    obj isa AbstractDict && haskey(obj, String(key)) && return true
+    try
+        return haskey(obj, key)
+    catch err
+        err isa MethodError || rethrow()
+        return false
+    end
+end
+
+function _json_get(obj, key::Symbol, default)
+    if obj isa AbstractDict
+        string_key = String(key)
+        haskey(obj, string_key) && return obj[string_key]
+    end
+    try
+        haskey(obj, key) && return obj[key]
+    catch err
+        err isa MethodError || rethrow()
+    end
+    default
+end
+
+function _json_get_required(obj, key::Symbol)
+    _json_haskey(obj, key) || throw(ProtocolError("JetStream response missing $(String(key))"))
+    _json_get(obj, key, nothing)
+end
+
+function _json_bool(value, default::Bool=false)::Bool
+    isnothing(value) && return default
+    Bool(value)
+end
+
+function _json_int(value, default::Int=0)::Int
+    isnothing(value) && return default
+    value isa Real && !(value isa Bool) || throw(ProtocolError("JetStream response integer field is not numeric"))
+    Int(value)
+end
+
+function _json_seconds_from_ns(value, default::Float64=0.0)::Float64
+    isnothing(value) && return default
+    value isa Real && !(value isa Bool) || throw(ProtocolError("JetStream response duration field is not numeric"))
+    _nanoseconds_to_seconds(value)
+end
+
+_json_datetime(value)::Union{DateTime,Nothing} = isnothing(value) ? nothing : _parse_rfc3339_datetime(String(value))
 
 function _js_error_from_object(err)
     code = Int(_json_get(err, :code, 0))
@@ -170,13 +255,13 @@ end
 function _js_read_response(msg::Msg)
     isempty(msg.data) && return nothing
     obj = JSON3.read(msg.data)
-    haskey(obj, :error) && throw(_js_error_from_object(obj[:error]))
+    _json_haskey(obj, :error) && throw(_js_error_from_object(_json_get(obj, :error, nothing)))
     obj
 end
 
 function _js_decode(msg::Msg)
     obj = _js_read_response(msg)
-    isnothing(obj) ? Dict{String,Any}() : _string_key_dict(obj)
+    isnothing(obj) ? (;) : obj
 end
 
 function _api_request(js::JetStreamContext, subject::String, payload=nothing; timeout::Real=js.timeout)
@@ -185,8 +270,9 @@ function _api_request(js::JetStreamContext, subject::String, payload=nothing; ti
 end
 
 function _puback(obj)
-    PubAck(String(obj[:stream]), Int(obj[:seq]), Bool(_json_get(obj, :duplicate, false)),
-           haskey(obj, :domain) ? String(obj[:domain]) : nothing)
+    PubAck(String(_json_get_required(obj, :stream)), Int(_json_get_required(obj, :seq)),
+           Bool(_json_get(obj, :duplicate, false)),
+           _json_haskey(obj, :domain) ? String(_json_get(obj, :domain, "")) : nothing)
 end
 
 function _js_header_nonempty(name::AbstractString, value)::String
@@ -386,11 +472,11 @@ function stream_list(js::JetStreamContext; offset::Int=0, timeout::Real=js.timeo
     streams = StreamInfo[]
     next_offset = offset
     while true
-        obj = _api_request(js, "$(js.prefix).STREAM.LIST", JSON3.write(Dict("offset" => next_offset)); timeout)
-        items = get(obj, "streams", Any[])
-        append!(streams, [_stream_info(Dict{String,Any}(String(k) => v for (k, v) in pairs(item))) for item in items])
-        total = Int(get(obj, "total", offset + length(streams)))
-        page_offset = Int(get(obj, "offset", next_offset))
+        obj = _api_request(js, "$(js.prefix).STREAM.LIST", JSON3.write((offset=next_offset,)); timeout)
+        items = _json_get(obj, :streams, ())
+        append!(streams, (_stream_info(item) for item in items))
+        total = _json_int(_json_get(obj, :total, offset + length(streams)))
+        page_offset = _json_int(_json_get(obj, :offset, next_offset))
         next_offset = page_offset + length(items)
         (isempty(items) || next_offset >= total) && break
     end
@@ -402,12 +488,12 @@ function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothin
     names = String[]
     next_offset = 0
     while true
-        req = isnothing(subject) ? Dict{String,Any}("offset" => next_offset) : Dict{String,Any}("subject" => subject, "offset" => next_offset)
+        req = isnothing(subject) ? (offset=next_offset,) : (subject=subject, offset=next_offset)
         obj = _api_request(js, "$(js.prefix).STREAM.NAMES", JSON3.write(req); timeout)
-        items = String.(get(obj, "streams", String[]))
+        items = String.(_json_get(obj, :streams, String[]))
         append!(names, items)
-        total = Int(get(obj, "total", length(names)))
-        page_offset = Int(get(obj, "offset", next_offset))
+        total = _json_int(_json_get(obj, :total, length(names)))
+        page_offset = _json_int(_json_get(obj, :offset, next_offset))
         next_offset = page_offset + length(items)
         (isempty(items) || next_offset >= total) && break
     end
@@ -415,7 +501,7 @@ function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothin
 end
 
 stream_delete(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout) =
-    Bool(_api_request(js, "$(js.prefix).STREAM.DELETE.$(_validate_api_name("stream", name))", ""; timeout)["success"])
+    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.DELETE.$(_validate_api_name("stream", name))", ""; timeout), :success))
 
 function _validate_stream_purge_keep(keep::Union{Integer,Nothing})
     isnothing(keep) && return nothing
@@ -431,14 +517,57 @@ stream_purge(js::JetStreamContext, name::AbstractString; filter_subject::Union{A
     isnothing(filter) || (req["filter"] = filter)
     keep = _validate_stream_purge_keep(keep)
     isnothing(keep) || (req["keep"] = keep)
-    Bool(_api_request(js, "$(js.prefix).STREAM.PURGE.$(_validate_api_name("stream", name))", JSON3.write(req); timeout)["success"])
+    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.PURGE.$(_validate_api_name("stream", name))", JSON3.write(req); timeout), :success))
 end
 
-function _stream_info(obj::Dict{String,Any})
-    cfg = _stream_config_from_payload(obj["config"])
-    st = Dict{String,Any}(String(k) => v for (k, v) in pairs(obj["state"]))
-    name = isnothing(cfg.name) ? String(get(_string_key_dict(obj["config"]), "name", "")) : cfg.name
-    StreamInfo(name, cfg, st, obj)
+function _json_int_vector(value)::Vector{Int}
+    isnothing(value) && return Int[]
+    out = Int[]
+    sizehint!(out, length(value))
+    for item in value
+        push!(out, _json_int(item))
+    end
+    out
+end
+
+function _json_string_int_dict(value)::Dict{String,Int}
+    out = Dict{String,Int}()
+    isnothing(value) && return out
+    for (k, v) in pairs(value)
+        out[String(k)] = _json_int(v)
+    end
+    out
+end
+
+function _stream_lost_data_from_payload(value)::Union{StreamLostData,Nothing}
+    isnothing(value) && return nothing
+    StreamLostData(msgs=_json_int_vector(_json_get(value, :msgs, ())),
+                   bytes=_json_int(_json_get(value, :bytes, 0)))
+end
+
+function _stream_state_from_payload(value)::StreamState
+    StreamState(
+        messages=_json_int(_json_get(value, :messages, 0)),
+        bytes=_json_int(_json_get(value, :bytes, 0)),
+        first_seq=_json_int(_json_get(value, :first_seq, 0)),
+        first_ts=_json_datetime(_json_get(value, :first_ts, nothing)),
+        last_seq=_json_int(_json_get(value, :last_seq, 0)),
+        last_ts=_json_datetime(_json_get(value, :last_ts, nothing)),
+        consumer_count=_json_int(_json_get(value, :consumer_count, _json_get(value, :consumers, 0))),
+        num_deleted=_json_int(_json_get(value, :num_deleted, 0)),
+        deleted=_json_int_vector(_json_get(value, :deleted, ())),
+        num_subjects=_json_int(_json_get(value, :num_subjects, 0)),
+        subjects=_json_string_int_dict(_json_get(value, :subjects, nothing)),
+        lost=_stream_lost_data_from_payload(_json_get(value, :lost, nothing)),
+    )
+end
+
+function _stream_info(obj)
+    config = _json_get_required(obj, :config)
+    cfg = _stream_config_from_payload(config)
+    state = _stream_state_from_payload(_json_get_required(obj, :state))
+    name = isnothing(cfg.name) ? String(_json_get(config, :name, "")) : cfg.name
+    StreamInfo(name, cfg, state)
 end
 
 function _validate_stream_sequence(seq::Int)::Int
@@ -529,16 +658,16 @@ function _stream_message_get_direct(js::JetStreamContext, stream::String, req::D
 end
 
 function _stream_message_from_api_payload(js::JetStreamContext, raw_msg)
-    msg = _string_key_dict(raw_msg)
-    data = haskey(msg, "data") ? base64decode(String(msg["data"])) : UInt8[]
-    hdrs = haskey(msg, "hdrs") ? _parse_headers(base64decode(String(msg["hdrs"]))) : Headers()
-    created = haskey(msg, "time") ? _parse_rfc3339_datetime(String(msg["time"])) : nothing
-    Msg(String(msg["subject"]), nothing, data; headers=hdrs), Int(msg["seq"]), created
+    data = _json_haskey(raw_msg, :data) ? base64decode(String(_json_get(raw_msg, :data, ""))) : UInt8[]
+    hdrs = _json_haskey(raw_msg, :hdrs) ? _parse_headers(base64decode(String(_json_get(raw_msg, :hdrs, "")))) : Headers()
+    created = _json_datetime(_json_get(raw_msg, :time, nothing))
+    Msg(String(_json_get_required(raw_msg, :subject)), nothing, data; headers=hdrs),
+        _json_int(_json_get_required(raw_msg, :seq)), created
 end
 
 function _stream_message_get_api(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any}; timeout::Real)
     obj = _api_request(js, "$(js.prefix).STREAM.MSG.GET.$stream", JSON3.write(req); timeout)
-    _stream_message_from_api_payload(js, obj["message"])
+    _stream_message_from_api_payload(js, _json_get_required(obj, :message))
 end
 
 function _stream_message_get_info(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any}; direct::Bool, timeout::Real)
@@ -558,7 +687,7 @@ end
 function stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Int; timeout::Real=js.timeout)
     stream = _validate_api_name("stream", stream)
     seq = _validate_stream_sequence(seq)
-    Bool(_api_request(js, "$(js.prefix).STREAM.MSG.DELETE.$stream", JSON3.write(Dict("seq" => seq)); timeout)["success"])
+    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.MSG.DELETE.$stream", JSON3.write((seq=seq,)); timeout), :success))
 end
 
 function _server_version_at_least(client::Client, major::Int, minor::Int)
@@ -643,11 +772,11 @@ function consumer_list(js::JetStreamContext, stream::AbstractString; offset::Int
     consumers = ConsumerInfo[]
     next_offset = offset
     while true
-        obj = _api_request(js, "$(js.prefix).CONSUMER.LIST.$stream", JSON3.write(Dict("offset" => next_offset)); timeout)
-        items = get(obj, "consumers", Any[])
-        append!(consumers, [_consumer_info(Dict{String,Any}(String(k) => v for (k, v) in pairs(item))) for item in items])
-        total = Int(get(obj, "total", offset + length(consumers)))
-        page_offset = Int(get(obj, "offset", next_offset))
+        obj = _api_request(js, "$(js.prefix).CONSUMER.LIST.$stream", JSON3.write((offset=next_offset,)); timeout)
+        items = _json_get(obj, :consumers, ())
+        append!(consumers, (_consumer_info(item) for item in items))
+        total = _json_int(_json_get(obj, :total, offset + length(consumers)))
+        page_offset = _json_int(_json_get(obj, :offset, next_offset))
         next_offset = page_offset + length(items)
         (isempty(items) || next_offset >= total) && break
     end
@@ -655,11 +784,34 @@ function consumer_list(js::JetStreamContext, stream::AbstractString; offset::Int
 end
 
 consumer_delete(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; timeout::Real=js.timeout) =
-    Bool(_api_request(js, "$(js.prefix).CONSUMER.DELETE.$(_validate_api_name("stream", stream)).$(_validate_api_name("consumer", consumer))", ""; timeout)["success"])
+    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).CONSUMER.DELETE.$(_validate_api_name("stream", stream)).$(_validate_api_name("consumer", consumer))", ""; timeout), :success))
 
-function _consumer_info(obj::Dict{String,Any})
-    cfg = _consumer_config_from_payload(obj["config"])
-    ConsumerInfo(String(obj["stream_name"]), String(obj["name"]), cfg, obj)
+function _consumer_sequence_info_from_payload(value)::ConsumerSequenceInfo
+    isnothing(value) && return ConsumerSequenceInfo()
+    ConsumerSequenceInfo(
+        consumer_seq=_json_int(_json_get(value, :consumer_seq, 0)),
+        stream_seq=_json_int(_json_get(value, :stream_seq, 0)),
+        last_active=_json_datetime(_json_get(value, :last_active, nothing)),
+    )
+end
+
+function _consumer_info(obj)
+    cfg = _consumer_config_from_payload(_json_get_required(obj, :config))
+    ConsumerInfo(
+        String(_json_get_required(obj, :stream_name)),
+        String(_json_get_required(obj, :name)),
+        cfg;
+        created=_json_datetime(_json_get(obj, :created, nothing)),
+        delivered=_consumer_sequence_info_from_payload(_json_get(obj, :delivered, nothing)),
+        ack_floor=_consumer_sequence_info_from_payload(_json_get(obj, :ack_floor, nothing)),
+        num_ack_pending=_json_int(_json_get(obj, :num_ack_pending, 0)),
+        num_redelivered=_json_int(_json_get(obj, :num_redelivered, 0)),
+        num_waiting=_json_int(_json_get(obj, :num_waiting, 0)),
+        num_pending=_json_int(_json_get(obj, :num_pending, 0)),
+        push_bound=_json_bool(_json_get(obj, :push_bound, false)),
+        paused=_json_bool(_json_get(obj, :paused, false)),
+        pause_remaining=_json_seconds_from_ns(_json_get(obj, :pause_remaining, nothing)),
+    )
 end
 
 _consumer_missing(err) = err isa JetStreamError && err.code == 404
@@ -706,7 +858,7 @@ function _consumer_config_field(info::ConsumerInfo, config::Dict{String,Any}, fi
 end
 
 function _validate_bound_consumer_config(info::ConsumerInfo, expected::Dict{String,Any}, fields)
-    current = _string_key_dict(info.raw["config"])
+    current = _js_config_payload(info.config)
     for field in fields
         expected_value = _consumer_normalized_config_value(get(expected, field, nothing))
         actual_value = _consumer_normalized_config_value(_consumer_config_field(info, current, field))

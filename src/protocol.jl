@@ -836,9 +836,9 @@ function _copy_publish_bytes(bytes::AbstractVector{UInt8})::Vector{UInt8}
 end
 
 function _snapshot_publish_frame(frame::_AbstractPublishFrame)
-    _PublishFrame(frame.subject, frame.reply,
-                  _copy_publish_bytes(frame.payload),
-                  _copy_publish_bytes(frame.headers))
+    _PendingPublishFrame(frame.subject, frame.reply,
+                         _copy_publish_bytes(frame.payload),
+                         _copy_publish_bytes(frame.headers))
 end
 
 _pub_payload_size(payload::AbstractVector{UInt8}, hdr::AbstractVector{UInt8}) = length(hdr) + length(payload)

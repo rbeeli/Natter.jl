@@ -63,8 +63,11 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `JetStreamContext` | JetStream API context for a client. |
 | `StreamConfig` | Typed stream configuration with local subject, name, and numeric validation. Raw `Dict` configs use the same seconds-based duration conversion for known stream fields. |
 | `ConsumerConfig` | Typed consumer configuration with local subject, name, queue, and numeric validation. Raw `Dict` configs use the same seconds-based duration conversion for known consumer fields. |
-| `StreamInfo` | Stream info response with typed config, state, and raw data. |
-| `ConsumerInfo` | Consumer info response with typed config, push-bound state, and raw data. |
+| `StreamLostData` | Typed lost-message summary nested under stream state. |
+| `StreamState` | Typed stream state counters, sequence bounds, subjects, deletion, and lost-data summary. |
+| `StreamInfo` | Stream info response with typed config and typed state. |
+| `ConsumerSequenceInfo` | Typed consumer/stream sequence cursor in consumer info responses. |
+| `ConsumerInfo` | Consumer info response with typed config, counters, sequence cursors, and push-bound state. |
 | `PubAck` | Publish acknowledgement with stream, sequence, duplicate, and domain. |
 | `JetStreamMsg` | JetStream consumer message data plus acknowledgement state for `ack`, `nak`, `in_progress`, and `term`. |
 | `PullSubscription` | Pull consumer handle. |

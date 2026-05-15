@@ -442,9 +442,32 @@ end
         "stream_name" => "ORDERS",
         "name" => "worker",
         "push_bound" => true,
+        "num_pending" => 3,
+        "delivered" => Dict{String,Any}("consumer_seq" => 2, "stream_seq" => 9),
         "config" => Dict{String,Any}("deliver_subject" => "_INBOX.worker"),
     ))
     @test info.push_bound
+    @test info.num_pending == 3
+    @test info.delivered.consumer_seq == 2
+    @test info.delivered.stream_seq == 9
+
+    stream_info = N._stream_info(Dict{String,Any}(
+        "config" => Dict{String,Any}("name" => "ORDERS"),
+        "state" => Dict{String,Any}(
+            "messages" => 2,
+            "bytes" => 128,
+            "subjects" => Dict{String,Any}("orders.created" => 2),
+            "lost" => Dict{String,Any}("msgs" => [4], "bytes" => 16),
+        ),
+    ))
+    @test stream_info.state.messages == 2
+    @test stream_info.state.bytes == 128
+    @test stream_info.state.subjects == Dict("orders.created" => 2)
+    @test stream_info.state.lost.msgs == [4]
+    @test stream_info.state.lost.bytes == 16
+    @test fieldtype(StreamInfo, :state) === StreamState
+    @test !(:raw in fieldnames(StreamInfo))
+    @test !(:raw in fieldnames(ConsumerInfo))
 end
 
 @testitem "JetStream typed config rejects invalid local metadata" begin
@@ -597,7 +620,7 @@ end
 
     const N = Natter
 
-    info(policy) = N.ConsumerInfo("ORDERS", "worker", ConsumerConfig(ack_policy=policy), Dict{String,Any}())
+    info(policy) = N.ConsumerInfo("ORDERS", "worker", ConsumerConfig(ack_policy=policy))
     callback = _ -> nothing
 
     @test !N._push_callback_auto_ack(true, callback, info(AckPolicy.EXPLICIT))
