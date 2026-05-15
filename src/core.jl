@@ -56,28 +56,32 @@ function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::_Abstr
 
     start = position(io.buffer) + 1
     entry_count = length(io.replayable_entries)
-    bytes = frame_size
-    write_frame = frame
+    replayable_bytes = io.replayable_bytes
     if replayable
-        _reserve_pending_bytes!(client, bytes)
+        _reserve_pending_bytes!(client, frame_size)
         try
-            write_frame = _snapshot_publish_frame(frame)
-            push!(io.replayable_entries, _PendingPublish(write_frame, bytes))
-            io.replayable_bytes += bytes
+            _write_pub_frame(io, frame)
+            written = position(io.buffer) - start + 1
+            written == frame_size || throw(AssertionError("buffered publish size mismatch"))
+            entry = _ReplayableEntry(start, frame_size, _pub_payload_size(frame), length(frame.headers))
+            push!(io.replayable_entries, entry)
+            io.replayable_bytes += frame_size
         catch
-            _release_pending_bytes!(client, bytes)
+            truncate(io.buffer, start - 1)
+            seekend(io.buffer)
+            resize!(io.replayable_entries, entry_count)
+            io.replayable_bytes = replayable_bytes
+            _release_pending_bytes!(client, frame_size)
             rethrow()
         end
-    end
-    try
-        _write_pub_frame(io, write_frame)
-    catch
-        truncate(io.buffer, start - 1)
-        seekend(io.buffer)
-        resize!(io.replayable_entries, entry_count)
-        replayable && (io.replayable_bytes = max(0, io.replayable_bytes - bytes))
-        replayable && _release_pending_bytes!(client, bytes)
-        rethrow()
+    else
+        try
+            _write_pub_frame(io, frame)
+        catch
+            truncate(io.buffer, start - 1)
+            seekend(io.buffer)
+            rethrow()
+        end
     end
     replayable
 end
@@ -266,7 +270,7 @@ function _pending_chunk(data::AbstractString)
     bytes
 end
 _pending_chunk(frame::_AbstractPublishFrame) =
-    _PendingPublish(_snapshot_publish_frame(frame), _serialized_size(frame))
+    _pending_publish_entry(frame, _serialized_size(frame))
 
 function _ensure_pending_enqueue_allowed_locked(client::Client)
     st = client.status
@@ -308,9 +312,15 @@ function _validate_publish_frame_for_client(client::Client, frame::_AbstractPubl
     nothing
 end
 
-_validate_pending_entry_for_client(client::Client, entry::_PendingBytes) = nothing
-_validate_pending_entry_for_client(client::Client, entry::_PendingPublish) =
-    _validate_publish_frame_for_client(client, entry.frame)
+function _validate_pending_entry_for_client(client::Client, entry::_PendingEntry)
+    entry.is_publish || return nothing
+    max_payload = _client_max_payload(client)
+    headers_supported = _client_headers_supported(client)
+    entry.header_bytes > 0 && !headers_supported &&
+        throw(UnsupportedFeatureError("headers are not supported by the connected server"))
+    entry.payload_size > max_payload && throw(MaxPayloadError(max_payload, entry.payload_size))
+    nothing
+end
 
 function _validate_pending_replay_for_client(client::Client, entries::AbstractVector{<:_PendingEntry})
     for entry in entries
@@ -585,20 +595,29 @@ function _dispatch_msg(client::Client, msg::Msg)
     end
 end
 
-function _take_subscription_msg_if_ready!(sub::Subscription)::Union{Msg,Nothing}
-    msg = nothing
+function _take_subscription_msg_ready!(sub::Subscription)::Tuple{Bool,Msg}
+    msg = EMPTY_MSG
     control_handler = _NoSubscriptionControlHandler()
-    @lock sub.lock begin
-        isready(sub.messages) || return nothing
-        msg = take!(sub.messages)
-        msg_bytes = _msg_pending_bytes(msg)
-        sub.pending_bytes = max(0, sub.pending_bytes - msg_bytes)
-        control_handler = sub.control_handler
+    ready = @lock sub.lock begin
+        if !isready(sub.messages)
+            false
+        else
+            msg = take!(sub.messages)
+            msg_bytes = _msg_pending_bytes(msg)
+            sub.pending_bytes = max(0, sub.pending_bytes - msg_bytes)
+            control_handler = sub.control_handler
+            true
+        end
     end
-    isnothing(msg) && return nothing
+    ready || return (false, EMPTY_MSG)
     _maybe_reply_to_subscription_flow_control!(sub, control_handler)
     _notify_subscription_waiters!(sub; all=true)
-    msg
+    return (true, msg)
+end
+
+function _take_subscription_msg_if_ready!(sub::Subscription)::Union{Msg,Nothing}
+    ready, msg = _take_subscription_msg_ready!(sub)
+    ready ? msg : nothing
 end
 
 function _ensure_sync_subscription(sub::Subscription)
@@ -611,8 +630,8 @@ function next(sub::Subscription; timeout::Real=1.0)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     while true
-        msg = _take_subscription_msg_if_ready!(sub)
-        !isnothing(msg) && return msg
+        ready, msg = _take_subscription_msg_ready!(sub)
+        ready && return msg
 
         wait_result = @lock sub.lock begin
             if sub.closed && !isready(sub.messages)

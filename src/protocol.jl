@@ -633,7 +633,10 @@ function _validate_headers(raw::AbstractVector{UInt8})
         isnothing(newline) && throw(ProtocolError("NATS header block missing terminator"))
         line_end = newline - 1
         line_end >= pos && raw[line_end] == UInt8('\r') && (line_end -= 1)
-        line_end < pos && return nothing
+        if line_end < pos
+            newline == raw_last && return nothing
+            throw(ProtocolError("NATS header block contains trailing bytes"))
+        end
 
         colon = _find_byte(raw, UInt8(':'), pos, line_end)
         isnothing(colon) && throw(ProtocolError("malformed NATS header line"))
@@ -660,7 +663,10 @@ function _parse_headers(raw::AbstractVector{UInt8})
         isnothing(newline) && throw(ProtocolError("NATS header block missing terminator"))
         line_end = newline - 1
         line_end >= pos && raw[line_end] == UInt8('\r') && (line_end -= 1)
-        line_end < pos && return h
+        if line_end < pos
+            newline == raw_last && return h
+            throw(ProtocolError("NATS header block contains trailing bytes"))
+        end
 
         colon = _find_byte(raw, UInt8(':'), pos, line_end)
         if isnothing(colon)
@@ -880,21 +886,14 @@ function _publish_frame(subject::AbstractString, reply::Union{AbstractString,Not
     _PublishFrame(subject, reply, _payload_bytes(data), _publish_header_bytes(headers))
 end
 
-function _copy_publish_bytes(bytes::AbstractVector{UInt8})::Vector{UInt8}
-    isempty(bytes) && return EMPTY_BYTES
-    out = Vector{UInt8}(undef, length(bytes))
-    copyto!(out, 1, bytes, firstindex(bytes), length(bytes))
-    out
-end
-
-function _snapshot_publish_frame(frame::_AbstractPublishFrame)
-    _PendingPublishFrame(frame.subject, frame.reply,
-                         _copy_publish_bytes(frame.payload),
-                         _copy_publish_bytes(frame.headers))
-end
-
 _pub_payload_size(payload::AbstractVector{UInt8}, hdr::AbstractVector{UInt8}) = length(hdr) + length(payload)
 _pub_payload_size(frame::_AbstractPublishFrame) = _pub_payload_size(frame.payload, frame.headers)
+
+function _pending_publish_entry(frame::_AbstractPublishFrame, frame_size::Int=_serialized_size(frame))
+    data = _pub_cmd(frame)
+    length(data) == frame_size || throw(AssertionError("pending publish size mismatch"))
+    _PendingPublishEntry(data, _pub_payload_size(frame), length(frame.headers))
+end
 
 function _decimal_digits(value::Int)::Int
     value >= 0 || throw(ArgumentError("value must be non-negative"))

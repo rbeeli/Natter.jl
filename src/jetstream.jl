@@ -1361,8 +1361,8 @@ function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
     client = sub.client
     deadline = time() + Float64(timeout)
     while true
-        msg = _take_subscription_msg_if_ready!(sub)
-        !isnothing(msg) && return msg
+        ready, msg = _take_subscription_msg_ready!(sub)
+        ready && return msg
 
         closed, empty = @lock sub.lock (sub.closed, !isready(sub.messages))
         st = status(client)
@@ -1373,8 +1373,8 @@ function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
             end
         end
         ready || throw(TimeoutError("next message timed out"))
-        msg = _take_subscription_msg_if_ready!(sub)
-        !isnothing(msg) && return msg
+        ready, msg = _take_subscription_msg_ready!(sub)
+        ready && return msg
         closed = @lock sub.lock sub.closed
         st = status(client)
         (closed || st != ConnectionStatus.CONNECTED) && _throw_pull_fetch_wait_interrupted(closed, st)

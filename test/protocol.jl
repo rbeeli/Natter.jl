@@ -96,11 +96,18 @@ using TestItems
 
     @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nMalformed\r\n\r\n"))
     @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nTrace: abc\r\n"))
+    trailing_hdr = TestHelpers.bytes("NATS/1.0\r\nA: b\r\n\r\njunk")
+    @test_throws ProtocolError N._parse_headers(trailing_hdr)
+    @test_throws ArgumentError N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), trailing_hdr)
 
     malformed_hdr = TestHelpers.bytes("NATS/1.0\r\nMalformed\r\n\r\n")
     malformed_payload = vcat(malformed_hdr, TestHelpers.bytes("body"))
     malformed_raw = vcat(TestHelpers.bytes("HMSG events 9 $(length(malformed_hdr)) $(length(malformed_payload))\r\n"), malformed_payload, N.CRLF_BYTES)
     @test_throws ProtocolError N._read_control_or_msg(IOBuffer(malformed_raw))
+
+    trailing_payload = vcat(trailing_hdr, TestHelpers.bytes("body"))
+    trailing_raw = vcat(TestHelpers.bytes("HMSG events 9 $(length(trailing_hdr)) $(length(trailing_payload))\r\n"), trailing_payload, N.CRLF_BYTES)
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(trailing_raw))
 
     frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("-ERR 'Authorization Violation'\r\n")))
     @test frame.op == :ERR

@@ -106,6 +106,94 @@ using TestItems
     @test_throws ConnectionClosedError subscribe(closed, "foo")
 end
 
+@testitem "hot path allocation behavior" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function discard_buffered_replay!(client, write_io)
+        replayable = write_io.replayable_bytes
+        N._take_replayable_bytes!(write_io)
+        N._release_pending_bytes!(client, replayable)
+        nothing
+    end
+
+    function queue_put_take_alloc()
+        q = N.MsgQueue{Msg}(8)
+        msg = Msg("foo", nothing, TestHelpers.bytes("x"); sid=1)
+        for _ in 1:1000
+            put!(q, msg)
+            take!(q)
+        end
+        GC.gc()
+        put_alloc = @allocated put!(q, msg)
+        take_alloc = @allocated take!(q)
+        put_alloc + take_alloc
+    end
+
+    function dispatch_take_alloc()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=devnull)
+        sub = subscribe(client, "foo")
+        msg = Msg("foo", nothing, TestHelpers.bytes("x"); sid=sub.sid)
+        for _ in 1:1000
+            N._dispatch_msg(client, msg)
+            ready, _ = N._take_subscription_msg_ready!(sub)
+            ready || throw(AssertionError("expected ready message"))
+        end
+        GC.gc()
+        @allocated begin
+            for _ in 1:1000
+                N._dispatch_msg(client, msg)
+                ready, _ = N._take_subscription_msg_ready!(sub)
+                ready || throw(AssertionError("expected ready message"))
+            end
+        end
+    end
+
+    function buffered_publish_alloc()
+        opts = N.ConnectOptions(write_buffer_size=1024)
+        write_io = N.BufferedWriteIO(devnull)
+        client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io)
+        payload = fill(UInt8('x'), 64)
+        for _ in 1:1000
+            publish(client, "foo", payload)
+            discard_buffered_replay!(client, write_io)
+        end
+        GC.gc()
+        @allocated publish(client, "foo", payload)
+    end
+
+    function buffered_replay_snapshot()
+        opts = N.ConnectOptions(write_buffer_size=1024)
+        write_io = N.BufferedWriteIO(devnull)
+        client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io)
+        payload = TestHelpers.bytes("bar")
+        publish(client, "foo", payload)
+        payload[1] = UInt8('B')
+        entries = N._take_replayable_writes!(write_io)
+        only(entries).is_publish || throw(AssertionError("expected publish replay entry"))
+        String(N._pending_entries_write_bytes(entries))
+    end
+
+    @test queue_put_take_alloc() == 0
+    @test dispatch_take_alloc() == 0
+    @test buffered_publish_alloc() == 0
+    @test buffered_replay_snapshot() == "PUB foo 3\r\nbar\r\n"
+end
+
+@testitem "empty subscription ready helper returns a typed empty result" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=devnull)
+    sub = subscribe(client, "empty.ready")
+
+    ready, msg = N._take_subscription_msg_ready!(sub)
+    @test ready == false
+    @test msg === N.EMPTY_MSG
+end
+
 @testitem "core timeout arguments are validated before protocol writes" setup=[TestHelpers] begin
     using Natter
 

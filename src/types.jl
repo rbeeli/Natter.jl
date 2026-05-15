@@ -172,29 +172,21 @@ abstract type AbstractNatterClient end
 abstract type AbstractMsg end
 abstract type _AbstractPublishFrame end
 
-struct _PendingBytes
+struct _PendingEntry
     data::Vector{UInt8}
     bytes::Int
-end
-_PendingBytes(data::Vector{UInt8}) = _PendingBytes(data, length(data))
-
-struct _PendingPublishFrame <: _AbstractPublishFrame
-    subject::String
-    reply::Union{String,Nothing}
-    payload::Vector{UInt8}
-    headers::Vector{UInt8}
+    payload_size::Int
+    header_bytes::Int
+    is_publish::Bool
 end
 
-struct _PendingPublish
-    frame::_PendingPublishFrame
-    bytes::Int
-end
+_PendingEntry(data::Vector{UInt8}) = _PendingEntry(data, length(data), 0, 0, false)
+_PendingPublishEntry(data::Vector{UInt8}, payload_size::Int, header_bytes::Int) =
+    _PendingEntry(data, length(data), payload_size, header_bytes, true)
 
-const _PendingEntry = Union{_PendingBytes,_PendingPublish}
-const EMPTY_PENDING_ENTRY = _PendingBytes(EMPTY_BYTES)
+const EMPTY_PENDING_ENTRY = _PendingEntry(EMPTY_BYTES)
 
-_pending_entry_size(entry::_PendingBytes)::Int = entry.bytes
-_pending_entry_size(entry::_PendingPublish)::Int = entry.bytes
+_pending_entry_size(entry::_PendingEntry)::Int = entry.bytes
 
 function _pending_entries_size(entries::AbstractVector{<:_PendingEntry})::Int
     bytes = 0
@@ -204,15 +196,9 @@ function _pending_entries_size(entries::AbstractVector{<:_PendingEntry})::Int
     bytes
 end
 
-function _copy_pending_entry_bytes!(out::Vector{UInt8}, pos::Int, entry::_PendingBytes)::Int
+function _copy_pending_entry_bytes!(out::Vector{UInt8}, pos::Int, entry::_PendingEntry)::Int
     copyto!(out, pos, entry.data, 1, entry.bytes)
     pos + entry.bytes
-end
-
-function _copy_pending_entry_bytes!(out::Vector{UInt8}, pos::Int, entry::_PendingPublish)::Int
-    bytes = _pub_cmd(entry.frame)
-    copyto!(out, pos, bytes, 1, length(bytes))
-    pos + length(bytes)
 end
 
 function _pending_entries_bytes(entries::AbstractVector{<:_PendingEntry})::Vector{UInt8}
@@ -223,6 +209,22 @@ function _pending_entries_bytes(entries::AbstractVector{<:_PendingEntry})::Vecto
     end
     pos == length(out) + 1 || throw(AssertionError("pending replay size mismatch"))
     out
+end
+
+_pending_entries_write_bytes(entries::Vector{_PendingEntry}) =
+    length(entries) == 1 ? entries[1].data : _pending_entries_bytes(entries)
+
+struct _ReplayableEntry
+    start::Int
+    bytes::Int
+    payload_size::Int
+    header_bytes::Int
+end
+
+function _copy_replayable_entry(buffer::AbstractVector{UInt8}, entry::_ReplayableEntry)::_PendingEntry
+    data = Vector{UInt8}(undef, entry.bytes)
+    copyto!(data, 1, buffer, entry.start, entry.bytes)
+    _PendingPublishEntry(data, entry.payload_size, entry.header_bytes)
 end
 
 function _append_header_value!(values::Vector{String}, value)
@@ -343,6 +345,8 @@ struct Msg <: AbstractMsg
     sid::Int
     header_bytes::Int
 end
+
+const EMPTY_MSG = Msg("", nothing, EMPTY_BYTES, nothing, 0, 0)
 
 function Msg(subject::String, reply::Union{String,Nothing}, data::Vector{UInt8};
              headers=nothing, sid=0, header_bytes::Union{Int,Nothing}=nothing)
@@ -838,12 +842,12 @@ end
 mutable struct BufferedWriteIO{I} <: IO
     io::I
     buffer::IOBuffer
-    replayable_entries::Vector{_PendingEntry}
+    replayable_entries::Vector{_ReplayableEntry}
     replayable_bytes::Int
     closed::Bool
 end
 
-BufferedWriteIO(io::I) where {I} = BufferedWriteIO{I}(io, IOBuffer(), _PendingEntry[], 0, false)
+BufferedWriteIO(io::I) where {I} = BufferedWriteIO{I}(io, IOBuffer(), _ReplayableEntry[], 0, false)
 
 function _ensure_open(io::BufferedWriteIO)
     io.closed && throw(Base.IOError("buffered write transport is closed", 0))
@@ -929,12 +933,25 @@ _buffered_bytes(::IO) = 0
 _buffered_bytes(io::BufferedWriteIO) = position(io.buffer)
 _take_replayable_writes!(::IO) = _PendingEntry[]
 function _take_replayable_writes!(io::BufferedWriteIO)
-    replayable = copy(io.replayable_entries)
+    replayable = Vector{_PendingEntry}(undef, length(io.replayable_entries))
+    for (i, entry) in pairs(io.replayable_entries)
+        replayable[i] = _copy_replayable_entry(io.buffer.data, entry)
+    end
     truncate(io.buffer, 0)
     seekstart(io.buffer)
     empty!(io.replayable_entries)
     io.replayable_bytes = 0
     replayable
+end
+
+_take_replayable_bytes!(::IO) = 0
+function _take_replayable_bytes!(io::BufferedWriteIO)
+    bytes = io.replayable_bytes
+    truncate(io.buffer, 0)
+    seekstart(io.buffer)
+    empty!(io.replayable_entries)
+    io.replayable_bytes = 0
+    bytes
 end
 _underlying_transport(io) = io
 _underlying_transport(io::BufferedWriteIO) = io.io
@@ -1015,7 +1032,7 @@ function _push_pending_chunk!(buffer::PendingBuffer, entry::_PendingEntry)
     buffer
 end
 _push_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8}) =
-    _push_pending_chunk!(buffer, _PendingBytes(data))
+    _push_pending_chunk!(buffer, _PendingEntry(data))
 
 function _prepend_pending_chunk!(buffer::PendingBuffer, entry::_PendingEntry)
     if isempty(buffer)
@@ -1030,7 +1047,7 @@ function _prepend_pending_chunk!(buffer::PendingBuffer, entry::_PendingEntry)
     buffer
 end
 _prepend_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8}) =
-    _prepend_pending_chunk!(buffer, _PendingBytes(data))
+    _prepend_pending_chunk!(buffer, _PendingEntry(data))
 
 function _prepend_pending_chunks!(buffer::PendingBuffer, entries::AbstractVector{<:_PendingEntry})
     for i in length(entries):-1:1
@@ -1089,14 +1106,14 @@ function Base.take!(buffer::PendingBuffer)
 end
 
 function Base.write(buffer::PendingBuffer, data::Vector{UInt8})
-    _push_pending_chunk!(buffer, _PendingBytes(copy(data)))
+    _push_pending_chunk!(buffer, _PendingEntry(copy(data)))
     length(data)
 end
 
 function Base.write(buffer::PendingBuffer, data::AbstractString)
     bytes = Vector{UInt8}(undef, ncodeunits(data))
     copyto!(bytes, 1, codeunits(data), 1, length(bytes))
-    _push_pending_chunk!(buffer, _PendingBytes(bytes))
+    _push_pending_chunk!(buffer, _PendingEntry(bytes))
     length(bytes)
 end
 
@@ -1107,7 +1124,7 @@ end
 function _pending_buffer_from(buffer::IOBuffer)
     data = take!(buffer)
     pending = PendingBuffer()
-    isempty(data) || _push_pending_chunk!(pending, _PendingBytes(data))
+    isempty(data) || _push_pending_chunk!(pending, _PendingEntry(data))
     pending
 end
 
@@ -1144,18 +1161,23 @@ struct _RequestMuxControlHandler end
 const _SubscriptionControlHandler = Union{_NoSubscriptionControlHandler,_JetStreamPushControlHandler,_RequestMuxControlHandler}
 
 mutable struct MsgQueue{T}
-    buffer::Vector{Union{T,Nothing}}
+    buffer::Vector{T}
+    empty::T
     head::Int
     len::Int
     closed::Bool
 end
 
-function MsgQueue{T}(capacity::Int) where {T}
+function MsgQueue{T}(capacity::Int, empty::T) where {T}
     capacity > 0 || throw(ArgumentError("message queue capacity must be positive"))
-    buffer = Vector{Union{T,Nothing}}(undef, capacity)
-    fill!(buffer, nothing)
-    MsgQueue{T}(buffer, 1, 0, false)
+    buffer = Vector{T}(undef, capacity)
+    fill!(buffer, empty)
+    MsgQueue{T}(buffer, empty, 1, 0, false)
 end
+
+MsgQueue{Msg}(capacity::Int) = MsgQueue{Msg}(capacity, EMPTY_MSG)
+MsgQueue{T}(capacity::Int) where {T} =
+    throw(ArgumentError("MsgQueue{$T} requires an empty sentinel value"))
 
 Base.isopen(q::MsgQueue) = !q.closed
 Base.isready(q::MsgQueue) = q.len > 0
@@ -1178,8 +1200,8 @@ end
 
 function Base.take!(q::MsgQueue{T}) where {T}
     q.len > 0 || throw(InvalidStateException("message queue is empty", q.closed ? :closed : :open))
-    msg = q.buffer[q.head]::T
-    q.buffer[q.head] = nothing
+    msg = q.buffer[q.head]
+    q.buffer[q.head] = q.empty
     q.len -= 1
     q.head = q.len == 0 ? 1 : mod1(q.head + 1, length(q.buffer))
     msg

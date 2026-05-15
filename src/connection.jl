@@ -990,7 +990,7 @@ function _take_transport!(client::Client; preserve_replayable::Bool=false, deadl
         if preserve && !isnothing(write_io)
             replayable = _take_replayable_writes!(write_io)
         elseif !isnothing(write_io)
-            dropped_replayable = _pending_entries_size(_take_replayable_writes!(write_io))
+            dropped_replayable = _take_replayable_bytes!(write_io)
         end
         read_io, write_io, sock
     end
@@ -1929,7 +1929,7 @@ function _flush_pending_buffer(client::Client; generation::Union{Int,Nothing}=no
         isempty(entries) && return
         try
             _validate_pending_replay_for_client(client, entries)
-            data = _pending_entries_bytes(entries)
+            data = _pending_entries_write_bytes(entries)
             _write_raw(client, data; force_flush=true, write_mode)
             _release_pending_bytes!(client, _pending_entries_size(entries))
         catch err
