@@ -335,12 +335,31 @@ end
     @test !haskey(userpass_body, :auth_token)
 
     option_token_client = TestHelpers.fake_client(; opts=N.ConnectOptions(token="secret"))
+    option_token_cmd = N._connect_command(option_token_client, N.ServerInfo(), nothing, nothing)
+    option_token_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", option_token_cmd).captures))
+    @test option_token_body.auth_token == "secret"
     @test_throws ArgumentError N._connect_command(option_token_client, N.ServerInfo(), "user", "pass")
     @test_throws ArgumentError N._connect_command(option_token_client, N.ServerInfo(), "url-token", nothing)
 
     option_userpass_client = TestHelpers.fake_client(; opts=N.ConnectOptions(user="user", password="pass"))
+    option_userpass_cmd = N._connect_command(option_userpass_client, N.ServerInfo(), nothing, nothing)
+    option_userpass_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", option_userpass_cmd).captures))
+    @test option_userpass_body.user == "user"
+    @test option_userpass_body.pass == "pass"
     @test_throws ArgumentError N._connect_command(option_userpass_client, N.ServerInfo(), "secret", nothing)
     @test_throws ArgumentError N._connect_command(option_userpass_client, N.ServerInfo(), "url-user", "url-pass")
+
+    function encoded_seed(public_prefix::UInt8)
+        data = Vector{UInt8}(undef, 34)
+        data[1] = N._NKEY_PREFIX_SEED | (public_prefix >> 5)
+        data[2] = (public_prefix & UInt8(0x1f)) << 3
+        data[3:end] .= UInt8(0x42)
+        raw = copy(data)
+        crc = N._nkey_crc16(data)
+        push!(raw, UInt8(crc & UInt16(0x00ff)))
+        push!(raw, UInt8(crc >> 8))
+        N._nkey_base32_encode(raw)
+    end
 
     seed = "SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY"
     public_nkey = "UAT6BWCSCWLUKJT6K6MBJJOEOTXZ5AJDOYKNEVRFC7VNO6OA43N4TRNO"
@@ -376,6 +395,31 @@ end
     @test callback_body.nkey == public_nkey
     @test callback_body.sig == callback_sig
 
+    for public_prefix in (
+        N._NKEY_PREFIX_OPERATOR,
+        N._NKEY_PREFIX_SERVER,
+        N._NKEY_PREFIX_CLUSTER,
+        N._NKEY_PREFIX_ACCOUNT,
+    )
+        non_user_public = N._nkey_encode_public(public_prefix, fill(UInt8(0x01), 32))
+        non_user_seed = encoded_seed(public_prefix)
+
+        non_user_public_client = TestHelpers.fake_client(; opts=N.ConnectOptions(
+            nkey=non_user_public,
+            signature_cb=nonce -> fill(UInt8(0x01), 64),
+        ))
+        @test_throws ArgumentError N._connect_command(non_user_public_client,
+                                                       N.ServerInfo(; nonce="nonce"),
+                                                       nothing, nothing)
+
+        non_user_seed_client = TestHelpers.fake_client(;
+            opts=N.ConnectOptions(nkey_seed=non_user_seed),
+        )
+        @test_throws ArgumentError N._connect_command(non_user_seed_client,
+                                                       N.ServerInfo(; nonce="nonce"),
+                                                       nothing, nothing)
+    end
+
     creds = join([
         "-----BEGIN NATS USER JWT-----",
         "header.payload.signature",
@@ -401,5 +445,21 @@ end
         @test creds_path_body.jwt == "header.payload.signature"
         @test creds_path_body.sig == expected_sig
         @test !haskey(creds_path_body, :nkey)
+    end
+
+    for public_prefix in (N._NKEY_PREFIX_OPERATOR, N._NKEY_PREFIX_ACCOUNT)
+        non_user_creds = join([
+            "-----BEGIN NATS USER JWT-----",
+            "header.payload.signature",
+            "------END NATS USER JWT------",
+            "",
+            encoded_seed(public_prefix),
+        ], "\n")
+        non_user_creds_client = TestHelpers.fake_client(;
+            opts=N.ConnectOptions(credentials=non_user_creds),
+        )
+        @test_throws ArgumentError N._connect_command(non_user_creds_client,
+                                                       N.ServerInfo(; nonce="nonce"),
+                                                       nothing, nothing)
     end
 end

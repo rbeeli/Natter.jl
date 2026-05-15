@@ -635,7 +635,9 @@ close(sub::Subscription) = unsubscribe(sub)
 
 _drain_deadline(timeout::Real)::Float64 = time() + Float64(timeout)
 _drain_timed_out(err)::Bool =
-    err isa TimeoutError || (err isa Base.CompositeException && any(_drain_timed_out, err.exceptions))
+    err isa TimeoutError ||
+    (err isa CleanupError && _drain_timed_out(err.cause)) ||
+    (err isa Base.CompositeException && any(_drain_timed_out, err.exceptions))
 _drain_timed_out(errors::Vector)::Bool = any(_drain_timed_out, errors)
 
 function _drain(sub::Subscription, deadline::Float64)
@@ -755,7 +757,8 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout)
         end
     end
     try
-        close(client; throw_errors=true, callback_timeout=_remaining_timeout(deadline))
+        _close_client!(client; throw_errors=true, callback_timeout=_remaining_timeout(deadline),
+                       deadline=deadline)
     catch err
         push!(errors, err)
     end
@@ -763,7 +766,12 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout)
     nothing
 end
 
-function close(client::Client; throw_errors::Bool=false, callback_timeout=nothing)
+function _client_task_close_timeout(client::Client)::Float64
+    min(5.0, max(0.5, client.options.connect_timeout + 0.2))
+end
+
+function _close_client!(client::Client; throw_errors::Bool=false, callback_timeout=nothing,
+                        deadline=nothing)
     callback_wait = isnothing(callback_timeout) ? client.options.close_callback_timeout :
                     _connect_option_nonnegative_float("callback_timeout", callback_timeout)
     already = false
@@ -799,10 +807,10 @@ function close(client::Client; throw_errors::Bool=false, callback_timeout=nothin
     end
     append!(errors, _close_transport(_take_transport!(client)...))
     _clear_pending_buffer!(client)
-    append!(errors, _stop_client_tasks!(client; timeout=min(5.0, max(0.5, client.options.connect_timeout + 0.2))))
+    append!(errors, _stop_client_tasks!(client; timeout=_client_task_close_timeout(client), deadline=deadline))
     for sub in subs
         _wait_task!(errors, "stop subscription processor $(sub.sid)", sub.processor;
-                    timeout=callback_wait)
+                    timeout=callback_wait, deadline=deadline)
     end
     try
         client.options.closed_cb()
@@ -817,6 +825,9 @@ function close(client::Client; throw_errors::Bool=false, callback_timeout=nothin
     end
     nothing
 end
+
+close(client::Client; throw_errors::Bool=false, callback_timeout=nothing) =
+    _close_client!(client; throw_errors=throw_errors, callback_timeout=callback_timeout)
 
 function new_inbox(client::Client; prefix::AbstractString=client.options.inbox_prefix)
     suffix = @lock client.lock randstring(client.rng, NUID_ALPHABET, 22)

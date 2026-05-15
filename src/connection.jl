@@ -266,17 +266,26 @@ function _record_stopped_task_error!(errors::Vector, operation::String, task::Ta
     errors
 end
 
+_task_wait_timeout(timeout::Real, deadline)::Float64 =
+    isnothing(deadline) ? Float64(timeout) : min(Float64(timeout), _remaining_timeout(deadline))
+
 function _wait_task!(errors::Vector, operation::String, task::Union{Task,Nothing};
-                     timeout::Real=0.5, interrupt::Bool=false, interrupt_first::Bool=false)
+                     timeout::Real=0.5, interrupt::Bool=false, interrupt_first::Bool=false,
+                     deadline=nothing)
     (isnothing(task) || istaskdone(task) || task === current_task()) && return errors
 
     interrupted = interrupt && interrupt_first && _request_task_stop!(errors, operation, task)
-    result = timedwait(timeout; pollint=0.005) do
+    result = timedwait(_task_wait_timeout(timeout, deadline); pollint=0.005) do
         istaskdone(task)
     end
     if result == :timed_out && interrupt && !interrupted
         interrupted = _request_task_stop!(errors, operation, task)
-        result = timedwait(min(timeout, 0.5); pollint=0.005) do
+        if !isnothing(deadline) && _remaining_timeout(deadline) <= 0
+            push!(errors, CleanupError(operation, TimeoutError("$operation timed out")))
+            return errors
+        end
+        grace = isnothing(deadline) ? min(timeout, 0.5) : min(0.5, _remaining_timeout(deadline))
+        result = timedwait(grace; pollint=0.005) do
             istaskdone(task)
         end
     end
@@ -854,11 +863,11 @@ function _take_client_tasks!(client::Client)
     end
 end
 
-function _stop_client_tasks!(client::Client; timeout::Real=0.5)
+function _stop_client_tasks!(client::Client; timeout::Real=0.5, deadline=nothing)
     tasks = _take_client_tasks!(client)
     errors = Any[]
     for (operation, task) in tasks
-        _wait_task!(errors, operation, task; timeout, interrupt=true)
+        _wait_task!(errors, operation, task; timeout, interrupt=true, deadline=deadline)
     end
     errors
 end
@@ -879,8 +888,8 @@ function _connect_auth_fields(opts::ConnectOptions, url_user, url_pass)
     if option_has_auth && url_has_auth
         throw(ArgumentError("authentication credentials must be provided either in options or URL userinfo, not both"))
     end
-    !isnothing(opts.nkey) && _nkey_decode_public(opts.nkey)
-    !isnothing(opts.nkey_seed) && _validate_nkey_seed(opts.nkey_seed)
+    !isnothing(opts.nkey) && _nkey_decode_user_public(opts.nkey)
+    !isnothing(opts.nkey_seed) && _validate_user_nkey_seed(opts.nkey_seed)
 
     token = !isnothing(opts.token) ? opts.token : (isnothing(url_user) || !isnothing(url_pass) ? nothing : url_user)
     user = !isnothing(opts.user) ? opts.user : (!isnothing(url_pass) ? url_user : nothing)
@@ -906,10 +915,10 @@ function _connect_command(client::Client, info::ServerInfo, url_user, url_pass)
     )
     isnothing(opts.name) || (body["name"] = opts.name)
     auth = _connect_auth_fields(opts, url_user, url_pass)
-    isnothing(auth.token) || (body["auth_token"] = auth.token)
+    isnothing(auth.token) || (body["auth_token"] = _secret_to_string(auth.token))
     if !isnothing(auth.user)
         body["user"] = auth.user
-        body["pass"] = auth.password
+        body["pass"] = _secret_to_string(auth.password)
     end
     nkey_jwt_auth = _connect_nkey_jwt_fields(opts, info)
     isnothing(nkey_jwt_auth.jwt) || (body["jwt"] = nkey_jwt_auth.jwt)

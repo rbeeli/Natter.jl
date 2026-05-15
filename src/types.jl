@@ -430,9 +430,9 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
     name::Union{String,Nothing}
     verbose::Bool
     pedantic::Bool
-    token::Union{String,Nothing}
+    token::Union{SecretBytes,Nothing}
     user::Union{String,Nothing}
-    password::Union{String,Nothing}
+    password::Union{SecretBytes,Nothing}
     nkey::Union{String,Nothing}
     nkey_seed::Union{SecretBytes,Nothing}
     nkey_seed_path::Union{String,Nothing}
@@ -489,6 +489,8 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
         discovered_server_cb,
     )
         servers = _connect_option_servers(servers)
+        token = _secret_bytes(token)
+        password = _secret_bytes(password)
         nkey_seed = _secret_bytes(nkey_seed)
         jwt = _secret_bytes(jwt)
         credentials = _secret_bytes(credentials)
@@ -531,6 +533,61 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},SignatureCallback,ErrorCall
             error_cb, disconnected_cb, reconnected_cb, closed_cb,
             discovered_server_cb)
     end
+end
+
+function _connect_option_show_redacted(name::Symbol)::Bool
+    name === :token || name === :user || name === :password
+end
+
+function _redacted_server_url(url::AbstractString)::String
+    text = String(url)
+    scheme = findfirst("://", text)
+    start = isnothing(scheme) ? firstindex(text) : nextind(text, last(scheme))
+    stop = lastindex(text)
+    for delimiter in ('/', '?', '#')
+        index = findnext(==(delimiter), text, start)
+        if !isnothing(index)
+            stop = min(stop, prevind(text, index))
+        end
+    end
+    stop < start && return text
+    at = nothing
+    index = findnext(==('@'), text, start)
+    while !isnothing(index) && index <= stop
+        at = index
+        index = findnext(==('@'), text, nextind(text, index))
+    end
+    isnothing(at) && return text
+
+    prefix = start == firstindex(text) ? "" : text[firstindex(text):prevind(text, start)]
+    suffix = at == lastindex(text) ? "" : text[nextind(text, at):lastindex(text)]
+    "$prefix<redacted>@$suffix"
+end
+
+function _show_connect_option_value(io::IO, name::Symbol, value)
+    if _connect_option_show_redacted(name) && !isnothing(value)
+        print(io, "<redacted>")
+    elseif name === :servers
+        show(io, map(_redacted_server_url, value))
+    else
+        show(io, value)
+    end
+    nothing
+end
+
+function Base.show(io::IO, opts::ConnectOptions)
+    print(io, "ConnectOptions(")
+    names = fieldnames(typeof(opts))
+    for (i, name) in pairs(names)
+        i == 1 || print(io, ", ")
+        print(io, name, "=")
+        _show_connect_option_value(io, name, getfield(opts, name))
+    end
+    print(io, ")")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", opts::ConnectOptions)
+    show(io, opts)
 end
 
 function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, pedantic=false,

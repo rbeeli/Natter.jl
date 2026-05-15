@@ -14,6 +14,7 @@ const _NKEY_PUBLIC_PREFIXES = (
 const _NKEY_BASE32_ALPHABET = codeunits("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
 
 _nkey_valid_public_prefix(prefix::UInt8)::Bool = prefix in _NKEY_PUBLIC_PREFIXES
+_nkey_is_user_public_prefix(prefix::UInt8)::Bool = prefix == _NKEY_PREFIX_USER
 
 _ascii_space(byte::UInt8)::Bool =
     byte == UInt8(' ') || byte == UInt8('\t') ||
@@ -43,27 +44,35 @@ function _nkey_base32_value(byte::UInt8)::UInt8
     throw(ArgumentError("invalid nkey base32 character"))
 end
 
-function _nkey_base32_decode(encoded)::Vector{UInt8}
+function _nkey_base32_decode!(out::Vector{UInt8}, encoded)::Vector{UInt8}
     input = _stripped_bytes(encoded)
+    _wipe_bytes!(out)
+    empty!(out)
     isempty(input) && throw(ArgumentError("nkey value cannot be empty"))
-    out = UInt8[]
     sizehint!(out, (length(input) * 5) ÷ 8)
     acc::UInt32 = 0
     bits::Int = 0
-    @inbounds for byte in input
-        byte == UInt8('=') && throw(ArgumentError("nkey base32 padding is not allowed"))
-        value = UInt32(_nkey_base32_value(byte))
-        acc = (acc << 5) | value
-        bits += 5
-        while bits >= 8
-            push!(out, UInt8((acc >> (bits - 8)) & 0xff))
-            bits -= 8
-            acc &= bits == 0 ? UInt32(0) : (UInt32(1) << bits) - UInt32(1)
+    try
+        @inbounds for byte in input
+            byte == UInt8('=') && throw(ArgumentError("nkey base32 padding is not allowed"))
+            value = UInt32(_nkey_base32_value(byte))
+            acc = (acc << 5) | value
+            bits += 5
+            while bits >= 8
+                push!(out, UInt8((acc >> (bits - 8)) & 0xff))
+                bits -= 8
+                acc &= bits == 0 ? UInt32(0) : (UInt32(1) << bits) - UInt32(1)
+            end
         end
+        bits > 0 && acc != 0 && throw(ArgumentError("invalid nkey base32 trailing bits"))
+        return out
+    catch
+        _wipe_bytes!(out)
+        rethrow()
     end
-    bits > 0 && acc != 0 && throw(ArgumentError("invalid nkey base32 trailing bits"))
-    out
 end
+
+_nkey_base32_decode(encoded)::Vector{UInt8} = _nkey_base32_decode!(UInt8[], encoded)
 
 function _nkey_base32_encode(bytes::AbstractVector{UInt8})::String
     out = Vector{UInt8}()
@@ -106,11 +115,11 @@ function _nkey_decode_checked(encoded, label::String)::Vector{UInt8}
     raw = _nkey_base32_decode(encoded)
     try
         length(raw) >= 4 || throw(ArgumentError("invalid $label encoding"))
-        data = raw[1:(end - 2)]
+        data = @view raw[1:(end - 2)]
         expected = UInt16(raw[end - 1]) | (UInt16(raw[end]) << 8)
         actual = _nkey_crc16(data)
         actual == expected || throw(ArgumentError("invalid $label checksum"))
-        data
+        copy(data)
     finally
         _wipe_bytes!(raw)
     end
@@ -137,12 +146,38 @@ function _validate_nkey_seed(encoded)
     nothing
 end
 
+function _nkey_decode_user_seed(encoded)
+    decoded = _nkey_decode_seed(encoded)
+    if !_nkey_is_user_public_prefix(decoded.public_prefix)
+        _wipe_bytes!(decoded.seed)
+        throw(ArgumentError("nkey seed must be a user NKEY seed"))
+    end
+    decoded
+end
+
+function _validate_user_nkey_seed(encoded)
+    decoded = _nkey_decode_user_seed(encoded)
+    _wipe_bytes!(decoded.seed)
+    nothing
+end
+
 function _nkey_decode_public(encoded::AbstractString)
     raw = _nkey_decode_checked(encoded, "nkey public key")
-    length(raw) == 33 || throw(ArgumentError("invalid nkey public key length"))
-    prefix = raw[1] & UInt8(0xf8)
-    _nkey_valid_public_prefix(prefix) || throw(ArgumentError("invalid nkey public prefix"))
-    (public_prefix=prefix, key=raw[2:end])
+    try
+        length(raw) == 33 || throw(ArgumentError("invalid nkey public key length"))
+        prefix = raw[1] & UInt8(0xf8)
+        _nkey_valid_public_prefix(prefix) || throw(ArgumentError("invalid nkey public prefix"))
+        (public_prefix=prefix, key=raw[2:end])
+    finally
+        _wipe_bytes!(raw)
+    end
+end
+
+function _nkey_decode_user_public(encoded::AbstractString)
+    decoded = _nkey_decode_public(encoded)
+    _nkey_is_user_public_prefix(decoded.public_prefix) ||
+        throw(ArgumentError("nkey public key must be a user NKEY"))
+    decoded
 end
 
 function _nkey_encode_public(public_prefix::UInt8, key::AbstractVector{UInt8})::String
@@ -176,7 +211,7 @@ function _ed25519_keypair_from_seed(seed::Vector{UInt8})
 end
 
 function _nkey_public_from_seed(encoded_seed)::String
-    decoded = _nkey_decode_seed(encoded_seed)
+    decoded = _nkey_decode_user_seed(encoded_seed)
     seed = decoded.seed
     public_key = UInt8[]
     secret_key = UInt8[]
@@ -190,7 +225,7 @@ function _nkey_public_from_seed(encoded_seed)::String
 end
 
 function _nkey_sign(encoded_seed, message::AbstractVector{UInt8})::Vector{UInt8}
-    decoded = _nkey_decode_seed(encoded_seed)
+    decoded = _nkey_decode_user_seed(encoded_seed)
     seed = decoded.seed
     secret_key = UInt8[]
     try
@@ -232,6 +267,10 @@ end
 
 function _secret_to_string(secret::SecretBytes)::String
     String(secret.bytes)
+end
+
+function _secret_to_string(value::AbstractString)::String
+    String(value)
 end
 
 function _read_auth_secret(path::AbstractString)::SecretBytes
@@ -342,12 +381,8 @@ function _find_nkey_seed_line(text)
         candidate_lo = firstindex(candidate)
         candidate_hi = lastindex(candidate)
         if length(candidate) >= 2 &&
-           ((candidate[candidate_lo] == UInt8('S') &&
-             candidate[candidate_lo + 1] == UInt8('O')) ||
-            (candidate[candidate_lo] == UInt8('S') &&
-             candidate[candidate_lo + 1] == UInt8('A')) ||
-            (candidate[candidate_lo] == UInt8('S') &&
-             candidate[candidate_lo + 1] == UInt8('U')))
+           candidate[candidate_lo] == UInt8('S') &&
+           candidate[candidate_lo + 1] == UInt8('U')
             return SecretBytes(candidate)
         end
         i = next_i
@@ -367,7 +402,7 @@ function _extract_nkey_seed(text)::SecretBytes
         end
     isnothing(seed) && throw(ArgumentError("credentials do not contain an nkey seed"))
     try
-        _validate_nkey_seed(seed)
+        _validate_user_nkey_seed(seed)
         return seed
     catch
         _wipe_secret!(seed)
@@ -480,7 +515,7 @@ end
 function _resolve_nkey(opts::ConnectOptions)::String
     if !isnothing(opts.nkey)
         nkey = strip(String(opts.nkey))
-        _nkey_decode_public(nkey)
+        _nkey_decode_user_public(nkey)
         if isnothing(opts.signature_cb) &&
            (!isnothing(opts.nkey_seed) || !isnothing(opts.nkey_seed_path))
             derived = _with_signature_seed(opts) do seed

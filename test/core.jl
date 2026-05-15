@@ -199,6 +199,33 @@ end
     @test seed_opts.nkey_seed isa N.SecretBytes
     jwt_opts = N.ConnectOptions(; jwt="header.payload.signature", nkey_seed=seed)
     @test jwt_opts.jwt isa N.SecretBytes
+    token_opts = N.ConnectOptions(; token="token-secret-123")
+    @test token_opts.token isa N.SecretBytes
+    @test !occursin("token-secret-123", sprint(show, token_opts))
+    @test occursin("token=<redacted>", sprint(show, token_opts))
+    @test !occursin("token-secret-123", sprint(show, MIME("text/plain"), token_opts))
+    userpass_opts = N.ConnectOptions(; user="auth-user-123", password="password-secret-123")
+    @test userpass_opts.password isa N.SecretBytes
+    userpass_show = sprint(show, userpass_opts)
+    @test !occursin("auth-user-123", userpass_show)
+    @test !occursin("password-secret-123", userpass_show)
+    @test occursin("user=<redacted>", userpass_show)
+    @test occursin("password=<redacted>", userpass_show)
+    url_auth_opts = N.ConnectOptions(; servers=(
+        "nats://url-token-123@nats.example:4222",
+        "tls://url-user-123:url-pass-123@nats.example:4223",
+        "nats://url-user-raw:url-pass-raw@extra@nats.example:4224",
+    ))
+    url_auth_show = sprint(show, url_auth_opts)
+    @test !occursin("url-token-123", url_auth_show)
+    @test !occursin("url-user-123", url_auth_show)
+    @test !occursin("url-pass-123", url_auth_show)
+    @test !occursin("url-user-raw", url_auth_show)
+    @test !occursin("url-pass-raw", url_auth_show)
+    @test !occursin("extra", url_auth_show)
+    @test occursin("nats://<redacted>@nats.example:4222", url_auth_show)
+    @test occursin("tls://<redacted>@nats.example:4223", url_auth_show)
+    @test occursin("nats://<redacted>@nats.example:4224", url_auth_show)
     secret_opts = N.ConnectOptions(; credentials=creds)
     @test secret_opts.credentials isa N.SecretBytes
     @test !occursin(seed, sprint(show, secret_opts))
@@ -1923,6 +1950,51 @@ end
 
     put!(release, true)
     wait(sub.processor)
+end
+
+@testitem "client drain close shares deadline across background task waits" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct ImmediatePongTransportForBackgroundClose <: IO
+        client::Base.RefValue{Any}
+    end
+    Base.write(::ImmediatePongTransportForBackgroundClose, data::Vector{UInt8}) = length(data)
+    Base.write(::ImmediatePongTransportForBackgroundClose, data::String) = ncodeunits(data)
+    Base.flush(t::ImmediatePongTransportForBackgroundClose) = (N._notify_pong(t.client[]); nothing)
+    Base.close(::ImmediatePongTransportForBackgroundClose) = nothing
+
+    opts = N.ConnectOptions(; connect_timeout=2.0)
+    client_ref = Ref{Any}(nothing)
+    transport = ImmediatePongTransportForBackgroundClose(client_ref)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    client_ref[] = client
+
+    started = Channel{Bool}(1)
+    stopped = Channel{Bool}(1)
+    blocker = Channel{Bool}(0)
+    reader_task = @async begin
+        put!(started, true)
+        try
+            take!(blocker)
+        finally
+            put!(stopped, true)
+        end
+    end
+    take!(started)
+    @lock client.lock client.reader_task = reader_task
+
+    start = time()
+    err = TestHelpers.thrown_exception(() -> drain(client; timeout=0.02))
+    elapsed = time() - start
+
+    @test N._drain_timed_out(err)
+    @test elapsed < 1.0
+    @test status(client) == N.ConnectionStatus.CLOSED
+    @test timedwait(1.0; pollint=0.01) do
+        isready(stopped)
+    end != :timed_out
 end
 
 @testitem "transport close waits for in-flight writes" setup=[TestHelpers] begin
