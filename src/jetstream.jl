@@ -33,8 +33,8 @@ end
 
 abstract type AbstractJetStreamAsyncPublishState{C<:Client} end
 
-mutable struct JetStreamPublishFuture{C<:Client}
-    state::AbstractJetStreamAsyncPublishState{C}
+mutable struct JetStreamPublishFuture{C<:Client,S<:AbstractJetStreamAsyncPublishState{C}}
+    state::S
     token::String
     reply::String
     subject::String
@@ -55,7 +55,7 @@ mutable struct JetStreamAsyncPublishState{C<:Client} <: AbstractJetStreamAsyncPu
     condition::Base.GenericCondition{ReentrantLock}
     setup_lock::ReentrantLock
     sub::Union{Subscription{C},Nothing}
-    futures::Dict{String,JetStreamPublishFuture{C}}
+    futures::Dict{String,JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}
     max_pending::Int
     pending::Int
     next_token::Int
@@ -87,7 +87,7 @@ function JetStreamAsyncPublishState(client::C, max_pending::Int) where {C<:Clien
         Base.Threads.Condition(lock),
         ReentrantLock(),
         nothing,
-        Dict{String,JetStreamPublishFuture{C}}(),
+        Dict{String,JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}(),
         max_pending,
         0,
         0,
@@ -668,7 +668,7 @@ function _js_async_publish_timeout_loop(state::JetStreamAsyncPublishState{C}) wh
             end
             now = time()
             nearest = Inf
-            expired = Tuple{JetStreamPublishFuture{C},Exception}[]
+            expired = Tuple{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}},Exception}[]
             for future in values(state.futures)
                 err = _js_async_publish_connection_error(state.client, future.generation)
                 if !isnothing(err)
@@ -767,9 +767,9 @@ function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
         state.next_token += 1
         token = "pa$(state.next_token)"
         reply = "$(state.prefix).$token"
-        future = JetStreamPublishFuture{C}(state, token, reply, String(subject), deadline,
-                                           generation, retry_attempts, retry_wait, 0, retry_frame,
-                                           false, true, nothing)
+        future = JetStreamPublishFuture{C,typeof(state)}(
+            state, token, reply, String(subject), deadline, generation, retry_attempts,
+            retry_wait, 0, retry_frame, false, true, nothing)
         state.futures[token] = future
         state.pending += 1
         _ensure_js_async_publish_timeout_task_locked!(state)
@@ -1470,6 +1470,30 @@ _consumer_missing(err) = err isa JetStreamError && err.code == 404
 _consumer_create_conflict(err) =
     err isa JetStreamError && err.err_code in (_JS_ERR_CONSUMER_NAME_EXISTS, _JS_ERR_CONSUMER_ALREADY_EXISTS)
 
+_priority_policy_none(policy::Union{PriorityPolicy.T,Nothing}) =
+    isnothing(policy) || policy == PriorityPolicy.NONE
+
+function _pull_consumer_priority_groups(info::ConsumerInfo)::Vector{String}
+    groups = info.config.priority_groups
+    isnothing(groups) ? String[] : copy(groups)
+end
+
+function _validate_pull_consumer_priority_config(info::ConsumerInfo)
+    groups = _pull_consumer_priority_groups(info)
+    policy = info.config.priority_policy
+    if isempty(groups)
+        _priority_policy_none(policy) ||
+            throw(ProtocolError("pull consumer $(info.name) has priority_policy without priority_groups"))
+    elseif _priority_policy_none(policy)
+        throw(ProtocolError("pull consumer $(info.name) has priority_groups without priority_policy"))
+    end
+    if !isnothing(info.config.priority_timeout) && policy != PriorityPolicy.PINNED_CLIENT
+        throw(ProtocolError(
+            "pull consumer $(info.name) has priority_timeout without priority_policy=pinned_client"))
+    end
+    policy, groups
+end
+
 function _consumer_info_or_nothing(js::JetStreamContext, stream::AbstractString, consumer::AbstractString;
                                    timeout::Real=js.timeout,
                                    cancel_token::MaybeCancellationToken=nothing)
@@ -1819,6 +1843,8 @@ mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription
     pin_id::Union{String,Nothing}
     active_fetches::Int
     active_stream::Bool
+    priority_policy::Union{PriorityPolicy.T,Nothing}
+    priority_groups::Vector{String}
 end
 
 mutable struct PullMessageStream{C<:Client,P<:PullSubscription{C}}
@@ -1834,12 +1860,15 @@ end
 
 function PullSubscription(js::J, sub::S, stream::AbstractString, consumer::AbstractString,
                           deliver::AbstractString, fetch_lock::ReentrantLock, close_lock::ReentrantLock,
-                          delete_on_close::Bool, closed::Bool) where {C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
+                          delete_on_close::Bool, closed::Bool,
+                          priority_policy::Union{PriorityPolicy.T,Nothing}=nothing,
+                          priority_groups::Vector{String}=String[]) where {C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
     stream = String(stream)
     consumer = String(consumer)
     PullSubscription{C,J,S}(js, sub, stream, consumer, _pull_fetch_next_subject(js, stream, consumer),
                             String(deliver), fetch_lock, close_lock,
-                            delete_on_close, closed, false, nothing, 0, false)
+                            delete_on_close, closed, false, nothing, 0, false,
+                            priority_policy, copy(priority_groups))
 end
 
 mutable struct PushSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
@@ -2369,9 +2398,11 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
         cfg["name"] = info.name
     end
     try
+        priority_policy, priority_groups = _validate_pull_consumer_priority_config(info)
         deliver = "$(new_inbox(js.client)).*"
         sub = subscribe(js.client, deliver; cancel_token)
-        PullSubscription(js, sub, stream, info.name, deliver, ReentrantLock(), ReentrantLock(), delete_on_close, false)
+        PullSubscription(js, sub, stream, info.name, deliver, ReentrantLock(), ReentrantLock(),
+                         delete_on_close, false, priority_policy, priority_groups)
     catch err
         if delete_on_close
             try
@@ -2432,6 +2463,32 @@ function _validate_pull_request_scheduling(prefix::AbstractString, min_pending, 
     min_pending, min_ack_pending, priority_group, priority
 end
 
+function _validate_pull_request_priority!(psub::PullSubscription, prefix::AbstractString,
+                                          min_pending::Union{Int,Nothing},
+                                          min_ack_pending::Union{Int,Nothing},
+                                          priority_group::Union{String,Nothing},
+                                          priority::Union{Int,Nothing})
+    has_groups = !isempty(psub.priority_groups)
+    if has_groups
+        isnothing(priority_group) &&
+            throw(ArgumentError("$prefix priority_group is required for priority consumer $(psub.consumer)"))
+        priority_group in psub.priority_groups ||
+            throw(ArgumentError("$prefix priority_group is not configured for consumer $(psub.consumer)"))
+    elseif !isnothing(priority_group)
+        throw(ArgumentError("$prefix priority_group is not supported for consumer $(psub.consumer)"))
+    end
+
+    if !isnothing(min_pending) || !isnothing(min_ack_pending)
+        psub.priority_policy == PriorityPolicy.OVERFLOW ||
+            throw(ArgumentError("$prefix min_pending and min_ack_pending require priority_policy=overflow"))
+    end
+    if !isnothing(priority)
+        psub.priority_policy == PriorityPolicy.PRIORITIZED ||
+            throw(ArgumentError("$prefix priority requires priority_policy=prioritized"))
+    end
+    nothing
+end
+
 function _bool_option(name::AbstractString, value)::Bool
     value isa Bool || throw(ArgumentError("$name must be a Bool"))
     value
@@ -2489,6 +2546,8 @@ function _validate_pull_fetch(psub::PullSubscription, batch, timeout::Real, expi
         _validate_pull_request_scheduling("fetch", min_pending, min_ack_pending,
                                           priority_group, priority)
     _check_pull_subscription_open(psub)
+    _validate_pull_request_priority!(psub, "fetch", min_pending, min_ack_pending,
+                                     priority_group, priority)
     batch, timeout, expires, _pull_fetch_heartbeat(expires, heartbeat), max_bytes, no_wait,
         min_pending, min_ack_pending, priority_group, priority
 end
@@ -2692,6 +2751,8 @@ function _validate_pull_messages(psub::PullSubscription, batch, max_bytes, expir
         _validate_pull_request_scheduling("messages", min_pending, min_ack_pending,
                                           priority_group, priority)
     _check_pull_subscription_open(psub)
+    _validate_pull_request_priority!(psub, "messages", min_pending, min_ack_pending,
+                                     priority_group, priority)
     _PullStreamConfig(batch, max_bytes, expires, heartbeat, threshold_messages,
                       threshold_bytes, min_pending, min_ack_pending, priority_group,
                       priority, stop_after, channel_size), channel_size

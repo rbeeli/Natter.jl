@@ -602,6 +602,43 @@ function _validate_filter_subjects_do_not_overlap(subjects::Vector{String})
     subjects
 end
 
+function _validate_consumer_priority_policy!(payload::Dict{String,Any})::Union{String,Nothing}
+    haskey(payload, "priority_policy") || return nothing
+    value = payload["priority_policy"]
+    isnothing(value) && return nothing
+    value isa AbstractString || throw(ArgumentError("priority_policy must be a string"))
+    policy = String(value)
+    policy in ("none", "overflow", "pinned_client", "prioritized") ||
+        throw(ArgumentError("priority_policy must be one of none, overflow, pinned_client, or prioritized"))
+    payload["priority_policy"] = policy
+    policy
+end
+
+function _validate_consumer_priority_config!(payload::Dict{String,Any},
+                                             policy::Union{String,Nothing},
+                                             priority_groups::Vector{String})
+    has_priority_groups = !isempty(priority_groups)
+    has_priority_policy = !isnothing(policy) && policy != "none"
+    has_priority_timeout = haskey(payload, "priority_timeout") && !isnothing(payload["priority_timeout"])
+    has_push_delivery =
+        (haskey(payload, "deliver_subject") && !isnothing(payload["deliver_subject"])) ||
+        (haskey(payload, "deliver_group") && !isnothing(payload["deliver_group"]))
+
+    if has_push_delivery && (has_priority_groups || has_priority_policy || has_priority_timeout)
+        throw(ArgumentError("push consumers do not support priority policy, priority groups, or priority_timeout"))
+    end
+    if has_priority_policy && !has_priority_groups
+        throw(ArgumentError("priority_policy requires at least one priority_groups entry"))
+    end
+    if has_priority_groups && !has_priority_policy
+        throw(ArgumentError("priority_groups require priority_policy"))
+    end
+    if has_priority_timeout && policy != "pinned_client"
+        throw(ArgumentError("priority_timeout requires priority_policy=pinned_client"))
+    end
+    payload
+end
+
 function _validate_consumer_config_payload!(payload::Dict{String,Any})::Dict{String,Any}
     _validate_js_name_field!(payload, "name", "consumer")
     _validate_js_name_field!(payload, "durable_name", "consumer")
@@ -670,6 +707,7 @@ function _validate_consumer_config_payload!(payload::Dict{String,Any})::Dict{Str
         payload["sample_freq"] = raw
     end
 
+    priority_groups = String[]
     if haskey(payload, "priority_groups") && !isnothing(payload["priority_groups"])
         groups = payload["priority_groups"]
         groups isa AbstractVector || throw(ArgumentError("priority_groups must be a vector of strings"))
@@ -683,7 +721,10 @@ function _validate_consumer_config_payload!(payload::Dict{String,Any})::Dict{Str
             push!(validated, s)
         end
         payload["priority_groups"] = validated
+        priority_groups = validated
     end
+    policy = _validate_consumer_priority_policy!(payload)
+    _validate_consumer_priority_config!(payload, policy, priority_groups)
     payload
 end
 

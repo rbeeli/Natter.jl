@@ -101,9 +101,6 @@ end
         max_batch=128,
         max_expires=3.0,
         max_bytes=4096,
-        priority_groups=["fast", "slow"],
-        priority_policy=PriorityPolicy.PINNED_CLIENT,
-        priority_timeout=4.0,
     )
 
     payload = N._js_config_payload(cfg)
@@ -117,8 +114,6 @@ end
     @test payload["idle_heartbeat"] == 1_000_000_000
     @test payload["inactive_threshold"] == 2_000_000_000
     @test payload["max_expires"] == 3_000_000_000
-    @test payload["priority_policy"] == "pinned_client"
-    @test payload["priority_timeout"] == 4_000_000_000
     @test startswith(payload["pause_until"], "2026-01-03T00:00:00")
 end
 
@@ -127,8 +122,10 @@ end
 
     const N = Natter
 
+    no_policy_payload = N._js_config_payload(ConsumerConfig(priority_policy=PriorityPolicy.NONE))
+    @test no_policy_payload["priority_policy"] == "none"
+
     cases = (
-        (PriorityPolicy.NONE, "none"),
         (PriorityPolicy.OVERFLOW, "overflow"),
         (PriorityPolicy.PINNED_CLIENT, "pinned_client"),
         (PriorityPolicy.PRIORITIZED, "prioritized"),
@@ -246,6 +243,25 @@ end
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(backoff=[0.1, -0.2]))
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(sample_freq="-1%"))
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_groups=["bad group"]))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_policy=PriorityPolicy.OVERFLOW))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_groups=["fast"]))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_policy=PriorityPolicy.NONE,
+                                                                    priority_groups=["fast"]))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_policy=PriorityPolicy.OVERFLOW,
+                                                                    priority_groups=["fast"],
+                                                                    deliver_subject="_INBOX.deliver"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_policy=PriorityPolicy.PRIORITIZED,
+                                                                    priority_groups=["fast"],
+                                                                    priority_timeout=1.0))
+    @test_throws ArgumentError N._validate_consumer_config_payload!(
+        N._js_config_payload(Dict{String,Any}("priority_policy" => "bad")))
+
+    priority_payload = N._js_config_payload(ConsumerConfig(priority_policy=PriorityPolicy.PINNED_CLIENT,
+                                                           priority_groups=["fast"],
+                                                           priority_timeout=1.0))
+    @test priority_payload["priority_policy"] == "pinned_client"
+    @test priority_payload["priority_groups"] == ["fast"]
+    @test priority_payload["priority_timeout"] == 1_000_000_000
 end
 
 @testitem "JetStream raw dict config serialization matches typed config units" begin
@@ -799,6 +815,7 @@ end
         name="worker",
         filter_subjects=["orders.created", "orders.updated"],
         priority_groups=["fast", "slow"],
+        priority_policy=PriorityPolicy.OVERFLOW,
     ))
     consumer_observed = deepcopy(consumer_requested)
     N._assert_js_config_reflected!("consumer", consumer_requested, consumer_observed)
@@ -938,6 +955,37 @@ end
         timeout=0.001,
     )
     @test TestHelpers.capture_text(capture) == ""
+end
+
+@testitem "JetStream pull consumer priority config validation" begin
+    using Natter
+
+    const N = Natter
+
+    info(config) = N.ConsumerInfo("ORDERS", "worker", config)
+
+    policy, groups = N._validate_pull_consumer_priority_config(info(ConsumerConfig()))
+    @test isnothing(policy)
+    @test isempty(groups)
+
+    policy, groups = N._validate_pull_consumer_priority_config(info(ConsumerConfig(
+        priority_policy=PriorityPolicy.OVERFLOW,
+        priority_groups=["fast", "slow"],
+    )))
+    @test policy == PriorityPolicy.OVERFLOW
+    @test groups == ["fast", "slow"]
+
+    @test_throws ProtocolError N._validate_pull_consumer_priority_config(info(ConsumerConfig(
+        priority_policy=PriorityPolicy.OVERFLOW,
+    )))
+    @test_throws ProtocolError N._validate_pull_consumer_priority_config(info(ConsumerConfig(
+        priority_groups=["fast"],
+    )))
+    @test_throws ProtocolError N._validate_pull_consumer_priority_config(info(ConsumerConfig(
+        priority_policy=PriorityPolicy.OVERFLOW,
+        priority_groups=["fast"],
+        priority_timeout=1.0,
+    )))
 end
 
 @testitem "JetStream stream purge validates filter locally" setup=[TestHelpers] begin
@@ -2186,7 +2234,8 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     js = jetstream(client)
     core_sub = subscribe(client, "_INBOX.pull")
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull",
+                              ReentrantLock(), ReentrantLock(), false, false)
 
     @test_throws ArgumentError fetch(psub, 0; timeout=1.0)
     @test client.pending_bytes == 0
@@ -2230,10 +2279,30 @@ end
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, priority_group="")
     @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(psub, 1; timeout=1.0, priority_group="workers")
+    @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, priority=10, priority_group="workers")
     @test client.pending_bytes == 0
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, min_pending=1)
     @test client.pending_bytes == 0
+
+    priority_sub = subscribe(client, "_INBOX.priority")
+    overflow_psub = N.PullSubscription(js, priority_sub, "ORDERS", "PRIORITY", "_INBOX.priority",
+                                       ReentrantLock(), ReentrantLock(), false, false,
+                                       PriorityPolicy.OVERFLOW, ["fast", "slow"])
+    @test_throws ArgumentError fetch(overflow_psub, 1; timeout=1.0)
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(overflow_psub, 1; timeout=1.0, priority_group="other")
+    @test client.pending_bytes == 0
+    @test_throws ArgumentError fetch(overflow_psub, 1; timeout=1.0, priority_group="fast", priority=1)
+    @test client.pending_bytes == 0
+
+    prioritized_psub = N.PullSubscription(js, priority_sub, "ORDERS", "PRIORITIZED", "_INBOX.priority",
+                                          ReentrantLock(), ReentrantLock(), false, false,
+                                          PriorityPolicy.PRIORITIZED, ["fast"])
+    validated = N._validate_pull_fetch(prioritized_psub, 1, 1.0, 0.9, 0, nothing,
+                                       false, nothing, nothing, "fast", 1)
+    @test validated[end] == 1
 
     close(psub)
     @test_throws ConnectionClosedError fetch(psub, 1; timeout=1.0)
@@ -2267,15 +2336,16 @@ end
     js = jetstream(client)
     core_sub = subscribe(client, "_INBOX.pull")
     take!(client.write_io)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull",
+                              ReentrantLock(), ReentrantLock(), false, false,
+                              PriorityPolicy.OVERFLOW, ["workers"])
 
     try
         N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
                                     sid=core_sub.sid))
         @test isempty(fetch(psub, big(10); timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true,
-                            min_pending=4, min_ack_pending=5, priority_group="workers",
-                            priority=2))
+                            min_pending=4, min_ack_pending=5, priority_group="workers"))
         payload = pull_request_payload(String(take!(client.write_io)))
         @test payload["batch"] == 10
         @test payload["max_bytes"] == 256
@@ -2284,7 +2354,6 @@ end
         @test payload["min_pending"] == 4
         @test payload["min_ack_pending"] == 5
         @test payload["group"] == "workers"
-        @test payload["priority"] == 2
     finally
         close(psub)
     end
@@ -2358,7 +2427,15 @@ end
     @test_throws ArgumentError messages(psub; batch=1, stop_after=0)
     @test_throws ArgumentError messages(psub; batch=1, min_pending=1)
     @test_throws ArgumentError messages(psub; batch=1, priority_group="bad group")
+    @test_throws ArgumentError messages(psub; batch=1, priority_group="workers")
     @test_throws ArgumentError messages(psub; batch=1, priority=-1, priority_group="workers")
+
+    priority_psub = N.PullSubscription(js, core_sub, "ORDERS", "PRIORITY", "_INBOX.pull.*",
+                                       ReentrantLock(), ReentrantLock(), false, false,
+                                       PriorityPolicy.PINNED_CLIENT, ["workers"])
+    @test_throws ArgumentError messages(priority_psub; batch=1)
+    @test_throws ArgumentError messages(priority_psub; batch=1, priority_group="other")
+    @test_throws ArgumentError messages(priority_psub; batch=1, priority_group="workers", min_pending=1)
 
     big_stream = messages(psub; batch=big(1), expires=1.0, heartbeat=0, stop_after=1)
     close(big_stream)
@@ -2748,11 +2825,13 @@ end
     js = jetstream(client)
     core_sub = subscribe(client, "_INBOX.pull.*")
     TestHelpers.clear_capture!(capture)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*",
+                              ReentrantLock(), ReentrantLock(), false, false,
+                              PriorityPolicy.OVERFLOW, ["workers"])
 
     stream = messages(psub; batch=2, expires=1.0, heartbeat=0, threshold_messages=1,
                       channel_size=1, stop_after=2, min_pending=3,
-                      min_ack_pending=4, priority_group="workers", priority=1)
+                      min_ack_pending=4, priority_group="workers")
     try
         @test timedwait(1.0; pollint=0.001) do
             length(request_payloads(capture)) >= 1
@@ -2762,7 +2841,6 @@ end
         @test first_payload["min_pending"] == 3
         @test first_payload["min_ack_pending"] == 4
         @test first_payload["group"] == "workers"
-        @test first_payload["priority"] == 1
 
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one");
                                     sid=core_sub.sid))
