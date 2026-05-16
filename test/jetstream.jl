@@ -676,6 +676,57 @@ end
     @test TestHelpers.capture_text(capture) == ""
 end
 
+@testitem "JetStream typed configs must be reflected by server response" begin
+    using Natter
+
+    const N = Natter
+
+    stream_requested = N._stream_config_payload(StreamConfig(
+        name="ORDERS",
+        subjects=["orders.*"],
+        subject_transform=SubjectTransform(src="orders.*", dest="archive.*"),
+        sources=[StreamSource(
+            name="ARCHIVE",
+            subject_transforms=[SubjectTransform(src="archive.*", dest="orders.*")],
+        )],
+        allow_msg_ttl=true,
+    ))
+    stream_observed = deepcopy(stream_requested)
+    N._assert_js_config_reflected!("stream", stream_requested, stream_observed)
+
+    missing_transform = deepcopy(stream_requested)
+    delete!(missing_transform, "subject_transform")
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "stream",
+        stream_requested,
+        missing_transform,
+    )
+
+    missing_source_transform = deepcopy(stream_requested)
+    delete!(missing_source_transform["sources"][1], "subject_transforms")
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "stream",
+        stream_requested,
+        missing_source_transform,
+    )
+
+    consumer_requested = N._js_config_payload(ConsumerConfig(
+        name="worker",
+        filter_subjects=["orders.created", "orders.updated"],
+        priority_groups=["fast", "slow"],
+    ))
+    consumer_observed = deepcopy(consumer_requested)
+    N._assert_js_config_reflected!("consumer", consumer_requested, consumer_observed)
+
+    missing_filters = deepcopy(consumer_requested)
+    delete!(missing_filters, "filter_subjects")
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "consumer",
+        consumer_requested,
+        missing_filters,
+    )
+end
+
 @testitem "JetStream stream discovery validates subjects before request" setup=[TestHelpers] begin
     using Natter
 

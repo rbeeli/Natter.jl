@@ -28,15 +28,15 @@ Most applications only need a few connection options. Production reconnect, buff
 ```julia
 publish(client, "events.created", "payload")
 publish(client, "events.created", UInt8[0x01, 0x02])
-publish(client, "events.created", (; id=1001, status="created"))
+publish(client, "events.created", """{"id":1001,"status":"created"}""")
 ```
 
-Payloads may be strings, byte vectors, `nothing`, or JSON-serializable Julia values. `publish` validates subjects and the active server payload limit before writing.
+Payloads may be strings, byte vectors, or `nothing`. Encode structured values explicitly before publishing. `publish` validates subjects and the active server payload limit before writing.
 
 Use `prepare_publish` when a hot path sends the same frame repeatedly:
 
 ```julia
-frame = prepare_publish("metrics.tick", (; service="api", value=1))
+frame = prepare_publish("metrics.tick", """{"service":"api","value":1}""")
 
 for _ in 1:1_000
     publish(client, frame)

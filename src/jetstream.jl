@@ -815,12 +815,86 @@ function _stream_config_payload(config::AbstractDict{String,<:Any})::Dict{String
     _validate_stream_config_payload!(payload)
 end
 
+_js_reflection_required(::Nothing) = false
+_js_reflection_required(value::Bool) = value
+_js_reflection_required(value::Real) = value != 0
+_js_reflection_required(value::AbstractString) = !isempty(value)
+_js_reflection_required(value::AbstractDict) = !isempty(value)
+_js_reflection_required(value::AbstractVector) = !isempty(value)
+_js_reflection_required(_value) = true
+
+function _js_requested_config_reflected(expected, observed)::Bool
+    _js_reflection_required(expected) || return true
+    if expected isa AbstractDict
+        observed isa AbstractDict || return false
+        for (raw_key, expected_value) in pairs(expected)
+            _js_reflection_required(expected_value) || continue
+            key = String(raw_key)
+            haskey(observed, key) || return false
+            _js_requested_config_reflected(expected_value, observed[key]) || return false
+        end
+        return true
+    elseif expected isa AbstractVector
+        observed isa AbstractVector || return false
+        length(expected) == length(observed) || return false
+        for i in eachindex(expected)
+            _js_requested_config_reflected(expected[i], observed[i]) || return false
+        end
+        return true
+    else
+        return expected == observed
+    end
+end
+
+function _js_stream_sources_reflected(expected, observed)::Bool
+    expected isa AbstractVector && observed isa AbstractVector || return false
+    length(expected) == length(observed) || return false
+    used = falses(length(observed))
+    for expected_source in expected
+        found = false
+        for i in eachindex(observed)
+            used[i] && continue
+            if _js_requested_config_reflected(expected_source, observed[i])
+                used[i] = true
+                found = true
+                break
+            end
+        end
+        found || return false
+    end
+    true
+end
+
+function _assert_js_config_reflected!(kind::AbstractString, requested::Dict{String,Any},
+                                      observed::Dict{String,Any})
+    for (field, expected) in requested
+        _js_reflection_required(expected) || continue
+        reflected = field == "sources" ?
+                    _js_stream_sources_reflected(expected, get(observed, field, nothing)) :
+                    (haskey(observed, field) && _js_requested_config_reflected(expected, observed[field]))
+        reflected ||
+            throw(UnsupportedFeatureError("JetStream $kind config field $field was not reflected by server response"))
+    end
+    nothing
+end
+
+function _assert_stream_config_reflected!(requested::Dict{String,Any}, info::StreamInfo)
+    _assert_js_config_reflected!("stream", requested, _js_config_payload(info.config))
+    info
+end
+
+function _assert_consumer_config_reflected!(requested::Dict{String,Any}, info::ConsumerInfo)
+    _assert_js_config_reflected!("consumer", requested, _js_config_payload(info.config))
+    info
+end
+
 function stream_create(js::JetStreamContext, config::StreamConfig; timeout::Real=js.timeout,
                        cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload);
-                              timeout, cancel_token))
+    info = _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload);
+                                     timeout, cancel_token))
+    _assert_stream_config_reflected!(payload, info)
 end
 
 function stream_create(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout,
@@ -835,8 +909,9 @@ function stream_update(js::JetStreamContext, config::StreamConfig; timeout::Real
                        cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload);
-                              timeout, cancel_token))
+    info = _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload);
+                                     timeout, cancel_token))
+    _assert_stream_config_reflected!(payload, info)
 end
 
 function stream_update(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout,
@@ -1148,18 +1223,23 @@ function _consumer_create_request(js::JetStreamContext, stream::AbstractString, 
                                   action::Union{String,Nothing}=nothing,
                                   cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
+    verify_config = config isa ConsumerConfig
     payload = _js_config_payload(config)
-    _consumer_create_payload_request(js, stream, payload; timeout, action, cancel_token)
+    _consumer_create_payload_request(js, stream, payload; timeout, action, verify_config,
+                                     cancel_token)
 end
 
 function _consumer_create_payload_request(js::JetStreamContext, stream::AbstractString, payload::Dict{String,Any};
                                           timeout::Real=js.timeout, action::Union{String,Nothing}=nothing,
+                                          verify_config::Bool=false,
                                           cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     _validate_consumer_config_payload!(payload)
     subject = _consumer_create_subject(js, stream, payload)
-    _consumer_info(_api_request(js, subject, JSON3.write(_consumer_request_payload(js, stream, payload, action));
-                                timeout, cancel_token))
+    info = _consumer_info(_api_request(js, subject, JSON3.write(_consumer_request_payload(js, stream, payload, action));
+                                       timeout, cancel_token))
+    verify_config && _assert_consumer_config_reflected!(payload, info)
+    info
 end
 
 consumer_create(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig;
@@ -1498,6 +1578,7 @@ end
 
 function _bind_or_create_consumer(js::JetStreamContext, stream::AbstractString, name::AbstractString,
                                   config::Dict{String,Any}, bind_fields; timeout::Real=js.timeout,
+                                  verify_config::Bool=false,
                                   cancel_token::MaybeCancellationToken=nothing)
     _validate_consumer_config_payload!(config)
     existing = _consumer_info_or_nothing(js, stream, name; timeout, cancel_token)
@@ -1505,7 +1586,8 @@ function _bind_or_create_consumer(js::JetStreamContext, stream::AbstractString, 
         return _validate_bound_consumer_config(existing, config, bind_fields), false
     end
     try
-        _consumer_create_payload_request(js, stream, config; timeout, action="create", cancel_token), true
+        _consumer_create_payload_request(js, stream, config; timeout, action="create",
+                                         verify_config, cancel_token), true
     catch err
         _consumer_create_conflict(err) || rethrow()
         _validate_bound_consumer_config(consumer_info(js, stream, name; timeout, cancel_token),
@@ -2054,6 +2136,7 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     _throw_if_cancelled(cancel_token)
     subject = _validate_subject(subject)
     timeout = _positive_timeout_seconds("timeout", timeout)
+    verify_config = config isa ConsumerConfig
     cfg = _js_config_payload(config)
     _validate_pull_consumer_config!(cfg)
     _validate_consumer_config_payload!(cfg)
@@ -2075,9 +2158,11 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     info =
         if isnothing(bind_name)
             _set_config_default!(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
-            _consumer_create_payload_request(js, stream, cfg; timeout, action="create", cancel_token)
+            _consumer_create_payload_request(js, stream, cfg; timeout, action="create",
+                                             verify_config, cancel_token)
         else
-            consumer, _created = _bind_or_create_consumer(js, stream, bind_name, cfg, bind_fields; timeout, cancel_token)
+            consumer, _created = _bind_or_create_consumer(js, stream, bind_name, cfg, bind_fields;
+                                                          timeout, verify_config, cancel_token)
             _validate_existing_pull_consumer(consumer)
         end
     if !haskey(cfg, "name") || isnothing(cfg["name"])
@@ -2824,6 +2909,7 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
     _throw_if_cancelled(cancel_token)
     subject = _validate_subject(subject)
     timeout = _positive_timeout_seconds("timeout", timeout)
+    verify_config = config isa ConsumerConfig
     cfg = _js_config_payload(config)
     queue_explicit = !isnothing(queue)
     local_queue = _resolve_push_queue!(cfg, queue)
@@ -2882,7 +2968,8 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
     try
         if create_consumer
             try
-                info = _consumer_create_payload_request(js, stream, cfg; timeout, action="create", cancel_token)
+                info = _consumer_create_payload_request(js, stream, cfg; timeout, action="create",
+                                                        verify_config, cancel_token)
                 consumer_created = true
             catch err
                 (!isnothing(bind_name) && _consumer_create_conflict(err)) || rethrow()

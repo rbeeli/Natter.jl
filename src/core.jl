@@ -978,6 +978,7 @@ close(client::Client; throw_errors::Bool=false, callback_timeout=nothing,
                    cancel_token=cancel_token)
 
 function new_inbox(client::Client; prefix::AbstractString=client.options.inbox_prefix)
+    prefix = _validate_inbox_prefix(prefix)
     suffix = @lock client.lock randstring(client.rng, NUID_ALPHABET, 22)
     "$prefix.$suffix"
 end

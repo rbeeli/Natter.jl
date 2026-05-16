@@ -6,7 +6,7 @@ Conventions:
 
 - Timeouts and durations are seconds.
 - Status enums are namespaced, for example `ConnectionStatus.CONNECTED` and `AckPolicy.EXPLICIT`.
-- Payload inputs may be strings, byte vectors, `nothing`, or JSON-serializable Julia values.
+- Payload inputs may be strings, byte vectors, or `nothing`; encode structured values explicitly.
 - `String(msg)` works for `Msg`, `JetStreamMsg`, and `KeyValueEntry`.
 - Blocking operations accept `cancel_token=cancellation_token(source)` where cancellation is useful.
 - Most `_async` helpers return `NatterTask`; `js_publish_async` returns `JetStreamPublishFuture`. `fetch(handle)` returns the operation result or rethrows the original error.
@@ -98,15 +98,15 @@ Parser/resource limits:
 | Function | Returns | Use |
 | :--- | :--- | :--- |
 | `connect(url_or_urls=nothing; kwargs...)` | `Client` | Connect to NATS. |
-| `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | `nothing` | Publish a core message. |
-| `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | `PublishFrame` | Validate and serialize a reusable publish frame. |
+| `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | `nothing` | Publish a core message. Payloads are `nothing`, strings, or byte vectors. |
+| `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | `PublishFrame` | Validate and serialize a reusable publish frame. Payloads are `nothing`, strings, or byte vectors. |
 | `publish(client, frame::PublishFrame)` | `nothing` | Publish a prepared frame. |
 | `subscribe(client, subject; queue=nothing, callback=nothing, max_msgs=0, pending_msgs_limit=..., pending_bytes_limit=...)` | `Subscription` | Create a subscription. |
 | `subscribe(callback, client, subject; kwargs...)` | `Subscription` | Callback-first form. |
 | `next(sub; timeout=1.0)` | `Msg` | Wait for a message on a non-callback subscription. |
 | `unsubscribe(sub; max_msgs=0)` | `nothing` | Unsubscribe now or after more messages. |
 | `close(sub)` | `nothing` | Alias for immediate unsubscribe. |
-| `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | `Msg` | Send a request and wait for one reply. |
+| `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | `Msg` | Send a request and wait for one reply. Payloads are `nothing`, strings, or byte vectors. |
 | `flush(client; timeout=10.0)` | `nothing` | Wait for a server round trip. |
 | `ping(client; timeout=10.0)` | `nothing` | Alias for `flush`. |
 | `drain(sub; timeout=...)` | `nothing` | Unsubscribe and wait for queued callback work. |
@@ -187,6 +187,8 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `ack(msg)`, `ack_sync(msg; timeout=1.0)`, `nak(msg; delay=nothing)`, `in_progress(msg)`, `term(msg)` | `nothing` or `Msg` | Acknowledge or control redelivery. |
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
 | `close(psub)`, `close(push)`, `close(stream)` | `nothing` | Close consumer/message handles. |
+
+Typed `StreamConfig` and `ConsumerConfig` create/update calls verify that requested non-default fields are reflected in the server response. Raw dictionary configs are pass-through for fields outside Natter's typed API.
 
 JetStream task-backed async helpers mirror management, subscribe, fetch, close, and acknowledgement functions: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_async_complete_async`. `js_publish_async` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
 

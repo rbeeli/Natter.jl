@@ -21,6 +21,17 @@ using TestItems
     @test_throws ArgumentError N._validate_publish_subject("foo.*")
     @test_throws ArgumentError N._validate_publish_subject("foo.>")
     @test_throws ArgumentError N._validate_publish_subject("foo..bar")
+    @test N._validate_queue("workers.v1") == "workers.v1"
+    @test_throws ArgumentError N._validate_queue("workers.*")
+    @test_throws ArgumentError N._validate_queue("workers.>")
+    @test_throws ArgumentError N._validate_queue("workers..v1")
+    @test_throws ArgumentError N._validate_queue("workers\x7fv1")
+    @test N.ConnectOptions(; inbox_prefix="CUSTOM.INBOX").inbox_prefix == "CUSTOM.INBOX"
+    @test_throws ArgumentError N.ConnectOptions(; inbox_prefix="")
+    @test_throws ArgumentError N.ConnectOptions(; inbox_prefix=".INBOX")
+    @test_throws ArgumentError N.ConnectOptions(; inbox_prefix="INBOX.")
+    @test_throws ArgumentError N.ConnectOptions(; inbox_prefix="INBOX.*")
+    @test_throws ArgumentError N.ConnectOptions(; inbox_prefix=123)
 
     stats_opts = N.ConnectOptions(record_stats=true)
     client = TestHelpers.fake_client(; opts=stats_opts, status=N.ConnectionStatus.RECONNECTING)
@@ -76,6 +87,12 @@ using TestItems
     @test_throws ArgumentError publish(invalid_publish_headers, "foo", "bar"; headers=Dict("Bad Key" => "abc"))
     @test String(take!(invalid_publish_headers.write_io)) == ""
     @test invalid_publish_headers.pending_bytes == 0
+
+    structured_payload = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    @test_throws ArgumentError publish(structured_payload, "foo", (; id=1))
+    @test String(take!(structured_payload.write_io)) == ""
+    @test structured_payload.pending_bytes == 0
+    @test_throws ArgumentError prepare_publish("prepared.structured", (; id=1))
 
     invalid_request_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     @test_throws ArgumentError request(invalid_request_headers, "svc", "body"; timeout=0.001, headers=Dict("Bad Key" => "abc"))
@@ -279,6 +296,7 @@ end
 
     inbox = new_inbox(client; prefix=SubString("_INBOX.extra", 1, 6))
     @test startswith(inbox, "_INBOX.")
+    @test_throws ArgumentError new_inbox(client; prefix="bad.*")
 end
 
 @testitem "ConnectOptions validates safety limits" begin
@@ -2366,16 +2384,14 @@ end
     Base.close(::KeepaliveFlushTransport) = nothing
 
     transport = KeepaliveFlushTransport(String[], Channel{Bool}(8))
-    opts = N.ConnectOptions(ping_interval=0.05, max_outstanding_pings=2)
-    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=transport)
-
-    ping_task = @async N._ping_loop(client, client.generation)
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    @lock client.lock begin
+        client.pings_out += 1
+        N._queue_ping_marker_locked!(client)
+    end
+    N._send_raw(client, "PING\r\n"; force_flush=true)
     @test timedwait(() -> isready(transport.flushed), 1.0; pollint=0.01) != :timed_out
     take!(transport.flushed)
-    @lock client.lock begin
-        N._bump_generation_locked!(client)
-    end
-    wait(ping_task)
 
     @test length(client.pongs) == 1
     keepalive_marker = only(client.pongs)

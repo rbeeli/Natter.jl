@@ -18,6 +18,8 @@ function _server_info(bytes_or_string)::ServerInfo
             info.connect_urls = String[String(url) for url in value]
         elseif key == "version" && !isnothing(value)
             info.version = String(value)
+        elseif key == "proto" && !isnothing(value)
+            info.proto = Int(value)
         elseif key == "headers" && !isnothing(value)
             info.headers = Bool(value)
         elseif key == "nonce" && !isnothing(value)
@@ -1110,31 +1112,34 @@ function _unsub_cmd(sid::Int, max_msgs=0)
     max_msgs > 0 ? "UNSUB $sid $max_msgs$CRLF" : "UNSUB $sid$CRLF"
 end
 
-function _validate_subject_token(wildcard::UInt8, token_chars::Int, allow_wildcards::Bool)
+function _validate_subject_token(wildcard::UInt8, token_chars::Int, allow_wildcards::Bool,
+                                 kind::AbstractString)
     wildcard == 0x00 && return nothing
-    token_chars == 1 || throw(ArgumentError("wildcards must occupy a complete subject token"))
-    allow_wildcards || throw(ArgumentError("publish subjects cannot contain wildcards"))
+    token_chars == 1 || throw(ArgumentError("wildcards must occupy a complete $kind token"))
+    allow_wildcards || throw(ArgumentError("$kind cannot contain wildcards"))
     nothing
 end
 
 @inline _invalid_subject_space(byte::UInt8)::Bool =
     byte <= 0x20 || byte == 0x7f
 
-function _validate_subject(subject::AbstractString; allow_wildcards::Bool=true)
+function _validate_subject(subject::AbstractString; allow_wildcards::Bool=true,
+                           kind::AbstractString="subject")
     s = String(subject)
-    isempty(s) && throw(ArgumentError("subject cannot be empty"))
+    isempty(s) && throw(ArgumentError("$kind cannot be empty"))
     token_chars = 0
     token_wildcard = UInt8(0)
     previous_dot = false
     for byte in codeunits(s)
-        _invalid_subject_space(byte) && throw(ArgumentError("subject cannot contain whitespace"))
+        _invalid_subject_space(byte) &&
+            throw(ArgumentError("$kind cannot contain whitespace or control characters"))
         if byte == UInt8('.')
             if token_chars == 0
-                msg = previous_dot ? "subject cannot contain consecutive dots" : "subject cannot start with '.'"
+                msg = previous_dot ? "$kind cannot contain consecutive dots" : "$kind cannot start with '.'"
                 throw(ArgumentError(msg))
             end
-            token_wildcard == UInt8('>') && throw(ArgumentError("subject wildcard '>' must be the final token"))
-            _validate_subject_token(token_wildcard, token_chars, allow_wildcards)
+            token_wildcard == UInt8('>') && throw(ArgumentError("$kind wildcard '>' must be the final token"))
+            _validate_subject_token(token_wildcard, token_chars, allow_wildcards, kind)
             token_chars = 0
             token_wildcard = UInt8(0)
             previous_dot = true
@@ -1146,35 +1151,33 @@ function _validate_subject(subject::AbstractString; allow_wildcards::Bool=true)
             previous_dot = false
         end
     end
-    previous_dot && throw(ArgumentError("subject cannot end with '.'"))
-    _validate_subject_token(token_wildcard, token_chars, allow_wildcards)
+    previous_dot && throw(ArgumentError("$kind cannot end with '.'"))
+    _validate_subject_token(token_wildcard, token_chars, allow_wildcards, kind)
     s
 end
 
-_validate_publish_subject(subject::AbstractString) = _validate_subject(subject; allow_wildcards=false)
+_validate_publish_subject(subject::AbstractString) =
+    _validate_subject(subject; allow_wildcards=false, kind="publish subject")
 
 function _validate_queue(queue::Union{AbstractString,Nothing})
     isnothing(queue) && return nothing
-    q = String(queue)
-    isempty(q) && throw(ArgumentError("queue cannot be empty"))
-    for byte in codeunits(q)
-        _invalid_subject_space(byte) && throw(ArgumentError("queue cannot contain whitespace"))
-    end
-    q
+    _validate_subject(queue; allow_wildcards=false, kind="queue")
 end
 
 _payload_bytes(::Nothing) = EMPTY_BYTES
 _payload_bytes(data::Vector{UInt8}) = data
 _payload_bytes(data::AbstractVector{UInt8}) = data
 _payload_bytes(data::AbstractString) = codeunits(String(data))
-_payload_bytes(data) = codeunits(JSON3.write(data))
+_payload_bytes(data) =
+    throw(ArgumentError("payload data must be nothing, an AbstractString, or an AbstractVector{UInt8}; encode structured values explicitly"))
 
 _prepared_payload_bytes(::Nothing) = codeunits("")
 _prepared_payload_bytes(data::String) = codeunits(data)
 _prepared_payload_bytes(data::AbstractString) = _prepared_payload_bytes(String(data))
 _prepared_payload_bytes(data::AbstractVector{UInt8}) =
     isempty(data) ? codeunits("") : ImmutableBytes(data)
-_prepared_payload_bytes(data) = _prepared_payload_bytes(JSON3.write(data))
+_prepared_payload_bytes(data) =
+    throw(ArgumentError("payload data must be nothing, an AbstractString, or an AbstractVector{UInt8}; encode structured values explicitly"))
 
 _publish_header_bytes(::Nothing) = EMPTY_BYTES
 function _publish_header_bytes(headers::AbstractVector{UInt8})

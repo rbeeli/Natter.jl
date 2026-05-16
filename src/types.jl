@@ -462,6 +462,38 @@ function _connect_option_optional_string(name::AbstractString, value)::Union{Str
     result
 end
 
+@inline _invalid_inbox_prefix_byte(byte::UInt8)::Bool =
+    byte <= 0x20 || byte == 0x7f
+
+function _validate_inbox_prefix(prefix::AbstractString)::String
+    value = String(prefix)
+    isempty(value) && throw(ArgumentError("inbox_prefix cannot be empty"))
+    token_chars = 0
+    previous_dot = false
+    for byte in codeunits(value)
+        _invalid_inbox_prefix_byte(byte) &&
+            throw(ArgumentError("inbox_prefix cannot contain whitespace or control characters"))
+        if byte == UInt8('.')
+            if token_chars == 0
+                msg = previous_dot ? "inbox_prefix cannot contain consecutive dots" :
+                      "inbox_prefix cannot start with '.'"
+                throw(ArgumentError(msg))
+            end
+            token_chars = 0
+            previous_dot = true
+        else
+            (byte == UInt8('>') || byte == UInt8('*')) &&
+                throw(ArgumentError("inbox_prefix cannot contain wildcards"))
+            token_chars += 1
+            previous_dot = false
+        end
+    end
+    previous_dot && throw(ArgumentError("inbox_prefix cannot end with '.'"))
+    value
+end
+_validate_inbox_prefix(_prefix) =
+    throw(ArgumentError("inbox_prefix must be a string"))
+
 _connect_option_present(value)::Bool = !isnothing(value)
 _connect_option_count_present(values...)::Int = count(_connect_option_present, values)
 
@@ -673,6 +705,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         sub_pending_bytes_limit = _connect_option_positive_int("sub_pending_bytes_limit", sub_pending_bytes_limit)
         drain_timeout = _connect_option_positive_float("drain_timeout", drain_timeout)
         close_callback_timeout = _connect_option_nonnegative_float("close_callback_timeout", close_callback_timeout)
+        inbox_prefix = _validate_inbox_prefix(inbox_prefix)
 
         new{typeof(servers),typeof(auth),typeof(error_cb),typeof(event_cb),typeof(reconnect_delay_cb)}(
             servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
@@ -807,6 +840,7 @@ Base.@kwdef mutable struct ServerInfo
     tls_available::Union{Bool,Nothing} = nothing
     connect_urls::Union{Vector{String},Nothing} = nothing
     version::Union{String,Nothing} = nothing
+    proto::Union{Int,Nothing} = nothing
     headers::Union{Bool,Nothing} = nothing
     nonce::Union{String,Nothing} = nothing
     ldm::Bool = false
@@ -827,6 +861,7 @@ function _merge_server_info!(dest::ServerInfo, src::ServerInfo)
     isnothing(src.tls_available) || (dest.tls_available = src.tls_available)
     isnothing(src.connect_urls) || (dest.connect_urls = copy(src.connect_urls))
     isnothing(src.version) || (dest.version = src.version)
+    isnothing(src.proto) || (dest.proto = src.proto)
     isnothing(src.headers) || (dest.headers = src.headers)
     isnothing(src.nonce) || (dest.nonce = src.nonce)
     dest.ldm = src.ldm

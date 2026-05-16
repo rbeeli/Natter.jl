@@ -1251,6 +1251,9 @@ function _connect_command(client::Client, server::Server, info::ServerInfo, url_
                           attempt::Int, reconnect::Bool)
     opts = client.options
     hdrs = info.headers === true
+    if opts.no_echo && !(something(info.proto, 0) >= 1)
+        throw(UnsupportedFeatureError("no_echo requires server protocol 1 support"))
+    end
     body = Dict{String,Any}(
         "verbose" => opts.verbose,
         "pedantic" => opts.pedantic,

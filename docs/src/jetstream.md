@@ -9,7 +9,7 @@ js = jetstream(client; timeout=5.0)
 
 ## Create A Stream
 
-Use typed Julia config structs for normal code. Only fields you set are sent to the server, and common names, subjects, queues, and numeric bounds are validated locally.
+Use typed Julia config structs for normal code. Only fields you set are sent to the server, common names, subjects, queues, and numeric bounds are validated locally, and typed fields must be reflected by the server response.
 
 ```julia
 stream_create(js, StreamConfig(
@@ -24,7 +24,7 @@ stream_create(js, StreamConfig(
 ))
 ```
 
-Raw dictionaries are available for newer server fields that are not typed yet:
+Raw dictionaries are available for newer server fields that are not typed yet. Dictionary fields are validated when Natter knows their semantics, but otherwise pass through to the server and are not round-trip verified:
 
 ```julia
 stream_update(js, Dict(

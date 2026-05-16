@@ -5,18 +5,20 @@ using TestItems
 
     const N = Natter
 
-    frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("INFO {\"server_id\":\"srv\",\"max_payload\":64,\"headers\":true,\"nonce\":\"abc123\"}\r\n")))
+    frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("INFO {\"server_id\":\"srv\",\"max_payload\":64,\"headers\":true,\"nonce\":\"abc123\",\"proto\":1}\r\n")))
     @test frame.op == :INFO
     data = N._protocol_info(frame)
     @test data.max_payload == 64
     @test data.headers == true
     @test data.nonce == "abc123"
+    @test data.proto == 1
 
     info = N.ServerInfo(; headers=true)
     N._merge_server_info!(info, N.ServerInfo(; connect_urls=["127.0.0.1:4222"]))
     @test info.headers == true
-    N._merge_server_info!(info, N.ServerInfo(; headers=false))
+    N._merge_server_info!(info, N.ServerInfo(; headers=false, proto=1))
     @test info.headers == false
+    @test info.proto == 1
 
     frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\n")))
     @test frame.op == :MSG
@@ -369,6 +371,13 @@ end
     headers_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", headers_cmd).captures))
     @test headers_body.headers == true
     @test headers_body.no_responders == true
+
+    no_echo_client = TestHelpers.fake_client(; opts=N.ConnectOptions(no_echo=true))
+    @test_throws UnsupportedFeatureError connect_command(no_echo_client)
+    @test_throws UnsupportedFeatureError connect_command(no_echo_client, N.ServerInfo(; proto=0))
+    no_echo_cmd = connect_command(no_echo_client, N.ServerInfo(; proto=1))
+    no_echo_body = JSON3.read(only(match(r"^CONNECT (.*)\r\n$", no_echo_cmd).captures))
+    @test no_echo_body.echo == false
 
     token_client = TestHelpers.fake_client()
     token_cmd = connect_command(token_client, N.ServerInfo(), "secret", nothing)
