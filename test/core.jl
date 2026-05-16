@@ -314,6 +314,25 @@ end
     @test opts.close_callback_timeout == 4.0
     @test N.ConnectOptions(close_callback_timeout=0).close_callback_timeout == 0.0
     @test !ismutable(opts)
+    cold_opts = N.ConnectOptions(name=SubString("client-extra", 1, 6),
+                                 verbose=true, pedantic=true, no_echo=true,
+                                 tls_required=true, tls_first=false, tls_verify=false,
+                                 tls_ca_path=SubString("ca.pem.extra", 1, 6),
+                                 tls_cert_path=SubString("client.pem.extra", 1, 10),
+                                 tls_key_path=SubString("key.pem.extra", 1, 7),
+                                 allow_reconnect=false, record_stats=true)
+    @test cold_opts.name == "client"
+    @test cold_opts.verbose
+    @test cold_opts.pedantic
+    @test cold_opts.no_echo
+    @test cold_opts.tls_required
+    @test cold_opts.tls_first == false
+    @test cold_opts.tls_verify == false
+    @test cold_opts.tls_ca_path == "ca.pem"
+    @test cold_opts.tls_cert_path == "client.pem"
+    @test cold_opts.tls_key_path == "key.pem"
+    @test !cold_opts.allow_reconnect
+    @test cold_opts.record_stats
     @test opts.servers isa Tuple{Vararg{String}}
     source_servers = ["nats://one.example:4222"]
     frozen = N.ConnectOptions(; servers=source_servers)
@@ -423,6 +442,20 @@ end
     rejects_expr("NKeyAuth must use either seed or seed_path, not both", () -> N.NKeyAuth(; seed="seed", seed_path="seed.nk"))
     rejects_expr("JwtAuth requires exactly one of jwt or jwt_path", () -> N.JwtAuth(; jwt="jwt", jwt_path="user.jwt", seed))
     rejects_expr("CredentialsAuth requires exactly one of credentials or path", () -> N.CredentialsAuth(; credentials="creds", path="user.creds"))
+    rejects(name="")
+    rejects(name=:client)
+    rejects(verbose=1)
+    rejects(pedantic=nothing)
+    rejects(no_echo=1)
+    rejects(tls_required=1)
+    rejects(tls_first=1)
+    rejects(tls_verify=1)
+    rejects(tls_ca_path="")
+    rejects(tls_ca_path=:ca)
+    rejects(tls_cert_path="", tls_key_path="client-key.pem")
+    rejects(tls_cert_path="client.pem", tls_key_path=:key)
+    rejects(allow_reconnect=1)
+    rejects(record_stats=1)
     rejects(connect_timeout=0)
     rejects(connect_timeout=Inf)
     rejects(ping_interval=0)

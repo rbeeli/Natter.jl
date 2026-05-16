@@ -479,7 +479,11 @@ end
     const N = Natter
 
     capture = TestHelpers.WriteCapture()
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    client = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=capture,
+    )
     kv = KeyValue(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
 
     @test_throws TimeoutError kv_watch(kv; key="alpha", timeout=0.001)

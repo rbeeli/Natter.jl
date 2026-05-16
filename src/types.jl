@@ -454,6 +454,16 @@ function _connect_option_reconnect_attempts(value)::Int
     result
 end
 
+function _connect_option_bool(name::AbstractString, value)::Bool
+    value isa Bool || throw(ArgumentError("$name must be a Bool"))
+    value
+end
+
+function _connect_option_optional_bool(name::AbstractString, value)::Union{Bool,Nothing}
+    isnothing(value) && return nothing
+    _connect_option_bool(name, value)
+end
+
 function _connect_option_optional_string(name::AbstractString, value)::Union{String,Nothing}
     isnothing(value) && return nothing
     value isa AbstractString || throw(ArgumentError("$name must be a string"))
@@ -678,14 +688,25 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         error_cb, event_cb, reconnect_delay_cb,
     )
         servers = _connect_option_servers(servers)
+        name = _connect_option_optional_string("name", name)
+        verbose = _connect_option_bool("verbose", verbose)
+        pedantic = _connect_option_bool("pedantic", pedantic)
         auth isa AbstractAuth || throw(ArgumentError("auth must be an AbstractAuth"))
+        no_echo = _connect_option_bool("no_echo", no_echo)
+        tls_required = _connect_option_bool("tls_required", tls_required)
+        tls_first = _connect_option_optional_bool("tls_first", tls_first)
+        tls_verify = _connect_option_bool("tls_verify", tls_verify)
+        tls_server_name = _connect_option_optional_string("tls_server_name", tls_server_name)
+        tls_ca_path = _connect_option_optional_string("tls_ca_path", tls_ca_path)
+        tls_cert_path = _connect_option_optional_string("tls_cert_path", tls_cert_path)
+        tls_key_path = _connect_option_optional_string("tls_key_path", tls_key_path)
         event_cb = isnothing(event_cb) ? _default_noop_event_cb : event_cb
         reconnect_delay_cb = isnothing(reconnect_delay_cb) ? _default_reconnect_delay_cb : reconnect_delay_cb
         _validate_connect_option_tls(tls_cert_path, tls_key_path)
-        tls_server_name = _connect_option_optional_string("tls_server_name", tls_server_name)
         connect_timeout = _connect_option_positive_float("connect_timeout", connect_timeout)
         ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
         max_outstanding_pings = _connect_option_positive_int("max_outstanding_pings", max_outstanding_pings)
+        allow_reconnect = _connect_option_bool("allow_reconnect", allow_reconnect)
         reconnect_wait = _connect_option_positive_float("reconnect_wait", reconnect_wait)
         reconnect_max_wait = _connect_option_positive_float("reconnect_max_wait", reconnect_max_wait)
         reconnect_max_wait >= reconnect_wait ||
@@ -696,7 +717,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         write_buffer_size = _connect_option_nonnegative_int("write_buffer_size", write_buffer_size)
         write_buffer_latency = _connect_option_nonnegative_float("write_buffer_latency", write_buffer_latency)
         write_timeout = _connect_option_positive_float("write_timeout", write_timeout)
-        record_stats isa Bool || throw(ArgumentError("record_stats must be a Bool"))
+        record_stats = _connect_option_bool("record_stats", record_stats)
         max_control_line = _connect_option_positive_int("max_control_line", max_control_line)
         max_inbound_payload = _connect_option_positive_int("max_inbound_payload", max_inbound_payload)
         max_header_bytes = _connect_option_positive_int("max_header_bytes", max_header_bytes)

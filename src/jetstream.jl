@@ -815,23 +815,56 @@ function _stream_config_payload(config::AbstractDict{String,<:Any})::Dict{String
     _validate_stream_config_payload!(payload)
 end
 
-_js_reflection_required(::Nothing) = false
-_js_reflection_required(value::Bool) = value
-_js_reflection_required(value::Real) = value != 0
-_js_reflection_required(value::AbstractString) = !isempty(value)
-_js_reflection_required(value::AbstractDict) = !isempty(value)
-_js_reflection_required(value::AbstractVector) = !isempty(value)
-_js_reflection_required(_value) = true
+struct _JSConfigFieldMissing end
+const _JS_CONFIG_FIELD_MISSING = _JSConfigFieldMissing()
+
+_js_config_field(observed::AbstractDict, field::String) =
+    haskey(observed, field) ? observed[field] : _JS_CONFIG_FIELD_MISSING
+
+_js_absent_config_field_reflects(::Nothing) = true
+_js_absent_config_field_reflects(value::Bool) = value == false
+_js_absent_config_field_reflects(value::Real) = value == 0
+_js_absent_config_field_reflects(value::AbstractString) = isempty(value)
+_js_absent_config_field_reflects(value::AbstractDict) = isempty(value)
+_js_absent_config_field_reflects(value::AbstractVector) = isempty(value)
+_js_absent_config_field_reflects(_value) = false
+
+# Server responses may omit false, zero, and empty defaults. Non-missing values
+# are still compared by _js_requested_config_reflected, so stale truthy values fail.
+function _js_config_value_is_empty_default(value)::Bool
+    value isa _JSConfigFieldMissing && return true
+    value isa Nothing && return true
+    value isa Bool && return value == false
+    value isa Real && return value == 0
+    value isa AbstractString && return isempty(value)
+    if value isa AbstractDict
+        for nested in values(value)
+            _js_config_value_is_empty_default(nested) || return false
+        end
+        return true
+    elseif value isa AbstractVector
+        for nested in value
+            _js_config_value_is_empty_default(nested) || return false
+        end
+        return true
+    end
+    false
+end
 
 function _js_requested_config_reflected(expected, observed)::Bool
-    _js_reflection_required(expected) || return true
+    observed isa _JSConfigFieldMissing && return _js_absent_config_field_reflects(expected)
     if expected isa AbstractDict
         observed isa AbstractDict || return false
+        expected_keys = Set{String}()
         for (raw_key, expected_value) in pairs(expected)
-            _js_reflection_required(expected_value) || continue
             key = String(raw_key)
-            haskey(observed, key) || return false
-            _js_requested_config_reflected(expected_value, observed[key]) || return false
+            push!(expected_keys, key)
+            _js_requested_config_reflected(expected_value, _js_config_field(observed, key)) ||
+                return false
+        end
+        for (raw_key, observed_value) in pairs(observed)
+            String(raw_key) in expected_keys && continue
+            _js_config_value_is_empty_default(observed_value) || return false
         end
         return true
     elseif expected isa AbstractVector
@@ -847,6 +880,7 @@ function _js_requested_config_reflected(expected, observed)::Bool
 end
 
 function _js_stream_sources_reflected(expected, observed)::Bool
+    observed isa _JSConfigFieldMissing && return _js_absent_config_field_reflects(expected)
     expected isa AbstractVector && observed isa AbstractVector || return false
     length(expected) == length(observed) || return false
     used = falses(length(observed))
@@ -865,13 +899,34 @@ function _js_stream_sources_reflected(expected, observed)::Bool
     true
 end
 
+_js_server_metadata_key(key::AbstractString)::Bool = startswith(String(key), "_nats")
+
+function _js_user_metadata(value::AbstractDict)::Dict{String,Any}
+    metadata = Dict{String,Any}()
+    for (raw_key, metadata_value) in pairs(value)
+        key = String(raw_key)
+        _js_server_metadata_key(key) && continue
+        metadata[key] = metadata_value
+    end
+    metadata
+end
+
+function _js_metadata_reflected(expected, observed)::Bool
+    expected isa AbstractDict || return false
+    requested = Dict{String,Any}(String(k) => v for (k, v) in pairs(expected))
+    observed isa _JSConfigFieldMissing && return isempty(requested)
+    observed isa AbstractDict || return false
+    requested == _js_user_metadata(observed)
+end
+
 function _assert_js_config_reflected!(kind::AbstractString, requested::Dict{String,Any},
                                       observed::Dict{String,Any})
     for (field, expected) in requested
-        _js_reflection_required(expected) || continue
-        reflected = field == "sources" ?
-                    _js_stream_sources_reflected(expected, get(observed, field, nothing)) :
-                    (haskey(observed, field) && _js_requested_config_reflected(expected, observed[field]))
+        reflected = field == "metadata" ?
+                    _js_metadata_reflected(expected, _js_config_field(observed, field)) :
+                    field == "sources" ?
+                    _js_stream_sources_reflected(expected, _js_config_field(observed, field)) :
+                    _js_requested_config_reflected(expected, _js_config_field(observed, field))
         reflected ||
             throw(UnsupportedFeatureError("JetStream $kind config field $field was not reflected by server response"))
     end
@@ -1180,11 +1235,13 @@ end
 
 function _server_version_at_least(client::Client, major::Int, minor::Int)
     version = @lock client.lock client.info.version
-    isnothing(version) && return true
+    isnothing(version) && return false
     m = match(r"^(\d+)\.(\d+)", version)
-    isnothing(m) && return true
-    server_major = parse(Int, m.captures[1])
-    server_minor = parse(Int, m.captures[2])
+    isnothing(m) && return false
+    server_major = tryparse(Int, m.captures[1])
+    isnothing(server_major) && return false
+    server_minor = tryparse(Int, m.captures[2])
+    isnothing(server_minor) && return false
     server_major > major || (server_major == major && server_minor >= minor)
 end
 

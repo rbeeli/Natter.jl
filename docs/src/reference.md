@@ -188,7 +188,7 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
 | `close(psub)`, `close(push)`, `close(stream)` | `nothing` | Close consumer/message handles. |
 
-Typed `StreamConfig` and `ConsumerConfig` create/update calls verify that requested non-default fields are reflected in the server response. Raw dictionary configs are pass-through for fields outside Natter's typed API.
+Typed `StreamConfig` and `ConsumerConfig` create/update calls verify that requested fields are reflected in the server response, including explicit false, zero, and empty values. Raw dictionary configs are pass-through for fields outside Natter's typed API.
 
 JetStream task-backed async helpers mirror management, subscribe, fetch, close, and acknowledgement functions: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_async_complete_async`. `js_publish_async` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
 

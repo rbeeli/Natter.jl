@@ -37,10 +37,10 @@ Statuses:
 | Context | Supported | `jetstream(client)`. |
 | Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options. `js_publish_async` uses protocol-level async publish with pending ack accounting, backpressure, completion waiting, and per-message ack/error futures. |
 | Stream management | Supported | Create, update, info, list, names, purge, delete. |
-| Typed stream config | Supported | `StreamConfig` plus nested helpers and raw `Dict` escape hatch. Typed create/update checks that requested non-default fields are reflected by the server response. |
+| Typed stream config | Supported | `StreamConfig` plus nested helpers and raw `Dict` escape hatch. Typed create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. |
 | Message lookup | Supported | Sequence, last-by-subject, next-by-subject, direct get, and message delete. |
 | Consumer management | Supported | Create, create-or-update, update, info, list, delete. |
-| Typed consumer config | Supported | `ConsumerConfig` plus raw `Dict` escape hatch. Typed create/update checks that requested non-default fields are reflected by the server response. |
+| Typed consumer config | Supported | `ConsumerConfig` plus raw `Dict` escape hatch. Typed create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. |
 | Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, `messages`, `consume`, and priority request fields. |
 | Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, queue groups, callbacks, manual/auto ack, flow control replies, and heartbeat reporting. Additional chaos testing remains. |
 | Acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, `term`. |

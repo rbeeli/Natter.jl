@@ -274,7 +274,11 @@ end
     const N = Natter
 
     capture = TestHelpers.WriteCapture()
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    client = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=capture,
+    )
     js = jetstream(client)
     payload = N._js_config_payload(Dict{String,Any}(
         "name" => "worker",
@@ -724,6 +728,95 @@ end
         "consumer",
         consumer_requested,
         missing_filters,
+    )
+
+    stream_clears = Dict{String,Any}(
+        "description" => "",
+        "max_age" => 0,
+        "allow_direct" => false,
+        "consumer_limits" => Dict{String,Any}(),
+        "metadata" => Dict{String,String}(),
+        "sources" => Any[],
+    )
+    stream_observed_cleared = Dict{String,Any}(
+        "metadata" => Dict{String,String}("_nats.ver" => "2.11.17"),
+    )
+    N._assert_js_config_reflected!("stream", stream_clears, stream_observed_cleared)
+
+    stream_still_enabled = deepcopy(stream_observed_cleared)
+    stream_still_enabled["allow_direct"] = true
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "stream",
+        stream_clears,
+        stream_still_enabled,
+    )
+
+    stream_still_limited = deepcopy(stream_observed_cleared)
+    stream_still_limited["max_age"] = 1
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "stream",
+        stream_clears,
+        stream_still_limited,
+    )
+
+    stream_still_described = deepcopy(stream_observed_cleared)
+    stream_still_described["description"] = "old"
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "stream",
+        stream_clears,
+        stream_still_described,
+    )
+
+    stream_still_tagged = deepcopy(stream_observed_cleared)
+    stream_still_tagged["metadata"]["owner"] = "core"
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "stream",
+        stream_clears,
+        stream_still_tagged,
+    )
+
+    stream_still_sourced = deepcopy(stream_observed_cleared)
+    stream_still_sourced["sources"] = [Dict{String,Any}("name" => "ARCHIVE")]
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "stream",
+        stream_clears,
+        stream_still_sourced,
+    )
+
+    consumer_clears = Dict{String,Any}(
+        "flow_control" => false,
+        "idle_heartbeat" => 0,
+        "headers_only" => false,
+        "backoff" => Any[],
+        "metadata" => Dict{String,String}(),
+    )
+    consumer_observed_cleared = Dict{String,Any}(
+        "metadata" => Dict{String,String}("_nats.ver" => "2.11.17"),
+    )
+    N._assert_js_config_reflected!("consumer", consumer_clears, consumer_observed_cleared)
+
+    consumer_still_enabled = deepcopy(consumer_observed_cleared)
+    consumer_still_enabled["headers_only"] = true
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "consumer",
+        consumer_clears,
+        consumer_still_enabled,
+    )
+
+    consumer_still_heartbeat = deepcopy(consumer_observed_cleared)
+    consumer_still_heartbeat["idle_heartbeat"] = 1
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "consumer",
+        consumer_clears,
+        consumer_still_heartbeat,
+    )
+
+    consumer_still_backoff = deepcopy(consumer_observed_cleared)
+    consumer_still_backoff["backoff"] = [1]
+    @test_throws UnsupportedFeatureError N._assert_js_config_reflected!(
+        "consumer",
+        consumer_clears,
+        consumer_still_backoff,
     )
 end
 
@@ -1210,7 +1303,11 @@ end
     const N = Natter
 
     capture = TestHelpers.WriteCapture()
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    client = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=capture,
+    )
     js = jetstream(client; timeout=0.001)
 
     @test_throws TimeoutError push_subscribe(js, "orders.created"; stream="ORDERS",
@@ -1232,7 +1329,11 @@ end
     const N = Natter
 
     capture = TestHelpers.WriteCapture()
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    client = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=capture,
+    )
     js = jetstream(client; timeout=0.001)
 
     @test_throws TimeoutError push_subscribe(js, "orders.created"; stream="ORDERS", ordered=true,
@@ -1260,7 +1361,12 @@ end
 
     opts = ConnectOptions(error_cb=_ -> nothing)
     capture = TestHelpers.WriteCapture()
-    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    client = TestHelpers.fake_client(;
+        opts,
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=capture,
+    )
     js = jetstream(client; timeout=0.001)
     handler = N._JetStreamPushControlHandler()
     @lock handler.lock handler.ordered = true
@@ -1709,7 +1815,7 @@ end
 
     const N = Natter
 
-    client = TestHelpers.fake_client()
+    client = TestHelpers.fake_client(; info=N.ServerInfo(; headers=true, version="2.10.0"))
     js = jetstream(client)
     payload = N._js_config_payload(ConsumerConfig(name="worker", durable_name="worker", filter_subject="orders.created"))
 
@@ -1731,10 +1837,22 @@ end
     @test N._consumer_create_subject(js, "ORDERS", payload) == "\$JS.API.CONSUMER.CREATE.ORDERS.worker.orders.created"
     @test_throws ArgumentError N._consumer_request_payload(js, "ORDERS", payload, "delete")
 
-    old_client = TestHelpers.fake_client()
-    old_client.info.version = "2.9.22"
+    old_client = TestHelpers.fake_client(; info=N.ServerInfo(; headers=true, version="2.9.22"))
     @test_throws UnsupportedFeatureError N._consumer_request_payload(jetstream(old_client), "ORDERS", payload, "create")
     @test_throws UnsupportedFeatureError N._consumer_request_payload(jetstream(old_client), "ORDERS", payload, "update")
+
+    missing_version_client = TestHelpers.fake_client(; info=N.ServerInfo(; headers=true))
+    invalid_version_client = TestHelpers.fake_client(; info=N.ServerInfo(; headers=true, version="unknown"))
+    overflow_version_client = TestHelpers.fake_client(; info=N.ServerInfo(; headers=true, version="$(typemax(Int))0.0"))
+    @test !N._server_supports_consumer_name(missing_version_client)
+    @test !N._server_supports_consumer_name(invalid_version_client)
+    @test !N._server_supports_consumer_name(overflow_version_client)
+    @test !N._server_supports_consumer_action(missing_version_client)
+    @test !N._server_supports_consumer_action(invalid_version_client)
+    @test !N._server_supports_consumer_action(overflow_version_client)
+    @test N._consumer_create_subject(jetstream(missing_version_client), "ORDERS", payload) == "\$JS.API.CONSUMER.DURABLE.CREATE.ORDERS.worker"
+    @test_throws UnsupportedFeatureError N._consumer_request_payload(jetstream(missing_version_client), "ORDERS", payload, "create")
+    @test_throws UnsupportedFeatureError N._consumer_request_payload(jetstream(invalid_version_client), "ORDERS", payload, "update")
 end
 
 @testitem "JetStream durable bind-or-create binds after create conflict" setup=[TestHelpers] begin
@@ -1772,7 +1890,11 @@ end
     missing = JSON3.write(Dict("error" => Dict("code" => 404, "description" => "consumer not found")))
     conflict = JSON3.write(Dict("error" => Dict("code" => 400, "err_code" => 10105, "description" => "consumer already exists")))
 
-    pull_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    pull_client = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=IOBuffer(),
+    )
     pull_js = jetstream(pull_client)
     pull_payload = N._js_config_payload(ConsumerConfig(name="worker", durable_name="worker", filter_subject="orders.created"))
     pull_task = @async N._bind_or_create_consumer(pull_js, "ORDERS", "worker", pull_payload, Set(["name", "durable_name", "filter_subject"]))
@@ -1784,7 +1906,11 @@ end
     @test !pull_created
     @test pull_info.name == "worker"
 
-    push_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    push_client = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=IOBuffer(),
+    )
     push_js = jetstream(push_client)
     push_task = @async push_subscribe(push_js, "orders.created"; stream="ORDERS", durable="worker")
     respond_next_request!(push_client, missing)
