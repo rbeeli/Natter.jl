@@ -177,7 +177,7 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `fetch(psub, batch=1; timeout=..., expires=..., heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `Vector{JetStreamMsg}` | Fetch a bounded batch. |
 | `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | `PullMessageStream` | Start a bounded refill stream. |
 | `consume(callback, psub; kwargs...)` | `PullMessageStream` | Run a callback over `messages`. |
-| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=...)` | `PushSubscription` | Create or bind a push consumer. |
+| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=..., ordered=false)` | `PushSubscription` | Create or bind a push consumer, or create an ordered ephemeral push consumer with `ordered=true`. |
 | `next(psub::PushSubscription; timeout=1.0)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
 | `ack(msg)`, `ack_sync(msg; timeout=1.0)`, `nak(msg; delay=nothing)`, `in_progress(msg)`, `term(msg)` | `nothing` or `Msg` | Acknowledge or control redelivery. |
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |

@@ -15,7 +15,7 @@ Statuses:
 | :--- | :--- | :--- |
 | TCP transport | Supported | Plain `nats://` connections. |
 | TLS transport | Supported | TLS-first, INFO-first upgrade, CA path, certificate verification controls, and client cert/key paths. |
-| WebSocket transport | Planned | `ws://` and `wss://` are not implemented. |
+| WebSocket transport | Not Planned | `ws://` and `wss://` are not implemented. |
 | Connect handshake | Supported | Client name, no echo, server INFO parsing, TLS requirements, and typed auth. |
 | Authentication | Supported | Token, user/password, NKEY, JWT, `.creds`, callback auth, and URL userinfo for token/user-password. |
 | PUB / HPUB / SUB / UNSUB | Supported | Core publish, headers, queue groups, unsubscribe limits, and local subject validation. |
@@ -42,12 +42,12 @@ Statuses:
 | Consumer management | Supported | Create, create-or-update, update, info, list, delete. |
 | Typed consumer config | Supported | `ConsumerConfig` plus raw `Dict` escape hatch. |
 | Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, `messages`, `consume`, and priority request fields. |
-| Push consumers | Partial | Durable/ephemeral push, queue groups, callbacks, manual/auto ack, flow control replies, and heartbeat reporting. Additional chaos testing remains. |
+| Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, queue groups, callbacks, manual/auto ack, flow control replies, and heartbeat reporting. Additional chaos testing remains. |
 | Acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, `term`. |
 | Metadata | Supported | Delivery metadata parsing. |
-| Ordered consumers | Partial | Used internally for KeyValue watch; no public ordered-consumer helper yet. |
-| Object Store | Planned | Not implemented. |
-| Services/Micro | Planned | Not implemented. |
+| Ordered consumers | Supported | Public ordered ephemeral push consumers use `push_subscribe(...; ordered=true)`, with flow control, heartbeats, and automatic reset after sequence gaps. Durable names, queue groups, and binding existing consumers are intentionally rejected. |
+| Object Store | Not Planned | Not implemented. |
+| Services/Micro | Not Planned | Not implemented. |
 | Stream templates and admin APIs | Not planned | Legacy or administrative APIs are not prioritized for client v1. |
 
 ## KeyValue

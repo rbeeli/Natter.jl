@@ -588,6 +588,28 @@ end
                 close(flow_sub)
             end
 
+            ordered_subject = "$subject_root.ordered"
+            ordered_sub = push_subscribe(js, ordered_subject; stream=stream, ordered=true,
+                                         config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW))
+            try
+                ordered_info = consumer_info(js, stream, ordered_sub.consumer)
+                @test ordered_info.config.ack_policy == AckPolicy.NONE
+                @test ordered_info.config.flow_control == true
+                @test ordered_info.config.max_deliver == 1
+                @test isnothing(ordered_info.config.durable_name)
+
+                js_publish(js, ordered_subject, "ordered-one"; stream=stream)
+                js_publish(js, ordered_subject, "ordered-two"; stream=stream)
+                first_ordered = next(ordered_sub; timeout=2.0)
+                second_ordered = next(ordered_sub; timeout=2.0)
+                @test first_ordered.subject == ordered_subject
+                @test second_ordered.subject == ordered_subject
+                @test String(first_ordered) == "ordered-one"
+                @test String(second_ordered) == "ordered-two"
+            finally
+                close(ordered_sub)
+            end
+
             bound_push_subject = "$subject_root.bound-push"
             bound_push_consumer = "PUSHBOUND_$(randstring(6))"
             bound_push_sub = push_subscribe(js, bound_push_subject; stream=stream, durable=bound_push_consumer,

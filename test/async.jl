@@ -69,6 +69,15 @@ end
     delete_err = TestHelpers.thrown_exception(() -> fetch(stream_message_delete_async(js, "ORDERS", 0)))
     @test delete_err isa ArgumentError
 
+    ordered_err = TestHelpers.thrown_exception(() -> fetch(push_subscribe_async(
+        js,
+        "orders.created";
+        stream="ORDERS",
+        ordered=true,
+        queue="workers",
+    )))
+    @test ordered_err isa ArgumentError
+
     ack_msg = JetStreamMsg(Msg("s", nothing, UInt8[]), client)
     ack_err = TestHelpers.thrown_exception(() -> fetch(ack_async(ack_msg)))
     @test ack_err isa JetStreamError

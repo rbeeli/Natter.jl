@@ -2292,6 +2292,40 @@ end
     @test waiter.value == false
 end
 
+@testitem "flush reports disconnected clients as closed" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    disconnected = TestHelpers.fake_client(; status=N.ConnectionStatus.DISCONNECTED)
+    err = TestHelpers.thrown_exception(() -> flush(disconnected; timeout=1.0))
+    @test err isa ConnectionClosedError
+    @test sprint(showerror, err) == "Natter.ConnectionClosedError: connection is disconnected"
+    @test isempty(disconnected.pongs)
+
+    mutable struct DisconnectingFlushTransport <: IO
+        client::Base.RefValue{Any}
+    end
+    Base.write(::DisconnectingFlushTransport, data::Vector{UInt8}) = length(data)
+    Base.write(::DisconnectingFlushTransport, data::String) = ncodeunits(data)
+    Base.flush(t::DisconnectingFlushTransport) = begin
+        client = t.client[]
+        @lock client.lock N._store_status_locked!(client, N.ConnectionStatus.DISCONNECTED)
+        N._notify_pong_waiters!(client, false)
+        nothing
+    end
+    Base.close(::DisconnectingFlushTransport) = nothing
+
+    client_ref = Ref{Any}(nothing)
+    transport = DisconnectingFlushTransport(client_ref)
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=transport)
+    client_ref[] = client
+
+    err = TestHelpers.thrown_exception(() -> flush(client; timeout=1.0))
+    @test err isa ConnectionClosedError
+    @test status(client) == N.ConnectionStatus.DISCONNECTED
+end
+
 @testitem "timed out flush consumes its own late pong" setup=[TestHelpers] begin
     using Natter
 
@@ -2315,6 +2349,49 @@ end
     @test !timed_out_waiter.active
     @test !timed_out_waiter.ready
     @test !later_waiter.ready
+end
+
+@testitem "keepalive pong does not satisfy later flush" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct KeepaliveFlushTransport <: IO
+        writes::Vector{String}
+        flushed::Channel{Bool}
+    end
+    Base.write(t::KeepaliveFlushTransport, data::Vector{UInt8}) = (push!(t.writes, String(copy(data))); length(data))
+    Base.write(t::KeepaliveFlushTransport, data::String) = (push!(t.writes, data); ncodeunits(data))
+    Base.flush(t::KeepaliveFlushTransport) = (put!(t.flushed, true); nothing)
+    Base.close(::KeepaliveFlushTransport) = nothing
+
+    transport = KeepaliveFlushTransport(String[], Channel{Bool}(8))
+    opts = N.ConnectOptions(ping_interval=0.05, max_outstanding_pings=2)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=transport)
+
+    ping_task = @async N._ping_loop(client, client.generation)
+    @test timedwait(() -> isready(transport.flushed), 1.0; pollint=0.01) != :timed_out
+    take!(transport.flushed)
+    @lock client.lock begin
+        N._bump_generation_locked!(client)
+    end
+    wait(ping_task)
+
+    @test length(client.pongs) == 1
+    keepalive_marker = only(client.pongs)
+    @test !keepalive_marker.active
+    @test keepalive_marker.ready
+
+    flush_task = @async flush(client; timeout=1.0)
+    @test timedwait(() -> length(client.pongs) == 2, 1.0; pollint=0.01) != :timed_out
+    @test count(==("PING\r\n"), transport.writes) == 2
+
+    N._notify_pong(client)
+    @test timedwait(() -> istaskdone(flush_task), 0.05; pollint=0.01) == :timed_out
+    @test length(client.pongs) == 1
+
+    N._notify_pong(client)
+    @test fetch(flush_task) === nothing
 end
 
 @testitem "stale flush waiters are bounded" setup=[TestHelpers] begin

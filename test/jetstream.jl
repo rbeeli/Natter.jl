@@ -1065,6 +1065,62 @@ end
     @test occursin("UNSUB ", written)
 end
 
+@testitem "JetStream public ordered push subscribe configures ordered consumer" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client; timeout=0.001)
+
+    @test_throws TimeoutError push_subscribe(js, "orders.created"; stream="ORDERS", ordered=true,
+                                             config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW))
+
+    written = TestHelpers.capture_text(capture)
+    @test occursin("SUB _INBOX.", written)
+    @test occursin("PUB \$JS.API.CONSUMER.CREATE.ORDERS", written)
+    @test occursin("\"filter_subject\":\"orders.created\"", written)
+    @test occursin("\"deliver_policy\":\"new\"", written)
+    @test occursin("\"ack_policy\":\"none\"", written)
+    @test occursin("\"flow_control\":true", written)
+    @test occursin("\"idle_heartbeat\":5000000000", written)
+    @test occursin("\"max_deliver\":1", written)
+    @test occursin("\"num_replicas\":1", written)
+    @test occursin("\"mem_storage\":true", written)
+    @test !occursin("\"durable_name\"", written)
+    @test occursin("UNSUB ", written)
+end
+
+@testitem "JetStream ordered push subscribe rejects unsupported options before write" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client; timeout=0.001)
+
+    function rejects_without_write(f)
+        TestHelpers.clear_capture!(capture)
+        @test_throws ArgumentError f()
+        @test TestHelpers.capture_text(capture) == ""
+    end
+
+    rejects_without_write(() -> push_subscribe(js, "orders.created"; stream="ORDERS",
+                                               ordered=true, durable="worker"))
+    rejects_without_write(() -> push_subscribe(js, "orders.created"; stream="ORDERS",
+                                               ordered=true, queue="workers"))
+    rejects_without_write(() -> push_subscribe(js, "orders.created"; stream="ORDERS",
+                                               ordered=true, config=ConsumerConfig(name="worker")))
+    rejects_without_write(() -> push_subscribe(js, "orders.created"; stream="ORDERS",
+                                               ordered=true, config=ConsumerConfig(deliver_subject="_INBOX.worker")))
+    rejects_without_write(() -> push_subscribe(js, "orders.created"; stream="ORDERS",
+                                               ordered=true, config=ConsumerConfig(ack_policy=AckPolicy.EXPLICIT)))
+    rejects_without_write(() -> push_subscribe(js, "orders.created"; stream="ORDERS",
+                                               ordered=true, config=ConsumerConfig(max_deliver=2)))
+end
+
 @testitem "JetStream push control dispatch filters heartbeats" setup=[TestHelpers] begin
     using Natter
 

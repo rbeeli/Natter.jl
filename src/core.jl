@@ -807,14 +807,19 @@ function _wait_pong_waiter!(waiter::PongWaiter, timeout::Real;
     end
 end
 
+function _throw_not_flushable_status(st::ConnectionStatus.T)
+    st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
+    st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
+    throw(ConnectionReconnectingError())
+end
+
 function _flush(client::Client; timeout::Real=10.0, deadline=nothing,
                 cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     wait_timeout = isnothing(deadline) ? _positive_timeout_seconds("timeout", timeout) :
                    min(Float64(timeout), _remaining_timeout(deadline))
     st = status(client)
-    st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
-    st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING, ConnectionStatus.DISCONNECTED) && throw(ConnectionReconnectingError())
+    st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING) || _throw_not_flushable_status(st)
     waiter = PongWaiter(Base.Threads.Condition(client.lock))
     @lock client.lock push!(client.pongs, waiter)
     try
@@ -841,7 +846,7 @@ function _flush(client::Client; timeout::Real=10.0, deadline=nothing,
         end
         throw(TimeoutError("flush timed out"))
     end
-    result || throw(status(client) == ConnectionStatus.CLOSED ? ConnectionClosedError() : ConnectionReconnectingError())
+    result || _throw_not_flushable_status(status(client))
     nothing
 end
 

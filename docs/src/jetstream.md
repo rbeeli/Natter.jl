@@ -168,6 +168,16 @@ push = push_subscribe(js, "orders.events.created";
 )
 ```
 
+Ordered push consumers are ephemeral, no-ack consumers that reset automatically after sequence gaps or missed heartbeats. They do not support durable names, queue groups, or binding an existing consumer.
+
+```julia
+ordered = push_subscribe(js, "orders.events.created";
+    stream="ORDERS",
+    ordered=true,
+    config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW),
+)
+```
+
 ## Acknowledgements
 
 ```julia

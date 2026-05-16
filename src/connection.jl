@@ -1091,6 +1091,14 @@ function _notify_pong_waiters!(client::Client, value::Bool)
     errors
 end
 
+function _queue_ping_marker_locked!(client::Client)::PongWaiter
+    # Non-user keepalive PINGs still need a queue entry so their PONG cannot
+    # satisfy a later user flush.
+    waiter = PongWaiter(Base.Threads.Condition(client.lock), true, false, false)
+    push!(client.pongs, waiter)
+    waiter
+end
+
 function _notify_request_waiters!(client::Client, err::Exception; clear_mux::Bool=false)
     errors = Any[]
     mux = @lock client.lock begin
@@ -1700,9 +1708,13 @@ function _ping_loop(client::Client, generation::Int)
     while _generation_matches(client, generation) && status(client) == ConnectionStatus.CONNECTED
         _sleep_interruptibly(client, generation, client.options.ping_interval) || return
         _generation_matches(client, generation) && status(client) == ConnectionStatus.CONNECTED || return
-        too_many = @lock client.lock begin
+        too_many, marker = @lock client.lock begin
             client.pings_out += 1
-            client.pings_out > client.options.max_outstanding_pings
+            if client.pings_out > client.options.max_outstanding_pings
+                (true, nothing)
+            else
+                (false, _queue_ping_marker_locked!(client))
+            end
         end
         if too_many
             _trigger_reconnect(client, TimeoutError("too many outstanding pings"))
@@ -1711,6 +1723,9 @@ function _ping_loop(client::Client, generation::Int)
         try
             _send_raw(client, "PING$CRLF"; force_flush=true)
         catch err
+            @lock client.lock begin
+                isnothing(marker) || _remove_pong_waiter_locked!(client, marker)
+            end
             _report_error(client, err)
             _trigger_reconnect(client, err)
             return

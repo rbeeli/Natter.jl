@@ -2548,9 +2548,10 @@ end
 function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
                         queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
-                        timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing)
+                        timeout::Real=js.timeout, ordered::Bool=false,
+                        cancel_token::MaybeCancellationToken=nothing)
     _push_subscribe(js, subject; stream, durable, queue, callback, manual_ack, config, timeout,
-                    cancel_token)
+                    ordered, cancel_token)
 end
 
 function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.timeout,
