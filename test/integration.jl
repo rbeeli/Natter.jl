@@ -2,6 +2,7 @@ using TestItems
 
 @testmodule IntegrationHelpers begin
     using Natter
+    using Sockets
 
     integration_timeout() = parse(Float64, get(ENV, "NATTER_INTEGRATION_TIMEOUT", "5.0"))
     integration_connect_timeout() =
@@ -11,6 +12,146 @@ using TestItems
         publish(client, subject, data; kwargs...)
         flush(client; timeout)
         nothing
+    end
+
+    function _proxy_close(resource, operation::String)
+        try
+            close(resource)
+        catch err
+            @debug "Natter integration proxy cleanup failed" operation exception=(err, catch_backtrace())
+        end
+        nothing
+    end
+
+    function _remember_proxy_resource!(resources::Vector{Any}, resource_lock::ReentrantLock, resource)
+        lock(resource_lock)
+        try
+            push!(resources, resource)
+        finally
+            unlock(resource_lock)
+        end
+        resource
+    end
+
+    function _proxy_resources_snapshot(resources::Vector{Any}, resource_lock::ReentrantLock)
+        lock(resource_lock)
+        try
+            return copy(resources)
+        finally
+            unlock(resource_lock)
+        end
+    end
+
+    function _proxy_pump(from, to; before_write=nothing)
+        try
+            while true
+                data = readavailable(from)
+                isempty(data) && break
+                isnothing(before_write) || before_write()
+                write(to, data)
+                flush(to)
+            end
+        catch err
+            @debug "Natter integration proxy pump stopped" exception=(err, catch_backtrace())
+        finally
+            _proxy_close(from, "close proxy source")
+            _proxy_close(to, "close proxy destination")
+        end
+        nothing
+    end
+
+    function start_tcp_proxy(target_host::AbstractString, target_port::Int; released::Bool=true,
+                             downstream_released::Bool=true)
+        server = Sockets.listen(ip"127.0.0.1", 0)
+        _, proxy_port = Sockets.getsockname(server)
+        resources = Any[server]
+        resource_lock = ReentrantLock()
+        release_gate = Channel{Bool}(1)
+        release_state = Ref(released)
+        downstream_gate = Channel{Bool}(1)
+        downstream_state = Ref(downstream_released)
+
+        function release!()
+            if !release_state[]
+                release_state[] = true
+                isready(release_gate) || put!(release_gate, true)
+            end
+            nothing
+        end
+
+        function pause_downstream!()
+            downstream_state[] = false
+            nothing
+        end
+
+        function resume_downstream!()
+            if !downstream_state[]
+                downstream_state[] = true
+                isready(downstream_gate) || put!(downstream_gate, true)
+            end
+            nothing
+        end
+
+        function wait_downstream!()
+            if !downstream_state[]
+                try
+                    take!(downstream_gate)
+                catch err
+                    @debug "Natter integration proxy downstream wait stopped" exception=(err, catch_backtrace())
+                end
+            end
+            nothing
+        end
+
+        accept_task = @async begin
+            while true
+                client_sock = try
+                    Sockets.accept(server)
+                catch err
+                    @debug "Natter integration proxy accept stopped" exception=(err, catch_backtrace())
+                    break
+                end
+                _remember_proxy_resource!(resources, resource_lock, client_sock)
+
+                if !release_state[]
+                    try
+                        take!(release_gate)
+                    catch err
+                        @debug "Natter integration proxy release wait stopped" exception=(err, catch_backtrace())
+                        _proxy_close(client_sock, "close unreleased proxy client")
+                        break
+                    end
+                end
+
+                server_sock = try
+                    Sockets.connect(String(target_host), target_port)
+                catch err
+                    @debug "Natter integration proxy target connect failed" exception=(err, catch_backtrace())
+                    _proxy_close(client_sock, "close proxy client after target connect failure")
+                    continue
+                end
+                _remember_proxy_resource!(resources, resource_lock, server_sock)
+
+                @async _proxy_pump(client_sock, server_sock)
+                @async _proxy_pump(server_sock, client_sock; before_write=wait_downstream!)
+            end
+        end
+
+        function stop!()
+            release!()
+            for resource in reverse(_proxy_resources_snapshot(resources, resource_lock))
+                _proxy_close(resource, "stop proxy")
+            end
+            resume_downstream!()
+            timedwait(0.5; pollint=0.01) do
+                istaskdone(accept_task)
+            end
+            nothing
+        end
+
+        (; url="nats://127.0.0.1:$(Int(proxy_port))",
+         release=release!, pause_downstream=pause_downstream!,
+         resume_downstream=resume_downstream!, stop=stop!)
     end
 end
 
@@ -195,118 +336,8 @@ end
 @testitem "real nats-server reconnect server-pool failover" setup=[IntegrationHelpers] begin
     using Natter
     using Random
-    using Sockets
 
     const N = Natter
-
-    function _proxy_close(resource, operation::String)
-        try
-            close(resource)
-        catch err
-            @debug "Natter integration proxy cleanup failed" operation exception=(err, catch_backtrace())
-        end
-        nothing
-    end
-
-    function _remember_proxy_resource!(resources::Vector{Any}, resource_lock::ReentrantLock, resource)
-        lock(resource_lock)
-        try
-            push!(resources, resource)
-        finally
-            unlock(resource_lock)
-        end
-        resource
-    end
-
-    function _proxy_resources_snapshot(resources::Vector{Any}, resource_lock::ReentrantLock)
-        lock(resource_lock)
-        try
-            return copy(resources)
-        finally
-            unlock(resource_lock)
-        end
-    end
-
-    function _proxy_pump(from, to)
-        try
-            while true
-                data = readavailable(from)
-                isempty(data) && break
-                write(to, data)
-                flush(to)
-            end
-        catch err
-            @debug "Natter integration proxy pump stopped" exception=(err, catch_backtrace())
-        finally
-            _proxy_close(from, "close proxy source")
-            _proxy_close(to, "close proxy destination")
-        end
-        nothing
-    end
-
-    function _start_tcp_proxy(target_host::AbstractString, target_port::Int; released::Bool=true)
-        server = Sockets.listen(ip"127.0.0.1", 0)
-        _, proxy_port = Sockets.getsockname(server)
-        resources = Any[server]
-        resource_lock = ReentrantLock()
-        release_gate = Channel{Bool}(1)
-        release_state = Ref(released)
-
-        function release!()
-            if !release_state[]
-                release_state[] = true
-                isready(release_gate) || put!(release_gate, true)
-            end
-            nothing
-        end
-
-        accept_task = @async begin
-            while true
-                client_sock = try
-                    Sockets.accept(server)
-                catch err
-                    @debug "Natter integration proxy accept stopped" exception=(err, catch_backtrace())
-                    break
-                end
-                _remember_proxy_resource!(resources, resource_lock, client_sock)
-
-                if !release_state[]
-                    try
-                        take!(release_gate)
-                    catch err
-                        @debug "Natter integration proxy release wait stopped" exception=(err, catch_backtrace())
-                        _proxy_close(client_sock, "close unreleased proxy client")
-                        break
-                    end
-                end
-
-                server_sock = try
-                    Sockets.connect(String(target_host), target_port)
-                catch err
-                    @debug "Natter integration proxy target connect failed" exception=(err, catch_backtrace())
-                    _proxy_close(client_sock, "close proxy client after target connect failure")
-                    continue
-                end
-                _remember_proxy_resource!(resources, resource_lock, server_sock)
-
-                @async _proxy_pump(client_sock, server_sock)
-                @async _proxy_pump(server_sock, client_sock)
-            end
-        end
-
-        function stop!()
-            release!()
-            for resource in reverse(_proxy_resources_snapshot(resources, resource_lock))
-                _proxy_close(resource, "stop proxy")
-            end
-            timedwait(0.5; pollint=0.01) do
-                istaskdone(accept_task)
-            end
-            nothing
-        end
-
-        (; url="nats://127.0.0.1:$(Int(proxy_port))", release=release!, stop=stop!)
-    end
 
     if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true"
         url = get(ENV, "NATTER_URL", "nats://127.0.0.1:4222")
@@ -314,8 +345,8 @@ end
         scheme, host, port, _, _ = N._server_parts(url)
 
         if scheme == "nats"
-            primary = _start_tcp_proxy(host, port)
-            secondary = _start_tcp_proxy(host, port; released=false)
+            primary = IntegrationHelpers.start_tcp_proxy(host, port)
+            secondary = IntegrationHelpers.start_tcp_proxy(host, port; released=false)
             disconnected = Ref(false)
             reconnected = Ref(false)
             client = N.connect([primary.url, secondary.url];
@@ -366,6 +397,91 @@ end
         end
     else
         @info "Skipping reconnect server-pool failover integration test; set NATTER_RUN_INTEGRATION=true to enable it."
+    end
+end
+
+@testitem "real nats-server JetStream async publish reconnect clears pending" setup=[TestHelpers, IntegrationHelpers] begin
+    using Natter
+    using Random
+
+    const N = Natter
+
+    if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" && get(ENV, "NATTER_RUN_JETSTREAM", "false") == "true"
+        url = get(ENV, "NATTER_URL", "nats://127.0.0.1:4222")
+        io_timeout = IntegrationHelpers.integration_timeout()
+        scheme, host, port, _, _ = N._server_parts(url)
+
+        if scheme == "nats"
+            primary = IntegrationHelpers.start_tcp_proxy(host, port)
+            secondary = IntegrationHelpers.start_tcp_proxy(host, port; released=false)
+            disconnected = Ref(false)
+            reconnected = Ref(false)
+            client = connect([primary.url, secondary.url];
+                             connect_timeout=IntegrationHelpers.integration_connect_timeout(),
+                             ping_interval=2.0,
+                             max_outstanding_pings=2,
+                             reconnect_wait=0.05,
+                             reconnect_jitter=0.0,
+                             max_reconnect_attempts=40,
+                             record_stats=true,
+                             event_cb=event -> begin
+                                 event.kind == N.ConnectionEventKind.DISCONNECTED && (disconnected[] = true)
+                                 event.kind == N.ConnectionEventKind.RECONNECTED && (reconnected[] = true)
+                             end)
+            js = jetstream(client; timeout=io_timeout)
+            stream = "NATTER_ASYNC_RECONNECT_$(randstring(8))"
+            subject = "natter.js.async-reconnect.$(randstring(8))"
+            stream_created = Ref(false)
+            try
+                @test connected_url(client) == primary.url
+                stream_create(js, StreamConfig(name=stream, subjects=[subject], storage=StorageType.MEMORY))
+                stream_created[] = true
+
+                warm = fetch(js_publish_async(js, subject, "warm"; stream, timeout=io_timeout))
+                @test warm.stream == stream
+                flush(client; timeout=io_timeout)
+
+                primary.pause_downstream()
+                future = js_publish_async(js, subject, "pending-during-reconnect"; stream, timeout=io_timeout)
+                @test js_publish_async_pending(js) == 1
+                @test !isready(future)
+
+                primary.stop()
+                @test timedwait(5.0; pollint=0.01) do
+                    isready(future) &&
+                        js_publish_async_pending(js) == 0 &&
+                        (disconnected[] || status(client) == N.ConnectionStatus.RECONNECTING)
+                end != :timed_out
+
+                err = TestHelpers.thrown_exception(() -> fetch(future))
+                @test err isa ConnectionReconnectingError
+                @test client.pending_bytes == 0
+
+                secondary.release()
+                @test timedwait(5.0; pollint=0.02) do
+                    reconnected[] &&
+                        status(client) == N.ConnectionStatus.CONNECTED &&
+                        connected_url(client) == secondary.url
+                end != :timed_out
+
+                after = js_publish(js, subject, "after-reconnect"; stream, timeout=io_timeout)
+                @test after.stream == stream
+                @test stats(client).reconnects >= 1
+            finally
+                try
+                    stream_created[] && status(client) == N.ConnectionStatus.CONNECTED &&
+                        stream_delete(js, stream; timeout=io_timeout)
+                finally
+                    close(client)
+                    primary.stop()
+                    secondary.stop()
+                end
+            end
+        else
+            @info "Skipping JetStream async publish reconnect integration test; NATTER_URL must use nats:// for the local proxy."
+        end
+    else
+        @info "Skipping JetStream async publish reconnect integration test; set NATTER_RUN_INTEGRATION=true and NATTER_RUN_JETSTREAM=true to enable it."
     end
 end
 
@@ -890,6 +1006,95 @@ end
         end
     else
         @info "Skipping real nats-server JetStream integration tests; set NATTER_RUN_INTEGRATION=true and NATTER_RUN_JETSTREAM=true to enable them."
+    end
+end
+
+@testitem "real nats-server JetStream ordered reset failure recovery" setup=[IntegrationHelpers] begin
+    using Natter
+    using Random
+
+    const N = Natter
+
+    function ordered_reset_done(psub)
+        task = psub.ordered_reset_task
+        !isnothing(task) && istaskdone(task)
+    end
+
+    if get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" && get(ENV, "NATTER_RUN_JETSTREAM", "false") == "true"
+        url = get(ENV, "NATTER_URL", "nats://127.0.0.1:4222")
+        io_timeout = IntegrationHelpers.integration_timeout()
+        reported = Channel{Any}(16)
+        client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
+                         connect_timeout=IntegrationHelpers.integration_connect_timeout(),
+                         error_cb=err -> put!(reported, err))
+        js = jetstream(client; timeout=io_timeout)
+        stream = "NATTER_ORDERED_RESET_$(randstring(8))"
+        subject = "natter.js.ordered-reset.$(randstring(8))"
+        stream_created = Ref(false)
+        ordered_sub = Ref{Any}(nothing)
+        try
+            stream_create(js, StreamConfig(name=stream, subjects=[subject], storage=StorageType.MEMORY))
+            stream_created[] = true
+            ordered_sub[] = push_subscribe(js, subject; stream, ordered=true,
+                                           config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW))
+            psub = ordered_sub[]::PushSubscription
+            handler = psub.control_handler::N._JetStreamPushControlHandler
+
+            js_publish(js, subject, "ordered-before-reset"; stream, timeout=io_timeout)
+            first = next(psub; timeout=io_timeout)
+            @test String(first) == "ordered-before-reset"
+            reset_seq = metadata(first).stream_sequence + 1
+
+            original_stream = psub.stream
+            psub.stream = "MISSING_$(randstring(8))"
+            try
+                N._request_ordered_push_reset!(handler, reset_seq)
+                @test timedwait(io_timeout; pollint=0.01) do
+                    ordered_reset_done(psub)
+                end != :timed_out
+            finally
+                psub.stream = original_stream
+            end
+            resetting = @lock handler.lock handler.ordered_resetting
+            @test !resetting
+            @test timedwait(io_timeout; pollint=0.01) do
+                isready(reported)
+            end != :timed_out
+            err = take!(reported)
+            @test err isa CleanupError
+            @test err.operation == "reset ordered push consumer"
+            @test err.cause isa JetStreamError
+
+            js_publish(js, subject, "ordered-after-failed-reset"; stream, timeout=io_timeout)
+            N._request_ordered_push_reset!(handler, reset_seq)
+            @test timedwait(io_timeout; pollint=0.01) do
+                ordered_reset_done(psub)
+            end != :timed_out
+            resetting = @lock handler.lock handler.ordered_resetting
+            @test !resetting
+
+            recovered = next(psub; timeout=io_timeout)
+            @test String(recovered) == "ordered-after-failed-reset"
+            @test metadata(recovered).stream_sequence == reset_seq
+
+            js_publish(js, subject, "ordered-after-recovery"; stream, timeout=io_timeout)
+            @test String(next(psub; timeout=io_timeout)) == "ordered-after-recovery"
+        finally
+            try
+                if !isnothing(ordered_sub[]) && status(client) == N.ConnectionStatus.CONNECTED
+                    close(ordered_sub[])
+                end
+            finally
+                try
+                    stream_created[] && status(client) == N.ConnectionStatus.CONNECTED &&
+                        stream_delete(js, stream; timeout=io_timeout)
+                finally
+                    close(client)
+                end
+            end
+        end
+    else
+        @info "Skipping JetStream ordered reset failure recovery integration test; set NATTER_RUN_INTEGRATION=true and NATTER_RUN_JETSTREAM=true to enable it."
     end
 end
 

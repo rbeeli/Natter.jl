@@ -149,7 +149,7 @@ Enums:
 | `AckPolicy` | `NONE`, `ALL`, `EXPLICIT` |
 | `DeliverPolicy` | `ALL`, `LAST`, `NEW`, `BY_START_SEQUENCE`, `BY_START_TIME`, `LAST_PER_SUBJECT` |
 | `ReplayPolicy` | `INSTANT`, `ORIGINAL` |
-| `PriorityPolicy` | `NONE`, `OVERFLOW`, `PINNED_CLIENT` |
+| `PriorityPolicy` | `NONE`, `OVERFLOW`, `PINNED_CLIENT`, `PRIORITIZED` |
 
 Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, `StreamSource`, `StreamConsumerLimits`, and `RePublish`.
 

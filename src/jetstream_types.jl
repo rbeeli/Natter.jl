@@ -48,6 +48,7 @@ EnumX.@enumx PriorityPolicy begin
     NONE
     OVERFLOW
     PINNED_CLIENT
+    PRIORITIZED
 end
 
 const _JS_MAX_REPLICAS = 5
@@ -329,6 +330,7 @@ _js_enum_value(value::PriorityPolicy.T)::String =
     value == PriorityPolicy.NONE ? "none" :
     value == PriorityPolicy.OVERFLOW ? "overflow" :
     value == PriorityPolicy.PINNED_CLIENT ? "pinned_client" :
+    value == PriorityPolicy.PRIORITIZED ? "prioritized" :
     throw(ArgumentError("invalid priority policy: $value"))
 
 function _js_field_value(field::Symbol, value)
@@ -777,6 +779,7 @@ function _parse_priority_policy(value)
     s == "none" && return PriorityPolicy.NONE
     s == "overflow" && return PriorityPolicy.OVERFLOW
     s == "pinned_client" && return PriorityPolicy.PINNED_CLIENT
+    s == "prioritized" && return PriorityPolicy.PRIORITIZED
     throw(ArgumentError("unknown priority policy: $s"))
 end
 

@@ -2172,12 +2172,22 @@ function _handle_push_sequence_heartbeat!(handler::_JetStreamPushControlHandler,
     nothing
 end
 
-function _remap_ordered_subscription!(sub::Subscription, deliver::String)::Tuple{Int,Int}
+struct _OrderedSubscriptionRemap
+    old_sid::Int
+    new_sid::Int
+    old_subject::String
+    new_subject::String
+    old_server_active::Bool
+end
+
+function _remap_ordered_subscription!(sub::Subscription, deliver::String)::_OrderedSubscriptionRemap
     client = sub.client
     @lock sub.lock begin
         sub.closed && throw(ConnectionClosedError("subscription is closed"))
         @lock client.lock begin
             old_sid = sub.sid
+            old_subject = sub.subject
+            old_server_active = sub.server_active
             _delete_subscription_locked!(client, old_sid, sub)
             client.sid += 1
             new_sid = client.sid
@@ -2186,15 +2196,56 @@ function _remap_ordered_subscription!(sub::Subscription, deliver::String)::Tuple
             sub.server_active = false
             client.subscriptions[new_sid] = sub
             _set_subscription_snapshot_locked!(client, new_sid, sub)
-            old_sid, new_sid
+            _OrderedSubscriptionRemap(old_sid, new_sid, old_subject, deliver, old_server_active)
         end
     end
 end
 
-function _send_ordered_subscription_reset!(sub::Subscription, old_sid::Int, new_sid::Int, deliver::String)
-    _send_raw(sub.client, string(_unsub_cmd(old_sid), _sub_cmd(deliver, sub.queue, new_sid)); force_flush=true)
+function _restore_ordered_subscription_mapping!(sub::Subscription, remap::_OrderedSubscriptionRemap;
+                                                server_active::Bool=false)::Bool
+    client = sub.client
     @lock sub.lock begin
-        if !sub.closed && sub.sid == new_sid
+        sub.closed && return false
+        @lock client.lock begin
+            sub.sid == remap.new_sid || return false
+            get(client.subscriptions, remap.new_sid, nothing) === sub || return false
+            _delete_subscription_locked!(client, remap.new_sid, sub)
+            sub.sid = remap.old_sid
+            sub.subject = remap.old_subject
+            sub.server_active = server_active
+            client.subscriptions[remap.old_sid] = sub
+            _set_subscription_snapshot_locked!(client, remap.old_sid, sub)
+            true
+        end
+    end
+end
+
+function _send_ordered_subscription_reset!(sub::Subscription, remap::_OrderedSubscriptionRemap)
+    _send_raw(sub.client, string(_unsub_cmd(remap.old_sid),
+                                 _sub_cmd(remap.new_subject, sub.queue, remap.new_sid));
+              force_flush=true)
+    @lock sub.lock begin
+        if !sub.closed && sub.sid == remap.new_sid
+            sub.server_active = true
+        end
+    end
+    nothing
+end
+
+function _rollback_ordered_subscription_reset!(sub::Subscription, remap::_OrderedSubscriptionRemap,
+                                               reset_sent::Bool)
+    restored = _restore_ordered_subscription_mapping!(
+        sub, remap;
+        server_active=!reset_sent && status(sub.client) == ConnectionStatus.CONNECTED &&
+                      remap.old_server_active,
+    )
+    restored || return nothing
+    reset_sent || return nothing
+    _send_raw(sub.client, string(_unsub_cmd(remap.new_sid),
+                                 _sub_cmd(remap.old_subject, sub.queue, remap.old_sid));
+              force_flush=true)
+    @lock sub.lock begin
+        if !sub.closed && sub.sid == remap.old_sid && sub.subject == remap.old_subject
             sub.server_active = true
         end
     end
@@ -2219,12 +2270,15 @@ end
 
 function _ordered_push_reset_task(psub::PushSubscription, base_config::Dict{String,Any}, start_seq::Int)
     handler = psub.control_handler
+    remap = nothing
+    reset_sent = false
     try
         (@lock psub.close_lock psub.closed) && return nothing
         old_consumer = psub.consumer
         deliver = new_inbox(psub.js.client)
-        old_sid, new_sid = _remap_ordered_subscription!(psub.sub, deliver)
-        _send_ordered_subscription_reset!(psub.sub, old_sid, new_sid, deliver)
+        remap = _remap_ordered_subscription!(psub.sub, deliver)
+        _send_ordered_subscription_reset!(psub.sub, remap)
+        reset_sent = true
 
         name = @lock psub.js.client.lock randstring(psub.js.client.rng, 16)
         cfg = _ordered_push_reset_config(base_config, name, deliver, start_seq)
@@ -2248,6 +2302,14 @@ function _ordered_push_reset_task(psub::PushSubscription, base_config::Dict{Stri
         end
         @async _ordered_delete_consumer_task(psub, old_consumer)
     catch err
+        if !isnothing(remap)
+            try
+                _rollback_ordered_subscription_reset!(psub.sub, remap, reset_sent)
+            catch cleanup_err
+                _report_error(psub.js.client,
+                              CleanupError("rollback ordered push subscription reset", cleanup_err))
+            end
+        end
         _report_error(psub.js.client, CleanupError("reset ordered push consumer", err))
     finally
         _finish_ordered_reset!(handler)

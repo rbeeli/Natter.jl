@@ -122,6 +122,33 @@ end
     @test startswith(payload["pause_until"], "2026-01-03T00:00:00")
 end
 
+@testitem "JetStream priority policy values serialize and parse" begin
+    using Natter
+
+    const N = Natter
+
+    cases = (
+        (PriorityPolicy.NONE, "none"),
+        (PriorityPolicy.OVERFLOW, "overflow"),
+        (PriorityPolicy.PINNED_CLIENT, "pinned_client"),
+        (PriorityPolicy.PRIORITIZED, "prioritized"),
+    )
+
+    for (policy, wire_value) in cases
+        payload = N._js_config_payload(ConsumerConfig(
+            priority_groups=["fast"],
+            priority_policy=policy,
+        ))
+        @test payload["priority_policy"] == wire_value
+
+        parsed = N._consumer_config_from_payload(Dict{String,Any}(
+            "priority_groups" => ["fast"],
+            "priority_policy" => wire_value,
+        ))
+        @test parsed.priority_policy == policy
+    end
+end
+
 @testitem "JetStream consumer filter config validation" begin
     using Natter
 
@@ -1447,6 +1474,47 @@ end
         @test !haskey(config, "opt_start_time")
         @test base_config["deliver_policy"] == "by_start_time"
         @test haskey(base_config, "opt_start_time")
+    finally
+        close(psub)
+    end
+end
+
+@testitem "JetStream ordered push reset rolls back subscription mapping after create failure" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    reported = Any[]
+    opts = ConnectOptions(error_cb=err -> push!(reported, err))
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(;
+        opts,
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=capture,
+    )
+    js = jetstream(client; timeout=0.001)
+    handler = N._JetStreamPushControlHandler()
+    @lock handler.lock handler.ordered = true
+    sub = subscribe(client, "_INBOX.ordered"; _control_handler=handler)
+    old_sid = sub.sid
+    old_subject = sub.subject
+    psub = N.PushSubscription(js, sub, "ORDERS", "OLD", ReentrantLock(), false, false, nothing, handler)
+    base_config = N._js_config_payload(ConsumerConfig(filter_subject="orders.created"))
+    N._prepare_ordered_push_consumer_config!(base_config, nothing)
+    TestHelpers.clear_capture!(capture)
+
+    try
+        N._ordered_push_reset_task(psub, base_config, 42)
+
+        mapped_sids = @lock client.lock sort!([sid for (sid, mapped) in client.subscriptions if mapped === sub])
+        @test sub.sid == old_sid
+        @test sub.subject == old_subject
+        @test sub.server_active
+        @test mapped_sids == [old_sid]
+        written = TestHelpers.capture_text(capture)
+        @test occursin("SUB _INBOX.ordered $old_sid\r\n", written)
+        @test any(err -> err isa N.CleanupError && err.operation == "reset ordered push consumer", reported)
     finally
         close(psub)
     end
