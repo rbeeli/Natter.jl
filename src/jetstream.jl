@@ -1236,6 +1236,7 @@ function _push_msg_metadata(msg::Msg)
 end
 
 function _record_subscription_data_received!(handler::_JetStreamPushControlHandler, msg::Msg)
+    _touch_push_control_handler!(handler)
     handler.flow_control[] && Threads.atomic_add!(handler.flow_incoming, one(UInt64))
     handler.ordered && return nothing
     parsed = _push_msg_metadata(msg)

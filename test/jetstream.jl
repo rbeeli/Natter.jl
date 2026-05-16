@@ -1382,6 +1382,40 @@ end
     end
 end
 
+@testitem "JetStream push data refreshes heartbeat activity" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    handler = N._JetStreamPushControlHandler(60.0)
+    sub = subscribe(client, "_INBOX.push"; _control_handler=handler)
+    stale = time() - 10
+    handler.last_seen[] = stale
+
+    data = Msg("_INBOX.push", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("work");
+               sid=sub.sid)
+    N._dispatch_msg(client, data)
+
+    @test handler.last_seen[] > stale
+    @test String(next(sub; timeout=0.1)) == "work"
+    close(sub)
+
+    ordered_handler = N._JetStreamPushControlHandler(60.0)
+    @lock ordered_handler.lock ordered_handler.ordered = true
+    ordered_sub = subscribe(client, "_INBOX.ordered"; _control_handler=ordered_handler)
+    ordered_stale = time() - 10
+    ordered_handler.last_seen[] = ordered_stale
+
+    ordered_data = Msg("_INBOX.ordered", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("ordered");
+                       sid=ordered_sub.sid)
+    N._dispatch_msg(client, ordered_data)
+
+    @test ordered_handler.last_seen[] > ordered_stale
+    @test String(next(ordered_sub; timeout=0.1)) == "ordered"
+    close(ordered_sub)
+end
+
 @testitem "JetStream push control dispatch does not invoke callbacks" setup=[TestHelpers] begin
     using Natter
 
