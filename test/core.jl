@@ -729,7 +729,7 @@ end
     close(sub)
 end
 
-@testitem "wake flusher does not wait for write lock" setup=[TestHelpers] begin
+@testitem "signal flusher does not wait for write lock" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -748,16 +748,16 @@ end
     end
     take!(entered)
 
-    wake_task = @async N._wake_flusher(client)
+    signal_task = @async N._signal_flusher(client)
     try
         @test timedwait(0.2; pollint=0.001) do
-            istaskdone(wake_task)
+            istaskdone(signal_task)
         end != :timed_out
         @test isready(client.flush_signal)
     finally
         put!(release, true)
         wait(holder)
-        wait(wake_task)
+        wait(signal_task)
     end
 end
 

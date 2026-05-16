@@ -139,12 +139,6 @@ function _nkey_decode_seed(encoded)
     end
 end
 
-function _validate_nkey_seed(encoded)
-    decoded = _nkey_decode_seed(encoded)
-    _wipe_bytes!(decoded.seed)
-    nothing
-end
-
 function _nkey_decode_user_seed(encoded)
     decoded = _nkey_decode_seed(encoded)
     if !_nkey_is_user_public_prefix(decoded.public_prefix)

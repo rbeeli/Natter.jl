@@ -68,8 +68,6 @@ function _default_error_cb(err)
     nothing
 end
 
-_default_noop_cb() = nothing
-
 struct _HeaderEntry
     name::String
     values::Vector{String}
@@ -248,25 +246,20 @@ function _copy_replayable_entry(buffer::AbstractVector{UInt8}, entry::_Replayabl
     _PendingPublishEntry(data, entry.payload_size, entry.header_bytes)
 end
 
-function _append_header_value!(values::Vector{String}, value)
+function _append_header_values!(values::Vector{String}, value)
     push!(values, String(value))
     values
 end
 
-function _append_header_values!(values::Vector{String}, value)
-    _append_header_value!(values, value)
-end
-
 function _append_header_values!(values::Vector{String}, values_input::Union{AbstractVector,Tuple})
     for value in values_input
-        _append_header_value!(values, value)
+        push!(values, String(value))
     end
     values
 end
 
-function _append_header_values!(values::Vector{String}, value::AbstractVector{UInt8})
-    _append_header_value!(values, value)
-end
+_append_header_values!(values::Vector{String}, value::AbstractVector{UInt8}) =
+    (push!(values, String(value)); values)
 
 _headers_from_pairs(::Nothing) = Headers()
 _headers_from_pairs(pair::Pair) = _headers_from_pairs((pair,))
@@ -305,14 +298,6 @@ Base.getindex(h::LazyHeaders, key::AbstractString) = getindex(_headers_materiali
 Base.haskey(h::LazyHeaders, key) = haskey(_headers_materialize!(h), key)
 Base.get(h::LazyHeaders, key, default) = get(_headers_materialize!(h), key, default)
 Base.keys(h::LazyHeaders) = keys(_headers_materialize!(h))
-
-_header_values(::Nothing, _key::AbstractString) = nothing
-_header_values(headers::LazyHeaders, key::AbstractString) =
-    _header_values(_headers_materialize!(headers), key)
-
-function _header_values(headers::Headers, key::AbstractString)
-    get(headers, key, nothing)
-end
 
 _header_first(::Nothing, _key::AbstractString) = nothing
 _header_first(headers::LazyHeaders, key::AbstractString) = _lazy_header_first(headers, key)
@@ -1647,13 +1632,6 @@ end
 
 function _notify_subscription_waiters!(sub::Subscription; all::Bool=false)
     @lock sub.lock _notify_subscription_waiters_locked(sub; all)
-    nothing
-end
-
-function _notify_all_subscription_waiters_locked(client; all::Bool=true)
-    for sub in values(client.subscriptions)
-        _notify_subscription_waiters!(sub; all)
-    end
     nothing
 end
 

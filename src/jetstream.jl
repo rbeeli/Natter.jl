@@ -158,13 +158,9 @@ function ConsumerInfo(stream_name::AbstractString, name::AbstractString, config:
                  push_bound, paused, Float64(pause_remaining))
 end
 
-function _js_publish_async_max_pending(value)::Int
-    _positive_integer_option("publish_async_max_pending", value)
-end
-
 function jetstream(client::Client; prefix::AbstractString="\$JS.API", timeout::Real=5.0,
                    publish_async_max_pending::Integer=256)
-    max_pending = _js_publish_async_max_pending(publish_async_max_pending)
+    max_pending = _positive_integer_option("publish_async_max_pending", publish_async_max_pending)
     JetStreamContext(client, String(prefix), _positive_timeout_seconds("timeout", timeout),
                      JetStreamAsyncPublishState(client, max_pending))
 end
@@ -427,10 +423,6 @@ function _js_publish_headers(headers; stream::Union{AbstractString,Nothing}=noth
     hdrs
 end
 
-function _js_publish_retry_attempts(value)::Int
-    _nonnegative_integer_option("retry_attempts", value)
-end
-
 function _js_publish_retry_wait(value)::Float64
     value isa Real && !(value isa Bool) ||
         throw(ArgumentError("retry_wait must be a positive number of seconds"))
@@ -455,7 +447,7 @@ function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing;
                                expected_last_subject_sequence, expected_last_subject,
                                expected_last_msg_id, ttl, schedule, schedule_at, schedule_every,
                                schedule_target, schedule_source, schedule_ttl, schedule_timezone)
-    attempts = _js_publish_retry_attempts(retry_attempts)
+    attempts = _nonnegative_integer_option("retry_attempts", retry_attempts)
     wait_seconds = _js_publish_retry_wait(retry_wait)
     deadline = time() + timeout
     attempt = 0
@@ -753,9 +745,6 @@ function js_publish_async(js::JetStreamContext, subject::AbstractString, data=no
     end
     future
 end
-
-publish_async(js::JetStreamContext, subject::AbstractString, data=nothing; kwargs...) =
-    js_publish_async(js, subject, data; kwargs...)
 
 function js_publish_async_pending(js::JetStreamContext)::Int
     lock(js.async_publish.condition)
@@ -1194,11 +1183,8 @@ function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::U
                             cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     req = _stream_message_get_request(seq, subject, next_by_subject)
-    if direct
-        msg, _seq, _created = _stream_message_get_direct_info(js, stream, req; timeout, cancel_token)
-        return msg
-    end
-    msg, _seq, _created = _stream_message_get_api(js, stream, req; timeout, cancel_token)
+    msg, _seq, _created = _stream_message_get_info(js, stream, req; direct, timeout,
+                                                   cancel_token)
     msg
 end
 

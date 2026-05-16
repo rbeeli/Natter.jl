@@ -228,14 +228,12 @@ function _fill_reader!(reader::ProtocolReader)
     nothing
 end
 
-function _read_exact_bytes(io, n::Int)::Vector{UInt8}
+function _read_exact_bytes_no_drop(io, n::Int)::Vector{UInt8}
     n == 0 && return UInt8[]
     data = Vector{UInt8}(undef, n)
     unsafe_read(io, pointer(data), UInt(n))
     data
 end
-
-_read_exact_bytes_no_drop(io, n::Int) = _read_exact_bytes(io, n)
 
 function _read_exact_bytes_no_drop(reader::ProtocolReader, n::Int)::Vector{UInt8}
     n == 0 && return UInt8[]
@@ -255,12 +253,6 @@ function _read_exact_bytes_no_drop(reader::ProtocolReader, n::Int)::Vector{UInt8
             remaining = 0
         end
     end
-    data
-end
-
-function _read_exact_bytes(reader::ProtocolReader, n::Int)::Vector{UInt8}
-    data = _read_exact_bytes_no_drop(reader, n)
-    _drop_consumed!(reader)
     data
 end
 

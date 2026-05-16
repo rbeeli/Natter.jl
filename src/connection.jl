@@ -827,11 +827,6 @@ function _signal_flusher(client::Client)
     nothing
 end
 
-function _wake_flusher(client::Client)
-    _signal_flusher(client)
-    nothing
-end
-
 function _flush_buffered_writes(client::Client; allow_missing::Bool=false, deadline=nothing,
                                 cancel_token::MaybeCancellationToken=nothing)
     _with_write_lock(client, "flush buffered writes"; deadline, cancel_token) do
@@ -840,14 +835,9 @@ function _flush_buffered_writes(client::Client; allow_missing::Bool=false, deadl
             allow_missing && return false
             throw(ConnectionClosedError("connection transport is closed"))
         end
-        _flush_buffered_writes_to_io(client, io)
+        _flush_write_io(client, io)
     end
     true
-end
-
-function _flush_buffered_writes_to_io(client::Client, io::WriteIO) where {WriteIO<:IO}
-    _flush_write_io(client, io)
-    nothing
 end
 
 function _reserve_pending_bytes_locked!(client::Client, bytes::Int)
@@ -1170,7 +1160,7 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
             _notify_subscription_waiters_locked(sub; all=true)
         end
     end
-    _wake_flusher(client)
+    _signal_flusher(client)
     errors = Any[]
     append!(errors, _notify_pong_waiters!(client, false))
     if !isnothing(request_mux)
@@ -1344,7 +1334,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
                     flush(write_io)
                 end
             elseif op == :ERR
-                _throw_server_err(_protocol_err(frame))
+                throw(_server_err(_protocol_err(frame)))
             elseif op == :OK
                 continue
             else
@@ -1560,8 +1550,6 @@ function _server_err(message::AbstractString)::NatterError
         return ProtocolError(text)
     end
 end
-
-_throw_server_err(message::AbstractString) = throw(_server_err(message))
 
 _same_auth_error(left::AuthenticationError, right::AuthenticationError)::Bool =
     typeof(left) === typeof(right)
@@ -1779,7 +1767,7 @@ function _trigger_reconnect(client::Client, reason)
         end
     end
     if should_start
-        _wake_flusher(client)
+        _signal_flusher(client)
         _report_cleanup_errors(client, _notify_request_waiters!(client, ConnectionReconnectingError()))
         _report_cleanup_errors(client, _notify_pong_waiters!(client, false))
         _close_transport_report_errors!(client; preserve_replayable=true)

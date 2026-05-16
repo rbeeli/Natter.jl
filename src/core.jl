@@ -261,9 +261,6 @@ _pending_size(data::Vector{UInt8}) = length(data)
 _pending_size(data::AbstractString) = ncodeunits(data)
 _pending_size(frame::_AbstractPublishFrame) = _serialized_size(frame)
 
-_write_pending(io::IO, data::Union{AbstractString,Vector{UInt8}}) = write(io, data)
-_write_pending(io::IO, frame::_AbstractPublishFrame) = _write_pub_frame(io, frame)
-
 _pending_chunk(data::Vector{UInt8}) = copy(data)
 function _pending_chunk(data::AbstractString)
     bytes = Vector{UInt8}(undef, ncodeunits(data))
@@ -372,14 +369,10 @@ function publish(client::Client, frame::PublishFrame; cancel_token::MaybeCancell
     _publish_prepared(client, frame; cancel_token)
 end
 
-function _validate_subscription_positive_limit(name::AbstractString, value)::Int
-    _positive_integer_option(name, value)
-end
-
 function _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
     max_msgs = _validate_core_max_msgs(max_msgs)
-    pending_msgs_limit = _validate_subscription_positive_limit("pending_msgs_limit", pending_msgs_limit)
-    pending_bytes_limit = _validate_subscription_positive_limit("pending_bytes_limit", pending_bytes_limit)
+    pending_msgs_limit = _positive_integer_option("pending_msgs_limit", pending_msgs_limit)
+    pending_bytes_limit = _positive_integer_option("pending_bytes_limit", pending_bytes_limit)
     max_msgs, pending_msgs_limit, pending_bytes_limit
 end
 
@@ -916,9 +909,9 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
     end
     errors = Any[]
     try
-        _wake_flusher(client)
+        _signal_flusher(client)
     catch err
-        push!(errors, CleanupError("wake flusher", err))
+        push!(errors, CleanupError("signal flusher", err))
     end
     append!(errors, _notify_pong_waiters!(client, false))
     append!(errors, _notify_request_waiters!(client, ConnectionClosedError(); clear_mux=true))

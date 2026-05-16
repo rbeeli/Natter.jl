@@ -423,8 +423,6 @@ function kv_status(kv::KeyValue; timeout::Real=kv.js.timeout,
     _kv_status(kv, stream_info(kv.js, kv.stream; timeout, cancel_token))
 end
 
-status(kv::KeyValue; kwargs...) = kv_status(kv; kwargs...)
-
 function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
                 direct::Union{Bool,Nothing}=nothing, timeout::Real=kv.js.timeout,
                 cancel_token::MaybeCancellationToken=nothing)
