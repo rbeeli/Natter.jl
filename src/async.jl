@@ -98,11 +98,8 @@ close_async(client::Client; kwargs...)::NatterTask =
 close_async(sub::Subscription; kwargs...)::NatterTask =
     _natter_async(close, sub; kwargs...)
 
-js_publish_async(js::JetStreamContext, subject::AbstractString, data=nothing; kwargs...)::NatterTask =
-    _natter_async(js_publish, js, subject, data; kwargs...)
-
-publish_async(js::JetStreamContext, subject::AbstractString, data=nothing; kwargs...)::NatterTask =
-    js_publish_async(js, subject, data; kwargs...)
+js_publish_async_complete_async(js::JetStreamContext; kwargs...)::NatterTask =
+    _natter_async(js_publish_async_complete, js; kwargs...)
 
 stream_create_async(js::JetStreamContext, config; kwargs...)::NatterTask =
     _natter_async(stream_create, js, config; kwargs...)

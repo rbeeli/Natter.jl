@@ -9,7 +9,7 @@ Conventions:
 - Payload inputs may be strings, byte vectors, `nothing`, or JSON-serializable Julia values.
 - `String(msg)` works for `Msg`, `JetStreamMsg`, and `KeyValueEntry`.
 - Blocking operations accept `cancel_token=cancellation_token(source)` where cancellation is useful.
-- `_async` helpers return `NatterTask`; `fetch(handle)` returns the direct-call result or rethrows the original error.
+- Most `_async` helpers return `NatterTask`; `js_publish_async` returns `JetStreamPublishFuture`. `fetch(handle)` returns the operation result or rethrows the original error.
 
 ## Core Types
 
@@ -25,7 +25,7 @@ Conventions:
 | `Headers` | Case-insensitive header dictionary of `String => Vector{String}`. |
 | `PublishFrame` | Prepared core publish frame from `prepare_publish`. |
 | `Subscription` | Core subscription handle. |
-| `NatterTask` | Explicit task handle returned by `_async` helpers. |
+| `NatterTask` | Explicit task handle returned by task-backed `_async` helpers. |
 | `CancellationSource`, `CancellationToken` | Cooperative cancellation source and token for blocking operations. |
 
 ## Authentication Types
@@ -133,6 +133,7 @@ Cancellation helpers: `CancellationSource()`, `cancellation_token(source)`, `can
 | `StreamInfo`, `StreamState`, `StreamLostData` | Typed stream info responses. |
 | `ConsumerInfo`, `ConsumerSequenceInfo` | Typed consumer info responses. |
 | `PubAck` | Publish acknowledgement. |
+| `JetStreamPublishFuture` | Future returned by protocol-level async JetStream publish. |
 | `JetStreamMsg` | Consumer message with acknowledgement state. |
 | `PullSubscription`, `PullMessageStream`, `PushSubscription` | Consumer handles. |
 
@@ -156,8 +157,12 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 
 | Function | Returns | Use |
 | :--- | :--- | :--- |
-| `jetstream(client; prefix="$JS.API", timeout=5.0)` | `JetStreamContext` | Create a context. |
+| `jetstream(client; prefix="$JS.API", timeout=5.0, publish_async_max_pending=256)` | `JetStreamContext` | Create a context. |
 | `js_publish(js, subject, data=nothing; kwargs...)` | `PubAck` | Publish and wait for an ack. |
+| `js_publish_async(js, subject, data=nothing; kwargs...)` | `JetStreamPublishFuture` | Publish with the context async publisher and return an ack future. |
+| `fetch(future::JetStreamPublishFuture)` | `PubAck` | Wait for the async publish ack or rethrow its error. |
+| `js_publish_async_pending(js)` | `Int` | Count async publishes still waiting for acks. |
+| `js_publish_async_complete(js; timeout=...)` | `nothing` | Wait until all pending async publishes on the context complete. |
 | `stream_create(js, config; timeout=...)` | `StreamInfo` | Create a stream. |
 | `stream_update(js, config; timeout=...)` | `StreamInfo` | Update a stream. |
 | `stream_info(js, name; timeout=...)` | `StreamInfo` | Fetch stream info. |
@@ -183,7 +188,7 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
 | `close(psub)`, `close(push)`, `close(stream)` | `nothing` | Close consumer/message handles. |
 
-JetStream async helpers mirror management, publish, subscribe, fetch, close, and acknowledgement functions: `js_publish_async`, `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, and `term_async`.
+JetStream task-backed async helpers mirror management, subscribe, fetch, close, and acknowledgement functions: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_async_complete_async`. `js_publish_async` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
 
 ## KeyValue Types
 

@@ -28,14 +28,14 @@ Statuses:
 | Publish replay | Partial | Buffered core publishes are replayed best-effort and can duplicate after ambiguous network failures. Use JetStream `msg_id` for durable idempotent publish paths. |
 | Slow consumer handling | Supported | Per-subscription pending limits report `SlowConsumerError`. |
 | Runtime inspection | Supported | `status`, `stats`, and `connected_url`. |
-| Async handles | Supported | Public `_async` helpers return `NatterTask`; blocking calls accept cooperative cancellation tokens and async handles rethrow `CancelledError` from cancelled operations. |
+| Async handles | Supported | Task-backed `_async` helpers return `NatterTask`; blocking calls accept cooperative cancellation tokens and async handles rethrow `CancelledError` from cancelled operations. JetStream publish has a protocol async publisher with `JetStreamPublishFuture`. |
 
 ## JetStream
 
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
 | Context | Supported | `jetstream(client)`. |
-| Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options. |
+| Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options. `js_publish_async` uses protocol-level async publish with pending ack accounting, backpressure, completion waiting, and per-message ack/error futures. |
 | Stream management | Supported | Create, update, info, list, names, purge, delete. |
 | Typed stream config | Supported | `StreamConfig` plus nested helpers and raw `Dict` escape hatch. |
 | Message lookup | Supported | Sequence, last-by-subject, next-by-subject, direct get, and message delete. |

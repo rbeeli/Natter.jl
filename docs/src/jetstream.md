@@ -70,6 +70,25 @@ acks = Vector{PubAck}(undef, 2)
 end
 ```
 
+For high-volume publishing where you want protocol-level async acks, use `js_publish_async`. The context owns one reply subscription, tracks pending acks, and applies backpressure at `publish_async_max_pending`.
+
+```julia
+js = jetstream(client; timeout=5.0, publish_async_max_pending=512)
+
+futures = [
+    js_publish_async(js, "orders.events.created", """{"id":$id}""";
+        stream="ORDERS",
+        msg_id="order-$id",
+    )
+    for id in 1001:1100
+]
+
+js_publish_async_complete(js; timeout=5.0)
+acks = fetch.(futures)
+```
+
+`fetch(future)` returns `PubAck` or throws the publish error for that message. Use `js_publish_async_pending(js)` to inspect the current pending count.
+
 ## Durable Pull Worker
 
 Pull consumers are a good default for durable workers because the application controls batch size and acknowledgement.

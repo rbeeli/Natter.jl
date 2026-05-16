@@ -395,6 +395,116 @@ end
     @test TestHelpers.capture_text(capture) == ""
 end
 
+@testitem "JetStream async publish uses protocol futures" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client; publish_async_max_pending=8)
+
+    future = js_publish_async(js, "orders.created", "payload"; timeout=1.0)
+
+    @test future isa JetStreamPublishFuture
+    @test !(future isa NatterTask)
+    @test !isready(future)
+    @test js_publish_async_pending(js) == 1
+    @test length(client.subscriptions) == 1
+    sub = only(values(client.subscriptions))
+    @test sub.has_callback
+    @test sub.subject == "$(js.async_publish.prefix).*"
+
+    written = TestHelpers.capture_text(capture)
+    @test occursin("SUB $(js.async_publish.prefix).* $(sub.sid)\r\n", written)
+    @test occursin("PUB orders.created $(future.reply) 7\r\npayload\r\n", written)
+
+    ack_payload = """{"stream":"ORDERS","seq":1,"duplicate":false}"""
+    N._dispatch_msg(client, Msg(future.reply, nothing, TestHelpers.bytes(ack_payload); sid=sub.sid))
+    @test timedwait(1.0; pollint=0.001) do
+        isready(future) && js_publish_async_pending(js) == 0
+    end == :ok
+
+    ack = fetch(future)
+    @test ack.stream == "ORDERS"
+    @test ack.seq == 1
+    @test !ack.duplicate
+    @test isnothing(js_publish_async_complete(js; timeout=0.1))
+
+    close(client)
+end
+
+@testitem "JetStream async publish applies backpressure and waits for completion" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client; publish_async_max_pending=1)
+
+    first = js_publish_async(js, "orders.created", "one"; timeout=1.0)
+    @test js_publish_async_pending(js) == 1
+
+    backpressure_err = TestHelpers.thrown_exception() do
+        js_publish_async(js, "orders.created", "two"; timeout=0.01)
+    end
+    @test backpressure_err isa TimeoutError
+    @test js_publish_async_pending(js) == 1
+
+    complete_task = @async js_publish_async_complete(js; timeout=1.0)
+    sleep(0.02)
+    @test !istaskdone(complete_task)
+
+    sub = only(values(client.subscriptions))
+    N._dispatch_msg(client, Msg(first.reply, nothing,
+                               TestHelpers.bytes("""{"stream":"ORDERS","seq":1}"""); sid=sub.sid))
+    @test isnothing(fetch(complete_task))
+    @test js_publish_async_pending(js) == 0
+
+    close(client)
+end
+
+@testitem "JetStream async publish futures receive server errors and timeouts" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    failed = js_publish_async(js, "orders.created", "bad"; timeout=1.0)
+    sub = only(values(client.subscriptions))
+    err_payload = """{"error":{"code":400,"err_code":10071,"description":"wrong stream"}}"""
+    N._dispatch_msg(client, Msg(failed.reply, nothing, TestHelpers.bytes(err_payload); sid=sub.sid))
+    @test timedwait(1.0; pollint=0.001) do
+        isready(failed)
+    end == :ok
+    failed_err = TestHelpers.thrown_exception(() -> fetch(failed))
+    @test failed_err isa JetStreamError
+    @test failed_err.code == 400
+    @test js_publish_async_pending(js) == 0
+
+    no_responders = js_publish_async(js, "orders.created", "missing"; timeout=1.0)
+    status_headers = Headers("Status" => ["503"], "Description" => ["No Responders"])
+    N._dispatch_msg(client, Msg(no_responders.reply, nothing, UInt8[];
+                               headers=status_headers, sid=sub.sid))
+    @test timedwait(1.0; pollint=0.001) do
+        isready(no_responders)
+    end == :ok
+    no_responders_err = TestHelpers.thrown_exception(() -> fetch(no_responders))
+    @test no_responders_err isa NoRespondersError
+    @test js_publish_async_pending(js) == 0
+
+    timed_out = js_publish_async(js, "orders.created", "slow"; timeout=0.01)
+    timeout_err = TestHelpers.thrown_exception(() -> fetch(timed_out))
+    @test timeout_err isa TimeoutError
+    @test js_publish_async_pending(js) == 0
+
+    close(client)
+end
+
 @testitem "JetStream typed config response parsing" begin
     using Natter
 
@@ -1090,6 +1200,45 @@ end
     @test occursin("\"mem_storage\":true", written)
     @test !occursin("\"durable_name\"", written)
     @test occursin("UNSUB ", written)
+end
+
+@testitem "JetStream ordered push reset clears stale start time" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    opts = ConnectOptions(error_cb=_ -> nothing)
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client; timeout=0.001)
+    handler = N._JetStreamPushControlHandler()
+    @lock handler.lock handler.ordered = true
+    sub = subscribe(client, "_INBOX.ordered"; _control_handler=handler)
+    psub = N.PushSubscription(js, sub, "ORDERS", "OLD", ReentrantLock(), false, false, nothing, handler)
+    base_config = N._js_config_payload(ConsumerConfig(
+        deliver_policy=DeliverPolicy.BY_START_TIME,
+        opt_start_time="2026-01-02T03:04:05Z",
+        filter_subject="orders.created",
+    ))
+    N._prepare_ordered_push_consumer_config!(base_config, nothing)
+    TestHelpers.clear_capture!(capture)
+
+    try
+        N._ordered_push_reset_task(psub, base_config, 42)
+
+        written = TestHelpers.capture_text(capture)
+        json_match = match(r"\{.*\}", written)
+        @test !isnothing(json_match)
+        request = N._json_dict(json_match.match)
+        config = N._consumer_normalized_config_value(request["config"])
+        @test config["deliver_policy"] == "by_start_sequence"
+        @test config["opt_start_seq"] == 42
+        @test !haskey(config, "opt_start_time")
+        @test base_config["deliver_policy"] == "by_start_time"
+        @test haskey(base_config, "opt_start_time")
+    finally
+        close(psub)
+    end
 end
 
 @testitem "JetStream ordered push subscribe rejects unsupported options before write" setup=[TestHelpers] begin
@@ -2449,6 +2598,74 @@ end
     close(push)
     @test push.closed
     @test push_core.closed
+end
+
+@testitem "JetStream ephemeral close retries server delete after transient failure" setup=[TestHelpers] begin
+    using Natter
+    using JSON3
+
+    const N = Natter
+
+    function respond_next_request!(client, payload::AbstractString)
+        result = timedwait(1.0; pollint=0.001) do
+            @lock client.lock begin
+                mux = client.request_mux
+                !isnothing(mux) && !isempty(mux.waiters)
+            end
+        end
+        result == :timed_out && return false
+        subject, sid = @lock client.lock begin
+            mux = client.request_mux
+            token = first(keys(mux.waiters))
+            "$(mux.prefix).$token", mux.sub.sid
+        end
+        N._dispatch_msg(client, Msg(subject, nothing, TestHelpers.bytes(payload); sid))
+        true
+    end
+
+    function retry_delete_after_reconnect!(client, closer)
+        err = TestHelpers.thrown_exception(closer)
+        @test err isa CleanupError
+        @test err.cause isa ConnectionReconnectingError
+
+        @lock client.lock N._store_status_locked!(client, N.ConnectionStatus.CONNECTED)
+        task = @async closer()
+        @test respond_next_request!(client, JSON3.write(Dict("success" => true)))
+        fetch(task)
+
+        written = String(take!(client.write_io))
+        @test occursin("\$JS.API.CONSUMER.DELETE.S.C", written)
+    end
+
+    pull_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+                                          write_io=IOBuffer())
+    pull_js = jetstream(pull_client)
+    pull_core = subscribe(pull_client, "_INBOX.pull")
+    pull = N.PullSubscription(pull_js, pull_core, "S", "C", "_INBOX.pull",
+                              ReentrantLock(), ReentrantLock(), true, false)
+
+    retry_delete_after_reconnect!(pull_client, () -> close(pull))
+    @test pull.closed
+    @test pull_core.closed
+    @test pull.server_deleted
+    @test close(pull) === nothing
+    @test String(take!(pull_client.write_io)) == ""
+
+    push_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+                                          write_io=IOBuffer())
+    push_js = jetstream(push_client)
+    handler = N._JetStreamPushControlHandler()
+    push_core = subscribe(push_client, "_INBOX.push"; _control_handler=handler)
+    push = N.PushSubscription(push_js, push_core, "S", "C", ReentrantLock(), true,
+                              false, nothing, handler)
+
+    retry_delete_after_reconnect!(push_client, () -> close(push))
+    @test push.closed
+    @test push_core.closed
+    @test push.server_deleted
+    @test handler.consumer_deleted[]
+    @test close(push) === nothing
+    @test String(take!(push_client.write_io)) == ""
 end
 
 @testitem "JetStream hot handles carry concrete client and subscription types" setup=[TestHelpers] begin

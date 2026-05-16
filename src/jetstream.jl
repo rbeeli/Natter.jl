@@ -1,9 +1,3 @@
-Base.@kwdef struct JetStreamContext{C<:Client}
-    client::C
-    prefix::String = "\$JS.API"
-    timeout::Float64 = 5.0
-end
-
 const _JS_ACK_OPEN = UInt8(0)
 const _JS_ACK_BUSY = UInt8(1)
 const _JS_ACK_DONE = UInt8(2)
@@ -35,6 +29,56 @@ struct PubAck
     seq::Int
     duplicate::Bool
     domain::Union{String,Nothing}
+end
+
+abstract type AbstractJetStreamAsyncPublishState{C<:Client} end
+
+mutable struct JetStreamPublishFuture{C<:Client}
+    state::AbstractJetStreamAsyncPublishState{C}
+    token::String
+    reply::String
+    subject::String
+    deadline::Float64
+    generation::Int
+    ready::Bool
+    active::Bool
+    value::Union{PubAck,Exception,Nothing}
+end
+
+mutable struct JetStreamAsyncPublishState{C<:Client} <: AbstractJetStreamAsyncPublishState{C}
+    client::C
+    prefix::String
+    condition::Base.GenericCondition{ReentrantLock}
+    setup_lock::ReentrantLock
+    sub::Union{Subscription{C},Nothing}
+    futures::Dict{String,JetStreamPublishFuture{C}}
+    max_pending::Int
+    pending::Int
+    next_token::Int
+    timeout_task::Union{Task,Nothing}
+end
+
+function JetStreamAsyncPublishState(client::C, max_pending::Int) where {C<:Client}
+    lock = ReentrantLock()
+    JetStreamAsyncPublishState{C}(
+        client,
+        new_inbox(client),
+        Base.Threads.Condition(lock),
+        ReentrantLock(),
+        nothing,
+        Dict{String,JetStreamPublishFuture{C}}(),
+        max_pending,
+        0,
+        0,
+        nothing,
+    )
+end
+
+struct JetStreamContext{C<:Client,S<:JetStreamAsyncPublishState{C}}
+    client::C
+    prefix::String
+    timeout::Float64
+    async_publish::S
 end
 
 const _JS_MSG_ID_HEADER = "Nats-Msg-Id"
@@ -114,8 +158,20 @@ function ConsumerInfo(stream_name::AbstractString, name::AbstractString, config:
                  push_bound, paused, Float64(pause_remaining))
 end
 
-jetstream(client::Client; prefix::AbstractString="\$JS.API", timeout::Real=5.0) =
-    JetStreamContext(client, String(prefix), _positive_timeout_seconds("timeout", timeout))
+function _js_publish_async_max_pending(value)::Int
+    value isa Integer && !(value isa Bool) ||
+        throw(ArgumentError("publish_async_max_pending must be a positive integer"))
+    1 <= value <= typemax(Int) ||
+        throw(ArgumentError("publish_async_max_pending must be a positive integer"))
+    Int(value)
+end
+
+function jetstream(client::Client; prefix::AbstractString="\$JS.API", timeout::Real=5.0,
+                   publish_async_max_pending::Integer=256)
+    max_pending = _js_publish_async_max_pending(publish_async_max_pending)
+    JetStreamContext(client, String(prefix), _positive_timeout_seconds("timeout", timeout),
+                     JetStreamAsyncPublishState(client, max_pending))
+end
 
 const _JS_STATUS_CONTROL = 100
 const _JS_STATUS_BAD_REQUEST = 400
@@ -428,6 +484,318 @@ function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing;
             _sleep_or_cancel(min(wait_seconds, max(0.0, deadline - time())), cancel_token)
         end
     end
+end
+
+function _js_async_publish_subscription_active(sub::Union{Subscription,Nothing})::Bool
+    isnothing(sub) && return false
+    @lock sub.lock !sub.closed && sub.server_active
+end
+
+function _js_async_publish_connection_error(client::Client, generation::Int)
+    st = status(client)
+    st == ConnectionStatus.CLOSED && return ConnectionClosedError()
+    st == ConnectionStatus.DISCONNECTED && return ConnectionClosedError("connection is disconnected")
+    st in (ConnectionStatus.CONNECTING, ConnectionStatus.RECONNECTING) && return ConnectionReconnectingError()
+    _load_generation(client) == generation || return ConnectionReconnectingError()
+    nothing
+end
+
+function _js_async_publish_result(future::JetStreamPublishFuture, msg::Msg)::Union{PubAck,Exception}
+    try
+        code = _status_header(msg)
+        if code == _JS_STATUS_NO_RESPONDERS
+            return NoRespondersError(future.subject)
+        elseif !isnothing(code) && code >= 400
+            return ProtocolError("request failed with status $code $(_status_description(msg))")
+        end
+        obj = _js_read_response(msg)
+        isnothing(obj) && throw(ProtocolError("JetStream publish response is empty"))
+        return _puback(obj)
+    catch err
+        return err
+    end
+end
+
+function _resolve_js_publish_future_locked!(future::JetStreamPublishFuture{C},
+                                            value::Union{PubAck,Exception})::Bool where {C<:Client}
+    future.active || return false
+    state = future.state::JetStreamAsyncPublishState{C}
+    future.value = value
+    future.ready = true
+    future.active = false
+    if get(state.futures, future.token, nothing) === future
+        delete!(state.futures, future.token)
+        state.pending = max(0, state.pending - 1)
+    end
+    notify(state.condition; all=true)
+    true
+end
+
+function _resolve_js_publish_future!(future::JetStreamPublishFuture{C},
+                                     value::Union{PubAck,Exception}) where {C<:Client}
+    state = future.state::JetStreamAsyncPublishState{C}
+    lock(state.condition)
+    try
+        _resolve_js_publish_future_locked!(future, value)
+    finally
+        unlock(state.condition)
+    end
+    nothing
+end
+
+function _handle_js_async_publish_ack(state::JetStreamAsyncPublishState, msg::Msg)
+    token = _request_mux_token(state.prefix, msg.subject)
+    if isnothing(token)
+        _record_drop!(state.client)
+        return nothing
+    end
+    future = lock(state.condition) do
+        get(state.futures, String(token), nothing)
+    end
+    if isnothing(future)
+        _record_drop!(state.client)
+        return nothing
+    end
+    _resolve_js_publish_future!(future, _js_async_publish_result(future, msg))
+    nothing
+end
+
+function _ensure_js_async_publish_timeout_task_locked!(state::JetStreamAsyncPublishState)
+    task = state.timeout_task
+    if isnothing(task) || istaskdone(task)
+        state.timeout_task = @async _js_async_publish_timeout_loop(state)
+    end
+    nothing
+end
+
+function _js_async_publish_timeout_loop(state::JetStreamAsyncPublishState{C}) where {C<:Client}
+    lock(state.condition)
+    try
+        while true
+            if isempty(state.futures)
+                state.timeout_task = nothing
+                return nothing
+            end
+            now = time()
+            nearest = Inf
+            expired = Tuple{JetStreamPublishFuture{C},Exception}[]
+            for future in values(state.futures)
+                err = _js_async_publish_connection_error(state.client, future.generation)
+                if !isnothing(err)
+                    push!(expired, (future, err))
+                elseif future.deadline <= now
+                    push!(expired, (future, TimeoutError("JetStream async publish ack timed out")))
+                else
+                    nearest = min(nearest, future.deadline)
+                end
+            end
+            for (future, err) in expired
+                _resolve_js_publish_future_locked!(future, err)
+            end
+            isempty(state.futures) && continue
+
+            delay = min(0.05, max(0.0, nearest - time()))
+            delay <= 0 && continue
+            timer = Timer(delay) do _
+                lock(state.condition)
+                try
+                    notify(state.condition; all=true)
+                finally
+                    unlock(state.condition)
+                end
+            end
+            try
+                wait(state.condition)
+            finally
+                close(timer)
+            end
+        end
+    finally
+        unlock(state.condition)
+    end
+end
+
+function _ensure_js_async_publish_subscription!(state::JetStreamAsyncPublishState{C}) where {C<:Client}
+    sub = lock(state.condition) do
+        state.sub
+    end
+    _js_async_publish_subscription_active(sub) && return sub::Subscription{C}
+
+    @lock state.setup_lock begin
+        sub = lock(state.condition) do
+            state.sub
+        end
+        _js_async_publish_subscription_active(sub) && return sub::Subscription{C}
+        _ensure_connected_for_request(state.client)
+
+        if !isnothing(sub)
+            closed = @lock sub.lock sub.closed
+            if !closed
+                _send_subscription_now!(sub) || throw(ConnectionReconnectingError())
+                _js_async_publish_subscription_active(sub) && return sub::Subscription{C}
+                throw(ConnectionReconnectingError())
+            end
+        end
+
+        callback = msg -> _handle_js_async_publish_ack(state, msg)
+        sub = _subscribe(state.client, "$(state.prefix).*";
+                         callback,
+                         pending_msgs_limit=state.max_pending,
+                         pending_bytes_limit=state.client.options.sub_pending_bytes_limit,
+                         require_connected=true)
+        lock(state.condition)
+        try
+            state.sub = sub
+            notify(state.condition; all=true)
+        finally
+            unlock(state.condition)
+        end
+        sub
+    end
+end
+
+function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
+                                           subject::AbstractString, deadline::Float64,
+                                           generation::Int,
+                                           cancel_token::MaybeCancellationToken) where {C<:Client}
+    lock(state.condition)
+    try
+        while state.pending >= state.max_pending
+            err = _js_async_publish_connection_error(state.client, generation)
+            isnothing(err) || throw(err)
+            remaining = deadline - time()
+            remaining > 0 || throw(TimeoutError("JetStream async publish backpressure timed out"))
+            ready = _wait_until_condition_locked(state.condition, remaining; cancel_token) do
+                state.pending < state.max_pending ||
+                    !isnothing(_js_async_publish_connection_error(state.client, generation))
+            end
+            ready || throw(TimeoutError("JetStream async publish backpressure timed out"))
+        end
+
+        state.next_token += 1
+        token = "pa$(state.next_token)"
+        reply = "$(state.prefix).$token"
+        future = JetStreamPublishFuture{C}(state, token, reply, String(subject), deadline,
+                                           generation, false, true, nothing)
+        state.futures[token] = future
+        state.pending += 1
+        _ensure_js_async_publish_timeout_task_locked!(state)
+        notify(state.condition; all=true)
+        future
+    finally
+        unlock(state.condition)
+    end
+end
+
+function Base.wait(future::JetStreamPublishFuture)
+    state = future.state
+    lock(state.condition)
+    value = try
+        while !future.ready
+            remaining = future.deadline - time()
+            if remaining <= 0
+                _resolve_js_publish_future_locked!(future, TimeoutError("JetStream async publish ack timed out"))
+                break
+            end
+            ready = _wait_until_condition_locked(state.condition, remaining) do
+                future.ready
+            end
+            if !ready
+                _resolve_js_publish_future_locked!(future, TimeoutError("JetStream async publish ack timed out"))
+                break
+            end
+        end
+        future.value
+    finally
+        unlock(state.condition)
+    end
+    value isa Exception && throw(value)
+    future
+end
+
+function Base.fetch(future::JetStreamPublishFuture)
+    wait(future)
+    future.value::PubAck
+end
+
+function Base.isready(future::JetStreamPublishFuture)
+    state = future.state
+    lock(state.condition)
+    try
+        future.ready
+    finally
+        unlock(state.condition)
+    end
+end
+
+Base.show(io::IO, future::JetStreamPublishFuture) =
+    print(io, "JetStreamPublishFuture(", future.subject, ", ",
+          isready(future) ? "ready" : "pending", ")")
+
+function js_publish_async(js::JetStreamContext, subject::AbstractString, data=nothing; timeout::Real=js.timeout,
+                          stream::Union{AbstractString,Nothing}=nothing, headers=nothing,
+                          expected_stream::Union{AbstractString,Nothing}=nothing, msg_id=nothing,
+                          expected_last_sequence=nothing, expected_last_subject_sequence=nothing,
+                          expected_last_subject=nothing, expected_last_msg_id=nothing, ttl=nothing,
+                          schedule=nothing, schedule_at=nothing, schedule_every=nothing,
+                          schedule_target=nothing, schedule_source=nothing, schedule_ttl=nothing,
+                          schedule_timezone=nothing, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    hdrs = _js_publish_headers(headers; stream, expected_stream, msg_id, expected_last_sequence,
+                               expected_last_subject_sequence, expected_last_subject,
+                               expected_last_msg_id, ttl, schedule, schedule_at, schedule_every,
+                               schedule_target, schedule_source, schedule_ttl, schedule_timezone)
+    frame = _prepare_publish_frame(subject, data, nothing, hdrs)
+    _validate_publish_frame_for_client(js.client, frame)
+    _ensure_js_async_publish_subscription!(js.async_publish)
+
+    deadline = time() + timeout
+    generation = _load_generation(js.client)
+    future = _reserve_js_async_publish_future!(js.async_publish, frame.subject, deadline, generation,
+                                               cancel_token)
+    publish_frame = _PublishFrame(frame.subject, future.reply, frame.payload, frame.headers)
+    try
+        _publish_frame_unchecked(js.client, publish_frame; buffer_on_reconnect=false, cancel_token)
+    catch err
+        _resolve_js_publish_future!(future, err)
+        rethrow()
+    end
+    future
+end
+
+publish_async(js::JetStreamContext, subject::AbstractString, data=nothing; kwargs...) =
+    js_publish_async(js, subject, data; kwargs...)
+
+function js_publish_async_pending(js::JetStreamContext)::Int
+    lock(js.async_publish.condition)
+    try
+        js.async_publish.pending
+    finally
+        unlock(js.async_publish.condition)
+    end
+end
+
+function js_publish_async_complete(js::JetStreamContext; timeout::Real=js.timeout,
+                                   cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
+    state = js.async_publish
+    lock(state.condition)
+    try
+        while state.pending > 0
+            remaining = deadline - time()
+            remaining > 0 || throw(TimeoutError("JetStream async publish completion timed out"))
+            ready = _wait_until_condition_locked(state.condition, remaining; cancel_token) do
+                state.pending == 0
+            end
+            ready || throw(TimeoutError("JetStream async publish completion timed out"))
+        end
+    finally
+        unlock(state.condition)
+    end
+    nothing
 end
 
 function _stream_config_name(config::StreamConfig)::String
@@ -893,6 +1261,24 @@ function _consumer_info_or_nothing(js::JetStreamContext, stream::AbstractString,
     end
 end
 
+function _delete_consumer_for_close!(mark_deleted::Function, js::JetStreamContext,
+                                     stream::AbstractString, consumer::AbstractString,
+                                     operation::AbstractString; timeout::Real,
+                                     cancel_token::MaybeCancellationToken=nothing)
+    try
+        consumer_delete(js, stream, consumer; timeout, cancel_token) ||
+            throw(ErrorException("consumer delete response did not indicate success"))
+        mark_deleted()
+    catch err
+        if _consumer_missing(err)
+            mark_deleted()
+            return nothing
+        end
+        throw(CleanupError("$operation $consumer", err))
+    end
+    nothing
+end
+
 function _consumer_normalized_config_value(value)
     if isnothing(value)
         return nothing
@@ -1026,6 +1412,17 @@ end
 
 function _copy_config_payload(config::Dict{String,Any})::Dict{String,Any}
     Dict{String,Any}(k => _consumer_normalized_config_value(v) for (k, v) in config)
+end
+
+function _ordered_push_reset_config(base_config::Dict{String,Any}, name::String, deliver::String,
+                                    start_seq::Int)::Dict{String,Any}
+    cfg = _copy_config_payload(base_config)
+    cfg["name"] = name
+    cfg["deliver_subject"] = deliver
+    cfg["deliver_policy"] = "by_start_sequence"
+    cfg["opt_start_seq"] = max(1, start_seq)
+    delete!(cfg, "opt_start_time")
+    cfg
 end
 
 function _validate_push_queue_control_config!(config::Dict{String,Any}, queue::Union{String,Nothing})
@@ -1233,6 +1630,7 @@ mutable struct PushSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription
     close_lock::ReentrantLock
     delete_on_close::Bool
     closed::Bool
+    server_deleted::Bool
     heartbeat_task::Union{Task,Nothing}
     ordered_reset_task::Union{Task,Nothing}
     control_handler::Union{_JetStreamPushControlHandler,Nothing}
@@ -1244,7 +1642,7 @@ function PushSubscription(js::J, sub::S, stream::AbstractString, consumer::Abstr
                           heartbeat_task::Union{Task,Nothing},
                           control_handler::Union{_JetStreamPushControlHandler,Nothing}) where {C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
     PushSubscription{C,J,S}(js, sub, String(stream), String(consumer), close_lock, delete_on_close, closed,
-                            heartbeat_task, nothing, control_handler, nothing)
+                            false, heartbeat_task, nothing, control_handler, nothing)
 end
 
 PushSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
@@ -1608,11 +2006,8 @@ function _ordered_push_reset_task(psub::PushSubscription, base_config::Dict{Stri
         old_sid, new_sid = _remap_ordered_subscription!(psub.sub, deliver)
         _send_ordered_subscription_reset!(psub.sub, old_sid, new_sid, deliver)
 
-        cfg = _copy_config_payload(base_config)
-        cfg["name"] = @lock psub.js.client.lock randstring(psub.js.client.rng, 16)
-        cfg["deliver_subject"] = deliver
-        cfg["deliver_policy"] = "by_start_sequence"
-        cfg["opt_start_seq"] = max(1, start_seq)
+        name = @lock psub.js.client.lock randstring(psub.js.client.rng, 16)
+        cfg = _ordered_push_reset_config(base_config, name, deliver, start_seq)
         info = _consumer_create_payload_request(psub.js, psub.stream, cfg; timeout=psub.js.timeout, action="create")
         closed = @lock psub.close_lock begin
             if !psub.closed
@@ -2513,7 +2908,7 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
         control_handler.flow_control[] = _push_flow_control_enabled(info)
         control_handler.last_seen[] = time()
         psub = PushSubscription(js, sub, String(stream), String(info.name), ReentrantLock(), delete_on_close, false,
-                                nothing, nothing, control_handler, info)
+                                false, nothing, nothing, control_handler, info)
         if ordered
             base_config = ordered_base_config::Dict{String,Any}
             @lock control_handler.lock begin
@@ -2554,6 +2949,26 @@ function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
                     ordered, cancel_token)
 end
 
+function _mark_push_server_deleted!(psub::PushSubscription)
+    handler = psub.control_handler
+    @lock psub.close_lock psub.server_deleted = true
+    isnothing(handler) || (handler.consumer_deleted[] = true)
+    nothing
+end
+
+function _push_server_deleted(psub::PushSubscription)::Bool
+    handler = psub.control_handler
+    @lock psub.close_lock begin
+        if psub.server_deleted
+            true
+        else
+            deleted = !isnothing(handler) && handler.consumer_deleted[]
+            deleted && (psub.server_deleted = true)
+            deleted
+        end
+    end
+end
+
 function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.timeout,
                                   cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
@@ -2564,21 +2979,24 @@ function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.
         psub.closed = true
         was_closed
     end
-    already_closed && return nothing
     errors = Any[]
-    try
-        close(psub.sub)
-    catch err
-        push!(errors, err)
+    if !already_closed
+        try
+            close(psub.sub)
+        catch err
+            push!(errors, err)
+        end
     end
     server_deleted = @lock psub.close_lock psub.server_deleted
     if psub.delete_on_close && !server_deleted
         try
-            consumer_delete(psub.js, psub.stream, psub.consumer;
-                            timeout=_remaining_timeout_or_throw(deadline, "close pull subscription"; cancel_token),
-                            cancel_token)
+            _delete_consumer_for_close!(
+                () -> (@lock psub.close_lock psub.server_deleted = true),
+                psub.js, psub.stream, psub.consumer, "delete pull consumer";
+                timeout=_remaining_timeout_or_throw(deadline, "close pull subscription"; cancel_token),
+                cancel_token)
         catch err
-            push!(errors, CleanupError("delete pull consumer $(psub.consumer)", err))
+            push!(errors, err isa CleanupError ? err : CleanupError("delete pull consumer $(psub.consumer)", err))
         end
     end
     _throw_errors(errors)
@@ -2598,26 +3016,28 @@ function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.
         psub.closed = true
         was_closed
     end
-    already_closed && return nothing
     errors = Any[]
-    try
-        close(psub.sub)
-    catch err
-        push!(errors, err)
+    if !already_closed
+        try
+            close(psub.sub)
+        catch err
+            push!(errors, err)
+        end
+        _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task;
+                    interrupt=true, deadline)
+        _wait_task!(errors, "stop ordered push reset $(psub.consumer)", psub.ordered_reset_task;
+                    interrupt=true, deadline)
     end
-    _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task;
-                interrupt=true, deadline)
-    _wait_task!(errors, "stop ordered push reset $(psub.consumer)", psub.ordered_reset_task;
-                interrupt=true, deadline)
-    handler = psub.control_handler
-    server_deleted = !isnothing(handler) && handler.consumer_deleted[]
+    server_deleted = _push_server_deleted(psub)
     if psub.delete_on_close && !server_deleted
         try
-            consumer_delete(psub.js, psub.stream, psub.consumer;
-                            timeout=_remaining_timeout_or_throw(deadline, "close push subscription"; cancel_token),
-                            cancel_token)
+            _delete_consumer_for_close!(
+                () -> _mark_push_server_deleted!(psub),
+                psub.js, psub.stream, psub.consumer, "delete push consumer";
+                timeout=_remaining_timeout_or_throw(deadline, "close push subscription"; cancel_token),
+                cancel_token)
         catch err
-            push!(errors, CleanupError("delete push consumer $(psub.consumer)", err))
+            push!(errors, err isa CleanupError ? err : CleanupError("delete push consumer $(psub.consumer)", err))
         end
     end
     _throw_errors(errors)
