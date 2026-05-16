@@ -6,11 +6,14 @@ function _ensure_usable_status_for_publish(st::ConnectionStatus.T)
 end
 
 function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; buffer_on_reconnect::Bool=false,
-                   force_flush::Bool=false, deadline=nothing)
+                   force_flush::Bool=false, deadline=nothing,
+                   cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     st = status(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
-            _write_raw(client, data; force_flush, deadline, write_mode=_RAW_WRITE_DRAIN)
+            _write_raw(client, data; force_flush, deadline, write_mode=_RAW_WRITE_DRAIN,
+                       cancel_token)
         catch err
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
                 if buffer_on_reconnect
@@ -330,7 +333,8 @@ function _validate_pending_replay_for_client(client::Client, entries::AbstractVe
 end
 
 function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
-                           force_flush::Bool=false)
+                           force_flush::Bool=false, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     frame_size = _serialized_size(frame)
     total = _pub_payload_size(frame)
     st = status(client)
@@ -345,13 +349,15 @@ function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_
 end
 
 function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
-                  headers=nothing, buffer_on_reconnect::Bool=true, force_flush::Bool=false)
+                  headers=nothing, buffer_on_reconnect::Bool=true, force_flush::Bool=false,
+                  cancel_token::MaybeCancellationToken=nothing)
     _publish_prepared(client, _prepare_publish_frame(subject, data, reply, headers);
-                      buffer_on_reconnect, force_flush)
+                      buffer_on_reconnect, force_flush, cancel_token)
 end
 
 function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
-                                  force_flush::Bool=false)
+                                  force_flush::Bool=false, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     frame_size = _serialized_size(frame)
     st = status(client)
     _ensure_usable_status_for_publish(st)
@@ -361,17 +367,19 @@ function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; 
 end
 
 function _publish_unchecked(client::Client, subject::String, payload::AbstractVector{UInt8};
-                            buffer_on_reconnect::Bool=true, force_flush::Bool=false)
+                            buffer_on_reconnect::Bool=true, force_flush::Bool=false,
+                            cancel_token::MaybeCancellationToken=nothing)
     _publish_frame_unchecked(client, _publish_frame(subject, nothing, payload, EMPTY_BYTES);
-                             buffer_on_reconnect, force_flush)
+                             buffer_on_reconnect, force_flush, cancel_token)
 end
 
-function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing, headers=nothing)
-    _publish(client, subject, data; reply, headers)
+function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
+                 headers=nothing, cancel_token::MaybeCancellationToken=nothing)
+    _publish(client, subject, data; reply, headers, cancel_token)
 end
 
-function publish(client::Client, frame::PublishFrame)
-    _publish_prepared(client, frame)
+function publish(client::Client, frame::PublishFrame; cancel_token::MaybeCancellationToken=nothing)
+    _publish_prepared(client, frame; cancel_token)
 end
 
 function _validate_subscription_positive_limit(name::AbstractString, value)::Int
@@ -451,12 +459,15 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
     sub
 end
 
-function subscribe(client::Client, subject::AbstractString; kwargs...)
+function subscribe(client::Client, subject::AbstractString; cancel_token::MaybeCancellationToken=nothing,
+                   kwargs...)
+    _throw_if_cancelled(cancel_token)
     _subscribe(client, subject; kwargs...)
 end
 
-function subscribe(callback, client::Client, subject::AbstractString; kwargs...)
-    subscribe(client, subject; callback, kwargs...)
+function subscribe(callback, client::Client, subject::AbstractString;
+                   cancel_token::MaybeCancellationToken=nothing, kwargs...)
+    subscribe(client, subject; callback, cancel_token, kwargs...)
 end
 
 function _subscription_processor(sub::Subscription, callback::Callback) where {Callback}
@@ -637,8 +648,9 @@ function _ensure_sync_subscription(sub::Subscription)
     nothing
 end
 
-function next(sub::Subscription; timeout::Real=1.0)
+function next(sub::Subscription; timeout::Real=1.0, cancel_token::MaybeCancellationToken=nothing)
     _ensure_sync_subscription(sub)
+    _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     while true
@@ -649,7 +661,8 @@ function next(sub::Subscription; timeout::Real=1.0)
             if sub.closed && !isready(sub.messages)
                 :closed
             else
-                ready = _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
+                ready = _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline);
+                                                     cancel_token) do
                     isready(sub.messages) || sub.closed
                 end
                 ready ? :retry : :timeout
@@ -666,7 +679,8 @@ function _unsubscribe_target(received::Int, additional::Int)
     received + additional
 end
 
-function unsubscribe(sub::Subscription; max_msgs=0)
+function unsubscribe(sub::Subscription; max_msgs=0, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     max_msgs = _validate_core_max_msgs(max_msgs)
     st = status(sub.client)
     closed, active, sid, target, previous_max = @lock sub.lock begin
@@ -713,7 +727,8 @@ function unsubscribe(sub::Subscription; max_msgs=0)
     nothing
 end
 
-close(sub::Subscription) = unsubscribe(sub)
+close(sub::Subscription; cancel_token::MaybeCancellationToken=nothing) =
+    unsubscribe(sub; cancel_token)
 
 _drain_deadline(timeout::Real)::Float64 = time() + _positive_timeout_seconds("timeout", timeout)
 _drain_timed_out(err)::Bool =
@@ -722,22 +737,24 @@ _drain_timed_out(err)::Bool =
     (err isa Base.CompositeException && any(_drain_timed_out, err.exceptions))
 _drain_timed_out(errors::Vector)::Bool = any(_drain_timed_out, errors)
 
-function _drain(sub::Subscription, deadline::Float64)
+function _drain(sub::Subscription, deadline::Float64; cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     closed, active, sid = @lock sub.lock (sub.closed, sub.server_active, sub.sid)
     closed && return nothing
     status(sub.client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING) || throw(ConnectionReconnectingError())
     if active
         try
-            _write_raw(sub.client, _unsub_cmd(sid); deadline=deadline, write_mode=_RAW_WRITE_DRAIN)
+            _write_raw(sub.client, _unsub_cmd(sid); deadline=deadline, write_mode=_RAW_WRITE_DRAIN,
+                       cancel_token)
         catch err
             _drain_timed_out(err) && rethrow()
             _recover_after_write_failure!(sub.client, err) || rethrow()
             throw(ConnectionReconnectingError())
         end
     end
-    _flush(sub.client; timeout=_remaining_timeout(deadline), deadline=deadline)
+    _flush(sub.client; timeout=_remaining_timeout(deadline), deadline=deadline, cancel_token)
     ready = @lock sub.lock begin
-        _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
+        _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline); cancel_token) do
             !isready(sub.messages) && sub.processing == 0
         end
     end
@@ -756,8 +773,9 @@ function _drain(sub::Subscription, deadline::Float64)
     nothing
 end
 
-function drain(sub::Subscription; timeout::Real=sub.client.options.drain_timeout)
-    _drain(sub, _drain_deadline(timeout))
+function drain(sub::Subscription; timeout::Real=sub.client.options.drain_timeout,
+               cancel_token::MaybeCancellationToken=nothing)
+    _drain(sub, _drain_deadline(timeout); cancel_token)
 end
 
 function _remove_pong_waiter_locked!(client::Client, waiter::PongWaiter)
@@ -765,11 +783,19 @@ function _remove_pong_waiter_locked!(client::Client, waiter::PongWaiter)
     nothing
 end
 
-function _wait_pong_waiter!(waiter::PongWaiter, timeout::Real)
+function _wait_pong_waiter!(waiter::PongWaiter, timeout::Real;
+                            cancel_token::MaybeCancellationToken=nothing)
     lock(waiter.condition)
     try
-        ready = _wait_until_condition_locked(waiter.condition, timeout) do
-            waiter.ready
+        ready = try
+            _wait_until_condition_locked(waiter.condition, timeout; cancel_token) do
+                waiter.ready
+            end
+        catch err
+            if err isa CancelledError
+                waiter.active = false
+            end
+            rethrow()
         end
         if !ready
             waiter.active = false
@@ -781,7 +807,9 @@ function _wait_pong_waiter!(waiter::PongWaiter, timeout::Real)
     end
 end
 
-function _flush(client::Client; timeout::Real=10.0, deadline=nothing)
+function _flush(client::Client; timeout::Real=10.0, deadline=nothing,
+                cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     wait_timeout = isnothing(deadline) ? _positive_timeout_seconds("timeout", timeout) :
                    min(Float64(timeout), _remaining_timeout(deadline))
     st = status(client)
@@ -790,12 +818,21 @@ function _flush(client::Client; timeout::Real=10.0, deadline=nothing)
     waiter = PongWaiter(Base.Threads.Condition(client.lock))
     @lock client.lock push!(client.pongs, waiter)
     try
-        _send_raw(client, "PING$CRLF"; force_flush=true, deadline)
+        _send_raw(client, "PING$CRLF"; force_flush=true, deadline, cancel_token)
     catch err
         @lock client.lock _remove_pong_waiter_locked!(client, waiter)
         rethrow()
     end
-    result = _wait_pong_waiter!(waiter, wait_timeout)
+    result = try
+        _wait_pong_waiter!(waiter, wait_timeout; cancel_token)
+    catch err
+        if err isa CancelledError
+            @lock client.lock begin
+                _trim_stale_pong_waiters_locked!(client)
+            end
+        end
+        rethrow()
+    end
     if result == :timed_out
         # Keep a bounded tombstone so a late PONG is consumed by its original
         # flush and cannot make a later flush appear complete.
@@ -808,11 +845,15 @@ function _flush(client::Client; timeout::Real=10.0, deadline=nothing)
     nothing
 end
 
-flush(client::Client; timeout::Real=10.0) = _flush(client; timeout)
+flush(client::Client; timeout::Real=10.0, cancel_token::MaybeCancellationToken=nothing) =
+    _flush(client; timeout, cancel_token)
 
-ping(client::Client; timeout::Real=10.0) = flush(client; timeout)
+ping(client::Client; timeout::Real=10.0, cancel_token::MaybeCancellationToken=nothing) =
+    flush(client; timeout, cancel_token)
 
-function drain(client::Client; timeout::Real=client.options.drain_timeout)
+function drain(client::Client; timeout::Real=client.options.drain_timeout,
+               cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     deadline = _drain_deadline(timeout)
     notify_subs = Subscription[]
     @lock client.lock begin
@@ -828,7 +869,7 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout)
     subs = @lock client.lock collect(values(client.subscriptions))
     for sub in subs
         try
-            _drain(sub, deadline)
+            _drain(sub, deadline; cancel_token)
         catch err
             push!(errors, err)
             _report_error(client, err)
@@ -837,7 +878,7 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout)
     end
     if !_drain_timed_out(errors)
         try
-            _flush(client; timeout=_remaining_timeout(deadline), deadline=deadline)
+            _flush(client; timeout=_remaining_timeout(deadline), deadline=deadline, cancel_token)
         catch err
             push!(errors, err)
             _report_error(client, err)
@@ -858,7 +899,8 @@ function _client_task_close_timeout(client::Client)::Float64
 end
 
 function _close_client!(client::Client; throw_errors::Bool=false, callback_timeout=nothing,
-                        deadline=nothing)
+                        deadline=nothing, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     callback_wait = isnothing(callback_timeout) ? client.options.close_callback_timeout :
                     _connect_option_nonnegative_float("callback_timeout", callback_timeout)
     already = false
@@ -925,8 +967,10 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
     nothing
 end
 
-close(client::Client; throw_errors::Bool=false, callback_timeout=nothing) =
-    _close_client!(client; throw_errors=throw_errors, callback_timeout=callback_timeout)
+close(client::Client; throw_errors::Bool=false, callback_timeout=nothing,
+      cancel_token::MaybeCancellationToken=nothing) =
+    _close_client!(client; throw_errors=throw_errors, callback_timeout=callback_timeout,
+                   cancel_token=cancel_token)
 
 function new_inbox(client::Client; prefix::AbstractString=client.options.inbox_prefix)
     suffix = @lock client.lock randstring(client.rng, NUID_ALPHABET, 22)
@@ -1101,17 +1145,25 @@ function _remove_request_waiter!(client::C, mux::RequestMux{C}, token::String,
     nothing
 end
 
-function _wait_request_reply(mux::RequestMux, waiter::RequestWaiter, timeout::Real)::Msg
+function _wait_request_reply(mux::RequestMux, waiter::RequestWaiter, timeout::Real;
+                             cancel_token::MaybeCancellationToken=nothing)::Msg
     deadline = waiter.deadline
     lock(mux.condition)
     value = try
         while !waiter.ready
+            _throw_if_cancelled(cancel_token)
             remaining = deadline - time()
             if remaining <= 0
                 waiter.active = false
                 throw(TimeoutError("request timed out"))
             end
-            wait(mux.condition)
+            ready = _wait_until_condition_locked(mux.condition, remaining; cancel_token) do
+                waiter.ready
+            end
+            if !ready
+                waiter.active = false
+                throw(TimeoutError("request timed out"))
+            end
         end
         waiter.value
     finally
@@ -1121,7 +1173,9 @@ function _wait_request_reply(mux::RequestMux, waiter::RequestWaiter, timeout::Re
     value::Msg
 end
 
-function _request_raw(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0, headers=nothing)
+function _request_raw(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0,
+                      headers=nothing, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     request_frame = _prepare_publish_frame(subject, data, nothing, headers)
     _ensure_connected_for_request(client)
@@ -1132,15 +1186,17 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     try
         _validate_publish_subject(reply)
         frame = _PublishFrame(request_frame.subject, reply, request_frame.payload, request_frame.headers)
-        _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true)
-        return _wait_request_reply(mux, waiter, timeout)
+        _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true,
+                                 cancel_token)
+        return _wait_request_reply(mux, waiter, timeout; cancel_token)
     finally
         _remove_request_waiter!(client, mux, token, waiter)
     end
 end
 
-function request(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0, headers=nothing)
-    msg = _request_raw(client, subject, data; timeout, headers)
+function request(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0,
+                 headers=nothing, cancel_token::MaybeCancellationToken=nothing)
+    msg = _request_raw(client, subject, data; timeout, headers, cancel_token)
     code = _status_header(msg)
     if code == 503
         throw(NoRespondersError(String(subject)))

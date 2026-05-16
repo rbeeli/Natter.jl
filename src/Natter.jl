@@ -13,6 +13,7 @@ using libsodium_jll
 import Base: close, fetch, flush
 
 export Client, ConnectOptions, ConnectionStatus, ConnectionEventKind, ConnectionEvent, NatterTask
+export CancellationSource, CancellationToken, cancellation_token, cancel!, iscancelled
 export AbstractAuth, NoAuth, TokenAuth, UserPassAuth, NKeyAuth, JwtAuth, CredentialsAuth, CallbackAuth, AuthRequest
 export Msg, Headers, PublishFrame, Subscription, Stats
 export connect, close, drain, flush, ping, publish, prepare_publish, subscribe, unsubscribe, request, next, new_inbox
@@ -38,7 +39,7 @@ export KeyValue, KeyValueEntry, KeyValueOperation, KeyValueStatus, KeyValueWatch
 export kv_create, kv_open, kv_delete_bucket, kv_status, kv_get, kv_put, kv_create_key, kv_update, kv_delete, kv_purge, kv_purge_deletes, kv_history, kv_keys, kv_watch
 export kv_create_async, kv_open_async, kv_delete_bucket_async, kv_status_async, kv_get_async, kv_put_async, kv_create_key_async, kv_update_async
 export kv_delete_async, kv_purge_async, kv_purge_deletes_async, kv_history_async, kv_keys_async, kv_watch_async
-export NatterError, TimeoutError, NoRespondersError, ConnectionClosedError, ConnectionReconnectingError
+export NatterError, TimeoutError, CancelledError, NoRespondersError, ConnectionClosedError, ConnectionReconnectingError
 export ConnectionDrainingError, ProtocolError, AuthenticationError, AuthorizationError
 export AuthenticationExpiredError, AuthenticationRevokedError, AccountAuthenticationExpiredError, PermissionViolationError
 export NoServersError, MaxPayloadError
@@ -59,6 +60,7 @@ const DEFAULT_MAX_INBOUND_PAYLOAD = 64 * 1024 * 1024
 const DEFAULT_MAX_HEADER_BYTES = 64 * 1024
 
 include("errors.jl")
+include("cancellation.jl")
 include("secrets.jl")
 include("types.jl")
 include("auth.jl")

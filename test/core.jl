@@ -1100,6 +1100,104 @@ end
     close(client)
 end
 
+@testitem "cancellation tokens cancel blocking core waits" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    source = CancellationSource()
+    token = cancellation_token(source)
+    @test !iscancelled(token)
+    @test cancel!(source)
+    @test iscancelled(token)
+    @test !cancel!(source)
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "updates")
+    already_cancelled = TestHelpers.thrown_exception(() -> next(sub; timeout=1.0, cancel_token=token))
+    @test already_cancelled isa CancelledError
+
+    source = CancellationSource()
+    token = cancellation_token(source)
+    next_task = @async TestHelpers.thrown_exception(() -> next(sub; timeout=30.0, cancel_token=token))
+    sleep(0.02)
+    @test cancel!(source)
+    @test fetch(next_task) isa CancelledError
+
+    async_source = CancellationSource()
+    async_token = cancellation_token(async_source)
+    handle = next_async(sub; timeout=30.0, cancel_token=async_token)
+    sleep(0.02)
+    cancel!(async_source)
+    async_err = TestHelpers.thrown_exception(() -> fetch(handle))
+    @test async_err isa CancelledError
+end
+
+@testitem "cancelled flush leaves a stale waiter tombstone" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    struct CancellableFlushSink <: IO end
+    Base.write(::CancellableFlushSink, data::Vector{UInt8}) = length(data)
+    Base.write(::CancellableFlushSink, data::String) = ncodeunits(data)
+    Base.flush(::CancellableFlushSink) = nothing
+    Base.close(::CancellableFlushSink) = nothing
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     write_io=CancellableFlushSink())
+    source = CancellationSource()
+    token = cancellation_token(source)
+    task = @async TestHelpers.thrown_exception(() -> flush(client; timeout=30.0, cancel_token=token))
+
+    @test timedwait(1.0; pollint=0.005) do
+        length(client.pongs) == 1
+    end == :ok
+    cancel!(source)
+
+    @test fetch(task) isa CancelledError
+    @test length(client.pongs) == 1
+    waiter = only(client.pongs)
+    @test !waiter.active
+    @test !waiter.ready
+end
+
+@testitem "cancelled request removes mux waiter" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct RequestCancelTransport <: IO
+        bytes::Vector{UInt8}
+    end
+    RequestCancelTransport() = RequestCancelTransport(UInt8[])
+    Base.write(t::RequestCancelTransport, data::Vector{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::RequestCancelTransport, data::Base.CodeUnits{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::RequestCancelTransport, data::Union{String,SubString{String}}) = (append!(t.bytes, codeunits(data)); ncodeunits(data))
+    Base.write(t::RequestCancelTransport, data::AbstractString) = (append!(t.bytes, codeunits(data)); ncodeunits(data))
+    Base.flush(::RequestCancelTransport) = nothing
+    Base.close(::RequestCancelTransport) = nothing
+
+    transport = RequestCancelTransport()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+    source = CancellationSource()
+    token = cancellation_token(source)
+    task = @async TestHelpers.thrown_exception(() -> request(client, "svc", "body";
+                                                             timeout=30.0, cancel_token=token))
+
+    @test timedwait(1.0; pollint=0.005) do
+        mux = @atomic client.request_mux
+        !isnothing(mux) && (@lock mux.condition !isempty(mux.waiters))
+    end == :ok
+    cancel!(source)
+
+    @test fetch(task) isa CancelledError
+    mux = @atomic client.request_mux
+    @test !isnothing(mux)
+    @test @lock mux.condition isempty(mux.waiters)
+end
+
 @testitem "connected replayable publishes are bounded by pending_size" setup=[TestHelpers] begin
     using Natter
 

@@ -173,6 +173,19 @@ response = fetch(handle)
 
 `fetch(handle)` returns the synchronous result or throws the same operation error.
 
+Use a cancellation token when an outer request or shutdown path needs to stop waiting before the normal timeout:
+
+```julia
+source = CancellationSource()
+handle = request_async(client, "users.lookup", user_id;
+                       timeout=5.0,
+                       cancel_token=cancellation_token(source))
+
+cancel!(source)
+```
+
+Cancelled operations throw `CancelledError`.
+
 ## Drain And Close
 
 `drain(sub)` unsubscribes and waits for queued callback work. `drain(client)` drains subscriptions, flushes, and closes the client within one timeout.

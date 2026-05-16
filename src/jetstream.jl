@@ -266,8 +266,9 @@ function _js_decode(msg::Msg)
     isnothing(obj) ? (;) : obj
 end
 
-function _api_request(js::JetStreamContext, subject::String, payload=nothing; timeout::Real=js.timeout)
-    msg = request(js.client, subject, payload; timeout)
+function _api_request(js::JetStreamContext, subject::String, payload=nothing; timeout::Real=js.timeout,
+                      cancel_token::MaybeCancellationToken=nothing)
+    msg = request(js.client, subject, payload; timeout, cancel_token)
     _js_decode(msg)
 end
 
@@ -400,7 +401,9 @@ function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing;
                     expected_last_subject=nothing, expected_last_msg_id=nothing, ttl=nothing,
                     schedule=nothing, schedule_at=nothing, schedule_every=nothing,
                     schedule_target=nothing, schedule_source=nothing, schedule_ttl=nothing,
-                    schedule_timezone=nothing, retry_attempts::Integer=0, retry_wait::Real=0.25)
+                    schedule_timezone=nothing, retry_attempts::Integer=0, retry_wait::Real=0.25,
+                    cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     hdrs = _js_publish_headers(headers; stream, expected_stream, msg_id, expected_last_sequence,
                                expected_last_subject_sequence, expected_last_subject,
@@ -412,16 +415,17 @@ function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing;
     attempt = 0
     while true
         remaining = deadline - time()
+        _throw_if_cancelled(cancel_token)
         remaining > 0 || throw(TimeoutError("request timed out"))
         try
-            msg = request(js.client, subject, data; timeout=remaining, headers=hdrs)
+            msg = request(js.client, subject, data; timeout=remaining, headers=hdrs, cancel_token)
             obj = _js_read_response(msg)
             isnothing(obj) && throw(ProtocolError("JetStream publish response is empty"))
             return _puback(obj)
         catch err
             err isa NoRespondersError && attempt < attempts || rethrow()
             attempt += 1
-            sleep(min(wait_seconds, max(0.0, deadline - time())))
+            _sleep_or_cancel(min(wait_seconds, max(0.0, deadline - time())), cancel_token)
         end
     end
 end
@@ -443,34 +447,45 @@ function _stream_config_payload(config::AbstractDict{String,<:Any})::Dict{String
     _validate_stream_config_payload!(payload)
 end
 
-function stream_create(js::JetStreamContext, config::StreamConfig; timeout::Real=js.timeout)
+function stream_create(js::JetStreamContext, config::StreamConfig; timeout::Real=js.timeout,
+                       cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload); timeout))
+    _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload);
+                              timeout, cancel_token))
 end
 
-function stream_create(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout)
+function stream_create(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout,
+                       cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload); timeout))
+    _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload);
+                              timeout, cancel_token))
 end
 
-function stream_update(js::JetStreamContext, config::StreamConfig; timeout::Real=js.timeout)
+function stream_update(js::JetStreamContext, config::StreamConfig; timeout::Real=js.timeout,
+                       cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload); timeout))
+    _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload);
+                              timeout, cancel_token))
 end
 
-function stream_update(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout)
+function stream_update(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout,
+                       cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload); timeout))
+    _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload);
+                              timeout, cancel_token))
 end
 
-stream_info(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout) =
-    _stream_info(_api_request(js, "$(js.prefix).STREAM.INFO.$(_validate_api_name("stream", name))", ""; timeout))
+stream_info(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout,
+            cancel_token::MaybeCancellationToken=nothing) =
+    _stream_info(_api_request(js, "$(js.prefix).STREAM.INFO.$(_validate_api_name("stream", name))", "";
+                              timeout, cancel_token))
 
-function stream_list(js::JetStreamContext; offset=0, timeout::Real=js.timeout)
+function stream_list(js::JetStreamContext; offset=0, timeout::Real=js.timeout,
+                     cancel_token::MaybeCancellationToken=nothing)
     offset = _nonnegative_int_option("stream list offset", offset)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
@@ -478,7 +493,8 @@ function stream_list(js::JetStreamContext; offset=0, timeout::Real=js.timeout)
     next_offset = offset
     while true
         obj = _api_request(js, "$(js.prefix).STREAM.LIST", JSON3.write((offset=next_offset,));
-                           timeout=_remaining_timeout_or_throw(deadline, "stream list"))
+                           timeout=_remaining_timeout_or_throw(deadline, "stream list"; cancel_token),
+                           cancel_token)
         items = _json_get(obj, :streams, ())
         append!(streams, (_stream_info(item) for item in items))
         total = _json_int(_json_get(obj, :total, offset + length(streams)))
@@ -489,7 +505,8 @@ function stream_list(js::JetStreamContext; offset=0, timeout::Real=js.timeout)
     streams
 end
 
-function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothing}=nothing, timeout::Real=js.timeout)
+function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothing}=nothing,
+                      timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing)
     subject = isnothing(subject) ? nothing : _validate_subject(subject)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
@@ -498,7 +515,8 @@ function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothin
     while true
         req = isnothing(subject) ? (offset=next_offset,) : (subject=subject, offset=next_offset)
         obj = _api_request(js, "$(js.prefix).STREAM.NAMES", JSON3.write(req);
-                           timeout=_remaining_timeout_or_throw(deadline, "stream names"))
+                           timeout=_remaining_timeout_or_throw(deadline, "stream names"; cancel_token),
+                           cancel_token)
         items = String.(_json_get(obj, :streams, String[]))
         append!(names, items)
         total = _json_int(_json_get(obj, :total, length(names)))
@@ -509,8 +527,10 @@ function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothin
     names
 end
 
-stream_delete(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout) =
-    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.DELETE.$(_validate_api_name("stream", name))", ""; timeout), :success))
+stream_delete(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout,
+              cancel_token::MaybeCancellationToken=nothing) =
+    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.DELETE.$(_validate_api_name("stream", name))", "";
+                                                timeout, cancel_token), :success))
 
 function _validate_stream_purge_keep(keep::Union{Integer,Nothing})
     isnothing(keep) && return nothing
@@ -520,13 +540,15 @@ function _validate_stream_purge_keep(keep::Union{Integer,Nothing})
 end
 
 stream_purge(js::JetStreamContext, name::AbstractString; filter_subject::Union{AbstractString,Nothing}=nothing,
-             keep::Union{Integer,Nothing}=nothing, timeout::Real=js.timeout) = begin
+             keep::Union{Integer,Nothing}=nothing, timeout::Real=js.timeout,
+             cancel_token::MaybeCancellationToken=nothing) = begin
     filter = isnothing(filter_subject) ? nothing : _validate_subject(filter_subject)
     req = Dict{String,Any}()
     isnothing(filter) || (req["filter"] = filter)
     keep = _validate_stream_purge_keep(keep)
     isnothing(keep) || (req["keep"] = keep)
-    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.PURGE.$(_validate_api_name("stream", name))", JSON3.write(req); timeout), :success))
+    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.PURGE.$(_validate_api_name("stream", name))",
+                                               JSON3.write(req); timeout, cancel_token), :success))
 end
 
 function _json_int_vector(value)::Vector{Int}
@@ -651,7 +673,9 @@ function _direct_message_response(js::JetStreamContext, request_subject::String,
     msg
 end
 
-function _stream_message_get_direct_info(js::JetStreamContext, stream::String, req::Dict{String,Any}; timeout::Real)
+function _stream_message_get_direct_info(js::JetStreamContext, stream::String, req::Dict{String,Any};
+                                         timeout::Real,
+                                         cancel_token::MaybeCancellationToken=nothing)
     request_subject =
         if haskey(req, "last_by_subj") && !haskey(req, "seq")
             "$(js.prefix).DIRECT.GET.$stream.$(req["last_by_subj"])"
@@ -659,12 +683,14 @@ function _stream_message_get_direct_info(js::JetStreamContext, stream::String, r
             "$(js.prefix).DIRECT.GET.$stream"
         end
     payload = haskey(req, "last_by_subj") && !haskey(req, "seq") ? "" : JSON3.write(req)
-    response = _request_raw(js.client, request_subject, payload; timeout)
+    response = _request_raw(js.client, request_subject, payload; timeout, cancel_token)
     _direct_message_response_info(js, request_subject, response)
 end
 
-function _stream_message_get_direct(js::JetStreamContext, stream::String, req::Dict{String,Any}; timeout::Real)
-    msg, _sequence, _created = _stream_message_get_direct_info(js, stream, req; timeout)
+function _stream_message_get_direct(js::JetStreamContext, stream::String, req::Dict{String,Any};
+                                    timeout::Real,
+                                    cancel_token::MaybeCancellationToken=nothing)
+    msg, _sequence, _created = _stream_message_get_direct_info(js, stream, req; timeout, cancel_token)
     msg
 end
 
@@ -676,29 +702,37 @@ function _stream_message_from_api_payload(js::JetStreamContext, raw_msg)
         _json_int(_json_get_required(raw_msg, :seq)), created
 end
 
-function _stream_message_get_api(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any}; timeout::Real)
-    obj = _api_request(js, "$(js.prefix).STREAM.MSG.GET.$stream", JSON3.write(req); timeout)
+function _stream_message_get_api(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any};
+                                 timeout::Real, cancel_token::MaybeCancellationToken=nothing)
+    obj = _api_request(js, "$(js.prefix).STREAM.MSG.GET.$stream", JSON3.write(req);
+                       timeout, cancel_token)
     _stream_message_from_api_payload(js, _json_get_required(obj, :message))
 end
 
-function _stream_message_get_info(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any}; direct::Bool, timeout::Real)
-    direct && return _stream_message_get_direct_info(js, stream, req; timeout)
-    _stream_message_get_api(js, stream, req; timeout)
+function _stream_message_get_info(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any};
+                                  direct::Bool, timeout::Real,
+                                  cancel_token::MaybeCancellationToken=nothing)
+    direct && return _stream_message_get_direct_info(js, stream, req; timeout, cancel_token)
+    _stream_message_get_api(js, stream, req; timeout, cancel_token)
 end
 
 function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::Union{Integer,Nothing}=nothing, subject::Union{AbstractString,Nothing}=nothing,
-                            direct::Bool=false, next_by_subject::Bool=false, timeout::Real=js.timeout)
+                            direct::Bool=false, next_by_subject::Bool=false, timeout::Real=js.timeout,
+                            cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     req = _stream_message_get_request(seq, subject, next_by_subject)
-    direct && return _stream_message_get_direct(js, stream, req; timeout)
-    msg, _seq, _created = _stream_message_get_api(js, stream, req; timeout)
+    direct && return _stream_message_get_direct(js, stream, req; timeout, cancel_token)
+    msg, _seq, _created = _stream_message_get_api(js, stream, req; timeout, cancel_token)
     msg
 end
 
-function stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Integer; timeout::Real=js.timeout)
+function stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Integer;
+                               timeout::Real=js.timeout,
+                               cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     seq = _validate_stream_sequence(seq)
-    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.MSG.DELETE.$stream", JSON3.write((seq=seq,)); timeout), :success))
+    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).STREAM.MSG.DELETE.$stream",
+                                               JSON3.write((seq=seq,)); timeout, cancel_token), :success))
 end
 
 function _server_version_at_least(client::Client, major::Int, minor::Int)
@@ -743,42 +777,54 @@ function _consumer_request_payload(js::JetStreamContext, stream::AbstractString,
 end
 
 function _consumer_create_request(js::JetStreamContext, stream::AbstractString, config; timeout::Real=js.timeout,
-                                  action::Union{String,Nothing}=nothing)
+                                  action::Union{String,Nothing}=nothing,
+                                  cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     payload = _js_config_payload(config)
-    _consumer_create_payload_request(js, stream, payload; timeout, action)
+    _consumer_create_payload_request(js, stream, payload; timeout, action, cancel_token)
 end
 
 function _consumer_create_payload_request(js::JetStreamContext, stream::AbstractString, payload::Dict{String,Any};
-                                          timeout::Real=js.timeout, action::Union{String,Nothing}=nothing)
+                                          timeout::Real=js.timeout, action::Union{String,Nothing}=nothing,
+                                          cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     _validate_consumer_config_payload!(payload)
     subject = _consumer_create_subject(js, stream, payload)
-    _consumer_info(_api_request(js, subject, JSON3.write(_consumer_request_payload(js, stream, payload, action)); timeout))
+    _consumer_info(_api_request(js, subject, JSON3.write(_consumer_request_payload(js, stream, payload, action));
+                                timeout, cancel_token))
 end
 
-consumer_create(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig; timeout::Real=js.timeout) =
-    _consumer_create_request(js, stream, config; timeout, action="create")
+consumer_create(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig;
+                timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
+    _consumer_create_request(js, stream, config; timeout, action="create", cancel_token)
 
-consumer_create(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout) =
-    _consumer_create_request(js, stream, config; timeout, action="create")
+consumer_create(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any};
+                timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
+    _consumer_create_request(js, stream, config; timeout, action="create", cancel_token)
 
-consumer_create_or_update(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig; timeout::Real=js.timeout) =
-    _consumer_create_request(js, stream, config; timeout)
+consumer_create_or_update(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig;
+                          timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
+    _consumer_create_request(js, stream, config; timeout, cancel_token)
 
-consumer_create_or_update(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout) =
-    _consumer_create_request(js, stream, config; timeout)
+consumer_create_or_update(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any};
+                          timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
+    _consumer_create_request(js, stream, config; timeout, cancel_token)
 
-consumer_update(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig; timeout::Real=js.timeout) =
-    _consumer_create_request(js, stream, config; timeout, action="update")
+consumer_update(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig;
+                timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
+    _consumer_create_request(js, stream, config; timeout, action="update", cancel_token)
 
-consumer_update(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout) =
-    _consumer_create_request(js, stream, config; timeout, action="update")
+consumer_update(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any};
+                timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
+    _consumer_create_request(js, stream, config; timeout, action="update", cancel_token)
 
-consumer_info(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; timeout::Real=js.timeout) =
-    _consumer_info(_api_request(js, "$(js.prefix).CONSUMER.INFO.$(_validate_api_name("stream", stream)).$(_validate_api_name("consumer", consumer))", ""; timeout))
+consumer_info(js::JetStreamContext, stream::AbstractString, consumer::AbstractString;
+              timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
+    _consumer_info(_api_request(js, "$(js.prefix).CONSUMER.INFO.$(_validate_api_name("stream", stream)).$(_validate_api_name("consumer", consumer))", "";
+                                timeout, cancel_token))
 
-function consumer_list(js::JetStreamContext, stream::AbstractString; offset=0, timeout::Real=js.timeout)
+function consumer_list(js::JetStreamContext, stream::AbstractString; offset=0, timeout::Real=js.timeout,
+                       cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     offset = _nonnegative_int_option("consumer list offset", offset)
     timeout = _positive_timeout_seconds("timeout", timeout)
@@ -787,7 +833,8 @@ function consumer_list(js::JetStreamContext, stream::AbstractString; offset=0, t
     next_offset = offset
     while true
         obj = _api_request(js, "$(js.prefix).CONSUMER.LIST.$stream", JSON3.write((offset=next_offset,));
-                           timeout=_remaining_timeout_or_throw(deadline, "consumer list"))
+                           timeout=_remaining_timeout_or_throw(deadline, "consumer list"; cancel_token),
+                           cancel_token)
         items = _json_get(obj, :consumers, ())
         append!(consumers, (_consumer_info(item) for item in items))
         total = _json_int(_json_get(obj, :total, offset + length(consumers)))
@@ -798,8 +845,10 @@ function consumer_list(js::JetStreamContext, stream::AbstractString; offset=0, t
     consumers
 end
 
-consumer_delete(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; timeout::Real=js.timeout) =
-    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).CONSUMER.DELETE.$(_validate_api_name("stream", stream)).$(_validate_api_name("consumer", consumer))", ""; timeout), :success))
+consumer_delete(js::JetStreamContext, stream::AbstractString, consumer::AbstractString;
+                timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
+    _json_bool(_json_get_required(_api_request(js, "$(js.prefix).CONSUMER.DELETE.$(_validate_api_name("stream", stream)).$(_validate_api_name("consumer", consumer))", "";
+                                              timeout, cancel_token), :success))
 
 function _consumer_sequence_info_from_payload(value)::ConsumerSequenceInfo
     isnothing(value) && return ConsumerSequenceInfo()
@@ -833,9 +882,11 @@ _consumer_missing(err) = err isa JetStreamError && err.code == 404
 _consumer_create_conflict(err) =
     err isa JetStreamError && err.err_code in (_JS_ERR_CONSUMER_NAME_EXISTS, _JS_ERR_CONSUMER_ALREADY_EXISTS)
 
-function _consumer_info_or_nothing(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; timeout::Real=js.timeout)
+function _consumer_info_or_nothing(js::JetStreamContext, stream::AbstractString, consumer::AbstractString;
+                                   timeout::Real=js.timeout,
+                                   cancel_token::MaybeCancellationToken=nothing)
     try
-        consumer_info(js, stream, consumer; timeout)
+        consumer_info(js, stream, consumer; timeout, cancel_token)
     catch err
         _consumer_missing(err) && return nothing
         rethrow()
@@ -1049,17 +1100,19 @@ function _default_push_queue_consumer!(config::Dict{String,Any}, bind_fields::Se
 end
 
 function _bind_or_create_consumer(js::JetStreamContext, stream::AbstractString, name::AbstractString,
-                                  config::Dict{String,Any}, bind_fields; timeout::Real=js.timeout)
+                                  config::Dict{String,Any}, bind_fields; timeout::Real=js.timeout,
+                                  cancel_token::MaybeCancellationToken=nothing)
     _validate_consumer_config_payload!(config)
-    existing = _consumer_info_or_nothing(js, stream, name; timeout)
+    existing = _consumer_info_or_nothing(js, stream, name; timeout, cancel_token)
     if !isnothing(existing)
         return _validate_bound_consumer_config(existing, config, bind_fields), false
     end
     try
-        _consumer_create_payload_request(js, stream, config; timeout, action="create"), true
+        _consumer_create_payload_request(js, stream, config; timeout, action="create", cancel_token), true
     catch err
         _consumer_create_conflict(err) || rethrow()
-        _validate_bound_consumer_config(consumer_info(js, stream, name; timeout), config, bind_fields), false
+        _validate_bound_consumer_config(consumer_info(js, stream, name; timeout, cancel_token),
+                                        config, bind_fields), false
     end
 end
 
@@ -1333,8 +1386,9 @@ function _start_push_heartbeat_monitor(psub::PushSubscription, handler::_JetStre
     @async _push_heartbeat_monitor(psub, handler)
 end
 
-function next(psub::PushSubscription{C}; timeout::Real=1.0)::JetStreamMsg{C} where {C<:Client}
-    JetStreamMsg(next(psub.sub; timeout), psub.js.client)
+function next(psub::PushSubscription{C}; timeout::Real=1.0,
+              cancel_token::MaybeCancellationToken=nothing)::JetStreamMsg{C} where {C<:Client}
+    JetStreamMsg(next(psub.sub; timeout, cancel_token), psub.js.client)
 end
 
 function _push_idle_heartbeat_seconds(info::ConsumerInfo)::Float64
@@ -1591,23 +1645,25 @@ function _schedule_ordered_push_reset!(psub::PushSubscription, base_config::Dict
     nothing
 end
 
-function _stream_by_subject(js::JetStreamContext, subject::AbstractString; timeout::Real=js.timeout)
+function _stream_by_subject(js::JetStreamContext, subject::AbstractString; timeout::Real=js.timeout,
+                            cancel_token::MaybeCancellationToken=nothing)
     subject = _validate_subject(subject)
-    names = stream_names(js; subject, timeout)
+    names = stream_names(js; subject, timeout, cancel_token)
     isempty(names) && throw(JetStreamError(404, nothing, "no stream found for subject $subject"))
     first(names)
 end
 
 function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
-                        timeout::Real=js.timeout)
+                        timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     subject = _validate_subject(subject)
     timeout = _positive_timeout_seconds("timeout", timeout)
     cfg = _js_config_payload(config)
     _validate_pull_consumer_config!(cfg)
     _validate_consumer_config_payload!(cfg)
 
-    stream = isnothing(stream) ? _stream_by_subject(js, subject; timeout) : _validate_api_name("stream", stream)
+    stream = isnothing(stream) ? _stream_by_subject(js, subject; timeout, cancel_token) : _validate_api_name("stream", stream)
     durable = isnothing(durable) ? nothing : _validate_api_name("consumer", durable)
     bind_fields = Set{String}(keys(cfg))
     if !_consumer_has_filter(cfg)
@@ -1624,9 +1680,9 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     info =
         if isnothing(bind_name)
             _set_config_default!(cfg, "name", @lock js.client.lock randstring(js.client.rng, 16))
-            _consumer_create_payload_request(js, stream, cfg; timeout, action="create")
+            _consumer_create_payload_request(js, stream, cfg; timeout, action="create", cancel_token)
         else
-            consumer, _created = _bind_or_create_consumer(js, stream, bind_name, cfg, bind_fields; timeout)
+            consumer, _created = _bind_or_create_consumer(js, stream, bind_name, cfg, bind_fields; timeout, cancel_token)
             _validate_existing_pull_consumer(consumer)
         end
     if !haskey(cfg, "name") || isnothing(cfg["name"])
@@ -1634,12 +1690,12 @@ function pull_subscribe(js::JetStreamContext, subject::AbstractString; stream::U
     end
     try
         deliver = "$(new_inbox(js.client)).*"
-        sub = subscribe(js.client, deliver)
+        sub = subscribe(js.client, deliver; cancel_token)
         PullSubscription(js, sub, stream, info.name, deliver, ReentrantLock(), ReentrantLock(), delete_on_close, false)
     catch err
         if delete_on_close
             try
-                consumer_delete(js, stream, info.name; timeout)
+                consumer_delete(js, stream, info.name; timeout, cancel_token)
             catch cleanup_err
                 throw(Base.CompositeException([err, CleanupError("delete pull consumer $(info.name)", cleanup_err)]))
             end
@@ -1783,7 +1839,9 @@ function _throw_pull_fetch_wait_interrupted(closed::Bool, st::ConnectionStatus.T
     throw(TimeoutError("next message timed out"))
 end
 
-function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
+function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real;
+                              cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     sub = psub.sub
     client = sub.client
     deadline = time() + Float64(timeout)
@@ -1795,7 +1853,7 @@ function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
         st = status(client)
         closed && empty && _throw_pull_fetch_wait_interrupted(closed, st)
         ready = @lock sub.lock begin
-            _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
+            _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline); cancel_token) do
                 isready(sub.messages) || sub.closed || status(client) != ConnectionStatus.CONNECTED
             end
         end
@@ -1809,10 +1867,10 @@ function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real)
 end
 
 function _publish_pull_fetch_request(psub::PullSubscription, request_subject::String, payload::AbstractString,
-                                     reply::String)
+                                     reply::String; cancel_token::MaybeCancellationToken=nothing)
     try
         _publish(psub.js.client, request_subject, payload; reply,
-                 buffer_on_reconnect=false, force_flush=true)
+                 buffer_on_reconnect=false, force_flush=true, cancel_token)
     catch err
         if err isa ConnectionReconnectingError ||
            (err isa ConnectionClosedError && status(psub.js.client) == ConnectionStatus.DISCONNECTED)
@@ -1846,7 +1904,9 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
                expires::Real=_pull_fetch_default_expires(timeout),
                heartbeat::Union{Nothing,Real}=nothing, max_bytes=nothing,
                no_wait=false, min_pending=nothing, min_ack_pending=nothing,
-               priority_group=nothing, priority=nothing) where {C}
+               priority_group=nothing, priority=nothing,
+               cancel_token::MaybeCancellationToken=nothing) where {C}
+    _throw_if_cancelled(cancel_token)
     batch, timeout_seconds, expires_seconds, heartbeat_seconds, max_bytes_int, no_wait_bool,
         min_pending, min_ack_pending, priority_group, priority =
         _validate_pull_fetch(psub, batch, timeout, expires, heartbeat, max_bytes, no_wait,
@@ -1862,7 +1922,7 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
                                                   min_pending, min_ack_pending,
                                                   priority_group, priority)
             reply, reply_token = _pull_fetch_reply(psub)
-            _publish_pull_fetch_request(psub, request_subject, payload, reply)
+            _publish_pull_fetch_request(psub, request_subject, payload, reply; cancel_token)
             msgs = JetStreamMsg{C}[]
             sizehint!(msgs, batch)
             deadline = time() + timeout_seconds
@@ -1871,7 +1931,7 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
                 wait_deadline = min(deadline, heartbeat_deadline)
                 remaining = max(0.001, wait_deadline - time())
                 try
-                    msg = _next_pull_fetch_msg(psub, remaining)
+                    msg = _next_pull_fetch_msg(psub, remaining; cancel_token)
                     action, err = _jetstream_status_action(msg; request_subject)
                     action != :message && !_pull_fetch_status_matches_request(msg.subject, reply_token) && continue
                     heartbeat_seconds > 0 && (heartbeat_deadline = time() + 2 * heartbeat_seconds)
@@ -2364,7 +2424,9 @@ Base.isopen(stream::PullMessageStream) =
 function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
                          queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
                          config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
-                         timeout::Real=js.timeout, ordered::Bool=false)
+                         timeout::Real=js.timeout, ordered::Bool=false,
+                         cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     subject = _validate_subject(subject)
     timeout = _positive_timeout_seconds("timeout", timeout)
     cfg = _js_config_payload(config)
@@ -2377,7 +2439,7 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
     bind_fields = Set{String}(keys(cfg))
     !isnothing(queue) && push!(bind_fields, "deliver_group")
 
-    stream = isnothing(stream) ? _stream_by_subject(js, subject; timeout) : _validate_api_name("stream", stream)
+    stream = isnothing(stream) ? _stream_by_subject(js, subject; timeout, cancel_token) : _validate_api_name("stream", stream)
     durable = isnothing(durable) ? nothing : _validate_api_name("consumer", durable)
     ordered && !isnothing(durable) && throw(ArgumentError("ordered push consumers do not support durable consumers"))
     deliver = new_inbox(js.client)
@@ -2403,7 +2465,7 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
         _set_config_default!(cfg, "deliver_subject", deliver)
         create_consumer = true
     else
-        existing = _consumer_info_or_nothing(js, stream, bind_name; timeout)
+        existing = _consumer_info_or_nothing(js, stream, bind_name; timeout, cancel_token)
         if isnothing(existing)
             _set_config_default!(cfg, "deliver_subject", deliver)
             create_consumer = true
@@ -2420,12 +2482,12 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
                _push_callback_auto_ack(manual_ack, callback, info)
     wrapped_callback = _jetstream_push_callback(js, callback, auto_ack)
     sub = subscribe(js.client, deliver_subject; queue=local_queue, callback=wrapped_callback,
-                    _control_handler=control_handler)
+                    _control_handler=control_handler, cancel_token)
     consumer_created = false
     try
         if create_consumer
             try
-                info = _consumer_create_payload_request(js, stream, cfg; timeout, action="create")
+                info = _consumer_create_payload_request(js, stream, cfg; timeout, action="create", cancel_token)
                 consumer_created = true
             catch err
                 (!isnothing(bind_name) && _consumer_create_conflict(err)) || rethrow()
@@ -2434,13 +2496,13 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
                 catch cleanup_err
                     throw(Base.CompositeException([err, CleanupError("close provisional push subscription $deliver_subject", cleanup_err)]))
                 end
-                existing = consumer_info(js, stream, bind_name; timeout)
+                existing = consumer_info(js, stream, bind_name; timeout, cancel_token)
                 info = _bind_existing_push_consumer!(existing, cfg, bind_fields, local_queue, queue_explicit)
                 deliver_subject = String(cfg["deliver_subject"])
                 retry_auto_ack = _push_callback_auto_ack(manual_ack, callback, info)
                 wrapped_callback = _jetstream_push_callback(js, callback, retry_auto_ack)
                 sub = subscribe(js.client, deliver_subject; queue=local_queue, callback=wrapped_callback,
-                                _control_handler=control_handler)
+                                _control_handler=control_handler, cancel_token)
             end
         end
         info = info::ConsumerInfo
@@ -2474,7 +2536,7 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
         end
         if delete_on_close && consumer_created
             try
-                consumer_delete(js, stream, (info::ConsumerInfo).name; timeout)
+                consumer_delete(js, stream, (info::ConsumerInfo).name; timeout, cancel_token)
             catch cleanup_err
                 push!(cleanup_errors, CleanupError("delete push consumer $((info::ConsumerInfo).name)", cleanup_err))
             end
@@ -2486,11 +2548,14 @@ end
 function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
                         queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
-                        timeout::Real=js.timeout)
-    _push_subscribe(js, subject; stream, durable, queue, callback, manual_ack, config, timeout)
+                        timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing)
+    _push_subscribe(js, subject; stream, durable, queue, callback, manual_ack, config, timeout,
+                    cancel_token)
 end
 
-function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.timeout)
+function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.timeout,
+                                  cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     already_closed = @lock psub.close_lock begin
@@ -2509,7 +2574,8 @@ function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.
     if psub.delete_on_close && !server_deleted
         try
             consumer_delete(psub.js, psub.stream, psub.consumer;
-                            timeout=_remaining_timeout_or_throw(deadline, "close pull subscription"))
+                            timeout=_remaining_timeout_or_throw(deadline, "close pull subscription"; cancel_token),
+                            cancel_token)
         catch err
             push!(errors, CleanupError("delete pull consumer $(psub.consumer)", err))
         end
@@ -2518,9 +2584,12 @@ function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.
     nothing
 end
 
-close(psub::PullSubscription) = _close_pull_subscription(psub)
+close(psub::PullSubscription; cancel_token::MaybeCancellationToken=nothing) =
+    _close_pull_subscription(psub; cancel_token)
 
-function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.timeout)
+function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.timeout,
+                                  cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     already_closed = @lock psub.close_lock begin
@@ -2544,7 +2613,8 @@ function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.
     if psub.delete_on_close && !server_deleted
         try
             consumer_delete(psub.js, psub.stream, psub.consumer;
-                            timeout=_remaining_timeout_or_throw(deadline, "close push subscription"))
+                            timeout=_remaining_timeout_or_throw(deadline, "close push subscription"; cancel_token),
+                            cancel_token)
         catch err
             push!(errors, CleanupError("delete push consumer $(psub.consumer)", err))
         end
@@ -2553,7 +2623,8 @@ function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.
     nothing
 end
 
-close(psub::PushSubscription) = _close_push_subscription(psub)
+close(psub::PushSubscription; cancel_token::MaybeCancellationToken=nothing) =
+    _close_push_subscription(psub; cancel_token)
 
 const _JS_ACK_PREFIX = "\$JS.ACK."
 const _JS_ACK_NOT_MESSAGE = "message is not a JetStream message"
@@ -2810,7 +2881,9 @@ end
 
 _acknowledged(msg::JetStreamMsg)::Bool = (@atomic msg._ack_state) == _JS_ACK_DONE
 
-function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing)::Nothing
+function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing,
+                      cancel_token::MaybeCancellationToken=nothing)::Nothing
+    _throw_if_cancelled(cancel_token)
     reply = _ack_reply_subject(msg)
     payload = _ack_payload(kind; delay)
     terminal = _ack_terminal(kind)
@@ -2819,7 +2892,8 @@ function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing)::Nothing
     try
         _publish_unchecked(msg._client, reply, payload;
                            buffer_on_reconnect=!terminal,
-                           force_flush=terminal)
+                           force_flush=terminal,
+                           cancel_token)
         succeeded = true
     finally
         _finish_ack!(msg, terminal, succeeded)
@@ -2827,7 +2901,9 @@ function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing)::Nothing
     nothing
 end
 
-function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::Real=1.0)::Msg
+function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::Real=1.0,
+                      cancel_token::MaybeCancellationToken=nothing)::Msg
+    _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     reply = _ack_reply_subject(msg)
     payload = _ack_payload(kind; delay)
@@ -2840,8 +2916,9 @@ function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::R
         response_subject = "$(mux.prefix).$token"
         response = try
             frame = _publish_frame(reply, response_subject, payload, EMPTY_BYTES)
-            _publish_frame_unchecked(msg._client, frame; buffer_on_reconnect=false, force_flush=true)
-            _wait_request_reply(mux, waiter, timeout)
+            _publish_frame_unchecked(msg._client, frame; buffer_on_reconnect=false, force_flush=true,
+                                     cancel_token)
+            _wait_request_reply(mux, waiter, timeout; cancel_token)
         finally
             _remove_request_waiter!(msg._client, mux, token, waiter)
         end
@@ -2858,8 +2935,13 @@ function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::R
     end
 end
 
-ack(msg::JetStreamMsg)::Nothing = _ack_publish(msg, :ack)
-ack_sync(msg::JetStreamMsg; timeout::Real=1.0)::Msg = _ack_request(msg, :ack; timeout)
-nak(msg::JetStreamMsg; delay=nothing)::Nothing = _ack_publish(msg, :nak; delay)
-in_progress(msg::JetStreamMsg)::Nothing = _ack_publish(msg, :progress)
-term(msg::JetStreamMsg)::Nothing = _ack_publish(msg, :term)
+ack(msg::JetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
+    _ack_publish(msg, :ack; cancel_token)
+ack_sync(msg::JetStreamMsg; timeout::Real=1.0, cancel_token::MaybeCancellationToken=nothing)::Msg =
+    _ack_request(msg, :ack; timeout, cancel_token)
+nak(msg::JetStreamMsg; delay=nothing, cancel_token::MaybeCancellationToken=nothing)::Nothing =
+    _ack_publish(msg, :nak; delay, cancel_token)
+in_progress(msg::JetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
+    _ack_publish(msg, :progress; cancel_token)
+term(msg::JetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
+    _ack_publish(msg, :term; cancel_token)

@@ -29,7 +29,8 @@ end
 _write_transport_for_options(io, opts::ConnectOptions) =
     max(0, opts.write_buffer_size) == 0 ? io : BufferedWriteIO(io)
 
-function connect(url_or_urls=nothing; kwargs...)
+function connect(url_or_urls=nothing; cancel_token::MaybeCancellationToken=nothing, kwargs...)
+    _throw_if_cancelled(cancel_token)
     opts = _parse_options(url_or_urls; kwargs...)
     client = Client(
         opts,
@@ -60,7 +61,7 @@ function connect(url_or_urls=nothing; kwargs...)
         MersenneTwister(rand(UInt)),
         0,
     )
-    _connect_initial!(client)
+    _connect_initial!(client; cancel_token)
     client
 end
 
@@ -399,7 +400,9 @@ function _tls_config(opts::ConnectOptions, authmode::Int=_tls_authmode(opts))
     conf
 end
 
-function _connect_tcp(host::String, port::Int, timeout::Real)
+function _connect_tcp(host::String, port::Int, timeout::Real,
+                      cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     ch = Channel{Union{Sockets.TCPSocket,Exception}}(1)
     timed_out = Threads.Atomic{Bool}(false)
     task = @async begin
@@ -417,7 +420,21 @@ function _connect_tcp(host::String, port::Int, timeout::Real)
         end
     end
     result = timedwait(timeout; pollint=0.01) do
-        isready(ch)
+        isready(ch) || iscancelled(cancel_token)
+    end
+    if iscancelled(cancel_token) && !isready(ch)
+        timed_out[] = true
+        @async begin
+            errors = Any[]
+            _wait_task!(errors, "stop cancelled connect to $host:$port task", task;
+                        interrupt=true, interrupt_first=true)
+            if isready(ch)
+                late = take!(ch)
+                late isa Sockets.TCPSocket && _close_resource!(errors, "close cancelled connect socket", late)
+            end
+            _warn_timeout_cleanup_errors("connect to $host:$port", errors)
+        end
+        throw(CancelledError("connect to $host:$port cancelled"))
     end
     if result == :timed_out
         timed_out[] = true
@@ -600,28 +617,38 @@ end
 
 _remaining_timeout(deadline::Float64)::Float64 = max(0.0, deadline - time())
 
-function _remaining_timeout_or_throw(deadline::Float64, operation::AbstractString)::Float64
+function _remaining_timeout_or_throw(deadline::Float64, operation::AbstractString;
+                                     cancel_token::MaybeCancellationToken=nothing)::Float64
+    _throw_if_cancelled(cancel_token)
     remaining = _remaining_timeout(deadline)
     remaining > 0 || throw(TimeoutError("$operation timed out"))
     remaining
 end
 
-function _lock_write!(client::Client, operation::String, deadline)
-    if isnothing(deadline)
+function _lock_write!(client::Client, operation::String, deadline,
+                      cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
+    if isnothing(deadline) && isnothing(cancel_token)
         lock(client.write_lock)
         return nothing
     end
 
     while true
         trylock(client.write_lock) && return nothing
+        _throw_if_cancelled(cancel_token)
+        if isnothing(deadline)
+            sleep(0.005)
+            continue
+        end
         remaining = _remaining_timeout(deadline)
         remaining <= 0 && throw(TimeoutError("$operation timed out"))
         sleep(min(remaining, 0.005))
     end
 end
 
-function _with_write_lock(f::Function, client::Client, operation::String; deadline=nothing)
-    _lock_write!(client, operation, deadline)
+function _with_write_lock(f::Function, client::Client, operation::String; deadline=nothing,
+                          cancel_token::MaybeCancellationToken=nothing)
+    _lock_write!(client, operation, deadline, cancel_token)
     try
         return f()
     finally
@@ -805,8 +832,9 @@ function _wake_flusher(client::Client)
     nothing
 end
 
-function _flush_buffered_writes(client::Client; allow_missing::Bool=false, deadline=nothing)
-    _with_write_lock(client, "flush buffered writes"; deadline) do
+function _flush_buffered_writes(client::Client; allow_missing::Bool=false, deadline=nothing,
+                                cancel_token::MaybeCancellationToken=nothing)
+    _with_write_lock(client, "flush buffered writes"; deadline, cancel_token) do
         io = @atomic client.write_io
         if isnothing(io)
             allow_missing && return false
@@ -925,8 +953,9 @@ function _ensure_raw_write_status(st::ConnectionStatus.T, mode::_RawWriteMode)
 end
 
 function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; force_flush::Bool=false,
-                    deadline=nothing, write_mode::_RawWriteMode=_RAW_WRITE_CONNECTED)
-    _with_write_lock(client, "write protocol command"; deadline) do
+                    deadline=nothing, write_mode::_RawWriteMode=_RAW_WRITE_CONNECTED,
+                    cancel_token::MaybeCancellationToken=nothing)
+    _with_write_lock(client, "write protocol command"; deadline, cancel_token) do
         st = @lock client.lock client.status
         io = @atomic client.write_io
         _ensure_raw_write_status(st, write_mode)
@@ -1240,11 +1269,13 @@ end
 
 function _connect_once!(client::Client, server::Server; mark_connected::Bool=true,
                         generation::Union{Nothing,Int}=nothing, attempt::Int=1,
-                        reconnect::Bool=!isnothing(generation))
+                        reconnect::Bool=!isnothing(generation),
+                        cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     scheme, host, port, url_user, url_pass = _server_parts(server.url)
     tls_host = _tls_server_name(client.options, server, host)
     deadline::Float64 = time() + client.options.connect_timeout
-    sock = _connect_tcp(host, port, _remaining_timeout(deadline))
+    sock = _connect_tcp(host, port, _remaining_timeout(deadline), cancel_token)
     read_io = sock
     write_io = sock
     reader = ProtocolReader(read_io)
@@ -1253,6 +1284,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     try
         tls_active::Bool = false
         if _tls_first_for_connection(client.options, scheme)
+            _throw_if_cancelled(cancel_token)
             tls = _run_interruptible_io_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                 _tls_wrap(sock, client.options, tls_host)
             end
@@ -1261,6 +1293,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             reader = ProtocolReader(read_io)
             tls_active = true
         end
+        _throw_if_cancelled(cancel_token)
         frame = _run_interruptible_io_with_timeout("connect INFO read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
             _read_control_or_msg(reader, client.options)
         end
@@ -1268,6 +1301,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
         info = _protocol_info(frame)
         wants_tls::Bool = !tls_active && (scheme == "tls" || client.options.tls_required || info.tls_required === true)
         if wants_tls
+            _throw_if_cancelled(cancel_token)
             available = something(info.tls_available, info.tls_required === true)
             available == true || throw(ProtocolError("TLS requested but server did not advertise TLS availability"))
             tls = _run_interruptible_io_with_timeout("TLS handshake", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
@@ -1278,12 +1312,14 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             reader = ProtocolReader(read_io)
             tls_active = true
         end
+        _throw_if_cancelled(cancel_token)
         _run_interruptible_io_with_timeout("connect command write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
             write(write_io, _connect_command(client, server, info, url_user, url_pass; attempt, reconnect))
             write(write_io, "PING$CRLF")
             flush(write_io)
         end
         while true
+            _throw_if_cancelled(cancel_token)
             frame = _run_interruptible_io_with_timeout("connect PONG read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                 _read_control_or_msg(reader, client.options)
             end
@@ -1291,6 +1327,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             if op == :PONG
                 break
             elseif op == :PING
+                _throw_if_cancelled(cancel_token)
                 _run_interruptible_io_with_timeout("connect PONG write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                     write(write_io, "PONG$CRLF")
                     flush(write_io)
@@ -1341,18 +1378,23 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     end
 end
 
-function _connect_initial!(client::Client)
+function _connect_initial!(client::Client; cancel_token::MaybeCancellationToken=nothing)
     generation = @lock client.lock begin
         _store_status_locked!(client, ConnectionStatus.CONNECTING)
         _bump_generation_locked!(client)
     end
     last_err = nothing
     for (attempt, server) in pairs(client.servers)
+        _throw_if_cancelled(cancel_token)
         try
-            _connect_once!(client, server; generation, attempt, reconnect=false)
+            _connect_once!(client, server; generation, attempt, reconnect=false, cancel_token)
             _start_background_tasks!(client, generation)
             return client
         catch err
+            if err isa CancelledError
+                @lock client.lock _store_status_locked!(client, ConnectionStatus.DISCONNECTED)
+                rethrow()
+            end
             last_err = err
             _report_error(client, err)
         end

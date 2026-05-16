@@ -3,3 +3,7 @@ do a full deep review of this pure Julia NATS client. look for performance issue
 ---
 
 do a full review of the Natter.jl library. review for correctness, good coverage of most important features, using idiomatic Julia with clean APIs and naming. Using type stable, type annotated and efficient code with few allocations and only required locking. compare to other major NATS client libraries like from Go, Python, Rust and C to judge the quality of this one you can find the repos of those client libraries inside folder /mnt/data/repos/. be critical.
+
+---
+
+proceed with implementation. use clean code, clear separation of concerns, type stable functions and data structures. do not maintain backwards compatibility in the Natter.jl public API, just refactor to the best solution.

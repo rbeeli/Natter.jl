@@ -5,6 +5,11 @@ struct TimeoutError <: NatterError
 end
 TimeoutError() = TimeoutError("operation timed out")
 
+struct CancelledError <: NatterError
+    message::String
+end
+CancelledError() = CancelledError("operation cancelled")
+
 struct NoRespondersError <: NatterError
     subject::String
 end
@@ -133,6 +138,9 @@ end
 
 function Base.showerror(io::IO, err::TimeoutError)
     print(io, "Natter.TimeoutError: ", err.message)
+end
+function Base.showerror(io::IO, err::CancelledError)
+    print(io, "Natter.CancelledError: ", err.message)
 end
 function Base.showerror(io::IO, err::NoRespondersError)
     print(io, "Natter.NoRespondersError: no responders for subject ", err.subject)

@@ -8,6 +8,7 @@ Conventions:
 - Status enums are namespaced, for example `ConnectionStatus.CONNECTED` and `AckPolicy.EXPLICIT`.
 - Payload inputs may be strings, byte vectors, `nothing`, or JSON-serializable Julia values.
 - `String(msg)` works for `Msg`, `JetStreamMsg`, and `KeyValueEntry`.
+- Blocking operations accept `cancel_token=cancellation_token(source)` where cancellation is useful.
 - `_async` helpers return `NatterTask`; `fetch(handle)` returns the direct-call result or rethrows the original error.
 
 ## Core Types
@@ -25,6 +26,7 @@ Conventions:
 | `PublishFrame` | Prepared core publish frame from `prepare_publish`. |
 | `Subscription` | Core subscription handle. |
 | `NatterTask` | Explicit task handle returned by `_async` helpers. |
+| `CancellationSource`, `CancellationToken` | Cooperative cancellation source and token for blocking operations. |
 
 ## Authentication Types
 
@@ -119,6 +121,8 @@ Parser/resource limits:
 
 Core async helpers: `connect_async`, `publish_async`, `subscribe_async`, `unsubscribe_async`, `next_async`, `request_async`, `flush_async`, `ping_async`, `drain_async`, and `close_async`.
 
+Cancellation helpers: `CancellationSource()`, `cancellation_token(source)`, `cancel!(source)`, and `iscancelled(token)`. Cancelled operations throw `CancelledError`; `_async` helpers rethrow the same error from `fetch(handle)`.
+
 ## JetStream Types
 
 | Type | Purpose |
@@ -170,7 +174,7 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `consumer_list(js, stream; offset=0, timeout=...)` | `Vector{ConsumerInfo}` | List consumers. |
 | `consumer_delete(js, stream, consumer; timeout=...)` | `Bool` | Delete a consumer. |
 | `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig(), timeout=...)` | `PullSubscription` | Create or bind a pull consumer. |
-| `fetch(psub, batch=1; timeout=..., expires=..., heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | `Vector{JetStreamMsg}` | Fetch a bounded batch. |
+| `fetch(psub, batch=1; timeout=..., expires=..., heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `Vector{JetStreamMsg}` | Fetch a bounded batch. |
 | `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | `PullMessageStream` | Start a bounded refill stream. |
 | `consume(callback, psub; kwargs...)` | `PullMessageStream` | Run a callback over `messages`. |
 | `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=...)` | `PushSubscription` | Create or bind a push consumer. |

@@ -28,7 +28,7 @@ Statuses:
 | Publish replay | Partial | Buffered core publishes are replayed best-effort and can duplicate after ambiguous network failures. Use JetStream `msg_id` for durable idempotent publish paths. |
 | Slow consumer handling | Supported | Per-subscription pending limits report `SlowConsumerError`. |
 | Runtime inspection | Supported | `status`, `stats`, and `connected_url`. |
-| Async handles | Supported | Public `_async` helpers return `NatterTask`. |
+| Async handles | Supported | Public `_async` helpers return `NatterTask`; blocking calls accept cooperative cancellation tokens and async handles rethrow `CancelledError` from cancelled operations. |
 
 ## JetStream
 

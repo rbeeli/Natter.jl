@@ -1526,10 +1526,12 @@ end
 end
 
 function _wait_until_condition_locked(predicate::Function, condition::Base.GenericCondition{ReentrantLock},
-                                      timeout::Real)::Bool
+                                      timeout::Real; cancel_token::MaybeCancellationToken=nothing)::Bool
+    _throw_if_cancelled(cancel_token)
     predicate() && return true
     seconds = Float64(timeout)
     seconds > 0 || return false
+    registration = _register_cancellation_waiter(cancel_token, condition)
     timed_out = Ref(false)
     timer = isfinite(seconds) ? Timer(seconds) do _
         lock(condition)
@@ -1542,13 +1544,31 @@ function _wait_until_condition_locked(predicate::Function, condition::Base.Gener
     end : nothing
     try
         while !predicate()
+            _throw_if_cancelled(cancel_token)
             timed_out[] && return false
             wait(condition)
         end
+        _throw_if_cancelled(cancel_token)
         true
     finally
+        _deregister_cancellation_waiter!(cancel_token, registration)
         isnothing(timer) || close(timer)
     end
+end
+
+function _sleep_or_cancel(seconds::Real, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
+    delay = Float64(seconds)
+    delay <= 0 && return nothing
+    lock = ReentrantLock()
+    condition = Base.Threads.Condition(lock)
+    lock(condition)
+    try
+        _wait_until_condition_locked(() -> false, condition, delay; cancel_token)
+    finally
+        unlock(condition)
+    end
+    nothing
 end
 
 function _notify_subscription_waiters_locked(sub::Subscription; all::Bool=false)

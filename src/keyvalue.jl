@@ -256,11 +256,13 @@ function _kv_watcher_close_state!(state::_KeyValueWatcherState)
     nothing
 end
 
-function _close_keyvalue_watcher(watcher::KeyValueWatcher; timeout::Real=watcher.subscription.js.timeout)
+function _close_keyvalue_watcher(watcher::KeyValueWatcher; timeout::Real=watcher.subscription.js.timeout,
+                                 cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     errors = Any[]
     _kv_watcher_close_state!(watcher.state)
     try
-        _close_push_subscription(watcher.subscription; timeout)
+        _close_push_subscription(watcher.subscription; timeout, cancel_token)
     catch err
         push!(errors, err)
     end
@@ -268,7 +270,8 @@ function _close_keyvalue_watcher(watcher::KeyValueWatcher; timeout::Real=watcher
     nothing
 end
 
-Base.close(watcher::KeyValueWatcher) = _close_keyvalue_watcher(watcher)
+Base.close(watcher::KeyValueWatcher; cancel_token::MaybeCancellationToken=nothing) =
+    _close_keyvalue_watcher(watcher; cancel_token)
 
 function Base.take!(watcher::KeyValueWatcher)
     isnothing(watcher.updates) &&
@@ -276,14 +279,16 @@ function Base.take!(watcher::KeyValueWatcher)
     take!(watcher.updates)
 end
 
-function _kv_take!(watcher::KeyValueWatcher, timeout::Real)
+function _kv_take!(watcher::KeyValueWatcher, timeout::Real,
+                   cancel_token::MaybeCancellationToken=nothing)
     updates = watcher.updates
     isnothing(updates) &&
         throw(ArgumentError("callback key-value watchers do not buffer updates"))
     timeout = _positive_timeout_seconds("timeout", timeout)
     result = timedwait(timeout; pollint=min(0.01, timeout)) do
-        isready(updates) || !isopen(updates)
+        isready(updates) || !isopen(updates) || iscancelled(cancel_token)
     end
+    _throw_if_cancelled(cancel_token)
     result == :timed_out && throw(TimeoutError("key-value watcher timed out"))
     take!(updates)
 end
@@ -293,7 +298,9 @@ const _KV_CLEANUP_TIMEOUT = 0.001
 _kv_cleanup_timeout(deadline::Float64)::Float64 =
     max(_remaining_timeout(deadline), _KV_CLEANUP_TIMEOUT)
 
-function _kv_throw_if_deadline_expired(deadline::Float64, operation::String)
+function _kv_throw_if_deadline_expired(deadline::Float64, operation::String;
+                                       cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     _remaining_timeout(deadline) <= 0 && throw(TimeoutError("$operation timed out"))
     nothing
 end
@@ -400,30 +407,35 @@ function kv_create(js::JetStreamContext, bucket::AbstractString; history::Intege
                    max_value_size::Integer=-1, storage::Union{AbstractString,StorageType.T}="file",
                    replicas::Integer=1, direct::Bool=false, compression=nothing,
                    metadata=nothing, limit_marker_ttl::Union{Real,Nothing}=nothing,
-                   timeout::Real=js.timeout)
+                   timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing)
     bucket = _validate_kv_bucket(bucket)
     cfg = _kv_stream_config(bucket; history, ttl, max_bytes, max_value_size, storage,
                             replicas, direct, compression, metadata, limit_marker_ttl)
-    info = stream_create(js, cfg; timeout)
+    info = stream_create(js, cfg; timeout, cancel_token)
     KeyValue(js, bucket, _kv_stream(bucket), _kv_prefix(bucket), something(info.config.allow_direct, false))
 end
 
-function kv_open(js::JetStreamContext, bucket::AbstractString; timeout::Real=js.timeout)
+function kv_open(js::JetStreamContext, bucket::AbstractString; timeout::Real=js.timeout,
+                 cancel_token::MaybeCancellationToken=nothing)
     bucket = _validate_kv_bucket(bucket)
-    info = stream_info(js, _kv_stream(bucket); timeout)
+    info = stream_info(js, _kv_stream(bucket); timeout, cancel_token)
     KeyValue(js, bucket, info.name, _kv_prefix(bucket), something(info.config.allow_direct, false))
 end
 
-kv_delete_bucket(kv::KeyValue; timeout::Real=kv.js.timeout) = stream_delete(kv.js, kv.stream; timeout)
+kv_delete_bucket(kv::KeyValue; timeout::Real=kv.js.timeout,
+                 cancel_token::MaybeCancellationToken=nothing) =
+    stream_delete(kv.js, kv.stream; timeout, cancel_token)
 
-function kv_status(kv::KeyValue; timeout::Real=kv.js.timeout)
-    _kv_status(kv, stream_info(kv.js, kv.stream; timeout))
+function kv_status(kv::KeyValue; timeout::Real=kv.js.timeout,
+                   cancel_token::MaybeCancellationToken=nothing)
+    _kv_status(kv, stream_info(kv.js, kv.stream; timeout, cancel_token))
 end
 
 status(kv::KeyValue; kwargs...) = kv_status(kv; kwargs...)
 
 function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
-                direct::Union{Bool,Nothing}=nothing, timeout::Real=kv.js.timeout)
+                direct::Union{Bool,Nothing}=nothing, timeout::Real=kv.js.timeout,
+                cancel_token::MaybeCancellationToken=nothing)
     key = _validate_kv_key(key)
     timeout = _positive_timeout_seconds("timeout", timeout)
     subject = "$(kv.prefix)$key"
@@ -432,7 +444,8 @@ function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integ
         req = isnothing(revision) ?
               _stream_message_get_request(nothing, subject, false) :
               _stream_message_get_request(revision, nothing, false)
-        _stream_message_get_info(kv.js, kv.stream, req; direct=use_direct, timeout)
+        _stream_message_get_info(kv.js, kv.stream, req; direct=use_direct, timeout,
+                                 cancel_token)
     catch err
         err isa JetStreamError && err.code == 404 ? throw(_kv_not_found_error(kv, key)) : rethrow()
     end
@@ -444,16 +457,19 @@ function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integ
 end
 
 _kv_publish_revision(kv::KeyValue, subject::AbstractString, value; headers=nothing,
-                     ttl=nothing, timeout::Real=kv.js.timeout)::Int =
-    js_publish(kv.js, subject, value; headers, ttl, timeout).seq
+                     ttl=nothing, timeout::Real=kv.js.timeout,
+                     cancel_token::MaybeCancellationToken=nothing)::Int =
+    js_publish(kv.js, subject, value; headers, ttl, timeout, cancel_token).seq
 
 function kv_put(kv::KeyValue, key::AbstractString, value; revision::Union{Nothing,Integer}=nothing,
-                ttl=nothing, timeout::Real=kv.js.timeout)::Int
+                ttl=nothing, timeout::Real=kv.js.timeout,
+                cancel_token::MaybeCancellationToken=nothing)::Int
     key = _validate_kv_key(key)
     hdrs = Headers()
     expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
-        _kv_publish_revision(kv, "$(kv.prefix)$key", value; headers=hdrs, ttl, timeout)
+        _kv_publish_revision(kv, "$(kv.prefix)$key", value; headers=hdrs, ttl, timeout,
+                             cancel_token)
     catch err
         _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
         rethrow()
@@ -464,10 +480,11 @@ _kv_wrong_last_sequence(err) = err isa JetStreamError && err.err_code == 10071
 _kv_delete_marker_revision(msg::AbstractMsg, sequence::Int) =
     _kv_is_delete_marker(_kv_operation(msg)) ? sequence : nothing
 
-function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String; timeout::Real=kv.js.timeout)
+function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String; timeout::Real=kv.js.timeout,
+                                           cancel_token::MaybeCancellationToken=nothing)
     req = _stream_message_get_request(nothing, subject, false)
     msg, sequence, _created = try
-        _stream_message_get_api(kv.js, kv.stream, req; timeout)
+        _stream_message_get_api(kv.js, kv.stream, req; timeout, cancel_token)
     catch err
         err isa JetStreamError && err.code == 404 && return nothing
         rethrow()
@@ -477,20 +494,23 @@ function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String; timeou
 end
 
 function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,
-                       timeout::Real=kv.js.timeout)::Int
+                       timeout::Real=kv.js.timeout,
+                       cancel_token::MaybeCancellationToken=nothing)::Int
     key = _validate_kv_key(key)
     timeout = _positive_timeout_seconds("timeout", timeout)
     subject = "$(kv.prefix)$key"
     hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => ["0"])
     try
-        return _kv_publish_revision(kv, subject, value; headers=hdrs, ttl, timeout)
+        return _kv_publish_revision(kv, subject, value; headers=hdrs, ttl, timeout,
+                                    cancel_token)
     catch err
         _kv_wrong_last_sequence(err) || rethrow()
-        marker_revision = _kv_latest_delete_marker_revision(kv, subject; timeout)
+        marker_revision = _kv_latest_delete_marker_revision(kv, subject; timeout, cancel_token)
         isnothing(marker_revision) && throw(_kv_key_exists_error(kv, key, err))
         retry_hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => [string(marker_revision)])
         try
-            return _kv_publish_revision(kv, subject, value; headers=retry_hdrs, ttl, timeout)
+            return _kv_publish_revision(kv, subject, value; headers=retry_hdrs, ttl, timeout,
+                                        cancel_token)
         catch retry_err
             _kv_wrong_last_sequence(retry_err) &&
                 throw(_kv_wrong_revision_error(kv, key, marker_revision, retry_err))
@@ -500,16 +520,17 @@ function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,
 end
 
 kv_update(kv::KeyValue, key::AbstractString, value, revision::Integer; ttl=nothing,
-          timeout::Real=kv.js.timeout)::Int =
-    kv_put(kv, key, value; revision, ttl, timeout)
+          timeout::Real=kv.js.timeout, cancel_token::MaybeCancellationToken=nothing)::Int =
+    kv_put(kv, key, value; revision, ttl, timeout, cancel_token)
 
 function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
-                   timeout::Real=kv.js.timeout)::Nothing
+                   timeout::Real=kv.js.timeout,
+                   cancel_token::MaybeCancellationToken=nothing)::Nothing
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["DEL"])
     expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
-        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs, timeout)
+        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs, timeout, cancel_token)
         nothing
     catch err
         _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
@@ -518,12 +539,13 @@ function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,In
 end
 
 function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
-                  ttl=nothing, timeout::Real=kv.js.timeout)::Nothing
+                  ttl=nothing, timeout::Real=kv.js.timeout,
+                  cancel_token::MaybeCancellationToken=nothing)::Nothing
     key = _validate_kv_key(key)
     hdrs = Headers("KV-Operation" => ["PURGE"], "Nats-Rollup" => ["sub"])
     expected_revision = _kv_add_expected_revision!(hdrs, revision)
     try
-        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs, ttl, timeout)
+        js_publish(kv.js, "$(kv.prefix)$key", UInt8[]; headers=hdrs, ttl, timeout, cancel_token)
         nothing
     catch err
         _kv_wrong_last_sequence(err) && throw(_kv_wrong_revision_error(kv, key, expected_revision, err))
@@ -531,26 +553,30 @@ function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int
     end
 end
 
-function kv_history(kv::KeyValue, key::AbstractString; batch=256, timeout::Real=kv.js.timeout)
+function kv_history(kv::KeyValue, key::AbstractString; batch=256, timeout::Real=kv.js.timeout,
+                    cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     key = _validate_kv_key(key)
     batch = _positive_int_option("key-value history batch", batch)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     sub = pull_subscribe(kv.js, "$(kv.prefix)$key"; stream=kv.stream,
                          config=ConsumerConfig(deliver_policy=DeliverPolicy.ALL),
-                         timeout=_remaining_timeout_or_throw(deadline, "key-value history"))
+                         timeout=_remaining_timeout_or_throw(deadline, "key-value history"; cancel_token),
+                         cancel_token)
     entries = KeyValueEntry[]
     try
         while true
             chunk = fetch(sub, batch;
-                          timeout=_remaining_timeout_or_throw(deadline, "key-value history"))
+                          timeout=_remaining_timeout_or_throw(deadline, "key-value history"; cancel_token),
+                          cancel_token)
             if isempty(chunk)
-                _kv_throw_if_deadline_expired(deadline, "key-value history")
+                _kv_throw_if_deadline_expired(deadline, "key-value history"; cancel_token)
                 break
             end
             pending = _kv_history_chunk_pending!(entries, kv, chunk)
             if pending == 0
-                _kv_throw_if_deadline_expired(deadline, "key-value history")
+                _kv_throw_if_deadline_expired(deadline, "key-value history"; cancel_token)
                 break
             end
         end
@@ -566,24 +592,28 @@ function kv_history(kv::KeyValue, key::AbstractString; batch=256, timeout::Real=
     entries
 end
 
-function kv_keys(kv::KeyValue; timeout::Real=kv.js.timeout)
+function kv_keys(kv::KeyValue; timeout::Real=kv.js.timeout,
+                 cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     sub = pull_subscribe(kv.js, "$(kv.prefix)>"; stream=kv.stream,
                          config=_kv_keys_consumer_config(),
-                         timeout=_remaining_timeout_or_throw(deadline, "key-value keys"))
+                         timeout=_remaining_timeout_or_throw(deadline, "key-value keys"; cancel_token),
+                         cancel_token)
     latest = Dict{String,Tuple{Int,Bool}}()
     try
         while true
             chunk = fetch(sub, 256;
-                          timeout=_remaining_timeout_or_throw(deadline, "key-value keys"))
+                          timeout=_remaining_timeout_or_throw(deadline, "key-value keys"; cancel_token),
+                          cancel_token)
             if isempty(chunk)
-                _kv_throw_if_deadline_expired(deadline, "key-value keys")
+                _kv_throw_if_deadline_expired(deadline, "key-value keys"; cancel_token)
                 break
             end
             pending = _kv_keys_chunk_pending!(latest, kv.prefix, chunk)
             if pending == 0
-                _kv_throw_if_deadline_expired(deadline, "key-value keys")
+                _kv_throw_if_deadline_expired(deadline, "key-value keys"; cancel_token)
                 break
             end
         end
@@ -679,7 +709,8 @@ function _kv_watch(callback, kv::KeyValue; key::AbstractString=">",
                    ignore_deletes::Bool=false, meta_only::Bool=false,
                    resume_revision::Union{Integer,Nothing}=nothing,
                    channel_size::Integer=256, notify_initial_done::Bool=false,
-                   timeout::Real=kv.js.timeout)
+                   timeout::Real=kv.js.timeout, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     filters = _kv_watch_filters(key, keys)
     cfg = _kv_watch_consumer_config(kv, filters; history, updates_only, meta_only, resume_revision)
@@ -687,7 +718,7 @@ function _kv_watch(callback, kv::KeyValue; key::AbstractString=">",
     entry_callback = _kv_watch_callback(kv, state, ignore_deletes)
     sub = _push_subscribe(kv.js, "$(kv.prefix)$(first(filters))"; stream=kv.stream,
                           callback=entry_callback, manual_ack=true, config=cfg, timeout,
-                          ordered=true)
+                          ordered=true, cancel_token)
     watcher = KeyValueWatcher(sub, state.updates, state)
     _kv_watcher_set_initial_pending!(state, _consumer_num_pending(sub.info), updates_only)
     watcher
@@ -709,16 +740,19 @@ function _kv_purge_deletes_threshold(older_than::Real)::Float64
 end
 
 function kv_purge_deletes(kv::KeyValue; older_than::Real=_KV_DEFAULT_PURGE_DELETES_OLDER_THAN,
-                          timeout::Real=kv.js.timeout)
+                          timeout::Real=kv.js.timeout, cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     threshold = _kv_purge_deletes_threshold(older_than)
     watcher = kv_watch(kv; key=">", meta_only=true,
-                       timeout=_remaining_timeout_or_throw(deadline, "key-value delete marker purge"))
+                       timeout=_remaining_timeout_or_throw(deadline, "key-value delete marker purge"; cancel_token),
+                       cancel_token)
     markers = KeyValueEntry[]
     try
         while true
-            update = _kv_take!(watcher, _remaining_timeout_or_throw(deadline, "key-value delete marker purge"))
+            update = _kv_take!(watcher, _remaining_timeout_or_throw(deadline, "key-value delete marker purge"; cancel_token),
+                               cancel_token)
             update isa KeyValueWatchInitialDone && break
             entry = update::KeyValueEntry
             _kv_is_delete_marker(entry.operation) && push!(markers, entry)
@@ -738,7 +772,8 @@ function kv_purge_deletes(kv::KeyValue; older_than::Real=_KV_DEFAULT_PURGE_DELET
     for entry in markers
         keep = !isnothing(limit) && entry.created > limit ? 1 : nothing
         stream_purge(kv.js, kv.stream; filter_subject="$(kv.prefix)$(entry.key)", keep,
-                     timeout=_remaining_timeout_or_throw(deadline, "key-value delete marker purge"))
+                     timeout=_remaining_timeout_or_throw(deadline, "key-value delete marker purge"; cancel_token),
+                     cancel_token)
     end
     nothing
 end
