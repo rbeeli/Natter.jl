@@ -76,6 +76,7 @@ makedocs(;
             "Reliability And TLS" => "reliability.md",
         ],
         "Examples" => [
+            "Overview" => "examples/index.md",
             "Connection Auth And TLS" => "examples/connection-auth-tls.md",
             "Basic Publish And Subscribe" => "examples/basic-pub-sub.md",
             "Request Reply Service" => "examples/request-reply.md",

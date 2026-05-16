@@ -1,6 +1,6 @@
 # Production Client
 
-This example collects common production options in one place.
+This recipe puts the common production pieces together: multi-server TLS, lifecycle callbacks, JetStream deduplication, a durable pull worker, and graceful shutdown.
 
 ```julia
 using Natter
@@ -22,11 +22,11 @@ function make_client()
         max_reconnect_attempts=-1,
         pending_size=16 * 1024 * 1024,
         write_timeout=5.0,
+        record_stats=true,
         sub_pending_msgs_limit=8192,
         sub_pending_bytes_limit=128 * 1024 * 1024,
         tls_ca_path="/etc/nats/ca.pem",
-        tls_cert_path="/etc/nats/client.pem",
-        tls_key_path="/etc/nats/client-key.pem",
+        auth=CredentialsAuth(; path="/etc/nats/billing.creds"),
         event_cb=event -> begin
             if event.kind == ConnectionEventKind.DISCONNECTED
                 @warn "NATS disconnected" error=event.error
@@ -36,9 +36,7 @@ function make_client()
                 @info "NATS connection closed"
             end
         end,
-        error_cb=err -> begin
-            @error "NATS client error" exception=err
-        end,
+        error_cb=err -> @error "NATS client error" exception=err,
     )
 end
 
@@ -55,6 +53,13 @@ stream_create(js, StreamConfig(
     allow_direct=true,
 ))
 
+function publish_billing_event(js, id, payload)
+    js_publish(js, "billing.events.created", payload;
+        stream="BILLING",
+        msg_id="billing-$id",
+    )
+end
+
 worker = pull_subscribe(js, "billing.events.created";
     stream="BILLING",
     durable="billing-created-workers",
@@ -67,33 +72,10 @@ worker = pull_subscribe(js, "billing.events.created";
 )
 
 try
-    for msg in fetch(worker, 50; timeout=2.0)
-        try
-            handle_billing_event(String(msg.data))
-            ack(msg)
-        catch err
-            @error "billing event failed" exception=err
-            nak(msg; delay=5.0)
-        end
-    end
-finally
-    close(worker)
-    drain(client; timeout=10.0)
-end
-```
-
-For exactly-once effects, combine JetStream message IDs with idempotent application storage. Reconnect publish replay protects availability, but duplicate delivery is still possible after ambiguous network failures.
-
-For CPU-light, I/O-heavy handlers, process a fetched batch concurrently with Julia tasks:
-
-```julia
-try
-    msgs = fetch(worker, 50; timeout=2.0)
-
-    @sync for msg in msgs
-        @async begin
+    while service_running()
+        for msg in fetch(worker, 50; timeout=2.0)
             try
-                handle_billing_event(String(msg.data))
+                handle_billing_event(String(msg))
                 ack(msg)
             catch err
                 @error "billing event failed" exception=err
@@ -106,3 +88,23 @@ finally
     drain(client; timeout=10.0)
 end
 ```
+
+For I/O-heavy handlers, process a fetched batch behind one `@sync` boundary:
+
+```julia
+msgs = fetch(worker, 50; timeout=2.0)
+
+@sync for msg in msgs
+    @async begin
+        try
+            handle_billing_event(String(msg))
+            ack(msg)
+        catch err
+            @error "billing event failed" exception=err
+            nak(msg; delay=5.0)
+        end
+    end
+end
+```
+
+Core reconnect buffering protects availability, but duplicate delivery is still possible after ambiguous network failures. For durable effects, combine JetStream `msg_id` values with idempotent application storage.

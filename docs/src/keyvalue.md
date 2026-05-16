@@ -1,6 +1,6 @@
 # KeyValue
 
-KeyValue buckets are built on JetStream streams and use the `JetStreamContext` API.
+KeyValue buckets are built on JetStream streams. They are useful for configuration, profiles, feature flags, small state records, and watched state.
 
 ```julia
 client = connect("nats://127.0.0.1:4222")
@@ -12,19 +12,15 @@ js = jetstream(client)
 ```julia
 kv = kv_create(js, "settings";
     history=5,
-    ttl=3600.0,
+    ttl=24 * 60 * 60,
     max_bytes=128 * 1024 * 1024,
     max_value_size=1 * 1024 * 1024,
     storage=StorageType.FILE,
     replicas=1,
     direct=true,
-    compression=true,
     metadata=Dict("owner" => "config-service"),
-    limit_marker_ttl=86400.0,
 )
 ```
-
-Durations are expressed in seconds. `history` must be between 1 and 64. `limit_marker_ttl` enables the backing stream support needed for expiring delete markers and per-message TTL markers.
 
 Open an existing bucket:
 
@@ -32,60 +28,74 @@ Open an existing bucket:
 kv = kv_open(js, "settings")
 ```
 
-When a bucket is created or opened with direct access enabled on its backing stream, `kv_get` uses direct reads by default. Override that per call with `direct=false` or `direct=true`.
-
-All networked KeyValue operations accept `timeout=...` in seconds and default to the timeout configured on the `JetStreamContext`.
-
-Inspect bucket state with `kv_status`:
+Inspect bucket state:
 
 ```julia
 st = kv_status(kv)
-@assert st.history == 5
-@assert st.direct == true
+@info "bucket" values=st.values history=st.history bytes=st.bytes
 ```
 
-## Put And Get
+Durations are seconds. `history` must be between 1 and 64. Buckets created with `direct=true` use direct reads by default when the server supports them.
+
+## Put, Get, And Update
 
 ```julia
-revision = kv_put(kv, "theme", "dark"; ttl=3600.0)
-entry = kv_get(kv, "theme"; timeout=2.0)
+revision = kv_put(kv, "checkout.currency", "CHF")
+entry = kv_get(kv, "checkout.currency"; timeout=2.0)
 
-@assert entry.key == "theme"
+@assert entry.key == "checkout.currency"
 @assert entry.revision == revision
 @assert entry.operation == KeyValueOperation.PUT
-@assert String(entry.value) == "dark"
+@assert String(entry) == "CHF"
 ```
 
-Create only if the key does not currently exist. A deleted key can be created again. Per-key TTL uses JetStream message TTL, must be at least `1.0` second, and requires the bucket to have `limit_marker_ttl` enabled.
+Create a key only when it is absent or currently deleted:
 
 ```julia
-kv_create_key(kv, "first-run", "complete"; ttl=3600.0)
+created = kv_create_key(kv, "checkout.enabled", "true")
 ```
 
-Update only if the key is still at a known revision:
+Update only when the key is still at a known revision:
 
 ```julia
-revision = kv_put(kv, "theme", "dark")
-kv_update(kv, "theme", "light", revision)
+current = kv_get(kv, "checkout.currency")
+new_revision = kv_update(kv, "checkout.currency", "EUR", current.revision)
 ```
+
+`kv_put(kv, key, value; revision=rev)` is the same guarded write pattern. Per-key TTL is available with `ttl=...` when the bucket is configured for message TTL markers.
 
 ## Delete And Purge
 
 ```julia
-latest = kv_get(kv, "theme")
-kv_delete(kv, "theme"; revision=latest.revision)
-kv_purge(kv, "theme"; ttl=60.0)
+latest = kv_get(kv, "checkout.currency")
+kv_delete(kv, "checkout.currency"; revision=latest.revision)
+
+kv_purge(kv, "checkout.currency")
 ```
 
-Absent keys raise `KeyValueKeyNotFoundError` from `kv_get`. Deleted and purged keys raise `KeyValueKeyDeletedError` with the tombstone entry attached.
+`kv_delete` leaves a delete marker. `kv_purge` removes prior values for that key and leaves a purge marker.
 
-Optimistic operations raise KV-specific errors. `kv_update`, `kv_put(...; revision=rev)`, `kv_delete(...; revision=rev)`, and `kv_purge(...; revision=rev)` raise `KeyValueWrongRevisionError` when the expected revision does not match. `kv_create_key` raises `KeyValueKeyExistsError` when the key is already active.
+Common KeyValue errors are typed:
+
+```julia
+try
+    kv_update(kv, "checkout.currency", "USD", 12)
+catch err
+    if err isa KeyValueWrongRevisionError
+        @warn "settings changed; reload and retry"
+    else
+        rethrow()
+    end
+end
+```
+
+`kv_get` raises `KeyValueKeyNotFoundError` for absent keys and `KeyValueKeyDeletedError` for deleted or purged keys.
 
 ## History And Keys
 
 ```julia
-for entry in kv_history(kv, "theme")
-    println(entry.revision, ": ", String(entry.value))
+for entry in kv_history(kv, "checkout.currency")
+    @info "version" revision=entry.revision operation=entry.operation value=String(entry)
 end
 
 for key in kv_keys(kv)
@@ -93,7 +103,57 @@ for key in kv_keys(kv)
 end
 ```
 
-## Concurrent KeyValue Work
+Remove old delete and purge markers:
+
+```julia
+kv_purge_deletes(kv; older_than=30 * 60)
+```
+
+## Watch Changes
+
+Channel watchers yield historical/current entries first, then the sentinel `KV_WATCH_INITIAL_DONE`, then live updates.
+
+```julia
+watcher = kv_watch(kv; keys=["checkout.*", "system.*"])
+
+try
+    while true
+        update = take!(watcher)
+        update === KV_WATCH_INITIAL_DONE && break
+        @info "initial setting" key=update.key revision=update.revision
+    end
+
+    @async begin
+        for update in watcher.updates
+            @info "setting changed" key=update.key operation=update.operation
+        end
+    end
+finally
+    close(watcher)
+end
+```
+
+Use the callback form when a channel is not needed:
+
+```julia
+watcher = kv_watch(kv; key="checkout.*", ignore_deletes=true) do entry
+    @info "setting changed" key=entry.key value=String(entry)
+end
+
+close(watcher)
+```
+
+Useful watch options:
+
+| Option | Use |
+| :--- | :--- |
+| `updates_only=true` | Skip the initial snapshot. |
+| `history=true` | Include historical revisions. |
+| `ignore_deletes=true` | Skip delete and purge markers. |
+| `meta_only=true` | Receive metadata without values. |
+| `resume_revision=rev` | Resume after a known stream revision. |
+
+## Concurrent Reads
 
 Use Julia tasks for independent KeyValue operations:
 
@@ -105,39 +165,6 @@ settings = Ref{KeyValueEntry}()
     @async profile[] = kv_get(kv, "users.42.profile")
     @async settings[] = kv_get(kv, "users.42.settings")
 end
-```
-
-`kv_purge_deletes(kv; older_than=1800.0)` removes current delete and purge markers. Negative `older_than` removes markers regardless of age; recent markers are kept when `older_than` is positive so watchers can still observe them.
-
-## Watch
-
-`kv_watch(kv)` returns a `KeyValueWatcher` with an `updates` channel. The channel yields `KeyValueEntry` values and then `KV_WATCH_INITIAL_DONE` after the initial snapshot has been delivered. Close the watcher when it is no longer needed.
-Watchers use ordered ephemeral push consumers with flow control, heartbeat monitoring, sequence-gap detection, and automatic reset from the next stream sequence.
-
-```julia
-watcher = kv_watch(kv; keys=["users.*.name", "system.theme"], meta_only=true)
-
-while true
-    update = take!(watcher)
-    update === KV_WATCH_INITIAL_DONE && break
-    @info "initial key" key=update.key revision=update.revision
-end
-
-close(watcher)
-```
-
-Use `close_async(watcher)` when watcher cleanup should be joined through a `NatterTask`.
-
-Use `updates_only=true` for changes after watcher creation, `history=true` to include historical revisions, `ignore_deletes=true` to skip delete and purge markers, and `resume_revision=rev` to resume from a stream revision.
-
-The callback form is available when you do not need a buffered updates channel:
-
-```julia
-watcher = kv_watch(kv; key=">", history=false) do entry
-    @info "key changed" key=entry.key revision=entry.revision value=String(entry.value)
-end
-
-close(watcher)
 ```
 
 ## Delete A Bucket

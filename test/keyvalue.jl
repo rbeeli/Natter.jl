@@ -261,6 +261,46 @@ end
     @test_throws ProtocolError N._kv_record_key!(latest, prefix, Msg("other.beta", "\$JS.ACK.KV_bucket.C.6.14.6.0.0", UInt8[]))
 end
 
+@testitem "KeyValue pagination uses pending metadata" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+    prefix = "\$KV.bucket."
+    kv = KeyValue(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", prefix)
+
+    history_msg(seq, pending) =
+        Msg("$(prefix)alpha", "\$JS.ACK.KV_bucket.C.$seq.$seq.$seq.0.$pending",
+            TestHelpers.bytes("value-$seq"))
+
+    entries = KeyValueEntry[]
+    full_history_chunk = [history_msg(1, 1), history_msg(2, 0)]
+    @test length(full_history_chunk) == 2
+    @test N._kv_history_chunk_pending!(entries, kv, full_history_chunk) == 0
+    @test length(entries) == 2
+    @test entries[end].delta == 0
+
+    more_entries = KeyValueEntry[]
+    full_nonterminal_history_chunk = [history_msg(3, 2), history_msg(4, 1)]
+    @test length(full_nonterminal_history_chunk) == 2
+    @test N._kv_history_chunk_pending!(more_entries, kv, full_nonterminal_history_chunk) == 1
+
+    key_msg(key, seq, pending; headers=nothing) =
+        Msg("$(prefix)$key", "\$JS.ACK.KV_bucket.C.$seq.$seq.$seq.0.$pending",
+            UInt8[]; headers)
+
+    latest = Dict{String,Tuple{Int,Bool}}()
+    full_keys_chunk = [key_msg("alpha", 1, 1), key_msg("beta", 2, 0)]
+    @test length(full_keys_chunk) == 2
+    @test N._kv_keys_chunk_pending!(latest, prefix, full_keys_chunk) == 0
+    @test sort(N._kv_active_keys(latest)) == ["alpha", "beta"]
+
+    full_nonterminal_keys_chunk = [key_msg("gamma", 3, 2),
+                                   key_msg("delta", 4, 1; headers=Headers("KV-Operation" => ["DEL"]))]
+    @test length(full_nonterminal_keys_chunk) == 2
+    @test N._kv_keys_chunk_pending!(latest, prefix, full_nonterminal_keys_chunk) == 1
+    @test !("delta" in N._kv_active_keys(latest))
+end
+
 @testitem "KeyValue create retry is limited to delete markers" begin
     using Natter
 

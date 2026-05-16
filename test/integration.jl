@@ -325,6 +325,7 @@ end
                                reconnect_wait=0.05,
                                reconnect_jitter=0.0,
                                max_reconnect_attempts=40,
+                               record_stats=true,
                                event_cb=event -> begin
                                    event.kind == N.ConnectionEventKind.DISCONNECTED && (disconnected[] = true)
                                    event.kind == N.ConnectionEventKind.RECONNECTED && (reconnected[] = true)
@@ -882,6 +883,7 @@ end
         client = connect(url; ping_interval=2.0, max_outstanding_pings=2,
                          connect_timeout=IntegrationHelpers.integration_connect_timeout(),
                          reconnect_wait=0.05, max_reconnect_attempts=20,
+                         record_stats=true,
                          event_cb=event -> begin
                              event.kind == N.ConnectionEventKind.RECONNECTED && (reconnected[] = true)
                          end)

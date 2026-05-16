@@ -842,30 +842,21 @@ function _headers_bytes(headers::Headers)
     out
 end
 
-struct PublishFrame <: _AbstractPublishFrame
-    _subject::String
-    _reply::Union{String,Nothing}
-    _payload::String
-    _headers::String
+struct PublishFrame{P<:AbstractVector{UInt8},H<:AbstractVector{UInt8}} <: _AbstractPublishFrame
+    subject::String
+    reply::Union{String,Nothing}
+    payload::P
+    headers::H
 
     function PublishFrame(subject::AbstractString, reply::Union{AbstractString,Nothing},
                           data, headers)
         subject = _validate_publish_subject(subject)
         reply = isnothing(reply) ? nothing : _validate_publish_subject(reply)
-        new(subject, reply, _payload_string(data), _publish_header_string(headers))
+        payload = _prepared_payload_bytes(data)
+        header_bytes = _prepared_header_bytes(headers)
+        new{typeof(payload),typeof(header_bytes)}(subject, reply, payload, header_bytes)
     end
 end
-
-function Base.getproperty(frame::PublishFrame, name::Symbol)
-    name === :subject && return getfield(frame, :_subject)
-    name === :reply && return getfield(frame, :_reply)
-    name === :payload && return codeunits(getfield(frame, :_payload))
-    name === :headers && return codeunits(getfield(frame, :_headers))
-    getfield(frame, name)
-end
-
-Base.propertynames(::PublishFrame, private::Bool=false) =
-    private ? fieldnames(PublishFrame) : (:subject, :reply, :payload, :headers)
 
 PublishFrame(subject::AbstractString, data=nothing;
              reply::Union{AbstractString,Nothing}=nothing,
@@ -1119,34 +1110,37 @@ function _unsub_cmd(sid::Int, max_msgs=0)
     max_msgs > 0 ? "UNSUB $sid $max_msgs$CRLF" : "UNSUB $sid$CRLF"
 end
 
-function _validate_subject_token(wildcard::Char, token_chars::Int, allow_wildcards::Bool)
-    wildcard == '\0' && return nothing
+function _validate_subject_token(wildcard::UInt8, token_chars::Int, allow_wildcards::Bool)
+    wildcard == 0x00 && return nothing
     token_chars == 1 || throw(ArgumentError("wildcards must occupy a complete subject token"))
     allow_wildcards || throw(ArgumentError("publish subjects cannot contain wildcards"))
     nothing
 end
 
+@inline _invalid_subject_space(byte::UInt8)::Bool =
+    byte <= 0x20 || byte == 0x7f
+
 function _validate_subject(subject::AbstractString; allow_wildcards::Bool=true)
     s = String(subject)
     isempty(s) && throw(ArgumentError("subject cannot be empty"))
     token_chars = 0
-    token_wildcard = '\0'
+    token_wildcard = UInt8(0)
     previous_dot = false
-    for c in s
-        isspace(c) && throw(ArgumentError("subject cannot contain whitespace"))
-        if c == '.'
+    for byte in codeunits(s)
+        _invalid_subject_space(byte) && throw(ArgumentError("subject cannot contain whitespace"))
+        if byte == UInt8('.')
             if token_chars == 0
                 msg = previous_dot ? "subject cannot contain consecutive dots" : "subject cannot start with '.'"
                 throw(ArgumentError(msg))
             end
-            token_wildcard == '>' && throw(ArgumentError("subject wildcard '>' must be the final token"))
+            token_wildcard == UInt8('>') && throw(ArgumentError("subject wildcard '>' must be the final token"))
             _validate_subject_token(token_wildcard, token_chars, allow_wildcards)
             token_chars = 0
-            token_wildcard = '\0'
+            token_wildcard = UInt8(0)
             previous_dot = true
         else
-            if c == '>' || c == '*'
-                token_wildcard = c
+            if byte == UInt8('>') || byte == UInt8('*')
+                token_wildcard = byte
             end
             token_chars += 1
             previous_dot = false
@@ -1163,7 +1157,9 @@ function _validate_queue(queue::Union{AbstractString,Nothing})
     isnothing(queue) && return nothing
     q = String(queue)
     isempty(q) && throw(ArgumentError("queue cannot be empty"))
-    occursin(r"\s", q) && throw(ArgumentError("queue cannot contain whitespace"))
+    for byte in codeunits(q)
+        _invalid_subject_space(byte) && throw(ArgumentError("queue cannot contain whitespace"))
+    end
     q
 end
 
@@ -1173,11 +1169,12 @@ _payload_bytes(data::AbstractVector{UInt8}) = data
 _payload_bytes(data::AbstractString) = codeunits(String(data))
 _payload_bytes(data) = codeunits(JSON3.write(data))
 
-_payload_string(::Nothing) = ""
-_payload_string(data::String) = data
-_payload_string(data::AbstractString) = String(data)
-_payload_string(data::AbstractVector{UInt8}) = _bytes_to_string(data)
-_payload_string(data) = JSON3.write(data)
+_prepared_payload_bytes(::Nothing) = codeunits("")
+_prepared_payload_bytes(data::String) = codeunits(data)
+_prepared_payload_bytes(data::AbstractString) = _prepared_payload_bytes(String(data))
+_prepared_payload_bytes(data::AbstractVector{UInt8}) =
+    isempty(data) ? codeunits("") : ImmutableBytes(data)
+_prepared_payload_bytes(data) = _prepared_payload_bytes(JSON3.write(data))
 
 _publish_header_bytes(::Nothing) = EMPTY_BYTES
 function _publish_header_bytes(headers::AbstractVector{UInt8})
@@ -1193,18 +1190,21 @@ end
 _publish_header_bytes(headers::Headers) = _headers_bytes(headers)
 _publish_header_bytes(headers) = _publish_header_bytes(_headers_from_input(headers))
 
-_publish_header_string(::Nothing) = ""
-function _publish_header_string(headers::AbstractVector{UInt8})
-    isempty(headers) && return ""
+_prepared_header_bytes(::Nothing) = codeunits("")
+function _prepared_header_bytes(headers::AbstractVector{UInt8})
+    isempty(headers) && return codeunits("")
     try
         _validate_headers(headers)
     catch err
         err isa ProtocolError && throw(ArgumentError(err.message))
         rethrow()
     end
-    _bytes_to_string(headers)
+    ImmutableBytes(headers)
 end
-_publish_header_string(headers::Headers) = _bytes_to_string(_headers_bytes(headers))
-_publish_header_string(headers) = _publish_header_string(_headers_from_input(headers))
+function _prepared_header_bytes(headers::Headers)
+    bytes = _headers_bytes(headers)
+    isempty(bytes) ? codeunits("") : ImmutableBytes(bytes; copy=false)
+end
+_prepared_header_bytes(headers) = _prepared_header_bytes(_headers_from_input(headers))
 
 _bytes(data) = Vector{UInt8}(_payload_bytes(data))

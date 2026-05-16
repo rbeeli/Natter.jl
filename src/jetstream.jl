@@ -1153,7 +1153,9 @@ end
 
 mutable struct PullMessageStream{C<:Client,P<:PullSubscription{C}}
     subscription::P
-    messages::Channel{JetStreamMsg{C}}
+    messages::MsgQueue{Msg}
+    message_lock::ReentrantLock
+    message_condition::Base.GenericCondition{ReentrantLock}
     config::_PullStreamConfig
     task::Task
     callback_task::Union{Task,Nothing}
@@ -1237,6 +1239,7 @@ end
 
 function _record_subscription_data_received!(handler::_JetStreamPushControlHandler, msg::Msg)
     handler.flow_control[] && Threads.atomic_add!(handler.flow_incoming, one(UInt64))
+    (handler.ordered || handler.idle_heartbeat[] > 0 || handler.flow_control[]) || return nothing
     handler.ordered && return nothing
     parsed = _push_msg_metadata(msg)
     isnothing(parsed) && return nothing
@@ -2135,15 +2138,29 @@ function _pull_stream_maybe_refill!(stream::PullMessageStream, config::_PullStre
     nothing
 end
 
-function _pull_stream_put!(stream::PullMessageStream{C}, msg::Msg)::Int where {C}
-    jsmsg = JetStreamMsg(msg, stream.subscription.js.client)
-    _pull_stream_closed(stream.state) && throw(_PullStreamClosed())
-    put!(stream.messages, jsmsg)
+function _pull_stream_put!(stream::PullMessageStream, msg::Msg)::Int
     bytes = _pull_stream_msg_bytes(msg)
-    @lock stream.state.lock begin
-        stream.state.buffered_messages += 1
-        stream.state.buffered_bytes += bytes
-        stream.state.delivered += 1
+    @lock stream.message_lock begin
+        while isopen(stream.messages) && length(stream.messages) >= _queue_capacity(stream.messages)
+            _pull_stream_closed(stream.state) && throw(_PullStreamClosed())
+            wait(stream.message_condition)
+        end
+        isopen(stream.messages) || throw(_PullStreamClosed())
+        @lock stream.state.lock begin
+            stream.state.closed && throw(_PullStreamClosed())
+            stream.state.buffered_messages += 1
+            stream.state.buffered_bytes += bytes
+            stream.state.delivered += 1
+            try
+                put!(stream.messages, msg)
+            catch
+                stream.state.buffered_messages = max(0, stream.state.buffered_messages - 1)
+                stream.state.buffered_bytes = max(0, stream.state.buffered_bytes - bytes)
+                stream.state.delivered = max(0, stream.state.delivered - 1)
+                rethrow()
+            end
+        end
+        notify(stream.message_condition)
     end
     1
 end
@@ -2203,6 +2220,7 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
             _pull_stream_maybe_refill!(stream, config)
         end
     catch err
+        err isa _PullStreamClosed && return nothing
         if _pull_stream_closed(stream.state) && err isa InvalidStateException
             return nothing
         end
@@ -2210,7 +2228,10 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
         rethrow()
     finally
         _pull_stream_close_state!(stream.state)
-        isopen(stream.messages) && close(stream.messages)
+        @lock stream.message_lock begin
+            isopen(stream.messages) && close(stream.messages)
+            notify(stream.message_condition; all=true)
+        end
         _end_pull_stream!(psub)
     end
     nothing
@@ -2229,8 +2250,11 @@ function messages(psub::PullSubscription{C}; batch=100, max_bytes=nothing,
                                                    priority_group, priority)
     _begin_pull_stream!(psub)
     state = _PullMessageStreamState()
-    channel = Channel{JetStreamMsg{C}}(channel_size)
-    stream = PullMessageStream{C,typeof(psub)}(psub, channel, config, Task(() -> nothing), nothing, state)
+    queue_lock = ReentrantLock()
+    queue_condition = Base.Threads.Condition(queue_lock)
+    queue = MsgQueue{Msg}(channel_size)
+    stream = PullMessageStream{C,typeof(psub)}(psub, queue, queue_lock, queue_condition,
+                                               config, Task(() -> nothing), nothing, state)
     task = @async _pull_stream_loop(stream, config)
     stream.task = task
     stream
@@ -2258,33 +2282,49 @@ end
 function Base.close(stream::PullMessageStream)
     already_closed = _pull_stream_close_state!(stream.state)
     already_closed || _notify_subscription_waiters!(stream.subscription.sub; all=true)
-    isopen(stream.messages) && close(stream.messages)
+    @lock stream.message_lock begin
+        isopen(stream.messages) && close(stream.messages)
+        notify(stream.message_condition; all=true)
+    end
     nothing
 end
 
 function Base.take!(stream::PullMessageStream)
     while true
-        if isready(stream.messages)
-            msg = take!(stream.messages)
-            @lock stream.state.lock begin
-                stream.state.buffered_messages = max(0, stream.state.buffered_messages - 1)
-                stream.state.buffered_bytes = max(0, stream.state.buffered_bytes - _pull_stream_msg_bytes(msg))
+        msg = EMPTY_MSG
+        ready = @lock stream.message_lock begin
+            while !isready(stream.messages) && isopen(stream.messages)
+                wait(stream.message_condition)
             end
+            if isready(stream.messages)
+                msg = take!(stream.messages)
+                @lock stream.state.lock begin
+                    stream.state.buffered_messages = max(0, stream.state.buffered_messages - 1)
+                    stream.state.buffered_bytes = max(0, stream.state.buffered_bytes - _pull_stream_msg_bytes(msg))
+                end
+                notify(stream.message_condition)
+                true
+            else
+                false
+            end
+        end
+        if ready
+            jsmsg = JetStreamMsg(msg, stream.subscription.js.client)
             try
                 _pull_stream_maybe_refill!(stream)
             catch err
                 _pull_stream_set_error!(stream.state, err)
                 _notify_subscription_waiters!(stream.subscription.sub; all=true)
-                isopen(stream.messages) && close(stream.messages)
+                @lock stream.message_lock begin
+                    isopen(stream.messages) && close(stream.messages)
+                    notify(stream.message_condition; all=true)
+                end
             end
-            return msg
+            return jsmsg
         end
-        if !isopen(stream.messages)
-            err = _pull_stream_error(stream.state)
-            isnothing(err) || throw(err)
-            throw(InvalidStateException("pull message stream is closed", :closed))
-        end
-        wait(stream.messages)
+        err = _pull_stream_error(stream.state)
+        isnothing(err) || throw(err)
+        throw(InvalidStateException("pull message stream is closed", :closed))
     end
 end
 
@@ -2292,7 +2332,8 @@ function Base.iterate(stream::PullMessageStream, state=nothing)
     try
         take!(stream), nothing
     catch err
-        err isa InvalidStateException && !isopen(stream.messages) && return nothing
+        queue_closed = @lock stream.message_lock !isopen(stream.messages)
+        err isa InvalidStateException && queue_closed && return nothing
         rethrow()
     end
 end
@@ -2317,7 +2358,8 @@ function Base.wait(stream::PullMessageStream)
 end
 
 Base.fetch(stream::PullMessageStream) = wait(stream)
-Base.isopen(stream::PullMessageStream) = isopen(stream.messages) && !_pull_stream_closed(stream.state)
+Base.isopen(stream::PullMessageStream) =
+    (@lock stream.message_lock isopen(stream.messages)) && !_pull_stream_closed(stream.state)
 
 function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
                          queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
@@ -2623,8 +2665,8 @@ function _parse_ack_metadata_no_domain(reply::String, first::Int, last::Int)::_P
     delivered, first = _ack_parse_int_token(reply, dot + 1, last, true)
     stream_sequence, first = _ack_parse_int_token(reply, first, last, true)
     consumer_sequence, first = _ack_parse_int_token(reply, first, last, true)
-    timestamp_ns, first = _ack_parse_int_token(reply, first, last, true)
-    pending = _ack_parse_int(reply, first, last)
+    timestamp_ns, first = _ack_parse_int_token(reply, first, last, false)
+    pending = first == 0 ? 0 : _ack_parse_int(reply, first, last)
 
     _ParsedMsgMetadata(stream_first, stream_last, consumer_first, consumer_last,
                        delivered, stream_sequence, consumer_sequence, timestamp_ns,
@@ -2662,7 +2704,7 @@ function _parse_msg_metadata(reply::String)::_ParsedMsgMetadata
     token_count = _ack_token_count(reply)
     first = ncodeunits(_JS_ACK_PREFIX) + 1
     last = ncodeunits(reply)
-    if token_count == 9
+    if token_count == 8 || token_count == 9
         return _parse_ack_metadata_no_domain(reply, first, last)
     elseif token_count >= 11
         return _parse_ack_metadata_with_domain(reply, first, last)
@@ -2797,7 +2839,7 @@ function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::R
         token, waiter = _register_request_waiter!(msg._client, mux, timeout)
         response_subject = "$(mux.prefix).$token"
         response = try
-            frame = PublishFrame(reply, response_subject, payload, EMPTY_BYTES)
+            frame = _publish_frame(reply, response_subject, payload, EMPTY_BYTES)
             _publish_frame_unchecked(msg._client, frame; buffer_on_reconnect=false, force_flush=true)
             _wait_request_reply(mux, waiter, timeout)
         finally

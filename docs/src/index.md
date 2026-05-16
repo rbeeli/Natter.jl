@@ -1,51 +1,49 @@
-# Natter.jl - Pure Julia NATS client
+# Natter.jl
 
-Natter.jl is a Julia client for [NATS](https://nats.io). It provides ergonomic direct APIs for application code and uses Julia tasks internally for the reader loop, pings, reconnects, subscription callbacks, and explicit async handles. Natter.jl uses task-based cooperative concurrency over Julia's async I/O model. It is not a multithreaded client implementation.
+Natter.jl is a pure Julia client for [NATS](https://nats.io). It is built for service code: connect once, publish and subscribe directly from Julia tasks, and let the client handle pings, reconnects, subscription replay, and cleanup.
 
-The client is intended for long-running services:
-
-- Core publish, subscribe, queue groups, headers, request/reply, flush, drain, and close.
-- Background reconnect with subscription replay and bounded publish buffering.
-- Token, user/password, NKEY/JWT, `.creds`, TLS, and client certificate connection modes.
-- TLS-first servers, INFO-first TLS upgrade, and optional certificate verification control.
-- JetStream stream and consumer management with typed Julia configuration structs.
-- Pull and push consumers, explicit acknowledgements, publish acknowledgements, message lookup, and direct get.
-- KeyValue buckets with direct reads, history, keys, optimistic writes, deletes, purges, and watches.
-
-## Quick Start
+## A First Client
 
 ```julia
 using Natter
 
-client = connect("nats://127.0.0.1:4222")
+client = connect("nats://127.0.0.1:4222"; name="orders-api")
 
-sub = subscribe(client, "events.created") do msg
-    @info "received event" subject=msg.subject data=String(msg.data)
+sub = subscribe(client, "orders.created") do msg
+    @info "order created" id=String(msg)
 end
 
-publish(client, "events.created", "hello")
+publish(client, "orders.created", "order-1001")
 flush(client)
 
 drain(sub)
 close(client)
 ```
 
-Use Julia tasks when your application needs concurrency:
+For concurrent work, use Julia tasks around the normal direct calls:
 
 ```julia
 @sync begin
-    @async publish(client, "events.created", "a")
-    @async publish(client, "events.created", "b")
+    @async publish(client, "orders.created", "order-1002")
+    @async publish(client, "orders.created", "order-1003")
 end
 
 flush(client)
 ```
 
-## Where To Go Next
+## Common Use Cases
 
-- [Getting Started](getting-started.md) covers installation, a local server, and the basic client lifecycle.
-- [Core Messaging](core.md) explains publish/subscribe, request/reply, headers, queue groups, and draining.
-- [JetStream](jetstream.md) covers streams, consumers, typed configs, direct get, and acknowledgements.
-- [KeyValue](keyvalue.md) documents buckets, reads, writes, watches, and direct access.
-- [Reliability And TLS](reliability.md) describes reconnect behavior, buffering, callbacks, and TLS options.
-- [Examples](examples/connection-auth-tls.md) provide complete patterns for common application code.
+| Use case | Start here |
+| :--- | :--- |
+| Publish/subscribe, queue workers, request/reply, headers | [Core Messaging](core.md) |
+| Persistent streams, durable workers, acknowledgements | [JetStream](jetstream.md) |
+| Configuration, profiles, leases, and watched state | [KeyValue](keyvalue.md) |
+| Reconnect behavior, production options, TLS and auth | [Reliability And TLS](reliability.md) |
+| Copyable end-to-end snippets | [Examples](examples/index.md) |
+| Full exported API summary | [Reference](reference.md) |
+
+## Feature Snapshot
+
+Natter.jl supports core NATS messaging, automatic reconnect, token/user-password/NKEY/JWT/`.creds` auth, TLS and mTLS, JetStream stream and consumer management, pull and push consumers, publish acknowledgements, message lookup, KeyValue buckets, optimistic writes, delete/purge operations, and watchers.
+
+See [Feature Coverage](feature-coverage.md) for unsupported areas such as WebSocket transport, Object Store, and Services/Micro.

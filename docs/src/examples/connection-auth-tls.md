@@ -1,6 +1,6 @@
 # Connection Auth And TLS
 
-These examples show the supported connection security modes. Use one NATS authentication scheme per connection: token, user/password, NKEY, or user JWT credentials. TLS client certificates are transport-level authentication and can be used with a NATS auth scheme when the deployment requires both.
+Use one NATS authentication scheme per connection. TLS client certificates are transport-level auth and can be combined with token, user/password, NKEY, or JWT credentials when the deployment requires both.
 
 ## Token And User Password
 
@@ -16,14 +16,14 @@ user_client = connect("nats://nats.example.com:4222";
 )
 ```
 
-Token and user/password credentials can also be supplied in URL userinfo. Do not mix URL credentials with option credentials on the same connection.
+URL userinfo is also supported for token and user/password connections. Do not mix URL credentials with `auth=...` on the same connection.
 
 ```julia
 token_client = connect("nats://token-value@nats.example.com:4222")
 user_client = connect("nats://app:secret@nats.example.com:4222")
 ```
 
-## NKEY And JWT Credentials
+## NKEY And JWT
 
 Use a seed file when Natter should derive the public NKEY and sign the server nonce:
 
@@ -33,7 +33,7 @@ nkey_client = connect("nats://nats.example.com:4222";
 )
 ```
 
-Use a standard decorated `.creds` file for user JWT auth:
+Use a standard `.creds` file for user JWT auth:
 
 ```julia
 creds_client = connect("nats://nats.example.com:4222";
@@ -49,7 +49,7 @@ jwt_client = connect("nats://nats.example.com:4222";
 )
 ```
 
-For HSM or external signer integrations, provide the public NKEY or JWT plus a callback that returns the raw 64-byte Ed25519 signature:
+For external signers, provide the public user NKEY or JWT plus a callback returning the raw 64-byte Ed25519 signature:
 
 ```julia
 signed_client = connect("nats://nats.example.com:4222";
@@ -60,7 +60,7 @@ signed_client = connect("nats://nats.example.com:4222";
 )
 ```
 
-Use `CallbackAuth` when credentials need to be chosen after server `INFO` is available:
+Use `CallbackAuth` when credentials depend on server `INFO`:
 
 ```julia
 client = connect("nats://nats.example.com:4222";
@@ -68,9 +68,9 @@ client = connect("nats://nats.example.com:4222";
 )
 ```
 
-## TLS Encryption
+## TLS And mTLS
 
-TLS is the supported transport encryption mode. `tls://` performs TLS before reading the server `INFO` line.
+`tls://` performs TLS before reading server `INFO`:
 
 ```julia
 tls_client = connect("tls://nats.example.com:4222";
@@ -78,7 +78,7 @@ tls_client = connect("tls://nats.example.com:4222";
 )
 ```
 
-Client certificate authentication requires both certificate and key paths:
+Client certificates require both certificate and key paths:
 
 ```julia
 mtls_client = connect("tls://nats.example.com:4222";
@@ -88,14 +88,14 @@ mtls_client = connect("tls://nats.example.com:4222";
 )
 ```
 
-For deployments that advertise TLS in `INFO` before upgrading, use `nats://` with `tls_required=true`, or force INFO-first behavior on a `tls://` URL with `tls_first=false`.
+For INFO-first TLS upgrades:
 
 ```julia
 upgrade_client = connect("nats://nats.example.com:4222"; tls_required=true)
 info_first_client = connect("tls://nats.example.com:4222"; tls_first=false)
 ```
 
-Certificate verification uses the URL host by default. IP-literal URLs must be covered by an IP subject alternative name in the server certificate. Use `tls_server_name` when connecting to an address but verifying a DNS certificate name:
+Verify a DNS certificate while dialing an IP address:
 
 ```julia
 named_cert_client = connect("tls://10.0.0.5:4222";
@@ -104,7 +104,7 @@ named_cert_client = connect("tls://10.0.0.5:4222";
 )
 ```
 
-Certificate verification is enabled by default. Disable it only in controlled development or test environments:
+Disable certificate verification only for controlled development or test environments:
 
 ```julia
 dev_client = connect("tls://127.0.0.1:4222"; tls_verify=false)

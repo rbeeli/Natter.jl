@@ -1,85 +1,140 @@
 # Reference
 
-This page summarizes the public API. Optional keyword defaults are documented in the guide pages when behavior matters. Timeout keyword values are positive finite seconds.
+This page summarizes the exported API. Guide pages show recommended usage; this page is for signatures, return types, and option names.
+
+Conventions:
+
+- Timeouts and durations are seconds.
+- Status enums are namespaced, for example `ConnectionStatus.CONNECTED` and `AckPolicy.EXPLICIT`.
+- Payload inputs may be strings, byte vectors, `nothing`, or JSON-serializable Julia values.
+- `String(msg)` works for `Msg`, `JetStreamMsg`, and `KeyValueEntry`.
+- `_async` helpers return `NatterTask`; `fetch(handle)` returns the direct-call result or rethrows the original error.
 
 ## Core Types
 
 | Type | Purpose |
 | :--- | :--- |
-| `Client` | Active client connection with background reader, ping, and reconnect tasks. |
-| `ConnectOptions` | Immutable keyword-backed connection configuration, including typed authentication, TLS verification and server-name control, reconnect, buffering, write timeout, parser, subscription, and close callback limits. |
-| `ConnectionStatus` | EnumX status namespace: `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
-| `ConnectionEventKind` | EnumX event namespace: `CONNECTED`, `DISCONNECTED`, `RECONNECT_ATTEMPT`, `RECONNECT_DELAY`, `RECONNECTED`, `DISCOVERED_SERVERS`, `TERMINAL_DISCONNECT`, `CLOSED`. |
-| `ConnectionEvent` | Lifecycle event passed to `event_cb`, with status, server, URL, attempt, delay, error, and generation fields. |
-| `NoAuth`, `TokenAuth`, `UserPassAuth`, `NKeyAuth`, `JwtAuth`, `CredentialsAuth`, `CallbackAuth` | Typed connection authentication values passed as `auth=...` to `connect` or `ConnectOptions`. |
-| `AuthRequest` | Context passed to `CallbackAuth`, including server, URL, nonce, INFO, attempt, and reconnect flag. |
-| `NatterTask` | Explicit async operation handle. Use `fetch(handle)` when code intentionally starts an operation and joins it later. Failed handles throw the same operation error that the synchronous API would throw. |
-| `Msg` | Core received message data with `subject`, `reply`, and byte-vector `data`; use `header(msg, key)` or `headers(msg)` for headers. |
-| `Headers` | Case-insensitive dictionary of header names to `Vector{String}` values; publish and request APIs also accept dictionaries with string or vector values and pair iterators. Outbound header names must be valid NATS/HTTP token field names. Mixed-case duplicates are merged under one entry, with the first inserted field spelling used for iteration and serialization. |
-| `PublishFrame` | Validated, immutable prepared core publish frame. Use `prepare_publish` when the same subject, reply, headers, and payload are published repeatedly on a hot path. |
+| `Client` | Active connection with reader, ping, reconnect, request, and subscription state. |
+| `ConnectOptions` | Immutable connection configuration built by `connect` or directly. |
+| `ConnectionStatus` | `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
+| `ConnectionEventKind` | Lifecycle event kind for `event_cb`. |
+| `ConnectionEvent` | Event passed to `event_cb`; includes kind, status, URL, attempt, delay, error, and generation. |
+| `Stats` | Snapshot of message, byte, reconnect, error, and dropped-message counters. |
+| `Msg` | Core message with `subject`, `reply`, byte-vector `data`, and optional headers. |
+| `Headers` | Case-insensitive header dictionary of `String => Vector{String}`. |
+| `PublishFrame` | Prepared core publish frame from `prepare_publish`. |
 | `Subscription` | Core subscription handle. |
-| `Stats` | Snapshot of message, byte, reconnect, error, and drop counters. |
+| `NatterTask` | Explicit task handle returned by `_async` helpers. |
+
+## Authentication Types
+
+| Type | Use |
+| :--- | :--- |
+| `NoAuth()` | No NATS authentication. |
+| `TokenAuth(token)` | Token auth. |
+| `UserPassAuth(user, password)` | Username/password auth. |
+| `NKeyAuth(; seed=...)`, `NKeyAuth(; seed_path=...)` | NKEY auth with local seed signing. |
+| `NKeyAuth(; nkey=..., signature_cb=...)` | NKEY auth with external signing. |
+| `JwtAuth(; jwt=..., seed=...)`, `JwtAuth(; jwt_path=..., seed_path=...)` | User JWT auth. |
+| `CredentialsAuth(; path=...)`, `CredentialsAuth(credentials)` | Standard decorated `.creds` auth. |
+| `CallbackAuth(f)` | Select auth after server `INFO`; `f(::AuthRequest)` returns a concrete auth value. |
+| `AuthRequest` | Callback context with server, URL, nonce, server info, attempt, and reconnect flag. |
+
+## Connect Options
+
+`connect(url_or_urls=nothing; kwargs...)` accepts one URL, a vector/tuple of URLs, or no URL for `nats://localhost:4222`.
+
+| Option | Default | Purpose |
+| :--- | :--- | :--- |
+| `name` | `nothing` | Human-readable connection name. |
+| `auth` | `NoAuth()` | One typed authentication value. |
+| `no_echo` | `false` | Do not receive this connection's own publishes. |
+| `connect_timeout` | `2.0` | Socket and handshake timeout. |
+| `ping_interval` | `120.0` | Keepalive interval. |
+| `max_outstanding_pings` | `2` | Missed keepalives before reconnect. |
+| `allow_reconnect` | `true` | Enable automatic reconnect. |
+| `reconnect_wait` | `0.5` | Initial reconnect wait. |
+| `reconnect_max_wait` | `5.0` | Maximum reconnect wait. |
+| `reconnect_jitter` | `0.1` | Added reconnect jitter. |
+| `max_reconnect_attempts` | `-1` | `-1` means unlimited attempts. |
+| `pending_size` | `2 MiB` | Buffered publish bytes retained for reconnect replay. |
+| `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |
+| `write_buffer_latency` | `0.001` | Maximum small-write coalescing delay. |
+| `write_timeout` | `10.0` | Maximum write/flush block time. |
+| `record_stats` | `false` | Enable client counters returned by `stats(client)`. |
+| `sub_pending_msgs_limit` | `1024` | Default per-subscription queued message limit. |
+| `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit. |
+| `drain_timeout` | `30.0` | Default `drain` timeout. |
+| `close_callback_timeout` | `5.0` | Wait for active callbacks during close. |
+| `inbox_prefix` | `"_INBOX"` | Prefix for generated inbox subjects. |
+| `error_cb` | warning callback | Receives background, callback, and cleanup errors. |
+| `event_cb` | no-op | Receives `ConnectionEvent` lifecycle events. |
+| `reconnect_delay_cb` | no-op | Optional reconnect delay override. |
+
+TLS options:
+
+| Option | Purpose |
+| :--- | :--- |
+| `tls_required` | Require TLS even for `nats://` URLs. |
+| `tls_first` | Force TLS-first or INFO-first behavior. |
+| `tls_verify` | Verify server certificates; default `true`. |
+| `tls_server_name` | Override SNI and certificate name verification. |
+| `tls_ca_path` | CA bundle/path. |
+| `tls_cert_path`, `tls_key_path` | Client certificate and key for mTLS. |
+
+Parser/resource limits:
+
+| Option | Default |
+| :--- | :--- |
+| `max_control_line` | `16 KiB` |
+| `max_inbound_payload` | `64 MiB` |
+| `max_header_bytes` | `64 KiB` |
+| `max_stale_pong_waiters` | `1024` |
 
 ## Core Functions
 
-| Function | Purpose |
-| :--- | :--- |
-| `connect(url_or_urls=nothing; kwargs...)` | Connect to one or more servers. |
-| `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | Publish a core message; header publishes require server INFO header support. Reconnect replay is best-effort and can duplicate retained frames after ambiguous transport failures. |
-| `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | Validate and serialize publish metadata once, returning a `PublishFrame` for repeated `publish(client, frame)` calls. |
-| `publish(client, frame::PublishFrame)` | Publish a prepared frame without repeating subject, reply, payload, or header serialization work. Server capability and size checks still run against the active client. |
-| `subscribe(client, subject; queue=nothing, callback=nothing, max_msgs=0, ...)` | Create a core subscription; positive `max_msgs` closes after that many total messages. Per-subscription pending limits must be positive. |
-| `next(sub; timeout=1.0)` | Wait for the next message from a non-callback subscription. |
-| `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | Send a request and wait for one response; request headers require server INFO header support. |
-| `flush(client; timeout=10.0)` | Wait until the server has processed previous commands. |
-| `ping(client; timeout=10.0)` | Alias for `flush`. |
-| `unsubscribe(sub; max_msgs=0)` | Unsubscribe immediately or after `max_msgs` additional messages. `max_msgs` must be non-negative. |
-| `drain(sub; timeout=...)` | Unsubscribe and wait for queued callback work within one deadline. |
-| `drain(client; timeout=...)` | Drain subscriptions and flush within one shared deadline, then close the client. |
-| `close(client; throw_errors=false, callback_timeout=nothing)` | Close transports, tasks, and subscriptions. Active callbacks are waited on without interruption for `callback_timeout` or `close_callback_timeout`. |
-| `new_inbox(client; prefix=...)` | Generate a reply inbox subject. |
-| `header(msg, key)` | Return the first header value by case-insensitive key lookup or `nothing`. |
-| `headers(msg)` | Return a copy of all message headers. |
-| `status(client)` | Return current `ConnectionStatus`. |
-| `stats(client)` | Return a `Stats` snapshot. |
-| `connected_url(client)` | Return the current server URL or `nothing`. |
+| Function | Returns | Use |
+| :--- | :--- | :--- |
+| `connect(url_or_urls=nothing; kwargs...)` | `Client` | Connect to NATS. |
+| `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | `nothing` | Publish a core message. |
+| `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | `PublishFrame` | Validate and serialize a reusable publish frame. |
+| `publish(client, frame::PublishFrame)` | `nothing` | Publish a prepared frame. |
+| `subscribe(client, subject; queue=nothing, callback=nothing, max_msgs=0, pending_msgs_limit=..., pending_bytes_limit=...)` | `Subscription` | Create a subscription. |
+| `subscribe(callback, client, subject; kwargs...)` | `Subscription` | Callback-first form. |
+| `next(sub; timeout=1.0)` | `Msg` | Wait for a message on a non-callback subscription. |
+| `unsubscribe(sub; max_msgs=0)` | `nothing` | Unsubscribe now or after more messages. |
+| `close(sub)` | `nothing` | Alias for immediate unsubscribe. |
+| `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | `Msg` | Send a request and wait for one reply. |
+| `flush(client; timeout=10.0)` | `nothing` | Wait for a server round trip. |
+| `ping(client; timeout=10.0)` | `nothing` | Alias for `flush`. |
+| `drain(sub; timeout=...)` | `nothing` | Unsubscribe and wait for queued callback work. |
+| `drain(client; timeout=...)` | `nothing` | Drain subscriptions, flush, and close. |
+| `close(client; throw_errors=false, callback_timeout=nothing)` | `nothing` | Close the client. |
+| `new_inbox(client; prefix=...)` | `String` | Generate an inbox subject. |
+| `header(msg, key)` | `Union{String,Nothing}` | First header value by case-insensitive key. |
+| `headers(msg)` | `Headers` | Copy all message headers. |
+| `status(client)` | `ConnectionStatus.T` | Current connection status. |
+| `stats(client)` | `Stats` | Counter snapshot. |
+| `connected_url(client)` | `Union{String,Nothing}` | Current server URL. |
 
-## Core Task Handle Helpers
-
-| Function | Purpose |
-| :--- | :--- |
-| `connect_async(url_or_urls=nothing; kwargs...)` | Start `connect` and return `NatterTask`. |
-| `publish_async(client, subject, data=nothing; kwargs...)` | Start core `publish` and return `NatterTask`. |
-| `publish_async(client, frame::PublishFrame)` | Start prepared-frame publish and return `NatterTask`. |
-| `subscribe_async(client, subject; kwargs...)` | Start `subscribe` and return `NatterTask`; callback-first style is supported. |
-| `next_async(sub; timeout=1.0)` | Start `next` and return `NatterTask`. |
-| `request_async(client, subject, data=nothing; kwargs...)` | Start `request` and return `NatterTask`. |
-| `flush_async(client; timeout=10.0)` | Start `flush` and return `NatterTask`. |
-| `ping_async(client; timeout=10.0)` | Start `ping` and return `NatterTask`. |
-| `unsubscribe_async(sub; max_msgs=0)` | Start `unsubscribe` and return `NatterTask`. |
-| `drain_async(client_or_sub; timeout=...)` | Start `drain` and return `NatterTask`. |
-| `close_async(client_or_sub_or_watcher; kwargs...)` | Start `close` and return `NatterTask`. |
+Core async helpers: `connect_async`, `publish_async`, `subscribe_async`, `unsubscribe_async`, `next_async`, `request_async`, `flush_async`, `ping_async`, `drain_async`, and `close_async`.
 
 ## JetStream Types
 
 | Type | Purpose |
 | :--- | :--- |
-| `JetStreamContext` | JetStream API context for a client. |
-| `StreamConfig` | Typed stream configuration with local subject, name, and numeric validation. Raw `Dict` configs use the same seconds-based duration conversion for known stream fields. |
-| `ConsumerConfig` | Typed consumer configuration with local subject, name, queue, and numeric validation. Raw `Dict` configs use the same seconds-based duration conversion for known consumer fields. |
-| `StreamLostData` | Typed lost-message summary nested under stream state. |
-| `StreamState` | Typed stream state counters, sequence bounds, subjects, deletion, and lost-data summary. |
-| `StreamInfo` | Stream info response with typed config and typed state. |
-| `ConsumerSequenceInfo` | Typed consumer/stream sequence cursor in consumer info responses. |
-| `ConsumerInfo` | Consumer info response with typed config, counters, sequence cursors, and push-bound state. |
-| `PubAck` | Publish acknowledgement with stream, sequence, duplicate, and domain. |
-| `JetStreamMsg` | JetStream consumer message data plus acknowledgement state for `ack`, `nak`, `in_progress`, and `term`. |
-| `PullSubscription` | Pull consumer handle. |
-| `PushSubscription` | Push consumer handle. |
+| `JetStreamContext` | JetStream API context from `jetstream(client)`. |
+| `StreamConfig` | Typed stream configuration. |
+| `ConsumerConfig` | Typed consumer configuration. |
+| `StreamInfo`, `StreamState`, `StreamLostData` | Typed stream info responses. |
+| `ConsumerInfo`, `ConsumerSequenceInfo` | Typed consumer info responses. |
+| `PubAck` | Publish acknowledgement. |
+| `JetStreamMsg` | Consumer message with acknowledgement state. |
+| `PullSubscription`, `PullMessageStream`, `PushSubscription` | Consumer handles. |
 
-## JetStream Enums
+Enums:
 
-| Enum Namespace | Values |
+| Namespace | Values |
 | :--- | :--- |
 | `RetentionPolicy` | `LIMITS`, `INTEREST`, `WORK_QUEUE` |
 | `StorageType` | `FILE`, `MEMORY` |
@@ -91,108 +146,81 @@ This page summarizes the public API. Optional keyword defaults are documented in
 | `ReplayPolicy` | `INSTANT`, `ORIGINAL` |
 | `PriorityPolicy` | `NONE`, `OVERFLOW`, `PINNED_CLIENT` |
 
+Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, `StreamSource`, `StreamConsumerLimits`, and `RePublish`.
+
 ## JetStream Functions
 
-| Function | Purpose |
-| :--- | :--- |
-| `jetstream(client; prefix="$JS.API", timeout=5.0)` | Create a JetStream context. |
-| `js_publish(js, subject, data=nothing; timeout=..., stream=nothing, headers=nothing, msg_id=nothing, expected_last_sequence=nothing, expected_last_subject_sequence=nothing, expected_last_subject=nothing, expected_last_msg_id=nothing, ttl=nothing, schedule=nothing, schedule_at=nothing, schedule_every=nothing, retry_attempts=0, retry_wait=0.25)` | Publish and wait for a `PubAck`; first-class options map to JetStream publish headers. Use `msg_id` with the stream duplicate window to suppress duplicate publishes caused by reconnect or retry ambiguity. |
-| `js_publish_async(js, subject, data=nothing; kwargs...)` | Start `js_publish` and return `NatterTask`. |
-| `publish_async(js, subject, data=nothing; kwargs...)` | Alias for `js_publish_async`. |
-| `stream_create(js, config)` | Create a stream from `StreamConfig` or `Dict`. |
-| `stream_update(js, config)` | Update a stream. |
-| `stream_info(js, name)` | Fetch stream info. |
-| `stream_list(js; offset=0)` | List streams, following pagination. |
-| `stream_names(js; subject=nothing)` | List stream names, optionally filtered by subject. |
-| `stream_purge(js, name; filter_subject=nothing, keep=nothing)` | Purge a stream or subject subset, optionally keeping recent messages. |
-| `stream_delete(js, name)` | Delete a stream. |
-| `stream_message_get(js, stream; seq=nothing, subject=nothing, direct=false, next_by_subject=false)` | Read a stored message. Sequence lookups require a positive sequence. |
-| `stream_message_delete(js, stream, seq)` | Delete one stored message by positive sequence. |
-| `consumer_create(js, stream, config)` | Strictly create a consumer from `ConsumerConfig` or `Dict`. |
-| `consumer_create_or_update(js, stream, config)` | Explicitly create or update a consumer. |
-| `consumer_update(js, stream, config)` | Strictly update an existing consumer. |
-| `consumer_info(js, stream, consumer)` | Fetch consumer info. |
-| `consumer_list(js, stream; offset=0)` | List consumers for a stream. |
-| `consumer_delete(js, stream, consumer)` | Delete a consumer. |
-| `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig(), timeout=...)` | Create or bind a pull subscription without mutating existing consumers. Configs with `deliver_subject` or `deliver_group` are rejected because they describe push delivery. |
-| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=...)` | Create or bind a push subscription without mutating existing consumers. Existing queue consumers require an explicit matching `queue`. Callback subscriptions receive `JetStreamMsg` and auto-ack unless `manual_ack=true` or the consumer uses `AckPolicy.NONE`; channel-backed subscriptions use `next(psub)` for `JetStreamMsg` delivery. |
-| `fetch(psub, batch=1; timeout=..., expires=<shorter than timeout>, heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | Fetch a bounded batch of `JetStreamMsg` values. `max_bytes` adds a server byte cap, and `no_wait=true` returns immediately with currently available messages. Fetches on one subscription are serialized, use unique reply subjects, ignore stale terminal statuses, and are not replayed after reconnect. |
-| `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | Start a threshold-refilled pull message stream and return `PullMessageStream`. Refill thresholds are based on messages and bytes buffered or already requested for the client. The stream supports iteration, `take!`, `wait`, `fetch`, and `close`. Only one active fetch or stream may use a pull subscription at a time. |
-| `consume(callback, psub; kwargs...)` | Start a callback worker on top of `messages`. The returned `PullMessageStream` controls shutdown and error propagation. |
-| `ack`, `ack_sync`, `nak`, `in_progress`, `term` | Acknowledge or control redelivery for `JetStreamMsg` values. Terminal acks are not queued during reconnect and remain retryable if the send fails. |
-| `metadata(msg)` | Parse JetStream delivery metadata. |
+| Function | Returns | Use |
+| :--- | :--- | :--- |
+| `jetstream(client; prefix="$JS.API", timeout=5.0)` | `JetStreamContext` | Create a context. |
+| `js_publish(js, subject, data=nothing; kwargs...)` | `PubAck` | Publish and wait for an ack. |
+| `stream_create(js, config; timeout=...)` | `StreamInfo` | Create a stream. |
+| `stream_update(js, config; timeout=...)` | `StreamInfo` | Update a stream. |
+| `stream_info(js, name; timeout=...)` | `StreamInfo` | Fetch stream info. |
+| `stream_list(js; offset=0, timeout=...)` | `Vector{StreamInfo}` | List streams. |
+| `stream_names(js; subject=nothing, timeout=...)` | `Vector{String}` | List stream names. |
+| `stream_purge(js, name; filter_subject=nothing, keep=nothing, timeout=...)` | `Bool` | Purge a stream or subject subset. |
+| `stream_delete(js, name; timeout=...)` | `Bool` | Delete a stream. |
+| `stream_message_get(js, stream; seq=nothing, subject=nothing, direct=false, next_by_subject=false, timeout=...)` | `Msg` | Read a stored message. |
+| `stream_message_delete(js, stream, seq; timeout=...)` | `Bool` | Delete one stored message. |
+| `consumer_create(js, stream, config; timeout=...)` | `ConsumerInfo` | Strict create. |
+| `consumer_create_or_update(js, stream, config; timeout=...)` | `ConsumerInfo` | Explicit upsert. |
+| `consumer_update(js, stream, config; timeout=...)` | `ConsumerInfo` | Strict update. |
+| `consumer_info(js, stream, consumer; timeout=...)` | `ConsumerInfo` | Fetch consumer info. |
+| `consumer_list(js, stream; offset=0, timeout=...)` | `Vector{ConsumerInfo}` | List consumers. |
+| `consumer_delete(js, stream, consumer; timeout=...)` | `Bool` | Delete a consumer. |
+| `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig(), timeout=...)` | `PullSubscription` | Create or bind a pull consumer. |
+| `fetch(psub, batch=1; timeout=..., expires=..., heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | `Vector{JetStreamMsg}` | Fetch a bounded batch. |
+| `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | `PullMessageStream` | Start a bounded refill stream. |
+| `consume(callback, psub; kwargs...)` | `PullMessageStream` | Run a callback over `messages`. |
+| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=...)` | `PushSubscription` | Create or bind a push consumer. |
+| `next(psub::PushSubscription; timeout=1.0)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
+| `ack(msg)`, `ack_sync(msg; timeout=1.0)`, `nak(msg; delay=nothing)`, `in_progress(msg)`, `term(msg)` | `nothing` or `Msg` | Acknowledge or control redelivery. |
+| `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
+| `close(psub)`, `close(push)`, `close(stream)` | `nothing` | Close consumer/message handles. |
 
-## JetStream Task Handle Helpers
+JetStream async helpers mirror management, publish, subscribe, fetch, close, and acknowledgement functions: `js_publish_async`, `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, and `term_async`.
 
-| Function | Purpose |
+## KeyValue Types
+
+| Type | Purpose |
 | :--- | :--- |
-| `stream_create_async(js, config)` | Start `stream_create` and return `NatterTask`. |
-| `stream_update_async(js, config)` | Start `stream_update` and return `NatterTask`. |
-| `stream_info_async(js, name)` | Start `stream_info` and return `NatterTask`. |
-| `stream_list_async(js; offset=0)` | Start `stream_list` and return `NatterTask`. |
-| `stream_names_async(js; subject=nothing)` | Start `stream_names` and return `NatterTask`. |
-| `stream_purge_async(js, name; filter_subject=nothing, keep=nothing)` | Start `stream_purge` and return `NatterTask`. |
-| `stream_delete_async(js, name)` | Start `stream_delete` and return `NatterTask`. |
-| `stream_message_get_async(js, stream; kwargs...)` | Start `stream_message_get` and return `NatterTask`. |
-| `stream_message_delete_async(js, stream, seq)` | Start `stream_message_delete` and return `NatterTask`. |
-| `consumer_create_async(js, stream, config)` | Start `consumer_create` and return `NatterTask`. |
-| `consumer_create_or_update_async(js, stream, config)` | Start `consumer_create_or_update` and return `NatterTask`. |
-| `consumer_update_async(js, stream, config)` | Start `consumer_update` and return `NatterTask`. |
-| `consumer_info_async(js, stream, consumer)` | Start `consumer_info` and return `NatterTask`. |
-| `consumer_list_async(js, stream; offset=0)` | Start `consumer_list` and return `NatterTask`. |
-| `consumer_delete_async(js, stream, consumer)` | Start `consumer_delete` and return `NatterTask`. |
-| `pull_subscribe_async(js, subject; kwargs...)` | Start `pull_subscribe` and return `NatterTask`. |
-| `push_subscribe_async(js, subject; kwargs...)` | Start `push_subscribe` and return `NatterTask`. |
-| `fetch_async(psub, batch=1; kwargs...)` | Start pull `fetch` and return `NatterTask`. |
-| `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async` | Start `JetStreamMsg` acknowledgement operations and return `NatterTask`. |
+| `KeyValue` | Bucket handle. |
+| `KeyValueEntry` | Bucket entry with `bucket`, `key`, `value`, `revision`, `created`, `delta`, and `operation`. |
+| `KeyValueOperation` | `PUT`, `DELETE`, `PURGE`. |
+| `KeyValueStatus` | Bucket status and backing stream info. |
+| `KeyValueWatcher` | Watch handle with `updates` channel and `take!(watcher)`. |
+| `KV_WATCH_INITIAL_DONE` | Sentinel emitted by channel watchers after the initial snapshot. |
 
 ## KeyValue Functions
 
-`KeyValueEntry` contains `bucket`, `key`, `value`, `revision`, `created`, `delta`, and `operation`.
-`operation` uses the `KeyValueOperation` enum namespace: `PUT`, `DELETE`, and `PURGE`.
-`KeyValueStatus` contains `bucket`, `stream`, `values`, `history`, `ttl`, `bytes`, `storage`, `replicas`, `direct`, and the backing `stream_info`.
-`KeyValueWatcher` wraps a push subscription. Channel-backed watchers yield `KeyValueEntry` values and the `KV_WATCH_INITIAL_DONE` sentinel.
+| Function | Returns | Use |
+| :--- | :--- | :--- |
+| `kv_create(js, bucket; history=1, ttl=nothing, max_bytes=-1, max_value_size=-1, storage="file", replicas=1, direct=false, compression=nothing, metadata=nothing, limit_marker_ttl=nothing, timeout=...)` | `KeyValue` | Create a bucket. |
+| `kv_open(js, bucket; timeout=...)` | `KeyValue` | Open an existing bucket. |
+| `kv_delete_bucket(kv; timeout=...)` | `Bool` | Delete the bucket. |
+| `kv_status(kv; timeout=...)` | `KeyValueStatus` | Inspect bucket state. |
+| `kv_get(kv, key; revision=nothing, direct=nothing, timeout=...)` | `KeyValueEntry` | Read a key. |
+| `kv_put(kv, key, value; revision=nothing, ttl=nothing, timeout=...)` | `Int` | Put a value and return the new revision. |
+| `kv_create_key(kv, key, value; ttl=nothing, timeout=...)` | `Int` | Put only if absent or deleted. |
+| `kv_update(kv, key, value, revision; ttl=nothing, timeout=...)` | `Int` | Put only at the expected revision. |
+| `kv_delete(kv, key; revision=nothing, timeout=...)` | `nothing` | Mark a key deleted. |
+| `kv_purge(kv, key; revision=nothing, ttl=nothing, timeout=...)` | `nothing` | Purge prior values for a key. |
+| `kv_purge_deletes(kv; older_than=1800.0, timeout=...)` | `nothing` | Remove old delete and purge markers. |
+| `kv_history(kv, key; batch=256, timeout=...)` | `Vector{KeyValueEntry}` | Read key history. |
+| `kv_keys(kv; timeout=...)` | `Vector{String}` | List active keys. |
+| `kv_watch(kv; key=">", keys=nothing, history=false, updates_only=false, ignore_deletes=false, meta_only=false, resume_revision=nothing, channel_size=256, notify_initial_done=false, timeout=...)` | `KeyValueWatcher` | Watch with a channel. |
+| `kv_watch(callback, kv; kwargs...)` | `KeyValueWatcher` | Watch with a callback. |
+| `close(watcher)` | `nothing` | Close a watcher. |
 
-| Function | Purpose |
-| :--- | :--- |
-| `kv_create(js, bucket; history=1, ttl=nothing, max_bytes=-1, max_value_size=-1, storage="file", replicas=1, direct=false, compression=nothing, metadata=nothing, limit_marker_ttl=nothing, timeout=...)` | Create a bucket. Durations are seconds; `history` is limited to 1 through 64. |
-| `kv_open(js, bucket; timeout=...)` | Open an existing bucket. |
-| `kv_delete_bucket(kv; timeout=...)` | Delete a bucket. |
-| `kv_status(kv; timeout=...)` | Return bucket status and stream-backed configuration. |
-| `kv_get(kv, key; revision=nothing, direct=nothing, timeout=...)` | Get the latest value or a revision as `KeyValueEntry`. |
-| `kv_put(kv, key, value; revision=nothing, ttl=nothing, timeout=...)` | Put a value, optionally expecting a revision or setting a per-key TTL; returns the new revision. |
-| `kv_create_key(kv, key, value; ttl=nothing, timeout=...)` | Put a value only if the key is absent or currently deleted; returns the new revision. |
-| `kv_update(kv, key, value, revision; ttl=nothing, timeout=...)` | Put a value only if the key is at `revision`; returns the new revision. |
-| `kv_delete(kv, key; revision=nothing, timeout=...)` | Mark a key deleted, optionally only if the key is at `revision`. |
-| `kv_purge(kv, key; revision=nothing, ttl=nothing, timeout=...)` | Purge a key with rollup, optionally only if the key is at `revision`; `ttl` expires the purge marker. |
-| `kv_purge_deletes(kv; older_than=1800.0, timeout=...)` | Remove delete and purge markers, keeping recent markers when `older_than` is positive. |
-| `kv_history(kv, key; batch=256, timeout=...)` | Return historical `KeyValueEntry` values for a key. |
-| `kv_keys(kv; timeout=...)` | Return active keys. |
-| `kv_watch(kv; key=">", keys=nothing, history=false, updates_only=false, ignore_deletes=false, meta_only=false, resume_revision=nothing, timeout=...)` | Watch bucket updates with a `KeyValueWatcher` and sentinel channel. |
-| `kv_watch(callback, kv; kwargs...)` | Watch bucket updates with a callback. |
-
-## KeyValue Task Handle Helpers
-
-| Function | Purpose |
-| :--- | :--- |
-| `kv_create_async(js, bucket; kwargs...)` | Start `kv_create` and return `NatterTask`. |
-| `kv_open_async(js, bucket; kwargs...)` | Start `kv_open` and return `NatterTask`. |
-| `kv_delete_bucket_async(kv; kwargs...)` | Start `kv_delete_bucket` and return `NatterTask`. |
-| `kv_status_async(kv; kwargs...)` | Start `kv_status` and return `NatterTask`. |
-| `kv_get_async(kv, key; kwargs...)` | Start `kv_get` and return `NatterTask`. |
-| `kv_put_async(kv, key, value; kwargs...)` | Start `kv_put` and return `NatterTask`; `fetch` returns the new revision. |
-| `kv_create_key_async(kv, key, value; kwargs...)` | Start `kv_create_key` and return `NatterTask`; `fetch` returns the new revision. |
-| `kv_update_async(kv, key, value, revision; kwargs...)` | Start `kv_update` and return `NatterTask`; `fetch` returns the new revision. |
-| `kv_delete_async(kv, key; kwargs...)` | Start `kv_delete` and return `NatterTask`. |
-| `kv_purge_async(kv, key; kwargs...)` | Start `kv_purge` and return `NatterTask`. |
-| `kv_purge_deletes_async(kv; kwargs...)` | Start `kv_purge_deletes` and return `NatterTask`. |
-| `kv_history_async(kv, key; kwargs...)` | Start `kv_history` and return `NatterTask`. |
-| `kv_keys_async(kv; kwargs...)` | Start `kv_keys` and return `NatterTask`. |
-| `kv_watch_async(kv; kwargs...)`, `kv_watch_async(callback, kv; kwargs...)` | Start `kv_watch` and return `NatterTask`. |
-| `close_async(watcher::KeyValueWatcher)` | Close a key-value watcher in a `NatterTask`. |
+KeyValue async helpers: `kv_create_async`, `kv_open_async`, `kv_delete_bucket_async`, `kv_status_async`, `kv_get_async`, `kv_put_async`, `kv_create_key_async`, `kv_update_async`, `kv_delete_async`, `kv_purge_async`, `kv_purge_deletes_async`, `kv_history_async`, `kv_keys_async`, `kv_watch_async`, and `close_async(watcher)`.
 
 ## Errors
 
-Public error types derive from `NatterError`: `TimeoutError`, `NoRespondersError`, `ConnectionClosedError`, `ConnectionReconnectingError`, `ConnectionDrainingError`, `ProtocolError`, `AuthenticationError`, `AuthorizationError`, `AuthenticationExpiredError`, `AuthenticationRevokedError`, `AccountAuthenticationExpiredError`, `PermissionViolationError`, `NoServersError`, `MaxPayloadError`, `OutboundBufferLimitError`, `SlowConsumerError`, `ConsumerSequenceMismatchError`, `JetStreamError`, `FetchDisconnectedError`, `KeyValueError`, `UnsupportedFeatureError`, and `CleanupError`.
+All public error types derive from `NatterError`.
 
-KeyValue-specific errors derive from `KeyValueError`: `KeyValueKeyNotFoundError`, `KeyValueKeyDeletedError`, `KeyValueWrongRevisionError`, and `KeyValueKeyExistsError`.
+Core and connection errors: `TimeoutError`, `NoRespondersError`, `ConnectionClosedError`, `ConnectionReconnectingError`, `ConnectionDrainingError`, `ProtocolError`, `AuthenticationError`, `AuthorizationError`, `AuthenticationExpiredError`, `AuthenticationRevokedError`, `AccountAuthenticationExpiredError`, `PermissionViolationError`, `NoServersError`, `MaxPayloadError`, `OutboundBufferLimitError`, `SlowConsumerError`, `UnsupportedFeatureError`, and `CleanupError`.
+
+JetStream errors: `JetStreamError`, `FetchDisconnectedError`, and `ConsumerSequenceMismatchError`.
+
+KeyValue errors: `KeyValueError`, `KeyValueKeyNotFoundError`, `KeyValueKeyDeletedError`, `KeyValueWrongRevisionError`, and `KeyValueKeyExistsError`.

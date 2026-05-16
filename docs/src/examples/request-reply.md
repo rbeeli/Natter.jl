@@ -14,13 +14,13 @@ service = subscribe(client, "time.now") do msg
 end
 
 response = request(client, "time.now", ""; timeout=1.0)
-println(String(response.data))
+println(String(response))
 
 drain(service)
 close(client)
 ```
 
-No active responder produces `NoRespondersError` when the server supports no-responder status messages.
+Handle missing responders explicitly:
 
 ```julia
 try

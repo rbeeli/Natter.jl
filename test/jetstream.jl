@@ -1630,6 +1630,16 @@ end
         @test parsed.stream_sequence == 10
     end
 
+    legacy_meta = metadata(Msg("s", "\$JS.ACK.ORDERS.C1.2.10.4.123456789", UInt8[]))
+    @test legacy_meta.stream == "ORDERS"
+    @test legacy_meta.consumer == "C1"
+    @test legacy_meta.delivered == 2
+    @test legacy_meta.stream_sequence == 10
+    @test legacy_meta.consumer_sequence == 4
+    @test legacy_meta.timestamp_ns == 123456789
+    @test legacy_meta.pending == 0
+    @test isnothing(legacy_meta.domain)
+
     meta2 = metadata(Msg("s", "\$JS.ACK._.acc.ORDERS.C1.3.11.5.987654321.8.rand", UInt8[]))
     @test meta2.domain == ""
     @test meta2.stream == "ORDERS"

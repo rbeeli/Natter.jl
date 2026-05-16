@@ -22,7 +22,8 @@ using TestItems
     @test_throws ArgumentError N._validate_publish_subject("foo.>")
     @test_throws ArgumentError N._validate_publish_subject("foo..bar")
 
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    stats_opts = N.ConnectOptions(record_stats=true)
+    client = TestHelpers.fake_client(; opts=stats_opts, status=N.ConnectionStatus.RECONNECTING)
     publish(client, "foo", "bar")
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
     @test stats(client).out_msgs == 1
@@ -592,7 +593,7 @@ end
     @test accepted_sub.pending_bytes == 0
 
     reported = Any[]
-    opts = N.ConnectOptions(error_cb=err -> push!(reported, err))
+    opts = N.ConnectOptions(record_stats=true, error_cb=err -> push!(reported, err))
     rejected = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
     rejected_sub = subscribe(rejected, "events"; pending_bytes_limit=length(hdr) - 1)
     rejected_msg = parse_header_msg(rejected, rejected_sub.sid, hdr)
@@ -1104,7 +1105,8 @@ end
 
     const N = Natter
 
-    opts = N.ConnectOptions(pending_size=64, write_buffer_size=1024 * 1024)
+    opts = N.ConnectOptions(pending_size=64, write_buffer_size=1024 * 1024,
+                            record_stats=true)
     transport = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io=N.BufferedWriteIO(transport))
@@ -1186,6 +1188,7 @@ end
     Base.close(t::FailingWriteTransport) = (t.closed = true; nothing)
 
     opts = N.ConnectOptions(write_buffer_size=0, max_reconnect_attempts=0,
+                            record_stats=true,
                             error_cb=err -> nothing)
     transport = FailingWriteTransport()
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
@@ -1410,7 +1413,9 @@ end
     Base.close(::BadWriteTransport) = nothing
 
     transport = BadWriteTransport()
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(record_stats=true),
+                                     status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
 
     publish(client, "foo", "bar")
     @test status(client) == N.ConnectionStatus.RECONNECTING
@@ -1500,7 +1505,9 @@ end
     const N = Natter
 
     transport = TestHelpers.WriteCapture()
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(record_stats=true),
+                                     status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
 
     @test_throws TimeoutError request(client, "svc", "body"; timeout=0.001, headers=("Trace" => "abc", "Trace" => "def"))
     request_frame = TestHelpers.capture_text(transport)
@@ -1534,7 +1541,9 @@ end
     Base.close(t::RequestPublishFailTransport) = (t.closed = true; nothing)
 
     transport = RequestPublishFailTransport(String[], false)
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(record_stats=true),
+                                     status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
 
     @test_throws ConnectionReconnectingError request(client, "foo", "bar"; timeout=0.001)
     @test status(client) == N.ConnectionStatus.RECONNECTING
@@ -1641,7 +1650,9 @@ end
     end
 
     transport = TestHelpers.WriteCapture()
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(record_stats=true),
+                                     status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
 
     @test_throws TimeoutError request(client, "svc", "first"; timeout=0.001)
     first_reply = only(request_publishes(transport))[1]

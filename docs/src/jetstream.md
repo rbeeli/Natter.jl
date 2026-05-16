@@ -1,71 +1,63 @@
 # JetStream
 
-JetStream support is exposed through a `JetStreamContext` created from a connected client. Timeout values are positive finite seconds.
+JetStream adds persistence, acknowledgements, durable consumers, replay, and stream management. Create a `JetStreamContext` from a connected client:
 
 ```julia
 client = connect("nats://127.0.0.1:4222")
 js = jetstream(client; timeout=5.0)
 ```
 
-## Typed Configuration
+## Create A Stream
 
-Streams and consumers use typed Julia config structs. Optional fields default to `nothing`, so only explicitly set fields are sent to the server.
-Typed configs validate known subject, name, queue, and numeric bounds locally before sending management requests.
+Use typed Julia config structs for normal code. Only fields you set are sent to the server, and common names, subjects, queues, and numeric bounds are validated locally.
 
 ```julia
 stream_create(js, StreamConfig(
     name="ORDERS",
-    subjects=["orders.*"],
+    subjects=["orders.events.*"],
     retention=RetentionPolicy.LIMITS,
     storage=StorageType.FILE,
     max_msgs=1_000_000,
     max_bytes=10 * 1024 * 1024 * 1024,
+    duplicate_window=120.0,
     allow_direct=true,
 ))
 ```
 
-Consumer configs use the same pattern:
-
-```julia
-consumer_create(js, "ORDERS", ConsumerConfig(
-    durable_name="orders-worker",
-    ack_policy=AckPolicy.EXPLICIT,
-    deliver_policy=DeliverPolicy.ALL,
-    max_ack_pending=500,
-    ack_wait=30.0,
-))
-```
-
-`consumer_create` is strict create-only and `consumer_update` is strict update-only on servers that support consumer actions. Use `consumer_create_or_update` only when create-or-update upsert behavior is intentional.
-
-Raw dictionaries are also accepted as an escape hatch for fields added by newer servers:
+Raw dictionaries are available for newer server fields that are not typed yet:
 
 ```julia
 stream_update(js, Dict(
     "name" => "ORDERS",
-    "subjects" => ["orders.*"],
+    "subjects" => ["orders.events.*"],
     "metadata" => Dict("owner" => "orders-team"),
 ))
 ```
 
-Known typed fields in raw dictionaries use the same Julia-side units as typed configs. Duration values such as `ack_wait`, `max_age`, and `backoff` are seconds and are serialized to the NATS wire format in nanoseconds.
+Duration values in typed configs and known dictionary fields are seconds.
 
-## Publish
+## Publish With Acknowledgement
 
-`js_publish` waits for a publish acknowledgement and returns a `PubAck`.
+`js_publish` waits for a server acknowledgement and returns `PubAck`.
 
 ```julia
-ack = js_publish(js, "orders.created", """{"id":1001}""";
+ack = js_publish(js, "orders.events.created", """{"id":1001}""";
     stream="ORDERS",
     msg_id="order-1001",
-    expected_last_subject_sequence=42,
-    ttl=300.0,
 )
 
 @info "stored" stream=ack.stream seq=ack.seq duplicate=ack.duplicate
 ```
 
-Publish options map to JetStream headers for deduplication, optimistic concurrency, per-message TTL, and message schedules. `msg_id` enables server-side duplicate detection within the stream `duplicate_window`, which is the recommended way to suppress duplicate publishes caused by reconnect or retry ambiguity. TTL values are seconds and must be at least `1.0`. Use `expected_last_sequence`, `expected_last_subject_sequence`, `expected_last_subject`, `expected_last_msg_id`, `schedule_at`, `schedule_every`, `schedule`, `schedule_target`, `schedule_source`, `schedule_ttl`, and `schedule_timezone` as needed. `retry_attempts` and `retry_wait` retry publish requests that receive a no-responders status.
+Use `msg_id` with the stream `duplicate_window` for retry-safe publishing. Optimistic constraints are also available:
+
+```julia
+js_publish(js, "orders.events.created", """{"id":1002}""";
+    stream="ORDERS",
+    msg_id="order-1002",
+    expected_last_subject_sequence=42,
+)
+```
 
 Publish independent messages concurrently with Julia tasks:
 
@@ -73,103 +65,58 @@ Publish independent messages concurrently with Julia tasks:
 acks = Vector{PubAck}(undef, 2)
 
 @sync begin
-    @async acks[1] = js_publish(js, "orders.created", """{"id":1001}"""; stream="ORDERS")
-    @async acks[2] = js_publish(js, "orders.created", """{"id":1002}"""; stream="ORDERS")
+    @async acks[1] = js_publish(js, "orders.events.created", """{"id":1001}"""; stream="ORDERS")
+    @async acks[2] = js_publish(js, "orders.events.created", """{"id":1002}"""; stream="ORDERS")
 end
 ```
 
-## Stream Management
+## Durable Pull Worker
+
+Pull consumers are a good default for durable workers because the application controls batch size and acknowledgement.
 
 ```julia
-info = stream_info(js, "ORDERS")
-names = stream_names(js; subject="orders.created")
-streams = stream_list(js)
-
-stream_purge(js, "ORDERS"; filter_subject="orders.failed")
-stream_delete(js, "ORDERS")
-```
-
-## Message Lookup And Direct Get
-
-Use `stream_message_get` to read a stored message by sequence or by the latest message for a subject.
-
-```julia
-by_sequence = stream_message_get(js, "ORDERS"; seq=42)
-latest_order = stream_message_get(js, "ORDERS"; subject="orders.created")
-```
-
-For streams created with `allow_direct=true`, direct get bypasses the normal management response envelope and returns the stored message directly.
-
-```julia
-fast = stream_message_get(js, "ORDERS"; seq=42, direct=true)
-last = stream_message_get(js, "ORDERS"; subject="orders.created", direct=true)
-```
-
-`next_by_subject=true` asks for the next sequence at or after `seq` for a subject.
-
-```julia
-msg = stream_message_get(js, "ORDERS";
-    seq=100,
-    subject="orders.created",
-    next_by_subject=true,
-)
-```
-
-Delete a stored message by positive stream sequence:
-
-```julia
-deleted = stream_message_delete(js, "ORDERS", 42)
-```
-
-## Pull Consumers
-
-Pull subscriptions create or bind a consumer and fetch batches on demand. Fetch calls on the same pull subscription are serialized. Durable or named consumers are bound when they already exist; any supplied config fields must match the existing consumer config. Pull subscription configs cannot set push delivery fields such as `deliver_subject` or `deliver_group`. Missing durable or named consumers are created strictly, and random ephemeral consumers are created strictly and deleted on close. Subscription setup accepts `timeout=...` for its JetStream API calls. Pull fetches return `JetStreamMsg` values, which carry the acknowledgement state needed by `ack`, `nak`, `in_progress`, and `term`.
-
-```julia
-sub = pull_subscribe(js, "orders.created";
+worker = pull_subscribe(js, "orders.events.created";
     stream="ORDERS",
     durable="orders-workers",
     timeout=2.0,
     config=ConsumerConfig(
         ack_policy=AckPolicy.EXPLICIT,
-        max_ack_pending=200,
+        ack_wait=30.0,
+        max_ack_pending=500,
     ),
 )
 
-for msg in fetch(sub, 10; timeout=2.0)
+for msg in fetch(worker, 25; timeout=2.0)
     try
-        handle_order(String(msg.data))
+        handle_order(String(msg))
         ack(msg)
     catch err
-        nak(msg; delay=1.0)
+        @error "order failed" exception=err
+        nak(msg; delay=2.0)
     end
 end
 ```
 
-Fetch requests use a unique reply subject under the pull subscription inbox, so late terminal status messages from an older request are ignored by the next request. The server-side request expiration defaults to a value shorter than the caller `timeout` (10% shorter, capped at a 5 second margin), so a timed-out local wait does not leave a live server request that can deliver data into a later fetch. Fetch requests are not replayed after reconnect. If the connection is lost before any messages arrive, `fetch` throws `FetchDisconnectedError`; retry the fetch after reconnect. JetStream delivery remains at-least-once until messages are acknowledged, so handlers should be idempotent when duplicate effects matter. For fetches with effective `expires >= 10`, Natter requests JetStream idle heartbeats and reports missed heartbeats as `JetStreamError`. Use `heartbeat=0` to disable heartbeat monitoring or set a shorter positive heartbeat explicitly; `expires` must be shorter than `timeout` and at least twice the heartbeat.
-
-Bounded fetches also support byte-limited and no-wait pull requests:
+Fetch options cover common pull request shapes:
 
 ```julia
-msgs = fetch(sub, 100; timeout=2.0, max_bytes=256 * 1024)
-available = fetch(sub, 10; timeout=1.0, no_wait=true)
+msgs = fetch(worker, 100; timeout=2.0, max_bytes=512 * 1024)
+available = fetch(worker, 10; timeout=1.0, no_wait=true)
 ```
 
-For long-running pull consumers, `messages` starts a threshold-refilled message stream. The returned `PullMessageStream` is iterable, supports `take!`, and should be closed when the worker exits. Only one active fetch or message stream may use a pull subscription at a time.
-Refills are based on the messages and bytes still buffered or already requested for the client, so a slow worker does not cause requests beyond the configured `channel_size` and `max_bytes` capacity. Pull request scheduling fields for priority consumers are available with `priority_group`, `min_pending`, `min_ack_pending`, and `priority`.
+For long-running workers, `messages` keeps a pull subscription refilled behind a bounded channel:
 
 ```julia
-stream = messages(sub;
+stream = messages(worker;
     batch=100,
-    max_bytes=1024 * 1024,
     threshold_messages=50,
-    threshold_bytes=512 * 1024,
     expires=30.0,
+    channel_size=100,
 )
 
 try
     for msg in stream
-        process(String(msg))
+        handle_order(String(msg))
         ack(msg)
     end
 finally
@@ -177,54 +124,47 @@ finally
 end
 ```
 
-Use `consume` when a callback-oriented worker is a better fit:
+Use `consume` for a callback worker:
 
 ```julia
-worker = consume(sub; batch=100, expires=30.0) do msg
-    process(String(msg))
+worker_stream = consume(worker; batch=100, expires=30.0) do msg
+    handle_order(String(msg))
     ack(msg)
 end
 
-close(worker)
+close(worker_stream)
 ```
 
-To process a fetched batch concurrently, use a structured `@sync` boundary:
-
-```julia
-msgs = fetch(sub, 10; timeout=2.0)
-
-@sync for msg in msgs
-    @async begin
-        try
-            handle_order(String(msg.data))
-            ack(msg)
-        catch err
-            nak(msg; delay=1.0)
-        end
-    end
-end
-```
-
-Close ephemeral subscriptions when finished. Durable consumers remain on the server.
-
-```julia
-close(sub)
-```
+Only one active `fetch`, `messages`, or `consume` stream should use a pull subscription at a time.
 
 ## Push Consumers
 
-Push subscriptions deliver messages to a normal NATS subscription. Durable or named push consumers bind to existing consumers without updating server-side config; supplied config fields must match. Queue groups can be set with `queue` or `ConsumerConfig(deliver_group=...)`; when both are present, they must match. Binding an existing queue push consumer requires the `queue` keyword to match the consumer deliver group. If no durable or name is supplied for a queue push subscription, the queue group is used as the durable consumer name so additional subscribers join the same server-side consumer. Existing non-queue push consumers cannot be bound by a second subscription while the server reports them as push-bound; use a queue group when multiple subscribers should share one push consumer. Subscription setup accepts `timeout=...` for its JetStream API calls. Non-queue push consumers with idle heartbeats report missed heartbeats through `error_cb`, ignore heartbeat control messages, and reply only to flow-control requests. Push callbacks and channel-backed `next(sub)` calls receive `JetStreamMsg` values; callback-backed push subscriptions are callback-only. Callback push subscriptions auto-ack by default for acking consumers; `AckPolicy.NONE` consumers are not auto-acked. Set `manual_ack=true` when the callback will acknowledge messages itself.
+Push consumers deliver through a NATS subscription. Callback subscriptions auto-ack by default for acking consumers; set `manual_ack=true` when the callback handles acknowledgements itself.
 
 ```julia
-sub = push_subscribe(js, "orders.created";
+push = push_subscribe(js, "orders.events.created";
     stream="ORDERS",
     durable="orders-push",
-    timeout=2.0,
     manual_ack=true,
+    config=ConsumerConfig(
+        ack_policy=AckPolicy.EXPLICIT,
+        idle_heartbeat=10.0,
+    ),
     callback=msg -> begin
-        handle_order(String(msg.data))
+        handle_order(String(msg))
         ack(msg)
     end,
+)
+```
+
+Use a queue group when several push subscribers should share one server-side consumer:
+
+```julia
+push = push_subscribe(js, "orders.events.created";
+    stream="ORDERS",
+    durable="orders-push-workers",
+    queue="orders-workers",
+    callback=msg -> handle_order(String(msg)),
 )
 ```
 
@@ -238,6 +178,52 @@ in_progress(msg)
 term(msg)
 ```
 
-Terminal acknowledgements (`ack`, `nak`, and `term`) are written through the active transport and are not queued for reconnect replay. If the client is reconnecting or the write fails before Natter can confirm the transport write, the call throws and the local message can be acknowledged again. `ack_sync` additionally waits for the server acknowledgement response.
+`ack_sync` waits for a server reply. Use `in_progress` for work that may exceed `ack_wait`, and `term` when a message should not be redelivered.
 
-Use `metadata(msg)` for JetStream delivery metadata on received consumer messages.
+Delivery metadata is available on JetStream messages:
+
+```julia
+md = metadata(msg)
+@info "delivery" stream=md.stream sequence=md.stream_sequence pending=md.pending
+```
+
+## Inspect Stored Messages
+
+Read stored messages by sequence or subject:
+
+```julia
+by_sequence = stream_message_get(js, "ORDERS"; seq=42)
+latest_order = stream_message_get(js, "ORDERS"; subject="orders.events.created")
+```
+
+For streams created with `allow_direct=true`, direct reads avoid the normal management response envelope:
+
+```julia
+fast = stream_message_get(js, "ORDERS"; seq=42, direct=true)
+```
+
+Delete a stored message by sequence:
+
+```julia
+stream_message_delete(js, "ORDERS", 42)
+```
+
+## Manage Streams And Consumers
+
+```julia
+info = stream_info(js, "ORDERS")
+names = stream_names(js; subject="orders.events.created")
+streams = stream_list(js)
+
+consumer_create(js, "ORDERS", ConsumerConfig(
+    durable_name="audit-reader",
+    ack_policy=AckPolicy.EXPLICIT,
+    deliver_policy=DeliverPolicy.ALL,
+))
+
+consumer_info(js, "ORDERS", "audit-reader")
+consumer_delete(js, "ORDERS", "audit-reader")
+stream_purge(js, "ORDERS"; filter_subject="orders.events.failed")
+```
+
+`consumer_create` is strict create-only, `consumer_update` is strict update-only, and `consumer_create_or_update` is the explicit upsert API.

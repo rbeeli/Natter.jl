@@ -1,6 +1,6 @@
 # KeyValue Store
 
-This example uses a KeyValue bucket with direct reads enabled.
+This recipe uses a KeyValue bucket with direct reads and optimistic writes.
 
 ```julia
 using Natter
@@ -14,23 +14,34 @@ kv = kv_create(js, "profiles";
     max_bytes=256 * 1024 * 1024,
     storage=StorageType.FILE,
     direct=true,
-    compression=true,
     metadata=Dict("app" => "profiles"),
 )
 
 created_revision = kv_create_key(kv, "users.42.name", "Ada")
-kv_update(kv, "users.42.name", "Ada Lovelace", created_revision)
+updated_revision = kv_update(kv, "users.42.name", "Ada Lovelace", created_revision)
 
 current = kv_get(kv, "users.42.name"; timeout=2.0)
-@assert current.key == "users.42.name"
-@assert String(current.value) == "Ada Lovelace"
+@assert current.revision == updated_revision
+@assert String(current) == "Ada Lovelace"
+```
 
+Read history and active keys:
+
+```julia
 for version in kv_history(kv, "users.42.name")
-    @info "profile version" revision=version.revision value=String(version.value)
+    @info "profile version" revision=version.revision value=String(version)
 end
 
+for key in kv_keys(kv)
+    @info "profile key" key
+end
+```
+
+Watch a subset of keys:
+
+```julia
 watcher = kv_watch(kv; key="users.*.name") do entry
-    @info "profile changed" key=entry.key operation=entry.operation value=String(entry.value)
+    @info "profile changed" key=entry.key operation=entry.operation value=String(entry)
 end
 
 kv_put(kv, "users.7.name", "Grace Hopper")
@@ -40,9 +51,21 @@ close(watcher)
 close(client)
 ```
 
-`kv_get(kv, key; direct=false)` can force the management API path for troubleshooting or compatibility.
+Handle optimistic-write conflicts:
 
-Independent KeyValue reads can run concurrently with Julia tasks:
+```julia
+try
+    kv_update(kv, "users.42.name", "Ada", 1)
+catch err
+    if err isa KeyValueWrongRevisionError
+        @warn "profile changed; reload and retry"
+    else
+        rethrow()
+    end
+end
+```
+
+Run independent reads concurrently with Julia tasks:
 
 ```julia
 name = Ref{KeyValueEntry}()

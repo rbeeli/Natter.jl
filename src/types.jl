@@ -22,7 +22,7 @@ struct AtomicCounter
 end
 
 function AtomicCounter(value::Int=0)
-    shards = [Threads.Atomic{Int}(0) for _ in 1:max(1, Threads.nthreads())]
+    shards = [Threads.Atomic{Int}(0) for _ in 1:max(1, Threads.maxthreadid())]
     shards[1][] = value
     AtomicCounter(shards)
 end
@@ -51,7 +51,7 @@ AtomicStats(stats::Stats) = AtomicStats(; in_msgs=stats.in_msgs, out_msgs=stats.
 
 @inline function _stat_add!(counter::AtomicCounter, value::Int=1)
     shards = counter.shards
-    @inbounds Threads.atomic_add!(shards[min(Threads.threadid(), length(shards))], value)
+    @inbounds Threads.atomic_add!(shards[Threads.threadid()], value)
     nothing
 end
 
@@ -171,6 +171,27 @@ const HeaderStorage = Union{Headers,LazyHeaders,Nothing}
 abstract type AbstractNatterClient end
 abstract type AbstractMsg end
 abstract type _AbstractPublishFrame end
+
+struct ImmutableBytes <: AbstractVector{UInt8}
+    data::Vector{UInt8}
+    function ImmutableBytes(data::Vector{UInt8}; copy::Bool=true)
+        new(copy ? Base.copy(data) : data)
+    end
+end
+
+ImmutableBytes(bytes::AbstractVector{UInt8}) =
+    ImmutableBytes(Vector{UInt8}(bytes); copy=false)
+
+Base.IndexStyle(::Type{ImmutableBytes}) = IndexLinear()
+Base.size(bytes::ImmutableBytes) = size(bytes.data)
+Base.length(bytes::ImmutableBytes) = length(bytes.data)
+Base.getindex(bytes::ImmutableBytes, i::Int) = getindex(bytes.data, i)
+Base.firstindex(bytes::ImmutableBytes) = firstindex(bytes.data)
+Base.lastindex(bytes::ImmutableBytes) = lastindex(bytes.data)
+Base.copy(bytes::ImmutableBytes) = copy(bytes.data)
+Base.copyto!(dest::Vector{UInt8}, destpos::Int, bytes::ImmutableBytes, srcpos::Int, n::Int) =
+    copyto!(dest, destpos, bytes.data, srcpos, n)
+Base.write(io::IO, bytes::ImmutableBytes) = write(io, bytes.data)
 
 struct _PendingEntry
     data::Vector{UInt8}
@@ -599,6 +620,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
     write_buffer_size::Int
     write_buffer_latency::Float64
     write_timeout::Float64
+    record_stats::Bool
     max_control_line::Int
     max_inbound_payload::Int
     max_header_bytes::Int
@@ -617,6 +639,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
         max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
+        record_stats,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
         sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
         inbox_prefix,
@@ -641,6 +664,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         write_buffer_size = _connect_option_nonnegative_int("write_buffer_size", write_buffer_size)
         write_buffer_latency = _connect_option_nonnegative_float("write_buffer_latency", write_buffer_latency)
         write_timeout = _connect_option_positive_float("write_timeout", write_timeout)
+        record_stats isa Bool || throw(ArgumentError("record_stats must be a Bool"))
         max_control_line = _connect_option_positive_int("max_control_line", max_control_line)
         max_inbound_payload = _connect_option_positive_int("max_inbound_payload", max_inbound_payload)
         max_header_bytes = _connect_option_positive_int("max_header_bytes", max_header_bytes)
@@ -655,7 +679,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
             tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
             max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
-            max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
+            record_stats, max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
             sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
             inbox_prefix,
             error_cb, event_cb, reconnect_delay_cb)
@@ -721,6 +745,7 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                         reconnect_jitter=0.1, max_reconnect_attempts=-1,
                         pending_size=2 * 1024 * 1024, write_buffer_size=DEFAULT_WRITE_BUFFER_SIZE,
                         write_buffer_latency=0.001, write_timeout=DEFAULT_WRITE_TIMEOUT,
+                        record_stats=false,
                         max_control_line=DEFAULT_MAX_CONTROL_LINE,
                         max_inbound_payload=DEFAULT_MAX_INBOUND_PAYLOAD,
                         max_header_bytes=DEFAULT_MAX_HEADER_BYTES,
@@ -735,7 +760,7 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                    ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
                    reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
                    write_buffer_size, write_buffer_latency, write_timeout,
-                   max_control_line, max_inbound_payload,
+                   record_stats, max_control_line, max_inbound_payload,
                    max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
                    sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
                    inbox_prefix, error_cb, event_cb, reconnect_delay_cb)
@@ -1170,6 +1195,7 @@ mutable struct MsgQueue{T}
     buffer::Vector{T}
     empty::T
     head::Int
+    tail::Int
     len::Int
     closed::Bool
 end
@@ -1178,7 +1204,7 @@ function MsgQueue{T}(capacity::Int, empty::T) where {T}
     capacity > 0 || throw(ArgumentError("message queue capacity must be positive"))
     buffer = Vector{T}(undef, capacity)
     fill!(buffer, empty)
-    MsgQueue{T}(buffer, empty, 1, 0, false)
+    MsgQueue{T}(buffer, empty, 1, 1, 0, false)
 end
 
 MsgQueue{Msg}(capacity::Int) = MsgQueue{Msg}(capacity, EMPTY_MSG)
@@ -1189,17 +1215,22 @@ Base.isopen(q::MsgQueue) = !q.closed
 Base.isready(q::MsgQueue) = q.len > 0
 Base.n_avail(q::MsgQueue) = q.len
 Base.length(q::MsgQueue) = q.len
+_queue_capacity(q::MsgQueue) = length(q.buffer)
 
 function Base.close(q::MsgQueue)
     q.closed = true
     q
 end
 
+@inline function _queue_next_index(q::MsgQueue, index::Int)::Int
+    index == length(q.buffer) ? 1 : index + 1
+end
+
 function Base.put!(q::MsgQueue{T}, msg::T) where {T}
     q.closed && throw(InvalidStateException("message queue is closed", :closed))
     q.len < length(q.buffer) || throw(InvalidStateException("message queue is full", :open))
-    idx = mod1(q.head + q.len, length(q.buffer))
-    q.buffer[idx] = msg
+    q.buffer[q.tail] = msg
+    q.tail = _queue_next_index(q, q.tail)
     q.len += 1
     q
 end
@@ -1209,7 +1240,12 @@ function Base.take!(q::MsgQueue{T}) where {T}
     msg = q.buffer[q.head]
     q.buffer[q.head] = q.empty
     q.len -= 1
-    q.head = q.len == 0 ? 1 : mod1(q.head + 1, length(q.buffer))
+    if q.len == 0
+        q.head = 1
+        q.tail = 1
+    else
+        q.head = _queue_next_index(q, q.head)
+    end
     msg
 end
 

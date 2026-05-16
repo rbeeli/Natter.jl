@@ -303,14 +303,40 @@ function _kv_report_cleanup_error(kv::KeyValue, operation::String, err)
     nothing
 end
 
-function _kv_record_key!(latest::Dict{String,Tuple{Int,Bool}}, prefix::String, msg::AbstractMsg)
+function _kv_record_key_pending!(latest::Dict{String,Tuple{Int,Bool}}, prefix::String, msg::AbstractMsg)::Int
     startswith(msg.subject, prefix) ||
         throw(ProtocolError("key-value keys consumer received subject outside bucket prefix"))
     key = String(chop(msg.subject; head=length(prefix), tail=0))
-    seq = _parse_msg_metadata(msg).stream_sequence
+    meta = _parse_msg_metadata(msg)
+    seq = meta.stream_sequence
     current_seq = get(latest, key, (0, false))[1]
     seq >= current_seq && (latest[key] = (seq, _kv_key_active(msg)))
+    meta.pending
+end
+
+function _kv_record_key!(latest::Dict{String,Tuple{Int,Bool}}, prefix::String, msg::AbstractMsg)
+    _kv_record_key_pending!(latest, prefix, msg)
     latest
+end
+
+function _kv_history_chunk_pending!(entries::Vector{KeyValueEntry}, kv::KeyValue,
+                                    chunk::AbstractVector{<:AbstractMsg})::Int
+    pending = 0
+    for msg in chunk
+        entry = _kv_entry_from_consumer_msg(kv, msg)
+        push!(entries, entry)
+        pending = entry.delta
+    end
+    pending
+end
+
+function _kv_keys_chunk_pending!(latest::Dict{String,Tuple{Int,Bool}}, prefix::String,
+                                 chunk::AbstractVector{<:AbstractMsg})::Int
+    pending = 0
+    for msg in chunk
+        pending = _kv_record_key_pending!(latest, prefix, msg)
+    end
+    pending
 end
 
 _kv_active_keys(latest::Dict{String,Tuple{Int,Bool}})::Vector{String} =
@@ -522,10 +548,8 @@ function kv_history(kv::KeyValue, key::AbstractString; batch=256, timeout::Real=
                 _kv_throw_if_deadline_expired(deadline, "key-value history")
                 break
             end
-            for msg in chunk
-                push!(entries, _kv_entry_from_consumer_msg(kv, msg))
-            end
-            if length(chunk) < batch
+            pending = _kv_history_chunk_pending!(entries, kv, chunk)
+            if pending == 0
                 _kv_throw_if_deadline_expired(deadline, "key-value history")
                 break
             end
@@ -557,10 +581,8 @@ function kv_keys(kv::KeyValue; timeout::Real=kv.js.timeout)
                 _kv_throw_if_deadline_expired(deadline, "key-value keys")
                 break
             end
-            for msg in chunk
-                _kv_record_key!(latest, kv.prefix, msg)
-            end
-            if length(chunk) < 256
+            pending = _kv_keys_chunk_pending!(latest, kv.prefix, chunk)
+            if pending == 0
                 _kv_throw_if_deadline_expired(deadline, "key-value keys")
                 break
             end

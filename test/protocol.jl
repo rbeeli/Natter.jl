@@ -310,7 +310,7 @@ end
     plain_frame = N.PublishFrame("foo", nothing, plain_payload, UInt8[])
     push!(plain_payload, UInt8('!'))
     @test collect(plain_frame.payload) == TestHelpers.bytes("hi")
-    @test plain_frame.payload isa Base.CodeUnits{UInt8,String}
+    @test plain_frame.payload isa N.ImmutableBytes
     @test plain_frame.headers isa Base.CodeUnits{UInt8,String}
     @test_throws MethodError push!(plain_frame.payload, 0x41)
 

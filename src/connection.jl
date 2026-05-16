@@ -764,28 +764,33 @@ function _throw_errors(errors::Vector)
 end
 
 function _record_error!(client::Client)
+    client.options.record_stats || return nothing
     _stat_add!(client.stats.errors)
     nothing
 end
 
 function _record_in!(client::Client, bytes::Int)
+    client.options.record_stats || return nothing
     _stat_add!(client.stats.in_msgs)
     _stat_add!(client.stats.in_bytes, bytes)
     nothing
 end
 
 function _record_out!(client::Client, bytes::Int)
+    client.options.record_stats || return nothing
     _stat_add!(client.stats.out_msgs)
     _stat_add!(client.stats.out_bytes, bytes)
     nothing
 end
 
 function _record_drop!(client::Client)
+    client.options.record_stats || return nothing
     _stat_add!(client.stats.dropped_msgs)
     nothing
 end
 
 function _record_reconnect!(client::Client)
+    client.options.record_stats || return nothing
     _stat_add!(client.stats.reconnects)
     nothing
 end

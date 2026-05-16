@@ -1,28 +1,35 @@
 # Getting Started
 
-## Add The Package
+## Install
 
-For a checked-out repository, activate the project and instantiate dependencies:
+In an application project:
 
-```bash
-julia --project=. -e 'using Pkg; Pkg.instantiate()'
+```julia
+using Pkg
+Pkg.add(url="https://github.com/rbeeli/Natter.jl")
 ```
 
-For application projects, add Natter.jl as a normal Julia dependency and import it with:
+Then import the package:
 
 ```julia
 using Natter
 ```
 
-## Run A Local Server
+For this repository, instantiate the local project instead:
 
-Most examples assume a local NATS server:
+```bash
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+```
+
+## Run NATS Locally
+
+Core messaging:
 
 ```bash
 docker run --rm -p 4222:4222 nats:2.11-alpine
 ```
 
-JetStream and KeyValue examples need JetStream enabled:
+JetStream and KeyValue:
 
 ```bash
 docker run --rm -p 4222:4222 nats:2.11-alpine -js
@@ -31,27 +38,24 @@ docker run --rm -p 4222:4222 nats:2.11-alpine -js
 ## Connect
 
 ```julia
-using Natter
-
 client = connect("nats://127.0.0.1:4222";
     name="orders-api",
     connect_timeout=2.0,
 )
 ```
 
-`connect` also accepts multiple URLs. The client tries servers in order and keeps discovered servers for reconnects.
+Use multiple URLs for failover:
 
 ```julia
 client = connect([
     "nats://nats-a.internal:4222",
     "nats://nats-b.internal:4222",
-    "nats://nats-c.internal:4222",
 ])
 ```
 
-See [Connection Auth And TLS](examples/connection-auth-tls.md) for token, user/password, NKEY/JWT, `.creds`, TLS, and client certificate examples.
-
 ## Publish And Subscribe
+
+Channel-style subscriptions are useful in scripts and tests:
 
 ```julia
 sub = subscribe(client, "orders.created")
@@ -59,32 +63,91 @@ sub = subscribe(client, "orders.created")
 publish(client, "orders.created", "order-1001")
 msg = next(sub; timeout=1.0)
 
-@assert String(msg.data) == "order-1001"
+@assert String(msg) == "order-1001"
 close(sub)
 ```
 
-Callbacks are run by a Julia task owned by the subscription:
+Callbacks are the usual service style:
 
 ```julia
 sub = subscribe(client, "orders.created") do msg
-    @info "new order" id=String(msg.data)
-end
-```
-
-Run independent work concurrently with Julia tasks:
-
-```julia
-@sync begin
-    @async publish(client, "orders.created", "order-1002")
-    @async publish(client, "orders.created", "order-1003")
+    @info "new order" id=String(msg)
 end
 
+publish(client, "orders.created", "order-1002")
 flush(client)
 ```
 
-## Close Cleanly
+Use queue groups when many workers should share one subject:
 
-Use `drain` when a service is shutting down and should finish in-flight messages first. The timeout is one overall deadline for draining work. Use `close` for immediate teardown.
+```julia
+worker = subscribe(client, "orders.process"; queue="order-workers") do msg
+    process_order(String(msg))
+end
+```
+
+## Request Reply
+
+```julia
+service = subscribe(client, "orders.lookup") do msg
+    isnothing(msg.reply) && return
+    publish(client, msg.reply, lookup_order(String(msg)))
+end
+
+response = request(client, "orders.lookup", "order-1001"; timeout=1.0)
+println(String(response))
+```
+
+## JetStream In One Minute
+
+Start the server with `-js`, then create a stream and publish with acknowledgements:
+
+```julia
+js = jetstream(client)
+
+stream_create(js, StreamConfig(
+    name="ORDERS",
+    subjects=["orders.events.*"],
+    storage=StorageType.FILE,
+    duplicate_window=120.0,
+))
+
+ack = js_publish(js, "orders.events.created", "order-1001";
+    stream="ORDERS",
+    msg_id="order-1001",
+)
+```
+
+Create a durable pull worker:
+
+```julia
+worker = pull_subscribe(js, "orders.events.created";
+    stream="ORDERS",
+    durable="order-workers",
+    config=ConsumerConfig(ack_policy=AckPolicy.EXPLICIT),
+)
+
+for msg in fetch(worker, 10; timeout=2.0)
+    process_order(String(msg))
+    ack(msg)
+end
+```
+
+## KeyValue In One Minute
+
+```julia
+kv = kv_create(js, "settings"; history=5, direct=true)
+
+revision = kv_put(kv, "checkout.currency", "CHF")
+entry = kv_get(kv, "checkout.currency")
+
+@assert entry.revision == revision
+@assert String(entry) == "CHF"
+```
+
+## Shutdown
+
+Use `drain` when shutdown should finish queued subscription work first. Use `close` for immediate teardown.
 
 ```julia
 drain(client; timeout=10.0)
