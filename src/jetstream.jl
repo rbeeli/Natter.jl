@@ -134,6 +134,8 @@ const _JS_DESC_BATCH_COMPLETED = "batch completed"
 const _JS_DESC_SERVER_SHUTDOWN = "server shutdown"
 const _JS_ERR_CONSUMER_NAME_EXISTS = 10013
 const _JS_ERR_CONSUMER_ALREADY_EXISTS = 10105
+const _JS_HEADER_CONSUMER_STALLED = "Nats-Consumer-Stalled"
+const _JS_HEADER_LAST_CONSUMER = "Nats-Last-Consumer"
 
 function _jetstream_control_status(msg::Msg)
     isempty(msg.data) || return nothing
@@ -1220,9 +1222,28 @@ function _close_subscription_from_control!(sub::Subscription)
     nothing
 end
 
-function _record_subscription_data_received!(handler::_JetStreamPushControlHandler)
-    handler.flow_control[] || return nothing
-    Threads.atomic_add!(handler.flow_incoming, one(UInt64))
+function _push_msg_metadata(msg::Msg)
+    reply = msg.reply
+    isnothing(reply) && return nothing
+    startswith(reply, _JS_ACK_PREFIX) || return nothing
+    try
+        _parse_msg_metadata(reply)
+    catch err
+        err isa JetStreamError || err isa ProtocolError || err isa ArgumentError ||
+            err isa OverflowError || rethrow()
+        nothing
+    end
+end
+
+function _record_subscription_data_received!(handler::_JetStreamPushControlHandler, msg::Msg)
+    handler.flow_control[] && Threads.atomic_add!(handler.flow_incoming, one(UInt64))
+    handler.ordered && return nothing
+    parsed = _push_msg_metadata(msg)
+    isnothing(parsed) && return nothing
+    @lock handler.lock begin
+        handler.next_consumer_seq = parsed.consumer_sequence + 1
+        handler.last_stream_seq = parsed.stream_sequence
+    end
     nothing
 end
 
@@ -1259,7 +1280,8 @@ function _handle_subscription_control(handler::_JetStreamPushControlHandler, sub
     if action == :flow_control
         _schedule_or_reply_to_flow_control(sub, handler, msg)
     elseif action == :idle_heartbeat
-        _handle_ordered_push_heartbeat!(handler, sub, msg)
+        _reply_to_consumer_stalled!(sub, msg)
+        _handle_push_sequence_heartbeat!(handler, sub, msg)
     elseif !isnothing(err)
         _report_error(sub.client, err)
     end
@@ -1289,7 +1311,7 @@ function _push_heartbeat_monitor(psub::PushSubscription, handler::_JetStreamPush
         missed = time() - handler.last_seen[] > 2 * interval
         if missed
             if handler.ordered
-                reset_seq = @lock handler.lock handler.ordered_last_stream_seq + 1
+                reset_seq = @lock handler.lock handler.last_stream_seq + 1
                 try
                     _request_ordered_push_reset!(handler, reset_seq)
                 catch err
@@ -1353,6 +1375,13 @@ function _publish_flow_control_reply(sub::Subscription, reply::String)
     nothing
 end
 
+function _reply_to_consumer_stalled!(sub::Subscription, msg::Msg)
+    reply = header(msg, _JS_HEADER_CONSUMER_STALLED)
+    isnothing(reply) && return nothing
+    !isempty(reply) && _publish_flow_control_reply(sub, reply)
+    nothing
+end
+
 function _schedule_or_reply_to_flow_control(sub::Subscription, handler::_JetStreamPushControlHandler, msg::Msg)
     if isnothing(msg.reply)
         _report_error(sub.client, JetStreamError(_JS_STATUS_CONTROL, nothing, "flow control request missing reply subject"))
@@ -1390,8 +1419,8 @@ function _request_ordered_push_reset!(handler::_JetStreamPushControlHandler, sta
         handler.ordered || return nothing
         handler.ordered_resetting && return nothing
         handler.ordered_resetting = true
-        handler.ordered_next_consumer_seq = 1
-        handler.ordered_last_stream_seq = max(0, start_seq - 1)
+        handler.next_consumer_seq = 1
+        handler.last_stream_seq = max(0, start_seq - 1)
         handler.flow_incoming[] = UInt64(0)
         handler.flow_delivered = UInt64(0)
         handler.flow_reply = nothing
@@ -1414,21 +1443,15 @@ end
 
 function _handle_ordered_push_data!(handler::_JetStreamPushControlHandler, client::Client, msg::Msg)::Bool
     handler.ordered || return false
-    reply = msg.reply
-    isnothing(reply) && return false
-    parsed = try
-        _parse_msg_metadata(reply)
-    catch err
-        err isa ProtocolError || rethrow()
-        return false
-    end
+    parsed = _push_msg_metadata(msg)
+    isnothing(parsed) && return false
     reset_seq = @lock handler.lock begin
         handler.ordered || return 0
-        if parsed.consumer_sequence != handler.ordered_next_consumer_seq
-            handler.ordered_last_stream_seq + 1
+        if parsed.consumer_sequence != handler.next_consumer_seq
+            handler.last_stream_seq + 1
         else
-            handler.ordered_next_consumer_seq = parsed.consumer_sequence + 1
-            handler.ordered_last_stream_seq = parsed.stream_sequence
+            handler.next_consumer_seq = parsed.consumer_sequence + 1
+            handler.last_stream_seq = parsed.stream_sequence
             0
         end
     end
@@ -1443,15 +1466,28 @@ end
 
 _handle_ordered_push_data!(::_SubscriptionControlHandler, ::Client, ::Msg)::Bool = false
 
-function _handle_ordered_push_heartbeat!(handler::_JetStreamPushControlHandler, sub::Subscription, msg::Msg)
-    handler.ordered || return nothing
-    last_consumer = _header_int(msg, "Nats-Last-Consumer")
+function _handle_push_sequence_heartbeat!(handler::_JetStreamPushControlHandler, sub::Subscription, msg::Msg)
+    last_consumer = _header_int(msg, _JS_HEADER_LAST_CONSUMER)
     isnothing(last_consumer) && return nothing
-    reset_seq = @lock handler.lock begin
-        handler.ordered || return 0
-        delivered = handler.ordered_next_consumer_seq - 1
-        last_consumer > delivered ? handler.ordered_last_stream_seq + 1 : 0
+    reset_seq = 0
+    report_err::Union{ConsumerSequenceMismatchError,Nothing} = nothing
+    have_sequence = false
+    @lock handler.lock begin
+        have_sequence = handler.last_stream_seq > 0
+        if have_sequence
+            delivered = handler.next_consumer_seq - 1
+            if last_consumer != delivered
+                if handler.ordered
+                    last_consumer > delivered && (reset_seq = handler.last_stream_seq + 1)
+                else
+                    report_err = ConsumerSequenceMismatchError(max(1, handler.last_stream_seq),
+                                                               delivered, last_consumer)
+                end
+            end
+        end
     end
+    have_sequence || return nothing
+    isnothing(report_err) || return _report_error(sub.client, report_err)
     reset_seq == 0 && return nothing
     try
         _request_ordered_push_reset!(handler, reset_seq)
@@ -1840,7 +1876,7 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
                     !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
                     if action in (:idle_heartbeat, :flow_control, :control)
                         continue
-                    elseif action in (:no_messages, :timeout, :batch_completed)
+                    elseif action in (:no_messages, :timeout, :batch_completed, :max_bytes_exceeded)
                         break
                     elseif action == :message
                         push!(msgs, JetStreamMsg(msg, psub.js.client))
@@ -2148,7 +2184,7 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
                 !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
                 if action in (:idle_heartbeat, :flow_control, :control)
                     continue
-                elseif action in (:no_messages, :timeout, :batch_completed)
+                elseif action in (:no_messages, :timeout, :batch_completed, :max_bytes_exceeded)
                     @lock stream.state.lock deleteat!(stream.state.requests, request_index)
                     _pull_stream_maybe_refill!(stream, config)
                     continue
@@ -2378,8 +2414,8 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
             base_config = ordered_base_config::Dict{String,Any}
             @lock control_handler.lock begin
                 control_handler.ordered = true
-                control_handler.ordered_next_consumer_seq = 1
-                control_handler.ordered_last_stream_seq = 0
+                control_handler.next_consumer_seq = 1
+                control_handler.last_stream_seq = 0
                 control_handler.ordered_resetting = false
                 control_handler.ordered_reset_callback =
                     start_seq -> _schedule_ordered_push_reset!(psub, base_config, start_seq)

@@ -488,7 +488,7 @@ function _subscription_processor(sub::Subscription, callback::Callback) where {C
 end
 
 _handle_subscription_control(::_NoSubscriptionControlHandler, _sub::Subscription, _msg::Msg)::Bool = false
-_record_subscription_data_received!(::_SubscriptionControlHandler) = nothing
+_record_subscription_data_received!(::_SubscriptionControlHandler, ::Msg) = nothing
 _maybe_reply_to_subscription_flow_control!(::Subscription, ::_SubscriptionControlHandler) = nothing
 
 function _request_mux_token(prefix::String, subject::String)::Union{SubString{String},Nothing}
@@ -601,7 +601,7 @@ function _dispatch_msg(client::Client, msg::Msg)
         return
     end
     _record_in!(client, length(msg.data))
-    _record_subscription_data_received!(control_handler)
+    _record_subscription_data_received!(control_handler, msg)
     if should_close
         _close_subscription_locally!(sub; throw_errors=false)
     end

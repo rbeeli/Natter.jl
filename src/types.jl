@@ -1147,8 +1147,8 @@ mutable struct _JetStreamPushControlHandler
     flow_reply::Union{String,Nothing}
     flow_target::UInt64
     ordered::Bool
-    ordered_next_consumer_seq::Int
-    ordered_last_stream_seq::Int
+    next_consumer_seq::Int
+    last_stream_seq::Int
     ordered_resetting::Bool
     ordered_reset_callback::Union{Nothing,Function}
     lock::ReentrantLock

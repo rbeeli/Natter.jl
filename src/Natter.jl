@@ -42,7 +42,7 @@ export NatterError, TimeoutError, NoRespondersError, ConnectionClosedError, Conn
 export ConnectionDrainingError, ProtocolError, AuthenticationError, AuthorizationError
 export AuthenticationExpiredError, AuthenticationRevokedError, AccountAuthenticationExpiredError, PermissionViolationError
 export NoServersError, MaxPayloadError
-export OutboundBufferLimitError, SlowConsumerError, JetStreamError, FetchDisconnectedError, KeyValueError, KeyValueKeyNotFoundError
+export OutboundBufferLimitError, SlowConsumerError, ConsumerSequenceMismatchError, JetStreamError, FetchDisconnectedError, KeyValueError, KeyValueKeyNotFoundError
 export KeyValueKeyDeletedError, KeyValueWrongRevisionError, KeyValueKeyExistsError, UnsupportedFeatureError, CleanupError
 
 const CRLF = "\r\n"

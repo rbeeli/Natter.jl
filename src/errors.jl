@@ -76,6 +76,12 @@ struct SlowConsumerError <: NatterError
     message::String
 end
 
+struct ConsumerSequenceMismatchError <: NatterError
+    stream_resume_sequence::Int
+    consumer_sequence::Int
+    last_consumer_sequence::Int
+end
+
 struct JetStreamError <: NatterError
     code::Int
     err_code::Union{Int,Nothing}
@@ -169,6 +175,11 @@ function Base.showerror(io::IO, err::OutboundBufferLimitError)
 end
 function Base.showerror(io::IO, err::SlowConsumerError)
     print(io, "Natter.SlowConsumerError: ", err.message, " subject=", err.subject, " sid=", err.sid)
+end
+function Base.showerror(io::IO, err::ConsumerSequenceMismatchError)
+    print(io, "Natter.ConsumerSequenceMismatchError: consumer sequence mismatch at sequence ",
+          err.consumer_sequence, " (", max(0, err.last_consumer_sequence - err.consumer_sequence),
+          " sequences behind), restart from stream sequence ", err.stream_resume_sequence)
 end
 function Base.showerror(io::IO, err::JetStreamError)
     print(io, "Natter.JetStreamError: code=", err.code)

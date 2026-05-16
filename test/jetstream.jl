@@ -1091,6 +1091,61 @@ end
     close(plain_sub)
 end
 
+@testitem "JetStream push idle heartbeat replies to stalled consumers" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+    TestHelpers.clear_capture!(capture)
+
+    heartbeat = Msg("_INBOX.push", nothing, UInt8[];
+                    headers=Headers("Status" => ["100"],
+                                    "Description" => ["Idle Heartbeat"],
+                                    "Nats-Consumer-Stalled" => ["_INBOX.fc"]),
+                    sid=sub.sid)
+    N._dispatch_msg(client, heartbeat)
+
+    @test !isready(sub.messages)
+    @test TestHelpers.capture_text(capture) == "PUB _INBOX.fc 0\r\n\r\n"
+    close(sub)
+end
+
+@testitem "JetStream push idle heartbeat reports consumer sequence mismatch" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    errors = Channel{Any}(1)
+    opts = ConnectOptions(error_cb=err -> put!(errors, err))
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+
+    data = Msg("_INBOX.push", "\$JS.ACK.ORDERS.C1.1.10.1.123456789.2",
+               TestHelpers.bytes("one"); sid=sub.sid)
+    N._dispatch_msg(client, data)
+    @test String(next(sub; timeout=0.1)) == "one"
+    @test !isready(errors)
+
+    heartbeat = Msg("_INBOX.push", nothing, UInt8[];
+                    headers=Headers("Status" => ["100"],
+                                    "Description" => ["Idle Heartbeat"],
+                                    "Nats-Last-Consumer" => ["2"]),
+                    sid=sub.sid)
+    N._dispatch_msg(client, heartbeat)
+
+    @test isready(errors)
+    err = take!(errors)
+    @test err isa ConsumerSequenceMismatchError
+    @test err.stream_resume_sequence == 10
+    @test err.consumer_sequence == 1
+    @test err.last_consumer_sequence == 2
+    @test !isready(sub.messages)
+    close(sub)
+end
+
 @testitem "JetStream push control dispatch maps lifecycle statuses" setup=[TestHelpers] begin
     using Natter
 
@@ -1895,6 +1950,46 @@ end
     end
 end
 
+@testitem "JetStream continuous pull treats max bytes status as terminal" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function request_count(capture)
+        length(collect(eachmatch(r"CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))))
+    end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull")
+    TestHelpers.clear_capture!(capture)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull",
+                              ReentrantLock(), ReentrantLock(), false, false)
+
+    stream = messages(psub; batch=1, max_bytes=8, expires=1.0, heartbeat=0, channel_size=1)
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            request_count(capture) >= 1
+        end != :timed_out
+
+        max_bytes = Msg("_INBOX.pull", nothing, UInt8[];
+                        headers=Headers("Status" => ["409"],
+                                        "Description" => ["Message Size Exceeds MaxBytes"]),
+                        sid=core_sub.sid)
+        N._dispatch_msg(client, max_bytes)
+
+        @test timedwait(1.0; pollint=0.001) do
+            request_count(capture) >= 2
+        end != :timed_out
+        close(stream)
+        wait(stream)
+    finally
+        close(stream)
+        close(psub)
+    end
+end
+
 @testitem "JetStream continuous pull refills from buffered capacity" setup=[TestHelpers] begin
     using Natter
     using JSON3
@@ -2153,9 +2248,9 @@ end
     @test isempty(run_fetch(Headers("Status" => ["404"], "Description" => ["No Messages"])))
     @test isempty(run_fetch(Headers("Status" => ["408"], "Description" => ["Request Timeout"])))
     @test isempty(run_fetch(Headers("Status" => ["409"], "Description" => ["Batch Completed"])))
+    @test isempty(run_fetch(Headers("Status" => ["409"], "Description" => ["Message Size Exceeds MaxBytes"])))
 
     @test_throws JetStreamError run_fetch(Headers("Status" => ["400"], "Description" => ["Bad Request"]))
-    @test_throws JetStreamError run_fetch(Headers("Status" => ["409"], "Description" => ["Message Size Exceeds MaxBytes"]))
     @test_throws JetStreamError run_fetch(Headers("Status" => ["409"], "Description" => ["Consumer Deleted"]))
     @test_throws JetStreamError run_fetch(Headers("Status" => ["409"], "Description" => ["Leadership Change"]))
     @test_throws JetStreamError run_fetch(Headers("Status" => ["409"], "Description" => ["Server Shutdown"]))

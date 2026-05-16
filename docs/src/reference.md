@@ -193,6 +193,6 @@ This page summarizes the public API. Optional keyword defaults are documented in
 
 ## Errors
 
-Public error types derive from `NatterError`: `TimeoutError`, `NoRespondersError`, `ConnectionClosedError`, `ConnectionReconnectingError`, `ConnectionDrainingError`, `ProtocolError`, `AuthenticationError`, `AuthorizationError`, `AuthenticationExpiredError`, `AuthenticationRevokedError`, `AccountAuthenticationExpiredError`, `PermissionViolationError`, `NoServersError`, `MaxPayloadError`, `OutboundBufferLimitError`, `SlowConsumerError`, `JetStreamError`, `FetchDisconnectedError`, `KeyValueError`, `UnsupportedFeatureError`, and `CleanupError`.
+Public error types derive from `NatterError`: `TimeoutError`, `NoRespondersError`, `ConnectionClosedError`, `ConnectionReconnectingError`, `ConnectionDrainingError`, `ProtocolError`, `AuthenticationError`, `AuthorizationError`, `AuthenticationExpiredError`, `AuthenticationRevokedError`, `AccountAuthenticationExpiredError`, `PermissionViolationError`, `NoServersError`, `MaxPayloadError`, `OutboundBufferLimitError`, `SlowConsumerError`, `ConsumerSequenceMismatchError`, `JetStreamError`, `FetchDisconnectedError`, `KeyValueError`, `UnsupportedFeatureError`, and `CleanupError`.
 
 KeyValue-specific errors derive from `KeyValueError`: `KeyValueKeyNotFoundError`, `KeyValueKeyDeletedError`, `KeyValueWrongRevisionError`, and `KeyValueKeyExistsError`.
