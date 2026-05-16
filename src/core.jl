@@ -297,8 +297,8 @@ prepare_publish(subject::AbstractString, data=nothing; reply::Union{AbstractStri
                 headers=nothing)::PublishFrame =
     PublishFrame(subject, reply, data, headers)
 
-function _validate_publish_frame_for_client(client::Client, frame::_AbstractPublishFrame)
-    total = _pub_payload_size(frame)
+function _validate_publish_frame_for_client(client::Client, frame::_AbstractPublishFrame,
+                                            total::Int=_pub_payload_size(frame))
     max_payload = _client_max_payload(client)
     headers_supported = _client_headers_supported(client)
     !isempty(frame.headers) && !headers_supported && throw(UnsupportedFeatureError("headers are not supported by the connected server"))
@@ -326,12 +326,13 @@ end
 function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
                            force_flush::Bool=false, cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
+    payload_size = _pub_payload_size(frame)
     frame_size = _serialized_size(frame)
     st = status(client)
     _ensure_usable_status_for_publish(st)
-    _validate_publish_frame_for_client(client, frame)
+    _validate_publish_frame_for_client(client, frame, payload_size)
     _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size, st)
-    _record_out!(client, length(frame.payload))
+    _record_out!(client, payload_size)
     nothing
 end
 
@@ -349,7 +350,7 @@ function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; 
     st = status(client)
     _ensure_usable_status_for_publish(st)
     _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size, st)
-    _record_out!(client, length(frame.payload))
+    _record_out!(client, _pub_payload_size(frame))
     nothing
 end
 
@@ -558,7 +559,7 @@ function _dispatch_msg(client::Client, msg::Msg)
     end
 
     if _handle_subscription_control(control_handler, sub, msg)
-        _record_in!(client, length(msg.data))
+        _record_in!(client, msg_bytes)
         return
     end
     if _handle_ordered_push_data!(control_handler, client, msg)
@@ -591,7 +592,7 @@ function _dispatch_msg(client::Client, msg::Msg)
         end
         return
     end
-    _record_in!(client, length(msg.data))
+    _record_in!(client, msg_bytes)
     _record_subscription_data_received!(control_handler, msg)
     if should_close
         _close_subscription_locally!(sub; throw_errors=false)
@@ -900,6 +901,7 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
         end
     end
     already && return nothing
+    _clear_js_async_publish_pending!(client, ConnectionClosedError())
     for sub in subs
         @lock sub.lock begin
             sub.closed = true
@@ -952,10 +954,12 @@ close(client::Client; throw_errors::Bool=false, callback_timeout=nothing,
     _close_client!(client; throw_errors=throw_errors, callback_timeout=callback_timeout,
                    cancel_token=cancel_token)
 
+_nuid_suffix(client::Client)::String =
+    @lock client.lock randstring(client.rng, NUID_ALPHABET, 22)
+
 function new_inbox(client::Client; prefix::AbstractString=client.options.inbox_prefix)
     prefix = _validate_inbox_prefix(prefix)
-    suffix = @lock client.lock randstring(client.rng, NUID_ALPHABET, 22)
-    "$prefix.$suffix"
+    "$prefix.$(_nuid_suffix(client))"
 end
 
 function _request_mux_active_locked(client::Client)
@@ -1091,13 +1095,13 @@ function _register_request_waiter!(client::C, mux::RequestMux{C}, timeout::Real)
     st == ConnectionStatus.CONNECTED || _throw_not_connected_for_request(st)
     sub_active = @lock mux.sub.lock !mux.sub.closed && mux.sub.server_active
     (@atomic client.request_mux) === mux && sub_active || throw(ConnectionReconnectingError())
-    lock(mux.condition)
-    try
-        sub_active = @lock mux.sub.lock !mux.sub.closed && mux.sub.server_active
-        (@atomic client.request_mux) === mux && sub_active || throw(ConnectionReconnectingError())
-        deadline = time() + Float64(timeout)
-        while true
-            token = randstring(NUID_ALPHABET, 22)
+    deadline = time() + Float64(timeout)
+    while true
+        token = _nuid_suffix(client)
+        lock(mux.condition)
+        try
+            sub_active = @lock mux.sub.lock !mux.sub.closed && mux.sub.server_active
+            (@atomic client.request_mux) === mux && sub_active || throw(ConnectionReconnectingError())
             if !haskey(mux.waiters, token)
                 waiter = RequestWaiter{C}(deadline)
                 mux.waiters[token] = waiter
@@ -1105,9 +1109,9 @@ function _register_request_waiter!(client::C, mux::RequestMux{C}, timeout::Real)
                 notify(mux.condition; all=true)
                 return token, waiter
             end
+        finally
+            unlock(mux.condition)
         end
-    finally
-        unlock(mux.condition)
     end
 end
 

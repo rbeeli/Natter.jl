@@ -40,6 +40,10 @@ mutable struct JetStreamPublishFuture{C<:Client}
     subject::String
     deadline::Float64
     generation::Int
+    retry_attempts::Int
+    retry_wait::Float64
+    retries::Int
+    retry_frame::Union{_AbstractPublishFrame,Nothing}
     ready::Bool
     active::Bool
     value::Union{PubAck,Exception,Nothing}
@@ -58,9 +62,26 @@ mutable struct JetStreamAsyncPublishState{C<:Client} <: AbstractJetStreamAsyncPu
     timeout_task::Union{Task,Nothing}
 end
 
+function _register_js_async_publish_state!(client::Client, state::JetStreamAsyncPublishState)
+    ref = WeakRef(state)
+    @lock client.lock begin
+        states = client.jetstream_async_publish_states
+        live = 1
+        for i in eachindex(states)
+            if !isnothing(states[i].value)
+                states[live] = states[i]
+                live += 1
+            end
+        end
+        resize!(states, live - 1)
+        push!(states, ref)
+    end
+    nothing
+end
+
 function JetStreamAsyncPublishState(client::C, max_pending::Int) where {C<:Client}
     lock = ReentrantLock()
-    JetStreamAsyncPublishState{C}(
+    state = JetStreamAsyncPublishState{C}(
         client,
         new_inbox(client),
         Base.Threads.Condition(lock),
@@ -72,6 +93,8 @@ function JetStreamAsyncPublishState(client::C, max_pending::Int) where {C<:Clien
         0,
         nothing,
     )
+    _register_js_async_publish_state!(client, state)
+    state
 end
 
 struct JetStreamContext{C<:Client,S<:JetStreamAsyncPublishState{C}}
@@ -184,6 +207,8 @@ const _JS_ERR_CONSUMER_NAME_EXISTS = 10013
 const _JS_ERR_CONSUMER_ALREADY_EXISTS = 10105
 const _JS_HEADER_CONSUMER_STALLED = "Nats-Consumer-Stalled"
 const _JS_HEADER_LAST_CONSUMER = "Nats-Last-Consumer"
+const DEFAULT_JS_PUBLISH_RETRY_ATTEMPTS = 2
+const DEFAULT_JS_PUBLISH_RETRY_WAIT = 0.25
 
 function _jetstream_control_status(msg::Msg)
     isempty(msg.data) || return nothing
@@ -439,7 +464,9 @@ function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing;
                     expected_last_subject=nothing, expected_last_msg_id=nothing, ttl=nothing,
                     schedule=nothing, schedule_at=nothing, schedule_every=nothing,
                     schedule_target=nothing, schedule_source=nothing, schedule_ttl=nothing,
-                    schedule_timezone=nothing, retry_attempts::Integer=0, retry_wait::Real=0.25,
+                    schedule_timezone=nothing,
+                    retry_attempts::Integer=DEFAULT_JS_PUBLISH_RETRY_ATTEMPTS,
+                    retry_wait::Real=DEFAULT_JS_PUBLISH_RETRY_WAIT,
                     cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
@@ -525,6 +552,48 @@ function _resolve_js_publish_future!(future::JetStreamPublishFuture{C},
     nothing
 end
 
+function _clear_js_async_publish_pending!(state::JetStreamAsyncPublishState{C},
+                                          err::Exception) where {C<:Client}
+    lock(state.condition)
+    try
+        isempty(state.futures) && return nothing
+        state.pending = 0
+        for future in values(state.futures)
+            if future.active
+                future.value = err
+                future.ready = true
+                future.active = false
+            end
+        end
+        empty!(state.futures)
+        notify(state.condition; all=true)
+    finally
+        unlock(state.condition)
+    end
+    nothing
+end
+
+function _clear_js_async_publish_pending!(client::Client, err::Exception)
+    states = Any[]
+    @lock client.lock begin
+        refs = client.jetstream_async_publish_states
+        live = 1
+        for i in eachindex(refs)
+            state = refs[i].value
+            if !isnothing(state)
+                refs[live] = refs[i]
+                live += 1
+                push!(states, state)
+            end
+        end
+        resize!(refs, live - 1)
+    end
+    for state in states
+        _clear_js_async_publish_pending!(state, err)
+    end
+    nothing
+end
+
 function _handle_js_async_publish_ack(state::JetStreamAsyncPublishState, msg::Msg)
     token = _request_mux_token(state.prefix, msg.subject)
     if isnothing(token)
@@ -538,8 +607,47 @@ function _handle_js_async_publish_ack(state::JetStreamAsyncPublishState, msg::Ms
         _record_drop!(state.client)
         return nothing
     end
-    _resolve_js_publish_future!(future, _js_async_publish_result(future, msg))
+    result = _js_async_publish_result(future, msg)
+    result isa NoRespondersError && _retry_js_async_publish!(future) && return nothing
+    _resolve_js_publish_future!(future, result)
     nothing
+end
+
+function _retry_js_async_publish!(future::JetStreamPublishFuture{C})::Bool where {C<:Client}
+    state = future.state::JetStreamAsyncPublishState{C}
+    frame = nothing
+    retry_wait = 0.0
+    lock(state.condition)
+    try
+        future.active || return false
+        future.retries < future.retry_attempts || return false
+        remaining = future.deadline - time()
+        remaining > 0 || return false
+        retry_frame = future.retry_frame
+        isnothing(retry_frame) && return false
+        future.retries += 1
+        frame = retry_frame
+        retry_wait = min(future.retry_wait, remaining)
+    finally
+        unlock(state.condition)
+    end
+
+    @async begin
+        sleep(retry_wait)
+        lock(state.condition)
+        try
+            future.active && future.deadline > time() || return
+            isnothing(_js_async_publish_connection_error(state.client, future.generation)) || return
+        finally
+            unlock(state.condition)
+        end
+        try
+            _publish_frame_unchecked(state.client, frame; buffer_on_reconnect=false)
+        catch err
+            _resolve_js_publish_future!(future, err)
+        end
+    end
+    true
 end
 
 function _ensure_js_async_publish_timeout_task_locked!(state::JetStreamAsyncPublishState)
@@ -639,6 +747,8 @@ end
 function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
                                            subject::AbstractString, deadline::Float64,
                                            generation::Int,
+                                           retry_attempts::Int, retry_wait::Float64,
+                                           retry_frame::Union{_AbstractPublishFrame,Nothing},
                                            cancel_token::MaybeCancellationToken) where {C<:Client}
     lock(state.condition)
     try
@@ -658,7 +768,8 @@ function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
         token = "pa$(state.next_token)"
         reply = "$(state.prefix).$token"
         future = JetStreamPublishFuture{C}(state, token, reply, String(subject), deadline,
-                                           generation, false, true, nothing)
+                                           generation, retry_attempts, retry_wait, 0, retry_frame,
+                                           false, true, nothing)
         state.futures[token] = future
         state.pending += 1
         _ensure_js_async_publish_timeout_task_locked!(state)
@@ -721,9 +832,14 @@ function js_publish_async(js::JetStreamContext, subject::AbstractString, data=no
                           expected_last_subject=nothing, expected_last_msg_id=nothing, ttl=nothing,
                           schedule=nothing, schedule_at=nothing, schedule_every=nothing,
                           schedule_target=nothing, schedule_source=nothing, schedule_ttl=nothing,
-                          schedule_timezone=nothing, cancel_token::MaybeCancellationToken=nothing)
+                          schedule_timezone=nothing,
+                          retry_attempts::Integer=DEFAULT_JS_PUBLISH_RETRY_ATTEMPTS,
+                          retry_wait::Real=DEFAULT_JS_PUBLISH_RETRY_WAIT,
+                          cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
+    attempts = _nonnegative_integer_option("retry_attempts", retry_attempts)
+    wait_seconds = _js_publish_retry_wait(retry_wait)
     hdrs = _js_publish_headers(headers; stream, expected_stream, msg_id, expected_last_sequence,
                                expected_last_subject_sequence, expected_last_subject,
                                expected_last_msg_id, ttl, schedule, schedule_at, schedule_every,
@@ -735,8 +851,11 @@ function js_publish_async(js::JetStreamContext, subject::AbstractString, data=no
     deadline = time() + timeout
     generation = _load_generation(js.client)
     future = _reserve_js_async_publish_future!(js.async_publish, frame.subject, deadline, generation,
-                                               cancel_token)
+                                               attempts, wait_seconds, nothing, cancel_token)
     publish_frame = _PublishFrame(frame.subject, future.reply, frame.payload, frame.headers)
+    if attempts > 0
+        future.retry_frame = publish_frame
+    end
     try
         _publish_frame_unchecked(js.client, publish_frame; buffer_on_reconnect=false, cancel_token)
     catch err
@@ -2719,12 +2838,17 @@ function _pull_stream_put!(stream::PullMessageStream, msg::Msg)::Int
         isopen(stream.messages) || throw(_PullStreamClosed())
         @lock stream.state.lock begin
             stream.state.closed && throw(_PullStreamClosed())
+            requested_messages_before = stream.state.requested_messages
+            requested_bytes_before = stream.state.requested_bytes
+            _pull_stream_release_counters!(stream.state, 1, bytes)
             stream.state.buffered_messages += 1
             stream.state.buffered_bytes += bytes
             stream.state.delivered += 1
             try
                 put!(stream.messages, msg)
             catch
+                stream.state.requested_messages = requested_messages_before
+                stream.state.requested_bytes = requested_bytes_before
                 stream.state.buffered_messages = max(0, stream.state.buffered_messages - 1)
                 stream.state.buffered_bytes = max(0, stream.state.buffered_bytes - bytes)
                 stream.state.delivered = max(0, stream.state.delivered - 1)
@@ -2787,7 +2911,6 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
             config.heartbeat > 0 && (heartbeat_deadline = time() + 2 * config.heartbeat)
             pin_id = header(msg, "Nats-Pin-Id")
             !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
-            @lock stream.state.lock _pull_stream_decrement_requested!(stream.state, msg)
             _pull_stream_put!(stream, msg)
             _pull_stream_maybe_refill!(stream, config)
         end

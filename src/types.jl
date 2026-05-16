@@ -1481,6 +1481,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     rng::MersenneTwister
     generation::Int
     generation_value::Threads.Atomic{Int}
+    jetstream_async_publish_states::Vector{WeakRef}
 end
 
 function Client(options::Options, servers::Vector{Server}, current_server::Union{Server,Nothing},
@@ -1540,7 +1541,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                    typed_request_mux, request_mux_lock,
                                    pending, pending_bytes, pongs,
                                    reader_task, ping_task, reconnect_task, pings_out, atomic_stats,
-                                   rng, generation, Threads.Atomic{Int}(generation))
+                                   rng, generation, Threads.Atomic{Int}(generation), WeakRef[])
 end
 
 function _set_subscription_snapshot_locked!(client::C, sid::Int,

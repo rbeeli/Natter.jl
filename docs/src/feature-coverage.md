@@ -35,7 +35,7 @@ Statuses:
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
 | Context | Supported | `jetstream(client)`. |
-| Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options. `js_publish_async` uses protocol-level async publish with pending ack accounting, backpressure, completion waiting, and per-message ack/error futures. |
+| Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options, including two default `NoRespondersError` retries. `js_publish_async` uses protocol-level async publish with pending ack accounting, backpressure, completion waiting, per-message ack/error futures, configurable no-responder retries, and explicit pending-future clearing on reconnect rather than replay. |
 | Stream management | Supported | Create, update, info, list, names, purge, delete. |
 | Typed stream config | Supported | `StreamConfig` plus nested helpers and raw `Dict` escape hatch. Typed create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. |
 | Message lookup | Supported | Sequence, last-by-subject, next-by-subject, direct get, and message delete. |

@@ -116,7 +116,7 @@ Parser/resource limits:
 | `header(msg, key)` | `Union{String,Nothing}` | First header value by case-insensitive key. |
 | `headers(msg)` | `Headers` | Copy all message headers. |
 | `status(client)` | `ConnectionStatus.T` | Current connection status. |
-| `stats(client)` | `Stats` | Counter snapshot. |
+| `stats(client)` | `Stats` | Counter snapshot; byte counters include payload and header bytes. |
 | `connected_url(client)` | `Union{String,Nothing}` | Current server URL. |
 
 Core async helpers: `connect_async`, `publish_async`, `subscribe_async`, `unsubscribe_async`, `next_async`, `request_async`, `flush_async`, `ping_async`, `drain_async`, and `close_async`.
@@ -159,7 +159,7 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | :--- | :--- | :--- |
 | `jetstream(client; prefix="$JS.API", timeout=5.0, publish_async_max_pending=256)` | `JetStreamContext` | Create a context. |
 | `js_publish(js, subject, data=nothing; kwargs...)` | `PubAck` | Publish and wait for an ack. |
-| `js_publish_async(js, subject, data=nothing; kwargs...)` | `JetStreamPublishFuture` | Publish with the context async publisher and return an ack future. |
+| `js_publish_async(js, subject, data=nothing; kwargs...)` | `JetStreamPublishFuture` | Publish with the context async publisher and return an ack future. Pending futures are failed, not replayed, on reconnect. |
 | `fetch(future::JetStreamPublishFuture)` | `PubAck` | Wait for the async publish ack or rethrow its error. |
 | `js_publish_async_pending(js)` | `Int` | Count async publishes still waiting for acks. |
 | `js_publish_async_complete(js; timeout=...)` | `nothing` | Wait until all pending async publishes on the context complete. |

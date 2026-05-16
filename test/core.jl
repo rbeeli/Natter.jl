@@ -124,6 +124,37 @@ using TestItems
     @test_throws ConnectionClosedError subscribe(closed, "foo")
 end
 
+@testitem "stats byte counters include headers" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    opts = N.ConnectOptions(record_stats=true)
+
+    outbound = TestHelpers.fake_client(; opts,
+                                       status=N.ConnectionStatus.CONNECTED,
+                                       info=N.ServerInfo(; headers=true),
+                                       write_io=IOBuffer())
+    hdrs = Headers("Trace" => "abc")
+    hdr_bytes = N._headers_bytes(hdrs)
+    payload = TestHelpers.bytes("body")
+    publish(outbound, "events", payload; headers=hdrs)
+    @test stats(outbound).out_msgs == 1
+    @test stats(outbound).out_bytes == length(hdr_bytes) + length(payload)
+
+    inbound = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(inbound, "events")
+    raw = vcat(TestHelpers.bytes("HMSG events $(sub.sid) $(length(hdr_bytes)) $(length(hdr_bytes) + length(payload))\r\n"),
+               hdr_bytes,
+               payload,
+               N.CRLF_BYTES)
+    frame = N._read_control_or_msg(IOBuffer(raw), inbound.options)
+    @test frame.op == :MSG
+    N._dispatch_msg(inbound, N._protocol_msg(frame))
+    @test stats(inbound).in_msgs == 1
+    @test stats(inbound).in_bytes == length(hdr_bytes) + length(payload)
+end
+
 @testitem "hot path allocation behavior" setup=[TestHelpers] begin
     using Natter
 
@@ -1769,6 +1800,29 @@ end
     @test isempty(mux.waiters)
     @test !occursin("UNSUB", TestHelpers.capture_text(transport))
     close(client)
+end
+
+@testitem "request mux reply tokens use client rng" setup=[TestHelpers] begin
+    using Natter
+    using Random
+
+    const N = Natter
+
+    expected_rng = MersenneTwister(1)
+    expected_prefix = "_INBOX.$(randstring(expected_rng, N.NUID_ALPHABET, 22))"
+    expected_token = randstring(expected_rng, N.NUID_ALPHABET, 22)
+
+    transport = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
+    try
+        @test_throws TimeoutError request(client, "svc", "body"; timeout=0.001)
+
+        lines = split(TestHelpers.capture_text(transport), "\r\n"; keepempty=false)
+        publish_line = only(line for line in lines if startswith(line, "PUB svc "))
+        @test split(publish_line)[3] == "$expected_prefix.$expected_token"
+    finally
+        close(client)
+    end
 end
 
 @testitem "late request replies are dropped after timeout" setup=[TestHelpers] begin

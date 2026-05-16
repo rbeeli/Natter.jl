@@ -1153,6 +1153,8 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     end
     terminal || return false
 
+    _clear_js_async_publish_pending!(client, ConnectionClosedError("connection is disconnected"))
+
     for sub in subs
         @lock sub.lock begin
             sub.closed = true
@@ -1767,6 +1769,7 @@ function _trigger_reconnect(client::Client, reason)
         end
     end
     if should_start
+        _clear_js_async_publish_pending!(client, ConnectionReconnectingError())
         _signal_flusher(client)
         _report_cleanup_errors(client, _notify_request_waiters!(client, ConnectionReconnectingError()))
         _report_cleanup_errors(client, _notify_pong_waiters!(client, false))

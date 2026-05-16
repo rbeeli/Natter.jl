@@ -396,6 +396,8 @@ end
     @test_throws ArgumentError js_publish(js, "orders.created", "payload"; ttl=0.5)
     @test_throws ArgumentError js_publish(js, "orders.created", "payload"; schedule="x", schedule_every=1.0)
     @test_throws ArgumentError js_publish(js, "orders.created", "payload"; retry_attempts=-1)
+    @test_throws ArgumentError js_publish_async(js, "orders.created", "payload"; retry_attempts=-1)
+    @test_throws ArgumentError js_publish_async(js, "orders.created", "payload"; retry_wait=0)
     @test TestHelpers.capture_text(capture) == ""
 end
 
@@ -413,6 +415,7 @@ end
     @test future isa JetStreamPublishFuture
     @test !(future isa NatterTask)
     @test !isready(future)
+    @test future.retry_attempts == N.DEFAULT_JS_PUBLISH_RETRY_ATTEMPTS
     @test js_publish_async_pending(js) == 1
     @test length(client.subscriptions) == 1
     sub = only(values(client.subscriptions))
@@ -436,6 +439,35 @@ end
     @test isnothing(js_publish_async_complete(js; timeout=0.1))
 
     close(client)
+end
+
+@testitem "JetStream async publish pending futures are cleared on reconnect" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    future = js_publish_async(js, "orders.created", "payload"; timeout=1.0)
+    @test js_publish_async_pending(js) == 1
+    @test !isempty(client.jetstream_async_publish_states)
+
+    TestHelpers.clear_capture!(capture)
+    N._trigger_reconnect(client, ErrorException("transport failed"))
+    @test timedwait(1.0; pollint=0.001) do
+        isready(future) && js_publish_async_pending(js) == 0
+    end == :ok
+
+    err = TestHelpers.thrown_exception(() -> fetch(future))
+    @test err isa ConnectionReconnectingError
+    @test TestHelpers.capture_text(capture) == ""
+    @test client.pending_bytes == 0
+
+    @test timedwait(1.0; pollint=0.001) do
+        status(client) == N.ConnectionStatus.DISCONNECTED
+    end == :ok
 end
 
 @testitem "JetStream async publish applies backpressure and waits for completion" setup=[TestHelpers] begin
@@ -490,7 +522,8 @@ end
     @test failed_err.code == 400
     @test js_publish_async_pending(js) == 0
 
-    no_responders = js_publish_async(js, "orders.created", "missing"; timeout=1.0)
+    no_responders = js_publish_async(js, "orders.created", "missing"; timeout=1.0,
+                                     retry_attempts=0)
     status_headers = Headers("Status" => ["503"], "Description" => ["No Responders"])
     N._dispatch_msg(client, Msg(no_responders.reply, nothing, UInt8[];
                                headers=status_headers, sid=sub.sid))
@@ -499,6 +532,27 @@ end
     end == :ok
     no_responders_err = TestHelpers.thrown_exception(() -> fetch(no_responders))
     @test no_responders_err isa NoRespondersError
+    @test js_publish_async_pending(js) == 0
+
+    TestHelpers.clear_capture!(capture)
+    retried = js_publish_async(js, "orders.created", "retry"; timeout=5.0,
+                               retry_attempts=1, retry_wait=0.001)
+    retry_reply = retried.reply
+    N._dispatch_msg(client, Msg(retry_reply, nothing, UInt8[];
+                               headers=status_headers, sid=sub.sid))
+    @test timedwait(1.0; pollint=0.001) do
+        length(collect(eachmatch(r"PUB orders.created ", TestHelpers.capture_text(capture)))) == 2
+    end == :ok
+    @test !isready(retried)
+
+    N._dispatch_msg(client, Msg(retry_reply, nothing,
+                               TestHelpers.bytes("""{"stream":"ORDERS","seq":3}"""); sid=sub.sid))
+    @test timedwait(1.0; pollint=0.001) do
+        isready(retried)
+    end == :ok
+    retry_ack = fetch(retried)
+    @test retry_ack.stream == "ORDERS"
+    @test retry_ack.seq == 3
     @test js_publish_async_pending(js) == 0
 
     timed_out = js_publish_async(js, "orders.created", "slow"; timeout=0.01)
@@ -2497,6 +2551,95 @@ end
         @test state.requested_messages == 1
         @test state.requested_bytes == 12
         @test state.requests[1].token == "second"
+    end
+end
+
+@testitem "JetStream continuous pull keeps requested credits while queue put is blocked" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     write_io=TestHelpers.WriteCapture())
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull.*")
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*",
+                              ReentrantLock(), ReentrantLock(), false, false)
+
+    state = N._PullMessageStreamState()
+    config = N._PullStreamConfig(2, 32, 1.0, 0.0, 1, 16,
+                                 nothing, nothing, nothing, nothing, nothing, 1)
+    queue_lock = ReentrantLock()
+    queue_condition = Base.Threads.Condition(queue_lock)
+    queue = N.MsgQueue{Msg}(1)
+    stream = N.PullMessageStream{typeof(client),typeof(psub)}(
+        psub, queue, queue_lock, queue_condition, config, Task(() -> nothing), nothing, state)
+
+    first = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("first"))
+    second = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.2.2.0.0", TestHelpers.bytes("second"))
+    first_bytes = N._pull_stream_msg_bytes(first)
+    second_bytes = N._pull_stream_msg_bytes(second)
+
+    @lock stream.message_lock begin
+        put!(stream.messages, first)
+        @lock state.lock begin
+            state.buffered_messages = 1
+            state.buffered_bytes = first_bytes
+            state.requested_messages = 1
+            state.requested_bytes = second_bytes
+        end
+    end
+
+    done = Channel{Any}(1)
+    task = @async begin
+        try
+            N._pull_stream_put!(stream, second)
+            put!(done, :ok)
+        catch err
+            put!(done, err)
+        end
+    end
+
+    try
+        @test timedwait(0.1; pollint=0.001) do
+            isready(done)
+        end == :timed_out
+        @lock state.lock begin
+            @test state.requested_messages == 1
+            @test state.requested_bytes == second_bytes
+            @test state.buffered_messages == 1
+            @test state.buffered_bytes == first_bytes
+        end
+
+        @lock stream.message_lock begin
+            msg = take!(stream.messages)
+            @test String(msg) == "first"
+            @lock state.lock begin
+                state.buffered_messages = max(0, state.buffered_messages - 1)
+                state.buffered_bytes = max(0, state.buffered_bytes - N._pull_stream_msg_bytes(msg))
+            end
+            notify(stream.message_condition)
+        end
+
+        @test timedwait(1.0; pollint=0.001) do
+            isready(done)
+        end == :ok
+        @test take!(done) == :ok
+        @lock state.lock begin
+            @test state.requested_messages == 0
+            @test state.requested_bytes == 0
+            @test state.buffered_messages == 1
+            @test state.buffered_bytes == second_bytes
+        end
+        @lock stream.message_lock begin
+            @test String(take!(stream.messages)) == "second"
+        end
+    finally
+        close(stream)
+        timedwait(1.0; pollint=0.001) do
+            istaskdone(task)
+        end
+        close(psub)
     end
 end
 

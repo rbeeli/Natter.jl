@@ -51,6 +51,8 @@ After a transient disconnect the client:
 
 Core publish replay is best-effort and should be treated as at-least-once for retained frames. If duplicate effects matter, use JetStream `js_publish(...; msg_id=...)` and idempotent application storage.
 
+JetStream protocol async publishes are stricter: pending `js_publish_async` futures are cleared on reconnect and are not put into the core reconnect buffer. `fetch(future)` throws `ConnectionReconnectingError` for those cleared futures. Applications that need to resend should do so after reconnect and should set `msg_id` to make the retry idempotent at the stream.
+
 Customize reconnect delay when needed:
 
 ```julia
