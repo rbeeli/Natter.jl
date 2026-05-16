@@ -178,9 +178,6 @@ end
 _kv_created_from_timestamp_ns(timestamp_ns::Int)::DateTime =
     DateTime(1970, 1, 1) + Millisecond(timestamp_ns ÷ 1_000_000)
 
-_kv_created_from_metadata(meta::MsgMetadata)::DateTime =
-    _kv_created_from_timestamp_ns(meta.timestamp_ns)
-
 function _kv_entry_from_consumer_msg(kv::KeyValue, msg::AbstractMsg)::KeyValueEntry
     meta = _parse_msg_metadata(msg)
     _kv_entry(kv, msg, meta.stream_sequence, _kv_created_from_timestamp_ns(meta.timestamp_ns), meta.pending)
@@ -319,11 +316,6 @@ function _kv_record_key_pending!(latest::Dict{String,Tuple{Int,Bool}}, prefix::S
     current_seq = get(latest, key, (0, false))[1]
     seq >= current_seq && (latest[key] = (seq, _kv_key_active(msg)))
     meta.pending
-end
-
-function _kv_record_key!(latest::Dict{String,Tuple{Int,Bool}}, prefix::String, msg::AbstractMsg)
-    _kv_record_key_pending!(latest, prefix, msg)
-    latest
 end
 
 function _kv_history_chunk_pending!(entries::Vector{KeyValueEntry}, kv::KeyValue,
@@ -557,7 +549,7 @@ function kv_history(kv::KeyValue, key::AbstractString; batch=256, timeout::Real=
                     cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     key = _validate_kv_key(key)
-    batch = _positive_int_option("key-value history batch", batch)
+    batch = _positive_integer_option("key-value history batch", batch)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     sub = pull_subscribe(kv.js, "$(kv.prefix)$key"; stream=kv.stream,

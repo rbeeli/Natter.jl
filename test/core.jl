@@ -46,11 +46,11 @@ using TestItems
     @test String(take!(binary_pending.pending)) == "PUB foo 3\r\nbin\r\n"
 
     hot_payload = fill(UInt8('x'), 64 * 1024)
-    direct_frame = N._prepare_publish_frame("foo", hot_payload, nothing, nothing)
+    direct_frame = N._publish_frame("foo", nothing, hot_payload, nothing)
     @test direct_frame.payload === hot_payload
     direct_frame = nothing
     GC.gc()
-    @test (@allocated N._prepare_publish_frame("foo", hot_payload, nothing, nothing)) < 1024
+    @test (@allocated N._publish_frame("foo", nothing, hot_payload, nothing)) < 1024
     hot_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=devnull)
     publish(hot_client, "foo", hot_payload)
     GC.gc()

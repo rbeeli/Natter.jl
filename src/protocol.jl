@@ -289,16 +289,6 @@ function _readline_crlf_range(reader::ProtocolReader, max_control_line::Int)::Un
     end
 end
 
-function _readline_crlf(reader::ProtocolReader, max_control_line::Int)
-    range = _readline_crlf_range(reader, max_control_line)
-    line = _bytes_string(reader.buffer, first(range), last(range))
-    _drop_consumed!(reader)
-    line
-end
-
-_readline_crlf(io, max_control_line::Int) =
-    _readline_crlf(ProtocolReader(io; read_size=1), max_control_line)
-
 function _validate_payload_size(size::Int, max_payload::Int)
     size >= 0 || throw(ProtocolError("message payload size cannot be negative"))
     size <= max_payload || throw(ProtocolError("message payload size $size exceeds configured limit of $max_payload bytes"))
@@ -356,44 +346,38 @@ function _read_payload_trailer_no_drop!(reader::ProtocolReader)
 end
 
 function _read_exact_payload(io, n::Int)
-    data = try
-        _read_exact_bytes_no_drop(io, n)
-    catch err
-        err isa EOFError || rethrow()
-        throw(ProtocolError("unexpected EOF while reading payload"))
-    end
-    try
-        _read_payload_trailer_no_drop!(io)
-    catch err
-        err isa EOFError || rethrow()
-        throw(ProtocolError("message payload missing CRLF trailer"))
-    end
+    data = _read_payload_bytes_no_drop(io, n)
+    _read_payload_trailer_or_error!(io)
     _drop_payload_consumed!(io)
     data
 end
 
 function _read_exact_header_payload(io, hsize::Int, total::Int)
     hsize <= total || throw(ProtocolError("header size exceeds message size"))
-    header = try
-        _read_exact_bytes_no_drop(io, hsize)
+    header = _read_payload_bytes_no_drop(io, hsize)
+    data = _read_payload_bytes_no_drop(io, total - hsize)
+    _read_payload_trailer_or_error!(io)
+    _drop_payload_consumed!(io)
+    header, data
+end
+
+function _read_payload_bytes_no_drop(io, n::Int)
+    try
+        _read_exact_bytes_no_drop(io, n)
     catch err
         err isa EOFError || rethrow()
         throw(ProtocolError("unexpected EOF while reading payload"))
     end
-    data = try
-        _read_exact_bytes_no_drop(io, total - hsize)
-    catch err
-        err isa EOFError || rethrow()
-        throw(ProtocolError("unexpected EOF while reading payload"))
-    end
+end
+
+function _read_payload_trailer_or_error!(io)
     try
         _read_payload_trailer_no_drop!(io)
     catch err
         err isa EOFError || rethrow()
         throw(ProtocolError("message payload missing CRLF trailer"))
     end
-    _drop_payload_consumed!(io)
-    header, data
+    nothing
 end
 
 function _skip_hspace(bytes::AbstractVector{UInt8}, pos::Int, stop::Int)::Int
@@ -1037,18 +1021,6 @@ function _pub_prefix!(out::Vector{UInt8}, frame::_AbstractPublishFrame)::Vector{
     out
 end
 
-function _pub_prefix(frame::_AbstractPublishFrame)::Vector{UInt8}
-    _pub_prefix!(UInt8[], frame)
-end
-
-function _write_pub_frame_direct(io, frame::_AbstractPublishFrame)
-    write(io, _pub_prefix(frame))
-    isempty(frame.headers) || write(io, frame.headers)
-    write(io, frame.payload)
-    write(io, CRLF)
-    nothing
-end
-
 function _write_pub_frame_direct(io, frame::_AbstractPublishFrame, scratch::Vector{UInt8})
     write(io, _pub_prefix!(scratch, frame))
     isempty(frame.headers) || write(io, frame.headers)
@@ -1088,23 +1060,12 @@ function _write_pub_frame(io, frame::_AbstractPublishFrame)
     nothing
 end
 
-function _pub_cmd(subject::String, reply::Union{String,Nothing}, payload::AbstractVector{UInt8}, headers::Headers)
-    _pub_cmd(_publish_frame(subject, reply, payload, headers))
-end
-
-function _pub_cmd(subject::String, reply::Union{String,Nothing}, payload::AbstractVector{UInt8}, hdr::AbstractVector{UInt8})
-    _pub_cmd(_publish_frame(subject, reply, payload, hdr))
-end
-
 function _sub_cmd(subject::String, queue::Union{String,Nothing}, sid::Int)
     isnothing(queue) || isempty(queue) ? "SUB $subject $sid$CRLF" : "SUB $subject $queue $sid$CRLF"
 end
 
 function _validate_core_max_msgs(max_msgs)::Int
-    max_msgs isa Bool && throw(ArgumentError("max_msgs must be a non-negative integer"))
-    max_msgs isa Integer || throw(ArgumentError("max_msgs must be a non-negative integer"))
-    0 <= max_msgs <= typemax(Int) || throw(ArgumentError("max_msgs must be a non-negative integer"))
-    Int(max_msgs)
+    _nonnegative_integer_option("max_msgs", max_msgs)
 end
 
 function _unsub_cmd(sid::Int, max_msgs=0)

@@ -159,11 +159,7 @@ function ConsumerInfo(stream_name::AbstractString, name::AbstractString, config:
 end
 
 function _js_publish_async_max_pending(value)::Int
-    value isa Integer && !(value isa Bool) ||
-        throw(ArgumentError("publish_async_max_pending must be a positive integer"))
-    1 <= value <= typemax(Int) ||
-        throw(ArgumentError("publish_async_max_pending must be a positive integer"))
-    Int(value)
+    _positive_integer_option("publish_async_max_pending", value)
 end
 
 function jetstream(client::Client; prefix::AbstractString="\$JS.API", timeout::Real=5.0,
@@ -341,10 +337,7 @@ function _js_header_nonempty(name::AbstractString, value)::String
 end
 
 function _js_header_sequence(name::AbstractString, value)::String
-    value isa Integer && !(value isa Bool) ||
-        throw(ArgumentError("$name must be a non-negative integer"))
-    value >= 0 || throw(ArgumentError("$name must be a non-negative integer"))
-    string(Int(value))
+    string(_nonnegative_integer_option(name, value))
 end
 
 function _js_duration_header(name::AbstractString, value; allow_never::Bool=false, min_seconds::Real=0.0)::String
@@ -435,10 +428,7 @@ function _js_publish_headers(headers; stream::Union{AbstractString,Nothing}=noth
 end
 
 function _js_publish_retry_attempts(value)::Int
-    value isa Integer && !(value isa Bool) ||
-        throw(ArgumentError("retry_attempts must be a non-negative integer"))
-    value >= 0 || throw(ArgumentError("retry_attempts must be a non-negative integer"))
-    Int(value)
+    _nonnegative_integer_option("retry_attempts", value)
 end
 
 function _js_publish_retry_wait(value)::Float64
@@ -746,7 +736,7 @@ function js_publish_async(js::JetStreamContext, subject::AbstractString, data=no
                                expected_last_subject_sequence, expected_last_subject,
                                expected_last_msg_id, ttl, schedule, schedule_at, schedule_every,
                                schedule_target, schedule_source, schedule_ttl, schedule_timezone)
-    frame = _prepare_publish_frame(subject, data, nothing, hdrs)
+    frame = _publish_frame(subject, nothing, data, hdrs)
     _validate_publish_frame_for_client(js.client, frame)
     _ensure_js_async_publish_subscription!(js.async_publish)
 
@@ -984,7 +974,7 @@ stream_info(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout
 
 function stream_list(js::JetStreamContext; offset=0, timeout::Real=js.timeout,
                      cancel_token::MaybeCancellationToken=nothing)
-    offset = _nonnegative_int_option("stream list offset", offset)
+    offset = _nonnegative_integer_option("stream list offset", offset)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     streams = StreamInfo[]
@@ -1100,10 +1090,7 @@ function _stream_info(obj)
 end
 
 function _validate_stream_sequence(seq)::Int
-    seq isa Bool && throw(ArgumentError("stream sequence must be a positive integer"))
-    seq isa Integer || throw(ArgumentError("stream sequence must be a positive integer"))
-    1 <= seq <= typemax(Int) || throw(ArgumentError("stream sequence must be a positive integer"))
-    Int(seq)
+    _positive_integer_option("stream sequence", seq)
 end
 
 function _stream_message_get_request(seq::Union{Integer,Nothing}, subject::Union{AbstractString,Nothing}, next_by_subject::Bool)::Dict{String,Any}
@@ -1146,7 +1133,7 @@ function _parse_direct_sequence(response::Msg)::Int
     end
 end
 
-function _direct_message_response_info(js::JetStreamContext, request_subject::String, response::Msg)
+function _direct_message_response_info(request_subject::String, response::Msg)
     code = _status_header(response)
     if code == 503
         throw(NoRespondersError(request_subject))
@@ -1166,11 +1153,6 @@ function _direct_message_response_info(js::JetStreamContext, request_subject::St
     Msg(subject, nothing, copy(response.data); headers), sequence, created
 end
 
-function _direct_message_response(js::JetStreamContext, request_subject::String, response::Msg)::Msg
-    msg, _sequence, _created = _direct_message_response_info(js, request_subject, response)
-    msg
-end
-
 function _stream_message_get_direct_info(js::JetStreamContext, stream::String, req::Dict{String,Any};
                                          timeout::Real,
                                          cancel_token::MaybeCancellationToken=nothing)
@@ -1182,17 +1164,10 @@ function _stream_message_get_direct_info(js::JetStreamContext, stream::String, r
         end
     payload = haskey(req, "last_by_subj") && !haskey(req, "seq") ? "" : JSON3.write(req)
     response = _request_raw(js.client, request_subject, payload; timeout, cancel_token)
-    _direct_message_response_info(js, request_subject, response)
+    _direct_message_response_info(request_subject, response)
 end
 
-function _stream_message_get_direct(js::JetStreamContext, stream::String, req::Dict{String,Any};
-                                    timeout::Real,
-                                    cancel_token::MaybeCancellationToken=nothing)
-    msg, _sequence, _created = _stream_message_get_direct_info(js, stream, req; timeout, cancel_token)
-    msg
-end
-
-function _stream_message_from_api_payload(js::JetStreamContext, raw_msg)
+function _stream_message_from_api_payload(raw_msg)
     data = _json_haskey(raw_msg, :data) ? base64decode(String(_json_get(raw_msg, :data, ""))) : UInt8[]
     hdrs = _json_haskey(raw_msg, :hdrs) ? _parse_headers(base64decode(String(_json_get(raw_msg, :hdrs, "")))) : Headers()
     created = _json_datetime(_json_get(raw_msg, :time, nothing))
@@ -1204,7 +1179,7 @@ function _stream_message_get_api(js::JetStreamContext, stream::AbstractString, r
                                  timeout::Real, cancel_token::MaybeCancellationToken=nothing)
     obj = _api_request(js, "$(js.prefix).STREAM.MSG.GET.$stream", JSON3.write(req);
                        timeout, cancel_token)
-    _stream_message_from_api_payload(js, _json_get_required(obj, :message))
+    _stream_message_from_api_payload(_json_get_required(obj, :message))
 end
 
 function _stream_message_get_info(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any};
@@ -1219,7 +1194,10 @@ function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::U
                             cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     req = _stream_message_get_request(seq, subject, next_by_subject)
-    direct && return _stream_message_get_direct(js, stream, req; timeout, cancel_token)
+    if direct
+        msg, _seq, _created = _stream_message_get_direct_info(js, stream, req; timeout, cancel_token)
+        return msg
+    end
     msg, _seq, _created = _stream_message_get_api(js, stream, req; timeout, cancel_token)
     msg
 end
@@ -1331,7 +1309,7 @@ consumer_info(js::JetStreamContext, stream::AbstractString, consumer::AbstractSt
 function consumer_list(js::JetStreamContext, stream::AbstractString; offset=0, timeout::Real=js.timeout,
                        cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
-    offset = _nonnegative_int_option("consumer list offset", offset)
+    offset = _nonnegative_integer_option("consumer list offset", offset)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     consumers = ConsumerInfo[]
@@ -1421,13 +1399,9 @@ function _consumer_normalized_config_value(value)
         return nothing
     elseif value isa AbstractString
         return String(value)
-    elseif value isa AbstractDict
+    elseif value isa Union{AbstractDict,JSON3.Object}
         return Dict{String,Any}(String(k) => _consumer_normalized_config_value(v) for (k, v) in pairs(value))
-    elseif value isa JSON3.Object
-        return Dict{String,Any}(String(k) => _consumer_normalized_config_value(v) for (k, v) in pairs(value))
-    elseif value isa AbstractVector
-        return Any[_consumer_normalized_config_value(v) for v in value]
-    elseif value isa JSON3.Array
+    elseif value isa Union{AbstractVector,JSON3.Array}
         return Any[_consumer_normalized_config_value(v) for v in value]
     else
         return value
@@ -1657,8 +1631,8 @@ _pull_fetch_next_subject(js::JetStreamContext, stream::AbstractString, consumer:
 
 mutable struct _PullStreamRequest
     token::Union{String,Nothing}
-    remaining_messages::Int
-    remaining_bytes::Union{Int,Nothing}
+    reserved_messages::Int
+    reserved_bytes::Int
 end
 
 struct _PullStreamReservation
@@ -1715,13 +1689,15 @@ mutable struct _PullMessageStreamState
     closed::Bool
     error::Union{Exception,Nothing}
     requests::Vector{_PullStreamRequest}
+    requested_messages::Int
+    requested_bytes::Int
     delivered::Int
     buffered_messages::Int
     buffered_bytes::Int
 end
 
 _PullMessageStreamState() = _PullMessageStreamState(ReentrantLock(), false, nothing,
-                                                    _PullStreamRequest[], 0, 0, 0)
+                                                    _PullStreamRequest[], 0, 0, 0, 0, 0)
 
 mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
     js::J
@@ -2260,31 +2236,14 @@ function _pull_fetch_default_expires(timeout::Real)::Float64
     ttl - min(ttl * 0.1, 5.0)
 end
 
-function _positive_int_option(name::AbstractString, value)::Int
-    value isa Bool && throw(ArgumentError("$name must be a positive integer"))
-    value isa Integer || throw(ArgumentError("$name must be a positive integer"))
-    1 <= value <= typemax(Int) || throw(ArgumentError("$name must be a positive integer"))
-    Int(value)
-end
-
-function _nonnegative_int_option(name::AbstractString, value)::Int
-    value isa Bool && throw(ArgumentError("$name must be a non-negative integer"))
-    value isa Integer || throw(ArgumentError("$name must be a non-negative integer"))
-    0 <= value <= typemax(Int) || throw(ArgumentError("$name must be a non-negative integer"))
-    Int(value)
-end
-
 function _optional_positive_int_option(name::AbstractString, value)::Union{Int,Nothing}
     isnothing(value) && return nothing
-    _positive_int_option(name, value)
+    _positive_integer_option(name, value)
 end
 
 function _optional_pull_priority(value)::Union{Int,Nothing}
     isnothing(value) && return nothing
-    value isa Bool && throw(ArgumentError("pull priority must be an integer from 0 to 9"))
-    value isa Integer || throw(ArgumentError("pull priority must be an integer from 0 to 9"))
-    0 <= value <= 9 || throw(ArgumentError("pull priority must be an integer from 0 to 9"))
-    Int(value)
+    _integer_range_option("pull priority", value, 0, 9, "an integer from 0 to 9")
 end
 
 function _validate_pull_priority_group(value)::Union{String,Nothing}
@@ -2353,7 +2312,7 @@ end
 function _validate_pull_fetch(psub::PullSubscription, batch, timeout::Real, expires::Real,
                               heartbeat::Union{Nothing,Real}, max_bytes, no_wait,
                               min_pending, min_ack_pending, priority_group, priority)
-    batch = _positive_int_option("fetch batch", batch)
+    batch = _positive_integer_option("fetch batch", batch)
     max_bytes = _optional_positive_int_option("fetch max_bytes", max_bytes)
     no_wait = _bool_option("fetch no_wait", no_wait)
     timeout = _positive_timeout_seconds("fetch timeout", timeout)
@@ -2519,6 +2478,7 @@ function _pull_stream_set_error!(state::_PullMessageStreamState, err)
     @lock state.lock begin
         isnothing(state.error) && (state.error = exception)
         state.closed = true
+        _pull_stream_clear_requests!(state)
     end
     nothing
 end
@@ -2527,12 +2487,13 @@ function _pull_stream_close_state!(state::_PullMessageStreamState)
     @lock state.lock begin
         was_closed = state.closed
         state.closed = true
+        _pull_stream_clear_requests!(state)
         was_closed
     end
 end
 
 function _pull_stream_threshold(name::AbstractString, value, limit::Int)::Int
-    threshold = _positive_int_option(name, value)
+    threshold = _positive_integer_option(name, value)
     threshold <= limit || throw(ArgumentError("$name must not exceed its request limit"))
     threshold
 end
@@ -2542,11 +2503,11 @@ function _validate_pull_messages(psub::PullSubscription, batch, max_bytes, expir
                                  threshold_bytes, channel_size, stop_after,
                                  min_pending, min_ack_pending, priority_group,
                                  priority)::Tuple{_PullStreamConfig,Int}
-    batch = _positive_int_option("messages batch", batch)
+    batch = _positive_integer_option("messages batch", batch)
     max_bytes = _optional_positive_int_option("messages max_bytes", max_bytes)
     expires = _positive_timeout_seconds("messages expires", expires)
     heartbeat = _pull_fetch_heartbeat(expires, heartbeat)
-    channel_size = _positive_int_option("messages channel_size", channel_size)
+    channel_size = _positive_integer_option("messages channel_size", channel_size)
     threshold_messages =
         isnothing(threshold_messages) ? max(1, min(batch, channel_size) ÷ 2) :
         _pull_stream_threshold("messages threshold_messages", threshold_messages, channel_size)
@@ -2597,34 +2558,17 @@ function _next_pull_stream_msg(stream::PullMessageStream, timeout::Real)
     end
 end
 
-function _pull_stream_requested_messages(requests::Vector{_PullStreamRequest})::Int
-    pending = 0
-    @inbounds for request in requests
-        pending += request.remaining_messages
-    end
-    pending
-end
-
-function _pull_stream_requested_bytes(requests::Vector{_PullStreamRequest})::Int
-    pending = 0
-    @inbounds for request in requests
-        bytes = request.remaining_bytes
-        isnothing(bytes) || (pending += bytes)
-    end
-    pending
-end
-
 function _pull_stream_pending_messages(state::_PullMessageStreamState)::Int
-    state.buffered_messages + _pull_stream_requested_messages(state.requests)
+    state.buffered_messages + state.requested_messages
 end
 
 function _pull_stream_pending_bytes(state::_PullMessageStreamState)::Int
-    state.buffered_bytes + _pull_stream_requested_bytes(state.requests)
+    state.buffered_bytes + state.requested_bytes
 end
 
 function _pull_stream_request_batch(config::_PullStreamConfig,
                                     state::_PullMessageStreamState)::Int
-    requested = _pull_stream_requested_messages(state.requests)
+    requested = state.requested_messages
     available = config.channel_size - state.buffered_messages - requested
     available > 0 || return 0
     batch = min(config.batch, available)
@@ -2634,6 +2578,23 @@ function _pull_stream_request_batch(config::_PullStreamConfig,
         batch = min(batch, remaining)
     end
     batch
+end
+
+_pull_stream_reserved_bytes(max_bytes::Union{Int,Nothing})::Int =
+    isnothing(max_bytes) ? 0 : max_bytes::Int
+
+function _pull_stream_reserve_counters!(state::_PullMessageStreamState,
+                                        request::_PullStreamRequest)
+    state.requested_messages += request.reserved_messages
+    state.requested_bytes += request.reserved_bytes
+    nothing
+end
+
+function _pull_stream_release_counters!(state::_PullMessageStreamState,
+                                        messages::Int, bytes::Int)
+    state.requested_messages = max(0, state.requested_messages - messages)
+    state.requested_bytes = max(0, state.requested_bytes - bytes)
+    nothing
 end
 
 function _pull_stream_request_max_bytes(config::_PullStreamConfig,
@@ -2659,8 +2620,9 @@ function _reserve_pull_stream_request!(config::_PullStreamConfig, state::_PullMe
         batch > 0 || return nothing
         max_bytes = _pull_stream_request_max_bytes(config, state)
         max_bytes === 0 && return nothing
-        request = _PullStreamRequest(token, batch, max_bytes)
+        request = _PullStreamRequest(token, batch, _pull_stream_reserved_bytes(max_bytes))
         push!(state.requests, request)
+        _pull_stream_reserve_counters!(state, request)
         _PullStreamReservation(request, batch, max_bytes)
     end
 end
@@ -2676,7 +2638,10 @@ end
 function _unreserve_pull_stream_request!(state::_PullMessageStreamState, request::_PullStreamRequest)
     @lock state.lock begin
         index = _pull_stream_request_index(state.requests, request)
-        index == 0 || deleteat!(state.requests, index)
+        if index != 0
+            deleteat!(state.requests, index)
+            _pull_stream_release_counters!(state, request.reserved_messages, request.reserved_bytes)
+        end
     end
     nothing
 end
@@ -2707,27 +2672,50 @@ function _pull_stream_find_request(requests::Vector{_PullStreamRequest}, subject
     0
 end
 
-function _pull_stream_msg_bytes(msg::Msg)::Int
+function _pull_stream_msg_bytes(msg::AbstractMsg)::Int
     max(1, msg.header_bytes + length(msg.data))
 end
 
-function _pull_stream_msg_bytes(msg::JetStreamMsg)::Int
-    max(1, msg.header_bytes + length(msg.data))
-end
-
-function _pull_stream_decrement_request!(requests::Vector{_PullStreamRequest}, msg::Msg)
-    isempty(requests) && return nothing
-    request = first(requests)
-    request.remaining_messages = max(0, request.remaining_messages - 1)
-    bytes = request.remaining_bytes
-    if !isnothing(bytes)
-        request.remaining_bytes = max(0, bytes - _pull_stream_msg_bytes(msg))
-    end
-    if request.remaining_messages == 0 ||
-       (!isnothing(request.remaining_bytes) && (request.remaining_bytes::Int) == 0)
-        popfirst!(requests)
-    end
+function _pull_stream_decrement_requested!(state::_PullMessageStreamState, msg::Msg)
+    _pull_stream_release_counters!(state, 1, _pull_stream_msg_bytes(msg))
     nothing
+end
+
+function _pull_stream_clear_requests!(state::_PullMessageStreamState)
+    empty!(state.requests)
+    state.requested_messages = 0
+    state.requested_bytes = 0
+    nothing
+end
+
+function _pull_stream_pending_header(msg::Msg, name::AbstractString)::Int
+    value = header(msg, name)
+    (isnothing(value) || isempty(value)) && return 0
+    parsed = tryparse(Int, value)
+    isnothing(parsed) && throw(ProtocolError("invalid $name header: $value"))
+    parsed >= 0 || throw(ProtocolError("invalid $name header: $value"))
+    parsed
+end
+
+function _pull_stream_status_pending(msg::Msg)::Tuple{Int,Int}
+    _pull_stream_pending_header(msg, "Nats-Pending-Messages"),
+        _pull_stream_pending_header(msg, "Nats-Pending-Bytes")
+end
+
+function _pull_stream_release_terminal_request!(state::_PullMessageStreamState,
+                                                request_index::Int, msg::Msg)
+    messages, bytes = _pull_stream_status_pending(msg)
+    deleteat!(state.requests, request_index)
+    _pull_stream_release_counters!(state, messages, bytes)
+    nothing
+end
+
+function _pull_stream_release_terminal_request!(state::_PullMessageStreamState,
+                                                subject::AbstractString, msg::Msg)::Bool
+    request_index = _pull_stream_find_request(state.requests, subject)
+    request_index == 0 && return false
+    _pull_stream_release_terminal_request!(state, request_index, msg)
+    true
 end
 
 function _pull_stream_maybe_refill!(stream::PullMessageStream, config::_PullStreamConfig=stream.config)
@@ -2781,7 +2769,7 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
                     if config.heartbeat > 0 && time() >= heartbeat_deadline
                         throw(_jetstream_heartbeat_error())
                     end
-                    @lock stream.state.lock empty!(stream.state.requests)
+                    @lock stream.state.lock _pull_stream_clear_requests!(stream.state)
                     continue
                 elseif err isa _PullStreamClosed
                     break
@@ -2799,7 +2787,8 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
                 if action in (:idle_heartbeat, :flow_control, :control)
                     continue
                 elseif action in (:no_messages, :timeout, :batch_completed, :max_bytes_exceeded)
-                    @lock stream.state.lock deleteat!(stream.state.requests, request_index)
+                    released = @lock stream.state.lock _pull_stream_release_terminal_request!(stream.state, msg.subject, msg)
+                    released || continue
                     _pull_stream_maybe_refill!(stream, config)
                     continue
                 else
@@ -2812,7 +2801,7 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
             config.heartbeat > 0 && (heartbeat_deadline = time() + 2 * config.heartbeat)
             pin_id = header(msg, "Nats-Pin-Id")
             !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
-            @lock stream.state.lock _pull_stream_decrement_request!(stream.state.requests, msg)
+            @lock stream.state.lock _pull_stream_decrement_requested!(stream.state, msg)
             _pull_stream_put!(stream, msg)
             _pull_stream_maybe_refill!(stream, config)
         end

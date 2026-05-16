@@ -240,25 +240,25 @@ end
     @test payload["headers_only"] == true
 
     large_value = fill(UInt8('x'), 8192)
-    N._kv_record_key!(latest, prefix, Msg("$(prefix)alpha", "\$JS.ACK.KV_bucket.C.1.10.1.0.0", large_value))
+    N._kv_record_key_pending!(latest, prefix, Msg("$(prefix)alpha", "\$JS.ACK.KV_bucket.C.1.10.1.0.0", large_value))
     @test latest == Dict("alpha" => (10, true))
     @test N._kv_active_keys(latest) == ["alpha"]
 
-    N._kv_record_key!(latest, prefix, Msg("$(prefix)alpha", "\$JS.ACK.KV_bucket.C.2.9.2.0.0", UInt8[]))
+    N._kv_record_key_pending!(latest, prefix, Msg("$(prefix)alpha", "\$JS.ACK.KV_bucket.C.2.9.2.0.0", UInt8[]))
     @test latest["alpha"] == (10, true)
 
-    N._kv_record_key!(latest, prefix, Msg("$(prefix)alpha", "\$JS.ACK.KV_bucket.C.3.11.3.0.0", UInt8[];
-                                         headers=Headers("KV-Operation" => ["DEL"])))
+    N._kv_record_key_pending!(latest, prefix, Msg("$(prefix)alpha", "\$JS.ACK.KV_bucket.C.3.11.3.0.0", UInt8[];
+                                                 headers=Headers("KV-Operation" => ["DEL"])))
     @test latest["alpha"] == (11, false)
     @test isempty(N._kv_active_keys(latest))
 
-    N._kv_record_key!(latest, prefix, Msg("$(prefix)beta", "\$JS.ACK.KV_bucket.C.4.12.4.0.0", UInt8[];
-                                         headers=Headers("KV-Operation" => ["PURGE"])))
+    N._kv_record_key_pending!(latest, prefix, Msg("$(prefix)beta", "\$JS.ACK.KV_bucket.C.4.12.4.0.0", UInt8[];
+                                                 headers=Headers("KV-Operation" => ["PURGE"])))
     @test isempty(N._kv_active_keys(latest))
 
-    N._kv_record_key!(latest, prefix, Msg("$(prefix)beta", "\$JS.ACK.KV_bucket.C.5.13.5.0.0", UInt8[]))
+    N._kv_record_key_pending!(latest, prefix, Msg("$(prefix)beta", "\$JS.ACK.KV_bucket.C.5.13.5.0.0", UInt8[]))
     @test N._kv_active_keys(latest) == ["beta"]
-    @test_throws ProtocolError N._kv_record_key!(latest, prefix, Msg("other.beta", "\$JS.ACK.KV_bucket.C.6.14.6.0.0", UInt8[]))
+    @test_throws ProtocolError N._kv_record_key_pending!(latest, prefix, Msg("other.beta", "\$JS.ACK.KV_bucket.C.6.14.6.0.0", UInt8[]))
 end
 
 @testitem "KeyValue pagination uses pending metadata" setup=[TestHelpers] begin

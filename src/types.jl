@@ -435,6 +435,19 @@ function _connect_option_int(name::String, value)::Int
     end
 end
 
+function _integer_range_option(name::AbstractString, value, min::Integer, max::Integer,
+                               requirement::AbstractString)::Int
+    value isa Bool && throw(ArgumentError("$name must be $requirement"))
+    value isa Integer || throw(ArgumentError("$name must be $requirement"))
+    min <= value <= max || throw(ArgumentError("$name must be $requirement"))
+    Int(value)
+end
+
+_positive_integer_option(name::AbstractString, value)::Int =
+    _integer_range_option(name, value, 1, typemax(Int), "a positive integer")
+_nonnegative_integer_option(name::AbstractString, value)::Int =
+    _integer_range_option(name, value, 0, typemax(Int), "a non-negative integer")
+
 function _connect_option_positive_int(name::String, value)::Int
     result = _connect_option_int(name, value)
     result > 0 || throw(ArgumentError("$name must be positive"))

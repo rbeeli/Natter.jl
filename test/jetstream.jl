@@ -1954,9 +1954,7 @@ end
     @test String(take!(delete_client.write_io)) == ""
     @test isempty(delete_client.subscriptions)
 
-    client = TestHelpers.fake_client()
-    js = jetstream(client)
-    api_msg, api_seq, api_created = N._stream_message_from_api_payload(js, Dict{String,Any}(
+    api_msg, api_seq, api_created = N._stream_message_from_api_payload(Dict{String,Any}(
         "subject" => "orders.created",
         "seq" => 7,
         "data" => "cGF5bG9hZA==",
@@ -1975,20 +1973,20 @@ end
                        "Nats-Time-Stamp" => ["2026-01-01T00:00:00Z"],
                        "x-test" => ["ok"],
                    ))
-    msg = N._direct_message_response(js, "\$JS.API.DIRECT.GET.ORDERS", response)
+    msg, _seq, _created = N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", response)
     @test msg.subject == "orders.created"
     @test String(msg) == "payload"
     @test header(msg, "X-Test") == "ok"
     @test isnothing(header(msg, "Nats-Sequence"))
-    info_msg, info_seq, info_created = N._direct_message_response_info(js, "\$JS.API.DIRECT.GET.ORDERS", response)
+    info_msg, info_seq, info_created = N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", response)
     @test info_msg.subject == "orders.created"
     @test info_seq == 7
     @test info_created == DateTime(2026, 1, 1)
 
     not_found = Msg("_INBOX.reply", nothing, UInt8[]; headers=Headers("Status" => ["404"], "Description" => ["no message found"]))
-    @test_throws JetStreamError N._direct_message_response(js, "\$JS.API.DIRECT.GET.ORDERS", not_found)
+    @test_throws JetStreamError N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", not_found)
     no_responders = Msg("_INBOX.reply", nothing, UInt8[]; headers=Headers("Status" => ["503"]))
-    @test_throws NoRespondersError N._direct_message_response(js, "\$JS.API.DIRECT.GET.MISSING", no_responders)
+    @test_throws NoRespondersError N._direct_message_response_info("\$JS.API.DIRECT.GET.MISSING", no_responders)
 end
 
 @testitem "JetStream metadata" begin
@@ -2401,7 +2399,9 @@ end
 
         max_bytes = Msg("_INBOX.pull", nothing, UInt8[];
                         headers=Headers("Status" => ["409"],
-                                        "Description" => ["Message Size Exceeds MaxBytes"]),
+                                        "Description" => ["Message Size Exceeds MaxBytes"],
+                                        "Nats-Pending-Messages" => ["1"],
+                                        "Nats-Pending-Bytes" => ["8"]),
                         sid=core_sub.sid)
         N._dispatch_msg(client, max_bytes)
 
@@ -2414,6 +2414,112 @@ end
         close(stream)
         close(psub)
     end
+end
+
+@testitem "JetStream continuous pull accounting uses aggregate request credits" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    state = N._PullMessageStreamState()
+    config = N._PullStreamConfig(2, nothing, 1.0, 0.0, 2, nothing,
+                                 nothing, nothing, nothing, nothing, nothing, 4)
+
+    first = N._reserve_pull_stream_request!(config, state, "first")
+    @test !isnothing(first)
+    @test state.requested_messages == 2
+    @test state.requested_bytes == 0
+    @test length(state.requests) == 1
+
+    msg = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one"))
+    @lock state.lock N._pull_stream_decrement_requested!(state, msg)
+    @test state.requested_messages == 1
+    @test length(state.requests) == 1
+
+    second = N._reserve_pull_stream_request!(config, state, "second")
+    @test !isnothing(second)
+    @test state.requested_messages == 3
+    @test length(state.requests) == 2
+
+    stale = Msg("_INBOX.pull.stale", nothing, UInt8[];
+                headers=Headers("Status" => ["404"], "Description" => ["No Messages"],
+                                "Nats-Pending-Messages" => ["1"]))
+    @lock state.lock begin
+        @test N._pull_stream_find_request(state.requests, stale.subject) == 0
+        @test state.requested_messages == 3
+    end
+
+    terminal = Msg("_INBOX.pull.first", nothing, UInt8[];
+                   headers=Headers("Status" => ["404"], "Description" => ["No Messages"],
+                                   "Nats-Pending-Messages" => ["1"]))
+    @lock state.lock begin
+        request_index = N._pull_stream_find_request(state.requests, terminal.subject)
+        @test request_index == 1
+        N._pull_stream_release_terminal_request!(state, request_index, terminal)
+        @test state.requested_messages == 2
+        @test length(state.requests) == 1
+        @test state.requests[1].token == "second"
+    end
+end
+
+@testitem "JetStream continuous pull accounting tracks byte credits from status headers" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    state = N._PullMessageStreamState()
+    config = N._PullStreamConfig(4, 20, 1.0, 0.0, 0, 10,
+                                 nothing, nothing, nothing, nothing, nothing, 4)
+
+    first = N._reserve_pull_stream_request!(config, state, "first")
+    @test !isnothing(first)
+    @test state.requested_messages == 4
+    @test state.requested_bytes == 20
+
+    msg = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("abcdefghijkl"))
+    @lock state.lock N._pull_stream_decrement_requested!(state, msg)
+    @test state.requested_messages == 3
+    @test state.requested_bytes == 8
+
+    second = N._reserve_pull_stream_request!(config, state, "second")
+    @test !isnothing(second)
+    @test state.requested_messages == 4
+    @test state.requested_bytes == 20
+
+    terminal = Msg("_INBOX.pull.first", nothing, UInt8[];
+                   headers=Headers("Status" => ["409"], "Description" => ["Batch Completed"],
+                                   "Nats-Pending-Messages" => ["3"],
+                                   "Nats-Pending-Bytes" => ["8"]))
+    @lock state.lock begin
+        request_index = N._pull_stream_find_request(state.requests, terminal.subject)
+        @test request_index == 1
+        N._pull_stream_release_terminal_request!(state, request_index, terminal)
+        @test state.requested_messages == 1
+        @test state.requested_bytes == 12
+        @test state.requests[1].token == "second"
+    end
+end
+
+@testitem "JetStream continuous pull validates status pending headers" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    ok = Msg("_INBOX.pull.token", nothing, UInt8[];
+             headers=Headers("Nats-Pending-Messages" => ["3"],
+                             "Nats-Pending-Bytes" => ["42"]))
+    @test N._pull_stream_status_pending(ok) == (3, 42)
+
+    missing = Msg("_INBOX.pull.token", nothing, UInt8[])
+    @test N._pull_stream_status_pending(missing) == (0, 0)
+
+    invalid_messages = Msg("_INBOX.pull.token", nothing, UInt8[];
+                           headers=Headers("Nats-Pending-Messages" => ["abc"]))
+    @test_throws ProtocolError N._pull_stream_status_pending(invalid_messages)
+
+    invalid_bytes = Msg("_INBOX.pull.token", nothing, UInt8[];
+                        headers=Headers("Nats-Pending-Bytes" => ["-1"]))
+    @test_throws ProtocolError N._pull_stream_status_pending(invalid_bytes)
 end
 
 @testitem "JetStream continuous pull refills from buffered capacity" setup=[TestHelpers] begin

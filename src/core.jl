@@ -188,8 +188,6 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
         end
     elseif st == ConnectionStatus.DISCONNECTED
         throw(ConnectionClosedError("connection is disconnected"))
-    elseif st == ConnectionStatus.DRAINING
-        throw(ConnectionDrainingError())
     else
         throw(ConnectionClosedError())
     end
@@ -298,10 +296,6 @@ function _enqueue_pending(client::Client, data)
     end
 end
 
-function _prepare_publish_frame(subject::AbstractString, data, reply::Union{AbstractString,Nothing}, headers)
-    _publish_frame(subject, reply, data, headers)
-end
-
 prepare_publish(subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
                 headers=nothing)::PublishFrame =
     PublishFrame(subject, reply, data, headers)
@@ -336,13 +330,9 @@ function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_
                            force_flush::Bool=false, cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     frame_size = _serialized_size(frame)
-    total = _pub_payload_size(frame)
     st = status(client)
-    max_payload = _client_max_payload(client)
-    headers_supported = _client_headers_supported(client)
     _ensure_usable_status_for_publish(st)
-    !isempty(frame.headers) && !headers_supported && throw(UnsupportedFeatureError("headers are not supported by the connected server"))
-    total > max_payload && throw(MaxPayloadError(max_payload, total))
+    _validate_publish_frame_for_client(client, frame)
     _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size, st)
     _record_out!(client, length(frame.payload))
     nothing
@@ -351,7 +341,7 @@ end
 function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
                   headers=nothing, buffer_on_reconnect::Bool=true, force_flush::Bool=false,
                   cancel_token::MaybeCancellationToken=nothing)
-    _publish_prepared(client, _prepare_publish_frame(subject, data, reply, headers);
+    _publish_prepared(client, _publish_frame(subject, reply, data, headers);
                       buffer_on_reconnect, force_flush, cancel_token)
 end
 
@@ -383,10 +373,7 @@ function publish(client::Client, frame::PublishFrame; cancel_token::MaybeCancell
 end
 
 function _validate_subscription_positive_limit(name::AbstractString, value)::Int
-    value isa Bool && throw(ArgumentError("$name must be a positive integer"))
-    value isa Integer || throw(ArgumentError("$name must be a positive integer"))
-    1 <= value <= typemax(Int) || throw(ArgumentError("$name must be a positive integer"))
-    Int(value)
+    _positive_integer_option(name, value)
 end
 
 function _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
@@ -636,11 +623,6 @@ function _take_subscription_msg_ready!(sub::Subscription)::Tuple{Bool,Msg}
     _maybe_reply_to_subscription_flow_control!(sub, control_handler)
     _notify_subscription_waiters!(sub; all=true)
     return (true, msg)
-end
-
-function _take_subscription_msg_if_ready!(sub::Subscription)::Union{Msg,Nothing}
-    ready, msg = _take_subscription_msg_ready!(sub)
-    ready ? msg : nothing
 end
 
 function _ensure_sync_subscription(sub::Subscription)
@@ -1183,7 +1165,7 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
                       headers=nothing, cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
-    request_frame = _prepare_publish_frame(subject, data, nothing, headers)
+    request_frame = _publish_frame(subject, nothing, data, headers)
     _ensure_connected_for_request(client)
     _validate_publish_frame_for_client(client, request_frame)
     mux = _ensure_request_mux(client)
