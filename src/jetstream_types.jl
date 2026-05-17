@@ -703,7 +703,12 @@ function _validate_consumer_config_payload!(payload::Dict{String,Any})::Dict{Str
         payload["sample_freq"] isa AbstractString || throw(ArgumentError("sample_freq must be a string"))
         raw = String(payload["sample_freq"])
         freq = endswith(raw, "%") ? chop(raw; tail=1) : raw
-        !isempty(freq) && all(isdigit, freq) || throw(ArgumentError("sample_freq must be a non-negative integer percentage"))
+        if isempty(freq) || !all(isdigit, freq)
+            throw(ArgumentError("sample_freq must be an integer percentage between 0 and 100"))
+        end
+        value = tryparse(Int, freq)
+        !isnothing(value) && 0 <= value <= 100 ||
+            throw(ArgumentError("sample_freq must be an integer percentage between 0 and 100"))
         payload["sample_freq"] = raw
     end
 
@@ -735,7 +740,8 @@ _maybe_string(value) = isnothing(value) ? nothing : String(value)
 _maybe_bool(value) = isnothing(value) ? nothing : Bool(value)
 _maybe_int(value) = isnothing(value) ? nothing : Int(value)
 _maybe_seconds(value) = isnothing(value) ? nothing : _nanoseconds_to_seconds(value)
-_maybe_timestamp(value) = isnothing(value) ? nothing : String(value)
+_maybe_timestamp(value) = isnothing(value) ? nothing :
+                          value isa DateTime ? value : _parse_rfc3339_datetime(String(value))
 
 function _maybe_string_vector(value)
     isnothing(value) && return nothing

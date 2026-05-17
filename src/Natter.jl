@@ -3,6 +3,7 @@ module Natter
 using Base64
 using Dates
 using EnumX
+using FunctionWrappers
 using JSON3
 using MbedTLS
 using Random
@@ -19,7 +20,7 @@ export Msg, BorrowedMsg, Headers, PublishFrame, Subscription, Stats
 export connect, close, drain, flush, ping, publish, prepare_publish, subscribe, unsubscribe, request, next, new_inbox
 export connect_async, close_async, drain_async, flush_async, ping_async, publish_async, subscribe_async, unsubscribe_async, request_async, next_async
 export header, headers, status, stats, connected_url
-export JetStreamContext, StreamLostData, StreamState, StreamInfo, ConsumerSequenceInfo, ConsumerInfo, PubAck, JetStreamPublishFuture, JetStreamMsg, BorrowedJetStreamMsg, PullSubscription, PullMessageStream, PushSubscription
+export JetStreamContext, StreamLostData, StreamState, StreamInfo, ConsumerSequenceInfo, ConsumerInfo, PubAck, JetStreamPublishFuture, AbstractJetStreamMsg, JetStreamMsg, BorrowedJetStreamMsg, PullSubscription, PullMessageStream, PushSubscription
 export RetentionPolicy, StorageType, DiscardPolicy, StoreCompression, PersistMode
 export AckPolicy, DeliverPolicy, ReplayPolicy, PriorityPolicy
 export Placement, ExternalStreamSource, SubjectTransform, StreamSource, StreamConsumerLimits, RePublish

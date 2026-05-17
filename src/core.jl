@@ -659,6 +659,42 @@ end
     nothing
 end
 
+@noinline function _finish_borrowed_callback!(sub::Subscription)
+    @lock sub.lock begin
+        sub.processing = max(0, sub.processing - 1)
+        _notify_subscription_waiters_locked(sub; all=true)
+    end
+    nothing
+end
+
+function _invoke_borrowed_handler(client::C, handler::_BorrowedCallback{C},
+                                  msg::_BorrowedDispatchMsg) where {C<:Client}
+    handler.invoke(client, msg)
+    nothing
+end
+
+function _borrowed_dispatch_msg(msg::BorrowedMsg)::_BorrowedDispatchMsg
+    data = Vector{UInt8}(msg.data)
+    BorrowedMsg(msg.subject, msg.reply, @view(data[1:length(data)]), msg.headers, msg.sid,
+                msg.header_bytes)
+end
+
+function _invoke_borrowed_handler(client::Client, handler::_BorrowedCallback,
+                                  msg::BorrowedMsg)
+    handler.invoke(client, _borrowed_dispatch_msg(msg))
+    nothing
+end
+
+@noinline function _run_borrowed_callback(client::Client, sub::Subscription,
+                                          handler::_BorrowedCallback, msg::M) where {M<:AbstractMsg}
+    try
+        _invoke_borrowed_handler(client, handler, msg)
+    finally
+        _finish_borrowed_callback!(sub)
+    end
+    nothing
+end
+
 function _dispatch_msg(client::Client, msg::BorrowedMsg)
     msg_bytes = _msg_pending_bytes(msg)
     sub = _lookup_subscription(client, msg.sid)
@@ -703,10 +739,10 @@ function _dispatch_borrowed_msg_to_sub(client::Client, sub::Subscription, msg::B
         return
     end
 
-    callback = sub.callback
+    handler = sub.borrowed_callback_handler
     should_close = false
     accepted = @lock sub.lock begin
-        if sub.closed || !sub.borrowed_callback || isnothing(callback)
+        if sub.closed || !sub.borrowed_callback || !sub.has_callback
             false
         else
             sub.received += 1
@@ -723,14 +759,7 @@ function _dispatch_borrowed_msg_to_sub(client::Client, sub::Subscription, msg::B
     _record_in!(client, msg_bytes)
     _record_subscription_data_received!(control_handler, msg)
     _maybe_reply_to_subscription_flow_control!(sub, control_handler)
-    try
-        _invoke_borrowed_callback(client, callback, msg)
-    finally
-        @lock sub.lock begin
-            sub.processing = max(0, sub.processing - 1)
-            _notify_subscription_waiters_locked(sub; all=true)
-        end
-    end
+    _run_borrowed_callback(client, sub, handler, msg)
     if should_close
         _close_subscription_locally!(sub; throw_errors=false)
     end

@@ -7,7 +7,7 @@ Conventions:
 - Timeouts and durations are seconds.
 - Status enums are namespaced, for example `ConnectionStatus.CONNECTED` and `AckPolicy.EXPLICIT`.
 - Payload inputs may be strings, byte vectors, or `nothing`; encode structured values explicitly.
-- `String(msg)` works for `Msg`, `BorrowedMsg`, `JetStreamMsg`, and `KeyValueEntry`.
+- `String(msg)` works for `Msg`, `BorrowedMsg`, `JetStreamMsg`, `BorrowedJetStreamMsg`, and `KeyValueEntry`.
 - Blocking operations accept `cancel_token=cancellation_token(source)` where cancellation is useful.
 - Most `_async` helpers return `NatterTask`; `js_publish_async` returns `JetStreamPublishFuture`. `fetch(handle)` returns the operation result or rethrows the original error.
 
@@ -140,6 +140,7 @@ Cancellation helpers: `CancellationSource()`, `cancellation_token(source)`, `can
 | `ConsumerInfo`, `ConsumerSequenceInfo` | Typed consumer info responses. |
 | `PubAck` | Publish acknowledgement. |
 | `JetStreamPublishFuture` | Future returned by protocol-level async JetStream publish. |
+| `AbstractJetStreamMsg` | Shared supertype for ackable JetStream consumer messages. |
 | `JetStreamMsg` | Consumer message with acknowledgement state. |
 | `BorrowedJetStreamMsg` | Push-callback JetStream message whose bytes are borrowed for the callback call. |
 | `PullSubscription`, `PullMessageStream`, `PushSubscription` | Consumer handles. |
@@ -191,13 +192,13 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `consume(callback, psub; kwargs...)` | `PullMessageStream` | Run a callback over `messages`. |
 | `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=..., ordered=false, borrowed=false)` | `PushSubscription` | Create or bind a push consumer, or create an ordered ephemeral push consumer with `ordered=true`. `borrowed=true` is callback-only and delivers `BorrowedJetStreamMsg`. |
 | `next(psub::PushSubscription; timeout=1.0)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
-| `ack(msg)`, `ack_sync(msg; timeout=1.0)`, `nak(msg; delay=nothing)`, `in_progress(msg)`, `term(msg)` | `nothing` or `Msg` | Acknowledge or control redelivery. |
+| `ack(msg; cancel_token=nothing)`, `ack_sync(msg; timeout=1.0, cancel_token=nothing)`, `nak(msg; delay=nothing, cancel_token=nothing)`, `in_progress(msg; cancel_token=nothing)`, `term(msg; cancel_token=nothing)` | `nothing` or `Msg` | Acknowledge or control redelivery for `AbstractJetStreamMsg` values. |
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
 | `close(psub; timeout=...)`, `close(push; timeout=...)`, `close(stream)` | `nothing` | Close consumer/message handles. Subscription close timeouts bound server cleanup. |
 
 Typed `StreamConfig` and `ConsumerConfig` create/update calls verify that requested fields are reflected in the server response, including explicit false, zero, and empty values. Raw dictionary configs are pass-through for fields outside Natter's typed API.
 
-JetStream task-backed async helpers mirror management, subscribe, fetch, timeout-aware close, and acknowledgement functions: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_async_complete_async`. `js_publish_async` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
+JetStream task-backed async helpers mirror management, subscribe, fetch, timeout-aware close, and acknowledgement functions, including acknowledgement kwargs and borrowed messages: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_async_complete_async`. `js_publish_async` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
 
 ## KeyValue Types
 

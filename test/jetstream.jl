@@ -242,6 +242,8 @@ end
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(idle_heartbeat=0.01))
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(backoff=[0.1, -0.2]))
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(sample_freq="-1%"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(sample_freq="101"))
+    @test_throws ArgumentError N._js_config_payload(ConsumerConfig(sample_freq="101%"))
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_groups=["bad group"]))
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_policy=PriorityPolicy.OVERFLOW))
     @test_throws ArgumentError N._js_config_payload(ConsumerConfig(priority_groups=["fast"]))
@@ -634,6 +636,7 @@ end
 end
 
 @testitem "JetStream typed config response parsing" begin
+    using Dates
     using Natter
 
     const N = Natter
@@ -649,7 +652,9 @@ end
         "duplicate_window" => 1_000_000_000,
         "subject_delete_marker_ttl" => 3_000_000_000,
         "placement" => Dict("cluster" => "C1", "preferred" => "S1"),
-        "mirror" => Dict("name" => "UPSTREAM", "external" => Dict("api" => "\$JS.domain.API")),
+        "mirror" => Dict("name" => "UPSTREAM",
+                         "opt_start_time" => "2026-01-02T03:04:05.123456789Z",
+                         "external" => Dict("api" => "\$JS.domain.API")),
         "consumer_limits" => Dict("inactive_threshold" => 4_000_000_000, "max_ack_pending" => 10),
         "metadata" => Dict("owner" => "core"),
     ))
@@ -665,11 +670,13 @@ end
     @test stream.subject_delete_marker_ttl == 3.0
     @test stream.placement.preferred == "S1"
     @test stream.mirror.external.api == "\$JS.domain.API"
+    @test stream.mirror.opt_start_time == DateTime(2026, 1, 2, 3, 4, 5, 123)
     @test stream.consumer_limits.inactive_threshold == 4.0
 
     consumer = N._consumer_config_from_payload(Dict{String,Any}(
         "name" => "worker",
         "deliver_policy" => "last_per_subject",
+        "opt_start_time" => "2026-01-03T04:05:06Z",
         "ack_policy" => "none",
         "ack_wait" => 5_000_000_000,
         "backoff" => [1_000_000_000, 2_000_000_000],
@@ -678,6 +685,7 @@ end
         "priority_policy" => "overflow",
         "priority_timeout" => 6_000_000_000,
         "priority_groups" => ["fast"],
+        "pause_until" => "2026-01-04T05:06:07.987654321Z",
     ))
 
     @test consumer.name == "worker"
@@ -689,6 +697,8 @@ end
     @test consumer.idle_heartbeat == 0.25
     @test consumer.priority_policy == PriorityPolicy.OVERFLOW
     @test consumer.priority_timeout == 6.0
+    @test consumer.opt_start_time == DateTime(2026, 1, 3, 4, 5, 6)
+    @test consumer.pause_until == DateTime(2026, 1, 4, 5, 6, 7, 987)
 
     info = N._consumer_info(Dict{String,Any}(
         "stream_name" => "ORDERS",
@@ -1156,6 +1166,50 @@ end
         @test_throws JetStreamError terminal_ack(terminal_msg)
         @test TestHelpers.capture_text(terminal_capture) == written
     end
+end
+
+@testitem "borrowed JetStream messages share terminal ack guard" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function fresh_msg()
+        capture = TestHelpers.WriteCapture()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+        data = TestHelpers.bytes("work")
+        msg = BorrowedJetStreamMsg(BorrowedMsg("orders.created", "ACK.REPLY",
+                                               @view(data[1:4]), nothing, 1, 0),
+                                   client)
+        msg, capture
+    end
+
+    progress_msg, progress_capture = fresh_msg()
+    in_progress(progress_msg)
+    in_progress(progress_msg)
+    @test !N._acknowledged(progress_msg)
+    @test TestHelpers.capture_text(progress_capture) ==
+          "PUB ACK.REPLY 4\r\n+WPI\r\nPUB ACK.REPLY 4\r\n+WPI\r\n"
+
+    for terminal_ack in (ack, msg -> nak(msg), term)
+        terminal_msg, terminal_capture = fresh_msg()
+        terminal_ack(terminal_msg)
+        @test N._acknowledged(terminal_msg)
+        written = TestHelpers.capture_text(terminal_capture)
+
+        @test_throws JetStreamError in_progress(terminal_msg)
+        @test_throws JetStreamError terminal_ack(terminal_msg)
+        @test TestHelpers.capture_text(terminal_capture) == written
+    end
+
+    data = TestHelpers.bytes("work")
+    auto_capture = TestHelpers.WriteCapture()
+    auto_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=auto_capture)
+    js = jetstream(auto_client)
+    wrapped = N._jetstream_push_callback(js, msg -> ack(msg), true; borrowed=true)
+
+    @test_throws JetStreamError wrapped(BorrowedMsg("orders.created", "ACK.REPLY",
+                                                    @view(data[1:4]), nothing, 1, 0))
+    @test TestHelpers.capture_text(auto_capture) == "PUB ACK.REPLY 0\r\n\r\n"
 end
 
 @testitem "JetStream terminal acks are not marked done while reconnecting" setup=[TestHelpers] begin
@@ -1673,6 +1727,72 @@ end
 
     close(push_sub)
     close(plain_sub)
+end
+
+@testitem "borrowed JetStream push control dispatch handles status frames" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    errors = Channel{Any}(2)
+    capture = TestHelpers.WriteCapture()
+    opts = ConnectOptions(error_cb=err -> put!(errors, err))
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    payload = UInt8[]
+    called = Ref(0)
+
+    heartbeat_sub = subscribe(client, "_INBOX.borrowed.hb";
+                              callback=_ -> (called[] += 1),
+                              borrowed=true,
+                              _control_handler=N._JetStreamPushControlHandler())
+    TestHelpers.clear_capture!(capture)
+    heartbeat = BorrowedMsg("_INBOX.borrowed.hb", nothing, @view(payload[:]),
+                            Headers("Status" => ["100"],
+                                    "Description" => ["Idle Heartbeat"],
+                                    "Nats-Consumer-Stalled" => ["_INBOX.fc"]),
+                            heartbeat_sub.sid, 0)
+    N._dispatch_msg(client, heartbeat)
+
+    @test called[] == 0
+    @test !isready(heartbeat_sub.messages)
+    @test TestHelpers.capture_text(capture) == "PUB _INBOX.fc 0\r\n\r\n"
+
+    TestHelpers.clear_capture!(capture)
+    flow_sub = subscribe(client, "_INBOX.borrowed.fc";
+                         callback=_ -> (called[] += 1),
+                         borrowed=true,
+                         _control_handler=N._JetStreamPushControlHandler())
+    TestHelpers.clear_capture!(capture)
+    flow_control = BorrowedMsg("_INBOX.borrowed.fc", "_INBOX.flow", @view(payload[:]),
+                               Headers("Status" => ["100"],
+                                       "Description" => ["FlowControl Request"]),
+                               flow_sub.sid, 0)
+    N._dispatch_msg(client, flow_control)
+
+    @test called[] == 0
+    @test !isready(flow_sub.messages)
+    @test TestHelpers.capture_text(capture) == "PUB _INBOX.flow 0\r\n\r\n"
+
+    deleted_sub = subscribe(client, "_INBOX.borrowed.deleted";
+                            callback=_ -> (called[] += 1),
+                            borrowed=true,
+                            _control_handler=N._JetStreamPushControlHandler())
+    deleted = BorrowedMsg("_INBOX.borrowed.deleted", nothing, @view(payload[:]),
+                          Headers("Status" => ["409"],
+                                  "Description" => ["Consumer Deleted"]),
+                          deleted_sub.sid, 0)
+    N._dispatch_msg(client, deleted)
+
+    @test called[] == 0
+    @test !isready(deleted_sub.messages)
+    @test (@lock deleted_sub.lock deleted_sub.closed)
+    @test timedwait(1.0; pollint=0.01) do
+        isready(errors)
+    end != :timed_out
+    @test take!(errors) isa JetStreamError
+
+    close(heartbeat_sub)
+    close(flow_sub)
 end
 
 @testitem "JetStream status controls classify lazy descriptions without allocation" setup=[TestHelpers] begin

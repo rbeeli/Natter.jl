@@ -206,16 +206,15 @@ end
         client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=devnull)
         sub = subscribe(client, "foo")
         msg = Msg("foo", nothing, TestHelpers.bytes("x"); sid=sub.sid)
-        msg_bytes = N._msg_pending_bytes(msg)
         for _ in 1:1000
-            N._dispatch_owned_msg_to_sub(client, sub, msg, msg_bytes)
+            N._dispatch_msg(client, msg)
             ready, _ = N._take_subscription_msg_ready!(sub)
             ready || throw(AssertionError("expected ready message"))
         end
         GC.gc()
         @allocated begin
             for _ in 1:1000
-                N._dispatch_owned_msg_to_sub(client, sub, msg, msg_bytes)
+                N._dispatch_msg(client, msg)
                 ready, _ = N._take_subscription_msg_ready!(sub)
                 ready || throw(AssertionError("expected ready message"))
             end
@@ -237,14 +236,13 @@ end
         sub = subscribe(client, "foo"; callback=counter, borrowed=true)
         data = TestHelpers.bytes("x")
         msg = BorrowedMsg("foo", nothing, @view(data[1:1]), nothing, sub.sid, 0)
-        msg_bytes = N._msg_pending_bytes(msg)
         for _ in 1:1000
-            N._dispatch_borrowed_msg_to_sub(client, sub, msg, msg_bytes)
+            N._dispatch_msg(client, msg)
         end
         GC.gc()
         @allocated begin
             for _ in 1:1000
-                N._dispatch_borrowed_msg_to_sub(client, sub, msg, msg_bytes)
+                N._dispatch_msg(client, msg)
             end
         end
     end
@@ -275,6 +273,8 @@ end
     end
 
     @test queue_put_take_alloc() == 0
+    @test !(:callback in fieldnames(N.Subscription))
+    @test !(Any in fieldtypes(N.Subscription{N.Client}))
     @test dispatch_take_alloc() == 0
     @test borrowed_dispatch_alloc() == 0
     @test buffered_publish_alloc() == 0
@@ -2506,6 +2506,66 @@ end
         end
         isopen(blocker) && close(blocker)
         done = timedwait(0.5; pollint=0.01) do
+            istaskdone(server_task)
+        end
+        done == :timed_out || wait(server_task)
+    end
+end
+
+@testitem "connect timeout bounds auth callbacks" setup=[TestHelpers] begin
+    using Natter
+    using Sockets
+
+    const N = Natter
+
+    listener = listen(ip"127.0.0.1", 0)
+    port = Int(getsockname(listener)[2])
+    accepted = Channel{Sockets.TCPSocket}(1)
+    server_task = @async begin
+        sock = try
+            accept(listener)
+        catch err
+            (err isa InvalidStateException || err isa InterruptException || err isa Base.IOError) || rethrow()
+            return nothing
+        end
+        put!(accepted, sock)
+        try
+            write(sock, "INFO {\"headers\":true,\"nonce\":\"nonce\"}\r\n")
+            flush(sock)
+            try
+                readline(sock)
+            catch err
+                (err isa EOFError || err isa Base.IOError || err isa InvalidStateException) || rethrow()
+            end
+        catch err
+            (err isa InvalidStateException || err isa InterruptException || err isa Base.IOError) || rethrow()
+        finally
+            close(sock)
+        end
+    end
+
+    started = Channel{Bool}(1)
+    blocker = Channel{Bool}(0)
+    try
+        err = TestHelpers.thrown_exception() do
+            N.connect("nats://127.0.0.1:$port";
+                      connect_timeout=0.1,
+                      auth=N.CallbackAuth(_ -> begin
+                          put!(started, true)
+                          take!(blocker)
+                          N.NoAuth()
+                      end))
+        end
+        @test err isa TimeoutError
+        @test isready(started)
+    finally
+        close(listener)
+        isopen(blocker) && close(blocker)
+        if isready(accepted)
+            sock = take!(accepted)
+            isopen(sock) && close(sock)
+        end
+        done = timedwait(1.0; pollint=0.01) do
             istaskdone(server_task)
         end
         done == :timed_out || wait(server_task)

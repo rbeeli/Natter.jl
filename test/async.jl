@@ -111,6 +111,51 @@ end
     @test put_err isa ArgumentError
 end
 
+@testitem "JetStream ack async helpers mirror ack signatures" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+
+    function borrowed(reply="ACK.REPLY")
+        data = TestHelpers.bytes("work")
+        BorrowedJetStreamMsg(BorrowedMsg("orders.created", reply, @view(data[1:4]), nothing, 1, 0),
+                             client)
+    end
+
+    source = CancellationSource()
+    cancel!(source)
+    cancelled = TestHelpers.thrown_exception() do
+        fetch(ack_async(JetStreamMsg(Msg("orders.created", "ACK.REPLY", TestHelpers.bytes("work")),
+                                     client);
+                        cancel_token=cancellation_token(source)))
+    end
+    @test cancelled isa CancelledError
+    @test TestHelpers.capture_text(capture) == ""
+
+    @test isnothing(fetch(ack_async(borrowed())))
+    @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 0\r\n\r\n"
+
+    TestHelpers.clear_capture!(capture)
+    @test isnothing(fetch(nak_async(borrowed(); delay=0)))
+    @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 16\r\n-NAK {\"delay\":0}\r\n"
+
+    TestHelpers.clear_capture!(capture)
+    @test isnothing(fetch(in_progress_async(borrowed())))
+    @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 4\r\n+WPI\r\n"
+
+    TestHelpers.clear_capture!(capture)
+    @test isnothing(fetch(term_async(borrowed())))
+    @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 5\r\n+TERM\r\n"
+
+    sync_err = TestHelpers.thrown_exception() do
+        fetch(ack_sync_async(borrowed(nothing); timeout=0.1))
+    end
+    @test sync_err isa JetStreamError
+end
+
 @testitem "NatterTask failures rethrow original operation errors" setup=[TestHelpers] begin
     using Natter
 

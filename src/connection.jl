@@ -1327,8 +1327,12 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             tls_active = true
         end
         _throw_if_cancelled(cancel_token)
+        connect_cmd = _run_with_timeout("connect auth resolution", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
+            _connect_command(client, server, info, url_user, url_pass; attempt, reconnect)
+        end
+        _throw_if_cancelled(cancel_token)
         _run_interruptible_io_with_timeout("connect command write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
-            write(write_io, _connect_command(client, server, info, url_user, url_pass; attempt, reconnect))
+            write(write_io, connect_cmd)
             write(write_io, "PING$CRLF")
             flush(write_io)
         end

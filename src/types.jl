@@ -169,6 +169,7 @@ const HeaderStorage = Union{Headers,AnyLazyHeaders,Nothing}
 
 abstract type AbstractNatterClient end
 abstract type AbstractMsg end
+abstract type _ProtocolMsg <: AbstractMsg end
 abstract type _AbstractPublishFrame end
 
 struct ImmutableBytes <: AbstractVector{UInt8}
@@ -344,7 +345,7 @@ struct MsgMetadata
     domain::Union{String,Nothing}
 end
 
-struct Msg <: AbstractMsg
+struct Msg <: _ProtocolMsg
     subject::String
     reply::Union{String,Nothing}
     data::Vector{UInt8}
@@ -353,7 +354,7 @@ struct Msg <: AbstractMsg
     header_bytes::Int
 end
 
-struct BorrowedMsg{D<:AbstractVector{UInt8}} <: AbstractMsg
+struct BorrowedMsg{D<:AbstractVector{UInt8}} <: _ProtocolMsg
     subject::String
     reply::Union{String,Nothing}
     data::D
@@ -943,8 +944,6 @@ ProtocolReader{I}(io; read_size::Int=DEFAULT_READ_BUFFER_SIZE,
                           _connect_option_positive_int("read_size", read_size)),
                       Dict{Int,String}())
 
-const _ProtocolMsg = Union{Msg,BorrowedMsg}
-
 abstract type _ProtocolFrame end
 
 struct MsgFrame{M<:_ProtocolMsg} <: _ProtocolFrame
@@ -1375,15 +1374,36 @@ function Base.take!(q::MsgQueue{T}) where {T}
     msg
 end
 
-mutable struct Subscription{C<:AbstractNatterClient,Callback}
+const _BorrowedDispatchData = SubArray{UInt8,1,Vector{UInt8},Tuple{UnitRange{Int}},true}
+const _BorrowedDispatchMsg = BorrowedMsg{_BorrowedDispatchData}
+
+struct _BorrowedCallback{C<:AbstractNatterClient}
+    invoke::FunctionWrappers.FunctionWrapper{Nothing,Tuple{C,_BorrowedDispatchMsg}}
+end
+
+_borrowed_callback_noop(_client, _msg::_BorrowedDispatchMsg) = nothing
+
+function _borrowed_callback_handler(client::C, ::Nothing) where {C<:AbstractNatterClient}
+    invoke = FunctionWrappers.FunctionWrapper{Nothing,Tuple{C,_BorrowedDispatchMsg}}(_borrowed_callback_noop)
+    _BorrowedCallback{C}(invoke)
+end
+
+function _borrowed_callback_handler(client::C, callback) where {C<:AbstractNatterClient}
+    invoke = FunctionWrappers.FunctionWrapper{Nothing,Tuple{C,_BorrowedDispatchMsg}}((client, msg) -> begin
+        _invoke_borrowed_callback(client, callback, msg)
+    end)
+    _BorrowedCallback{C}(invoke)
+end
+
+mutable struct Subscription{C<:AbstractNatterClient}
     client::C
     lock::ReentrantLock
     sid::Int
     subject::String
     queue::Union{String,Nothing}
     has_callback::Bool
-    callback::Callback
     borrowed_callback::Bool
+    borrowed_callback_handler::_BorrowedCallback{C}
     messages::MsgQueue{Msg}
     condition::Base.GenericCondition{ReentrantLock}
     control_handler::_SubscriptionControlHandler
@@ -1406,10 +1426,11 @@ function Subscription(client::C, sid::Int, subject::String, queue::Union{String,
                       pending_msgs_limit::Int, pending_bytes_limit::Int, pending_bytes::Int,
                       received::Int, max_msgs::Int, closed::Bool, processor::Union{Task,Nothing},
                       server_active::Bool, processing::Int) where {C<:AbstractNatterClient}
-    Subscription{C,typeof(callback)}(client, lock, sid, subject, queue, !isnothing(callback), callback,
-                                     borrowed_callback, messages, condition, control_handler,
-                                     pending_msgs_limit, pending_bytes_limit, pending_bytes, received,
-                                     max_msgs, closed, processor, server_active, processing)
+    Subscription{C}(client, lock, sid, subject, queue, !isnothing(callback),
+                    borrowed_callback, _borrowed_callback_handler(client, borrowed_callback ? callback : nothing),
+                    messages, condition, control_handler,
+                    pending_msgs_limit, pending_bytes_limit, pending_bytes, received,
+                    max_msgs, closed, processor, server_active, processing)
 end
 
 mutable struct PongWaiter
