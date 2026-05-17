@@ -16,6 +16,7 @@ function make_client()
         ping_interval=30.0,
         max_outstanding_pings=2,
         allow_reconnect=true,
+        retry_on_initial_connect=true,
         reconnect_wait=0.25,
         reconnect_max_wait=5.0,
         reconnect_jitter=0.2,

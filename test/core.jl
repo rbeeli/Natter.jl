@@ -6,6 +6,7 @@ using TestItems
     const N = Natter
 
     @test N.ConnectOptions().allow_reconnect
+    @test !N.ConnectOptions().retry_on_initial_connect
     @test N.ConnectOptions().max_reconnect_attempts == -1
     @test N.ConnectOptions().sub_pending_msgs_limit == 1024
 
@@ -343,6 +344,7 @@ end
     @test opts.write_buffer_size == 0
     @test opts.write_timeout == 3.0
     @test opts.close_callback_timeout == 4.0
+    @test opts.randomize_servers
     @test N.ConnectOptions(close_callback_timeout=0).close_callback_timeout == 0.0
     @test !ismutable(opts)
     cold_opts = N.ConnectOptions(name=SubString("client-extra", 1, 6),
@@ -351,7 +353,8 @@ end
                                  tls_ca_path=SubString("ca.pem.extra", 1, 6),
                                  tls_cert_path=SubString("client.pem.extra", 1, 10),
                                  tls_key_path=SubString("key.pem.extra", 1, 7),
-                                 allow_reconnect=false, record_stats=true)
+                                 allow_reconnect=false, retry_on_initial_connect=true,
+                                 randomize_servers=false, record_stats=true)
     @test cold_opts.name == "client"
     @test cold_opts.verbose
     @test cold_opts.pedantic
@@ -363,6 +366,8 @@ end
     @test cold_opts.tls_cert_path == "client.pem"
     @test cold_opts.tls_key_path == "key.pem"
     @test !cold_opts.allow_reconnect
+    @test cold_opts.retry_on_initial_connect
+    @test !cold_opts.randomize_servers
     @test cold_opts.record_stats
     @test opts.servers isa Tuple{Vararg{String}}
     source_servers = ["nats://one.example:4222"]
@@ -461,6 +466,7 @@ end
 
     rejects(servers=String[])
     rejects(servers=[""])
+    rejects(randomize_servers=1)
     rejects_with("tls_cert_path and tls_key_path must be provided together"; tls_cert_path="client.pem")
     rejects_with("tls_cert_path and tls_key_path must be provided together"; tls_key_path="client-key.pem")
     rejects_with("auth must be an AbstractAuth"; auth="secret")
@@ -486,6 +492,7 @@ end
     rejects(tls_cert_path="", tls_key_path="client-key.pem")
     rejects(tls_cert_path="client.pem", tls_key_path=:key)
     rejects(allow_reconnect=1)
+    rejects(retry_on_initial_connect=1)
     rejects(record_stats=1)
     rejects(connect_timeout=0)
     rejects(connect_timeout=Inf)
@@ -511,6 +518,34 @@ end
     rejects(sub_pending_msgs_limit=0)
     rejects(sub_pending_bytes_limit=0)
     rejects(drain_timeout=0)
+end
+
+@testitem "server attempt order randomizes with opt-out" setup=[TestHelpers] begin
+    using Natter
+    using Random
+
+    const N = Natter
+
+    urls = [
+        "nats://one.example:4222",
+        "nats://two.example:4222",
+        "nats://three.example:4222",
+        "nats://four.example:4222",
+    ]
+
+    ordered_opts = N.ConnectOptions(; servers=urls, randomize_servers=false)
+    ordered_client = TestHelpers.fake_client(; opts=ordered_opts)
+    append!(ordered_client.servers, N.Server.(urls))
+    @test [server.url for server in N._server_attempt_order!(ordered_client)] == urls
+
+    randomized_opts = N.ConnectOptions(; servers=urls)
+    randomized_client = TestHelpers.fake_client(; opts=randomized_opts)
+    append!(randomized_client.servers, N.Server.(urls))
+    expected = copy(urls)
+    shuffle!(MersenneTwister(1), expected)
+    randomized = [server.url for server in N._server_attempt_order!(randomized_client)]
+    @test randomized == expected
+    @test Set(randomized) == Set(urls)
 end
 
 @testitem "server URL userinfo is percent-decoded" begin
@@ -2136,6 +2171,123 @@ end
             istaskdone(server_task)
         end
         done == :timed_out || wait(server_task)
+    end
+end
+
+@testitem "initial connect retry is opt-in and bounded" setup=[TestHelpers] begin
+    using Natter
+    using Sockets
+
+    const N = Natter
+
+    listener = listen(ip"127.0.0.1", 0)
+    port = Int(getsockname(listener)[2])
+    attempts = Ref(0)
+    server_task = @async begin
+        try
+            while attempts[] < 2
+                sock = accept(listener)
+                attempts[] += 1
+                close(sock)
+            end
+        finally
+            isopen(listener) && close(listener)
+        end
+    end
+
+    reported = Any[]
+    events = N.ConnectionEvent[]
+    try
+        err = TestHelpers.thrown_exception() do
+            N.connect("nats://127.0.0.1:$port";
+                      retry_on_initial_connect=true,
+                      connect_timeout=0.5,
+                      reconnect_wait=0.01,
+                      reconnect_jitter=0.0,
+                      max_reconnect_attempts=1,
+                      error_cb=err -> push!(reported, err),
+                      event_cb=event -> push!(events, event))
+        end
+
+        @test !(err isa N.CancelledError)
+        @test attempts[] == 2
+        @test length(reported) == 2
+        delay_events = filter(event -> event.kind == N.ConnectionEventKind.RECONNECT_DELAY, events)
+        @test length(delay_events) == 1
+        @test only(delay_events).status == N.ConnectionStatus.CONNECTING
+        @test only(delay_events).attempt == 1
+    finally
+        isopen(listener) && close(listener)
+        timedwait(1.0; pollint=0.01) do
+            istaskdone(server_task)
+        end == :timed_out || wait(server_task)
+    end
+end
+
+@testitem "initial connect retry succeeds when server appears" begin
+    using Natter
+    using Sockets
+
+    const N = Natter
+
+    listener = listen(ip"127.0.0.1", 0)
+    port = Int(getsockname(listener)[2])
+    attempts = Ref(0)
+    reported = Ref(0)
+    release = Channel{Bool}(1)
+    handshake = Channel{Tuple{String,String}}(1)
+    server_task = @async begin
+        try
+            while true
+                sock = accept(listener)
+                attempts[] += 1
+                if attempts[] == 1
+                    close(sock)
+                    continue
+                end
+                try
+                    write(sock, "INFO {\"headers\":true,\"proto\":1,\"max_payload\":1048576}\r\n")
+                    flush(sock)
+                    connect_line = rstrip(readline(sock), '\r')
+                    ping_line = rstrip(readline(sock), '\r')
+                    put!(handshake, (connect_line, ping_line))
+                    write(sock, "PONG\r\n")
+                    flush(sock)
+                    take!(release)
+                finally
+                    close(sock)
+                end
+                break
+            end
+        finally
+            isopen(listener) && close(listener)
+        end
+    end
+
+    client_ref = Ref{Any}(nothing)
+    try
+        client_ref[] = N.connect("nats://127.0.0.1:$port";
+                                 retry_on_initial_connect=true,
+                                 connect_timeout=0.5,
+                                 reconnect_wait=0.01,
+                                 reconnect_jitter=0.0,
+                                 max_reconnect_attempts=5,
+                                 error_cb=_ -> (reported[] += 1; nothing))
+        client = client_ref[]
+        @test status(client) == N.ConnectionStatus.CONNECTED
+        @test attempts[] == 2
+        @test reported[] >= 1
+        connect_line, ping_line = take!(handshake)
+        @test startswith(connect_line, "CONNECT ")
+        @test ping_line == "PING"
+    finally
+        client = client_ref[]
+        isnothing(client) || close(client)
+        isready(release) || put!(release, true)
+        isopen(listener) && close(listener)
+        timedwait(1.0; pollint=0.01) do
+            istaskdone(server_task)
+        end == :timed_out || wait(server_task)
     end
 end
 

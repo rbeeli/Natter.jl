@@ -53,6 +53,8 @@ client = connect([
 ])
 ```
 
+Natter randomizes multi-server attempt order by default so client startups spread across the pool.
+
 ## Publish And Subscribe
 
 Channel-style subscriptions are useful in scripts and tests:

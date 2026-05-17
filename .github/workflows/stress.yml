@@ -1,0 +1,40 @@
+name: Stress
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+
+jobs:
+  live-server-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+      - uses: julia-actions/cache@v2
+      - run: docker run -d --name nats -p 4222:4222 nats:2.11-alpine -js
+      - run: |
+          set -euo pipefail
+          ready=false
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 4222; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "${ready}" != "true" ]; then
+            docker logs nats
+            exit 1
+          fi
+      - run: julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
+        env:
+          NATTER_RUN_INTEGRATION: 'true'
+          NATTER_RUN_JETSTREAM: 'true'
+          NATTER_RUN_STRESS: 'true'
+          NATTER_STRESS_SECONDS: '25.0'
+      - if: failure()
+        run: docker logs nats

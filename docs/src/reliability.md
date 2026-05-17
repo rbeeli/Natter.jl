@@ -15,6 +15,7 @@ client = connect([
     ping_interval=30.0,
     max_outstanding_pings=2,
     allow_reconnect=true,
+    retry_on_initial_connect=true,
     reconnect_wait=0.25,
     reconnect_max_wait=5.0,
     reconnect_jitter=0.2,
@@ -37,14 +38,14 @@ client = connect([
 )
 ```
 
-`max_reconnect_attempts=-1` means unlimited reconnect attempts.
+`retry_on_initial_connect=true` makes startup tolerate NATS not being reachable yet. `max_reconnect_attempts=-1` means unlimited reconnect attempts, including initial retries when that mode is enabled. When several URLs are configured, Natter randomizes the server attempt order for both initial connect and reconnect so new clients spread across the pool. Set `randomize_servers=false` only when the listed order is the intended failover policy.
 
 ## Reconnect Semantics
 
 After a transient disconnect the client:
 
 - marks the connection as `ConnectionStatus.RECONNECTING`;
-- tries configured and server-discovered URLs;
+- tries configured and server-discovered URLs, randomized unless `randomize_servers=false`;
 - replays active subscriptions;
 - flushes buffered publishes up to `pending_size`;
 - emits `ConnectionEvent` values through `event_cb`.

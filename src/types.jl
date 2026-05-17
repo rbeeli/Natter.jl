@@ -636,6 +636,7 @@ _default_reconnect_delay_cb(_event) = nothing
 
 struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCallback,EventCallback,ReconnectDelayCallback}
     servers::Servers
+    randomize_servers::Bool
     name::Union{String,Nothing}
     verbose::Bool
     pedantic::Bool
@@ -652,6 +653,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
     ping_interval::Float64
     max_outstanding_pings::Int
     allow_reconnect::Bool
+    retry_on_initial_connect::Bool
     reconnect_wait::Float64
     reconnect_max_wait::Float64
     reconnect_jitter::Float64
@@ -675,17 +677,18 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
     reconnect_delay_cb::ReconnectDelayCallback
 
     function ConnectOptions(
-        servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
+        servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
         tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
-        max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
-        max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
-        record_stats,
+        max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
+        reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
+        pending_size, write_buffer_size, write_buffer_latency, write_timeout, record_stats,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
         sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
         inbox_prefix,
         error_cb, event_cb, reconnect_delay_cb,
     )
         servers = _connect_option_servers(servers)
+        randomize_servers = _connect_option_bool("randomize_servers", randomize_servers)
         name = _connect_option_optional_string("name", name)
         verbose = _connect_option_bool("verbose", verbose)
         pedantic = _connect_option_bool("pedantic", pedantic)
@@ -705,6 +708,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
         max_outstanding_pings = _connect_option_positive_int("max_outstanding_pings", max_outstanding_pings)
         allow_reconnect = _connect_option_bool("allow_reconnect", allow_reconnect)
+        retry_on_initial_connect = _connect_option_bool("retry_on_initial_connect", retry_on_initial_connect)
         reconnect_wait = _connect_option_positive_float("reconnect_wait", reconnect_wait)
         reconnect_max_wait = _connect_option_positive_float("reconnect_max_wait", reconnect_max_wait)
         reconnect_max_wait >= reconnect_wait ||
@@ -727,11 +731,12 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         inbox_prefix = _validate_inbox_prefix(inbox_prefix)
 
         new{typeof(servers),typeof(auth),typeof(error_cb),typeof(event_cb),typeof(reconnect_delay_cb)}(
-            servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
+            servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
             tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
-            max_outstanding_pings, allow_reconnect, reconnect_wait, reconnect_max_wait, reconnect_jitter,
-            max_reconnect_attempts, pending_size, write_buffer_size, write_buffer_latency, write_timeout,
-            record_stats, max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
+            max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
+            reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
+            pending_size, write_buffer_size, write_buffer_latency, write_timeout, record_stats,
+            max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
             sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
             inbox_prefix,
             error_cb, event_cb, reconnect_delay_cb)
@@ -787,14 +792,15 @@ function Base.show(io::IO, ::MIME"text/plain", opts::ConnectOptions)
     show(io, opts)
 end
 
-function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, pedantic=false,
-                        auth=NoAuth(), no_echo=false, tls_required=false,
+function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=nothing,
+                        verbose=false, pedantic=false, auth=NoAuth(), no_echo=false, tls_required=false,
                         tls_first=nothing, tls_verify=true,
                         tls_server_name=nothing, tls_ca_path=nothing,
                         tls_cert_path=nothing, tls_key_path=nothing,
                         connect_timeout=2.0, ping_interval=120.0, max_outstanding_pings=2,
-                        allow_reconnect=true, reconnect_wait=0.5, reconnect_max_wait=5.0,
-                        reconnect_jitter=0.1, max_reconnect_attempts=-1,
+                        allow_reconnect=true, retry_on_initial_connect=false,
+                        reconnect_wait=0.5, reconnect_max_wait=5.0, reconnect_jitter=0.1,
+                        max_reconnect_attempts=-1,
                         pending_size=2 * 1024 * 1024, write_buffer_size=DEFAULT_WRITE_BUFFER_SIZE,
                         write_buffer_latency=0.001, write_timeout=DEFAULT_WRITE_TIMEOUT,
                         record_stats=false,
@@ -806,11 +812,12 @@ function ConnectOptions(; servers=(DEFAULT_URL,), name=nothing, verbose=false, p
                         close_callback_timeout=5.0, inbox_prefix=DEFAULT_INBOX_PREFIX,
                         error_cb=_default_error_cb, event_cb=_default_noop_event_cb,
                         reconnect_delay_cb=_default_reconnect_delay_cb)
-    ConnectOptions(servers, name, verbose, pedantic, auth, no_echo, tls_required,
+    ConnectOptions(servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required,
                    tls_first, tls_verify, tls_server_name, tls_ca_path,
                    tls_cert_path, tls_key_path, connect_timeout,
-                   ping_interval, max_outstanding_pings, allow_reconnect, reconnect_wait,
-                   reconnect_max_wait, reconnect_jitter, max_reconnect_attempts, pending_size,
+                   ping_interval, max_outstanding_pings, allow_reconnect,
+                   retry_on_initial_connect, reconnect_wait, reconnect_max_wait,
+                   reconnect_jitter, max_reconnect_attempts, pending_size,
                    write_buffer_size, write_buffer_latency, write_timeout,
                    record_stats, max_control_line, max_inbound_payload,
                    max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,

@@ -1,160 +1,5 @@
 using TestItems
 
-@testmodule IntegrationHelpers begin
-    using Natter
-    using Sockets
-
-    integration_timeout() = parse(Float64, get(ENV, "NATTER_INTEGRATION_TIMEOUT", "5.0"))
-    integration_connect_timeout() =
-        parse(Float64, get(ENV, "NATTER_INTEGRATION_CONNECT_TIMEOUT", "10.0"))
-
-    function publish_and_flush(client, subject::AbstractString, data=nothing; timeout::Real=integration_timeout(), kwargs...)
-        publish(client, subject, data; kwargs...)
-        flush(client; timeout)
-        nothing
-    end
-
-    function _proxy_close(resource, operation::String)
-        try
-            close(resource)
-        catch err
-            @debug "Natter integration proxy cleanup failed" operation exception=(err, catch_backtrace())
-        end
-        nothing
-    end
-
-    function _remember_proxy_resource!(resources::Vector{Any}, resource_lock::ReentrantLock, resource)
-        lock(resource_lock)
-        try
-            push!(resources, resource)
-        finally
-            unlock(resource_lock)
-        end
-        resource
-    end
-
-    function _proxy_resources_snapshot(resources::Vector{Any}, resource_lock::ReentrantLock)
-        lock(resource_lock)
-        try
-            return copy(resources)
-        finally
-            unlock(resource_lock)
-        end
-    end
-
-    function _proxy_pump(from, to; before_write=nothing)
-        try
-            while true
-                data = readavailable(from)
-                isempty(data) && break
-                isnothing(before_write) || before_write()
-                write(to, data)
-                flush(to)
-            end
-        catch err
-            @debug "Natter integration proxy pump stopped" exception=(err, catch_backtrace())
-        finally
-            _proxy_close(from, "close proxy source")
-            _proxy_close(to, "close proxy destination")
-        end
-        nothing
-    end
-
-    function start_tcp_proxy(target_host::AbstractString, target_port::Int; released::Bool=true,
-                             downstream_released::Bool=true)
-        server = Sockets.listen(ip"127.0.0.1", 0)
-        _, proxy_port = Sockets.getsockname(server)
-        resources = Any[server]
-        resource_lock = ReentrantLock()
-        release_gate = Channel{Bool}(1)
-        release_state = Ref(released)
-        downstream_gate = Channel{Bool}(1)
-        downstream_state = Ref(downstream_released)
-
-        function release!()
-            if !release_state[]
-                release_state[] = true
-                isready(release_gate) || put!(release_gate, true)
-            end
-            nothing
-        end
-
-        function pause_downstream!()
-            downstream_state[] = false
-            nothing
-        end
-
-        function resume_downstream!()
-            if !downstream_state[]
-                downstream_state[] = true
-                isready(downstream_gate) || put!(downstream_gate, true)
-            end
-            nothing
-        end
-
-        function wait_downstream!()
-            if !downstream_state[]
-                try
-                    take!(downstream_gate)
-                catch err
-                    @debug "Natter integration proxy downstream wait stopped" exception=(err, catch_backtrace())
-                end
-            end
-            nothing
-        end
-
-        accept_task = @async begin
-            while true
-                client_sock = try
-                    Sockets.accept(server)
-                catch err
-                    @debug "Natter integration proxy accept stopped" exception=(err, catch_backtrace())
-                    break
-                end
-                _remember_proxy_resource!(resources, resource_lock, client_sock)
-
-                if !release_state[]
-                    try
-                        take!(release_gate)
-                    catch err
-                        @debug "Natter integration proxy release wait stopped" exception=(err, catch_backtrace())
-                        _proxy_close(client_sock, "close unreleased proxy client")
-                        break
-                    end
-                end
-
-                server_sock = try
-                    Sockets.connect(String(target_host), target_port)
-                catch err
-                    @debug "Natter integration proxy target connect failed" exception=(err, catch_backtrace())
-                    _proxy_close(client_sock, "close proxy client after target connect failure")
-                    continue
-                end
-                _remember_proxy_resource!(resources, resource_lock, server_sock)
-
-                @async _proxy_pump(client_sock, server_sock)
-                @async _proxy_pump(server_sock, client_sock; before_write=wait_downstream!)
-            end
-        end
-
-        function stop!()
-            release!()
-            for resource in reverse(_proxy_resources_snapshot(resources, resource_lock))
-                _proxy_close(resource, "stop proxy")
-            end
-            resume_downstream!()
-            timedwait(0.5; pollint=0.01) do
-                istaskdone(accept_task)
-            end
-            nothing
-        end
-
-        (; url="nats://127.0.0.1:$(Int(proxy_port))",
-         release=release!, pause_downstream=pause_downstream!,
-         resume_downstream=resume_downstream!, stop=stop!)
-    end
-end
-
 @testitem "real nats-server core integration" setup=[TestHelpers, IntegrationHelpers] begin
     using Natter
     using Dates
@@ -351,6 +196,7 @@ end
             reconnected = Ref(false)
             client = N.connect([primary.url, secondary.url];
                                connect_timeout=IntegrationHelpers.integration_connect_timeout(),
+                               randomize_servers=false,
                                ping_interval=2.0,
                                max_outstanding_pings=2,
                                reconnect_wait=0.05,
@@ -418,6 +264,7 @@ end
             reconnected = Ref(false)
             client = connect([primary.url, secondary.url];
                              connect_timeout=IntegrationHelpers.integration_connect_timeout(),
+                             randomize_servers=false,
                              ping_interval=2.0,
                              max_outstanding_pings=2,
                              reconnect_wait=0.05,

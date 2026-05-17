@@ -24,7 +24,7 @@ Statuses:
 | Request/reply | Supported | Shared inbox mux, timeouts, and `NoRespondersError` when supported by the server. |
 | Flush and ping | Supported | `flush`/`ping` use a server round trip. |
 | Drain and close | Supported | Subscription/client drain and deterministic close paths. |
-| Reconnect | Partial | Automatic reconnect, discovered servers, subscription replay, bounded publish replay, lifecycle events, and delay callbacks are implemented. Broader cluster chaos and auth failover hardening remain. |
+| Reconnect | Supported | Automatic reconnect, optional initial-connect retry, randomized server-pool attempts with ordered opt-out, discovered servers, subscription replay, bounded publish replay, lifecycle events, delay callbacks, and bounded live-server chaos CI are implemented. Broader cluster chaos and auth failover scenarios remain as additional hardening coverage. |
 | Publish replay | Partial | Buffered core publishes are replayed best-effort and can duplicate after ambiguous network failures. Use JetStream `msg_id` for durable idempotent publish paths. |
 | Slow consumer handling | Supported | Per-subscription pending limits report `SlowConsumerError`. |
 | Runtime inspection | Supported | `status`, `stats`, and `connected_url`. |
@@ -42,7 +42,7 @@ Statuses:
 | Consumer management | Supported | Create, create-or-update, update, info, list, delete. |
 | Typed consumer config | Supported | `ConsumerConfig` plus raw `Dict` escape hatch. Typed create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. |
 | Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, `messages`, `consume`, and priority request fields. |
-| Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, queue groups, callbacks, manual/auto ack, flow control replies, and heartbeat reporting. Additional chaos testing remains. |
+| Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, queue groups, callbacks, manual/auto ack, flow control replies, heartbeat reporting, and bounded reconnect chaos coverage. Additional long-duration push chaos remains. |
 | Acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, `term`. |
 | Metadata | Supported | Delivery metadata parsing. |
 | Ordered consumers | Supported | Public ordered ephemeral push consumers use `push_subscribe(...; ordered=true)`, with flow control, heartbeats, and automatic reset after sequence gaps. Durable names, queue groups, and binding existing consumers are intentionally rejected. |
@@ -59,7 +59,7 @@ Statuses:
 | Get/put/create/update | Supported | Typed entries, optimistic revision checks, per-key TTL, and typed conflict errors. |
 | Delete/purge | Supported | Delete markers, purge markers, guarded delete/purge, and marker cleanup. |
 | History and keys | Partial | Common paths implemented; broader large-bucket stress coverage remains. |
-| Watch | Partial | Channel and callback watchers, filters, updates-only, history, ignore deletes, metadata-only, resume revision, and ordered-consumer recovery. More chaos testing remains. |
+| Watch | Partial | Channel and callback watchers, filters, updates-only, history, ignore deletes, metadata-only, resume revision, ordered-consumer recovery, and bounded reconnect chaos coverage. Broader large-watch stress remains. |
 | Direct get | Supported | `direct=true` buckets use direct reads by default. |
 | Async handles | Supported | Bucket, key, history, keys, watch, and close helpers. |
 
@@ -84,4 +84,16 @@ Real-server tests are opt-in:
 
 ```bash
 env NATTER_RUN_INTEGRATION=true NATTER_RUN_JETSTREAM=true julia --project=. -e 'using Pkg; Pkg.test()'
+```
+
+Bounded live-server chaos tests run in CI and can be enabled locally:
+
+```bash
+env NATTER_RUN_INTEGRATION=true NATTER_RUN_JETSTREAM=true NATTER_RUN_CHAOS=true julia --project=. -e 'using Pkg; Pkg.test()'
+```
+
+Longer reconnect stress coverage is intended for scheduled/manual CI:
+
+```bash
+env NATTER_RUN_INTEGRATION=true NATTER_RUN_JETSTREAM=true NATTER_RUN_STRESS=true julia --project=. -e 'using Pkg; Pkg.test()'
 ```

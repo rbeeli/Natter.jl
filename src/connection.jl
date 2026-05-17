@@ -65,6 +65,14 @@ function connect(url_or_urls=nothing; cancel_token::MaybeCancellationToken=nothi
     client
 end
 
+function _server_attempt_order!(client::Client)::Vector{Server}
+    @lock client.lock begin
+        servers = copy(client.servers)
+        client.options.randomize_servers && shuffle!(client.rng, servers)
+        servers
+    end
+end
+
 function _normalize_url(url::String)
     contains(url, "://") ? url : "nats://$url"
 end
@@ -1381,29 +1389,75 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     end
 end
 
-function _connect_initial!(client::Client; cancel_token::MaybeCancellationToken=nothing)
-    generation = @lock client.lock begin
-        _store_status_locked!(client, ConnectionStatus.CONNECTING)
-        _bump_generation_locked!(client)
-    end
+function _try_connect_initial_servers!(client::Client, generation::Int, attempt_counter::Base.RefValue{Int};
+                                       cancel_token::MaybeCancellationToken=nothing)
     last_err = nothing
-    for (attempt, server) in pairs(client.servers)
+    servers = _server_attempt_order!(client)
+    for server in servers
         _throw_if_cancelled(cancel_token)
+        attempt_counter[] += 1
         try
-            _connect_once!(client, server; generation, attempt, reconnect=false, cancel_token)
+            _connect_once!(client, server; generation, attempt=attempt_counter[],
+                           reconnect=false, cancel_token)
             _start_background_tasks!(client, generation)
-            return client
+            return nothing
         catch err
-            if err isa CancelledError
-                @lock client.lock _store_status_locked!(client, ConnectionStatus.DISCONNECTED)
-                rethrow()
+            err isa CancelledError && rethrow()
+            if err isa AuthenticationError && _record_auth_error!(client, server, err)
+                _report_error(client, err)
+                throw(err)
             end
             last_err = err
             _report_error(client, err)
         end
     end
-    @lock client.lock _store_status_locked!(client, ConnectionStatus.DISCONNECTED)
-    isnothing(last_err) ? throw(NoServersError()) : throw(last_err)
+    isnothing(last_err) ? NoServersError() : last_err
+end
+
+function _sleep_before_initial_retry!(client::Client, generation::Int, retry_attempt::Int,
+                                      delay::Float64, cancel_token::MaybeCancellationToken)::Float64
+    default_wait = @lock client.lock max(0.0, delay + rand(client.rng) * client.options.reconnect_jitter)
+    delay_event = _connection_event(client, ConnectionEventKind.RECONNECT_DELAY;
+                                    attempt=retry_attempt, delay=default_wait,
+                                    generation)
+    wait_time = _resolve_reconnect_delay(client, delay_event, default_wait)
+    _emit_connection_event(client, ConnectionEventKind.RECONNECT_DELAY;
+                           attempt=retry_attempt, delay=wait_time, generation)
+    _sleep_interruptibly(client, generation, wait_time, cancel_token) ||
+        throw(ConnectionClosedError("connection state changed while connecting"))
+    min(client.options.reconnect_max_wait, delay * 2)
+end
+
+function _connect_initial!(client::Client; cancel_token::MaybeCancellationToken=nothing)
+    generation = @lock client.lock begin
+        _store_status_locked!(client, ConnectionStatus.CONNECTING)
+        _bump_generation_locked!(client)
+    end
+    opts = client.options
+    attempt_counter = Ref(0)
+    retry_attempt = 0
+    delay = opts.reconnect_wait
+    try
+        while true
+            last_err = _try_connect_initial_servers!(client, generation, attempt_counter; cancel_token)
+            isnothing(last_err) && return client
+
+            if !opts.retry_on_initial_connect ||
+               (opts.max_reconnect_attempts >= 0 && retry_attempt >= opts.max_reconnect_attempts)
+                throw(last_err)
+            end
+
+            retry_attempt += 1
+            delay = _sleep_before_initial_retry!(client, generation, retry_attempt, delay, cancel_token)
+        end
+    catch err
+        @lock client.lock begin
+            if client.generation == generation && client.status == ConnectionStatus.CONNECTING
+                _store_status_locked!(client, ConnectionStatus.DISCONNECTED)
+            end
+        end
+        rethrow()
+    end
 end
 
 function _start_flusher_task!(client::Client, generation::Int=(@lock client.lock client.generation))
@@ -1637,13 +1691,16 @@ function _generation_matches(client::Client, generation::Int)
     _load_generation(client) == generation
 end
 
-function _sleep_interruptibly(client::Client, generation::Int, seconds::Real)
+function _sleep_interruptibly(client::Client, generation::Int, seconds::Real,
+                              cancel_token::MaybeCancellationToken=nothing)
     deadline = time() + max(0.0, seconds)
     while time() < deadline
+        _throw_if_cancelled(cancel_token)
         _generation_matches(client, generation) || return false
         status(client) in (ConnectionStatus.CLOSED, ConnectionStatus.DISCONNECTED) && return false
         sleep(min(0.05, max(0.0, deadline - time())))
     end
+    _throw_if_cancelled(cancel_token)
     _generation_matches(client, generation) &&
         !(status(client) in (ConnectionStatus.CLOSED, ConnectionStatus.DISCONNECTED))
 end
@@ -1828,11 +1885,7 @@ function _reconnect_loop(client::Client, generation::Int)
             _terminal_disconnect!(client, generation, NoServersError())
             return
         end
-        servers = @lock client.lock begin
-            servers = copy(client.servers)
-            shuffle!(client.rng, servers)
-            servers
-        end
+        servers = _server_attempt_order!(client)
         if isempty(servers)
             _terminal_disconnect!(client, generation, NoServersError())
             return

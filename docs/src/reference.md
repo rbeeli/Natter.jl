@@ -44,10 +44,11 @@ Conventions:
 
 ## Connect Options
 
-`connect(url_or_urls=nothing; kwargs...)` accepts one URL, a vector/tuple of URLs, or no URL for `nats://localhost:4222`.
+`connect(url_or_urls=nothing; kwargs...)` accepts one URL, a vector/tuple of URLs, or no URL for `nats://localhost:4222`. Multi-server pools are randomized by default for initial connect and reconnect; set `randomize_servers=false` when ordered failover is required.
 
 | Option | Default | Purpose |
 | :--- | :--- | :--- |
+| `randomize_servers` | `true` | Shuffle configured server attempts for initial connect and reconnect. |
 | `name` | `nothing` | Human-readable connection name. |
 | `auth` | `NoAuth()` | One typed authentication value. |
 | `no_echo` | `false` | Do not receive this connection's own publishes. |
@@ -55,10 +56,11 @@ Conventions:
 | `ping_interval` | `120.0` | Keepalive interval. |
 | `max_outstanding_pings` | `2` | Missed keepalives before reconnect. |
 | `allow_reconnect` | `true` | Enable automatic reconnect. |
+| `retry_on_initial_connect` | `false` | Retry startup connection failures using the reconnect wait and attempt settings. |
 | `reconnect_wait` | `0.5` | Initial reconnect wait. |
 | `reconnect_max_wait` | `5.0` | Maximum reconnect wait. |
 | `reconnect_jitter` | `0.1` | Added reconnect jitter. |
-| `max_reconnect_attempts` | `-1` | `-1` means unlimited attempts. |
+| `max_reconnect_attempts` | `-1` | `-1` means unlimited reconnect and initial-retry attempts. |
 | `pending_size` | `2 MiB` | Buffered publish bytes retained for reconnect replay. |
 | `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |
 | `write_buffer_latency` | `0.001` | Maximum small-write coalescing delay. |
