@@ -178,6 +178,16 @@ push = push_subscribe(js, "orders.events.created";
 )
 ```
 
+For hot callbacks that finish with the message before returning, `borrowed=true` delivers a `BorrowedJetStreamMsg` with a borrowed byte view and still handles JetStream heartbeats and flow-control frames before user delivery.
+
+```julia
+push = push_subscribe(js, "orders.events.created";
+    stream="ORDERS",
+    borrowed=true,
+    callback=msg -> process_order(msg.data),
+)
+```
+
 Use a queue group when several push subscribers should share one server-side consumer:
 
 ```julia

@@ -25,6 +25,22 @@ JetStreamMsg(msg::Msg, client::C) where {C<:Client} =
 
 Base.String(msg::JetStreamMsg) = _bytes_to_string(msg.data)
 
+struct BorrowedJetStreamMsg{C<:Client,D<:AbstractVector{UInt8},H} <: AbstractMsg
+    subject::String
+    reply::Union{String,Nothing}
+    data::D
+    headers::H
+    sid::Int
+    header_bytes::Int
+    _client::C
+end
+
+BorrowedJetStreamMsg(msg::BorrowedMsg, client::C) where {C<:Client} =
+    BorrowedJetStreamMsg{C,typeof(msg.data),typeof(msg.headers)}(
+        msg.subject, msg.reply, msg.data, msg.headers, msg.sid, msg.header_bytes, client)
+
+Base.String(msg::BorrowedJetStreamMsg) = _bytes_to_string(msg.data)
+
 struct PubAck
     stream::String
     seq::Int
@@ -275,21 +291,29 @@ end
 function _jetstream_status_description_eq(msg::Msg, expected::AbstractString)::Bool
     hdrs = msg.headers
     if hdrs isa LazyHeaders
-        first, last = _lazy_status_description_range(hdrs)
-        return _js_ascii_eq_ci_stripped(hdrs.raw, first, last, expected)
+        return _jetstream_status_description_eq_lazy(hdrs, expected)
     end
     description = _status_description(msg)
     _js_ascii_eq_ci_stripped(description, 1, ncodeunits(description), expected)
 end
 
+function _jetstream_status_description_eq_lazy(hdrs::LazyHeaders, expected::AbstractString)::Bool
+    first, last = _lazy_status_description_range(hdrs)
+    _js_ascii_eq_ci_stripped(hdrs.raw, first, last, expected)
+end
+
 function _jetstream_status_description_contains(msg::Msg, expected::AbstractString)::Bool
     hdrs = msg.headers
     if hdrs isa LazyHeaders
-        first, last = _lazy_status_description_range(hdrs)
-        return _js_ascii_contains_ci(hdrs.raw, first, last, expected)
+        return _jetstream_status_description_contains_lazy(hdrs, expected)
     end
     description = _status_description(msg)
     _js_ascii_contains_ci(description, 1, ncodeunits(description), expected)
+end
+
+function _jetstream_status_description_contains_lazy(hdrs::LazyHeaders, expected::AbstractString)::Bool
+    first, last = _lazy_status_description_range(hdrs)
+    _js_ascii_contains_ci(hdrs.raw, first, last, expected)
 end
 
 function _jetstream_status_description(msg::Msg, code::Int)::String
@@ -297,7 +321,7 @@ function _jetstream_status_description(msg::Msg, code::Int)::String
     isempty(description) ? _jetstream_default_status_description(code) : description
 end
 
-function _jetstream_status_action(msg::Msg; request_subject::Union{String,Nothing}=nothing)
+function _jetstream_status_action(msg::Msg, request_subject::Union{String,Nothing}=nothing)
     code = _jetstream_control_status(msg)
     isnothing(code) && return :message, nothing
     subject = isnothing(request_subject) ? msg.subject : request_subject
@@ -349,6 +373,9 @@ function _json_haskey(obj, key::Symbol)::Bool
         return false
     end
 end
+
+_jetstream_status_action(msg::BorrowedMsg, request_subject::Union{String,Nothing}=nothing) =
+    _jetstream_status_action(_owned_msg(msg), request_subject)
 
 function _json_get(obj, key::Symbol, default)
     if obj isa AbstractDict
@@ -2002,7 +2029,7 @@ function _close_subscription_from_control!(sub::Subscription)
     nothing
 end
 
-function _push_msg_metadata(msg::Msg)
+function _push_msg_metadata(msg::M) where {M<:AbstractMsg}
     reply = msg.reply
     isnothing(reply) && return nothing
     startswith(reply, _JS_ACK_PREFIX) || return nothing
@@ -2015,7 +2042,8 @@ function _push_msg_metadata(msg::Msg)
     end
 end
 
-function _record_subscription_data_received!(handler::_JetStreamPushControlHandler, msg::Msg)
+function _record_subscription_data_received!(handler::_JetStreamPushControlHandler,
+                                             msg::M) where {M<:AbstractMsg}
     handler.flow_control[] && Threads.atomic_add!(handler.flow_incoming, one(UInt64))
     (handler.ordered || handler.idle_heartbeat[] > 0 || handler.flow_control[]) || return nothing
     handler.ordered && return nothing
@@ -2053,7 +2081,8 @@ function _maybe_reply_to_subscription_flow_control!(sub::Subscription, handler::
     nothing
 end
 
-function _handle_subscription_control(handler::_JetStreamPushControlHandler, sub::Subscription, msg::Msg)::Bool
+function _handle_subscription_control(handler::_JetStreamPushControlHandler, sub::Subscription,
+                                      msg::M)::Bool where {M<:AbstractMsg}
     _touch_push_control_handler!(handler)
     isempty(msg.data) || return false
     action, err = _jetstream_status_action(msg)
@@ -2138,8 +2167,16 @@ function _push_callback_auto_ack(manual_ack::Bool, callback, config::Dict{String
 end
 
 function _jetstream_push_callback(js::JetStreamContext{C}, callback,
-                                  auto_ack::Bool) where {C<:Client}
+                                  auto_ack::Bool; borrowed::Bool=false) where {C<:Client}
     isnothing(callback) && return nothing
+    if borrowed
+        return msg -> begin
+            jsmsg = BorrowedJetStreamMsg(msg, js.client)
+            callback(jsmsg)
+            auto_ack && _ack_publish_raw(js.client, _ack_reply_subject(jsmsg), :ack)
+            nothing
+        end
+    end
     msg -> begin
         jsmsg = JetStreamMsg(msg, js.client)
         callback(jsmsg)
@@ -2223,7 +2260,8 @@ function _request_ordered_push_reset!(handler::_JetStreamPushControlHandler, sta
     nothing
 end
 
-function _handle_ordered_push_data!(handler::_JetStreamPushControlHandler, client::Client, msg::Msg)::Bool
+function _handle_ordered_push_data!(handler::_JetStreamPushControlHandler, client::Client,
+                                    msg::M)::Bool where {M<:AbstractMsg}
     handler.ordered || return false
     parsed = _push_msg_metadata(msg)
     isnothing(parsed) && return false
@@ -2246,7 +2284,7 @@ function _handle_ordered_push_data!(handler::_JetStreamPushControlHandler, clien
     true
 end
 
-_handle_ordered_push_data!(::_SubscriptionControlHandler, ::Client, ::Msg)::Bool = false
+_handle_ordered_push_data!(::_SubscriptionControlHandler, ::Client, ::AbstractMsg)::Bool = false
 
 function _handle_push_sequence_heartbeat!(handler::_JetStreamPushControlHandler, sub::Subscription, msg::Msg)
     last_consumer = _header_int(msg, _JS_HEADER_LAST_CONSUMER)
@@ -2732,7 +2770,7 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
                 remaining = max(0.001, wait_deadline - time())
                 try
                     msg = _next_pull_fetch_msg(psub, remaining; cancel_token)
-                    action, err = _jetstream_status_action(msg; request_subject)
+                    action, err = _jetstream_status_action(msg, request_subject)
                     action != :message && !_pull_fetch_status_matches_request(msg.subject, reply_token) && continue
                     heartbeat_seconds > 0 && (heartbeat_deadline = time() + 2 * heartbeat_seconds)
                     pin_id = header(msg, "Nats-Pin-Id")
@@ -3088,7 +3126,7 @@ function _pull_stream_loop(stream::PullMessageStream, config::_PullStreamConfig)
                 rethrow()
             end
 
-            action, err = _jetstream_status_action(msg; request_subject=psub.next_subject)
+            action, err = _jetstream_status_action(msg, psub.next_subject)
             if action != :message
                 request_index = @lock stream.state.lock _pull_stream_find_request(stream.state.requests, msg.subject)
                 request_index == 0 && continue
@@ -3260,11 +3298,14 @@ Base.isopen(stream::PullMessageStream) =
 function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
                          queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
                          config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
-                         timeout::Real=js.timeout, ordered::Bool=false,
+                         timeout::Real=js.timeout, ordered::Bool=false, borrowed::Bool=false,
                          cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     subject = _validate_subject(subject)
     timeout = _positive_timeout_seconds("timeout", timeout)
+    borrowed = _connect_option_bool("borrowed", borrowed)
+    borrowed && isnothing(callback) &&
+        throw(ArgumentError("borrowed push subscriptions require a callback"))
     verify_config = config isa ConsumerConfig
     cfg = _js_config_payload(config)
     queue_explicit = !isnothing(queue)
@@ -3317,8 +3358,9 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
     deliver_subject = String(cfg["deliver_subject"])
     auto_ack = isnothing(info) ? _push_callback_auto_ack(manual_ack, callback, cfg) :
                _push_callback_auto_ack(manual_ack, callback, info)
-    wrapped_callback = _jetstream_push_callback(js, callback, auto_ack)
+    wrapped_callback = _jetstream_push_callback(js, callback, auto_ack; borrowed)
     sub = subscribe(js.client, deliver_subject; queue=local_queue, callback=wrapped_callback,
+                    borrowed=!isnothing(wrapped_callback) && borrowed,
                     _control_handler=control_handler, cancel_token)
     consumer_created = false
     try
@@ -3338,8 +3380,9 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
                 info = _bind_existing_push_consumer!(existing, cfg, bind_fields, local_queue, queue_explicit)
                 deliver_subject = String(cfg["deliver_subject"])
                 retry_auto_ack = _push_callback_auto_ack(manual_ack, callback, info)
-                wrapped_callback = _jetstream_push_callback(js, callback, retry_auto_ack)
+                wrapped_callback = _jetstream_push_callback(js, callback, retry_auto_ack; borrowed)
                 sub = subscribe(js.client, deliver_subject; queue=local_queue, callback=wrapped_callback,
+                                borrowed=!isnothing(wrapped_callback) && borrowed,
                                 _control_handler=control_handler, cancel_token)
             end
         end
@@ -3386,10 +3429,10 @@ end
 function push_subscribe(js::JetStreamContext, subject::AbstractString; stream::Union{AbstractString,Nothing}=nothing, durable::Union{AbstractString,Nothing}=nothing,
                         queue::Union{AbstractString,Nothing}=nothing, callback=nothing, manual_ack::Bool=false,
                         config::Union{ConsumerConfig,AbstractDict{String,<:Any}}=ConsumerConfig(),
-                        timeout::Real=js.timeout, ordered::Bool=false,
+                        timeout::Real=js.timeout, ordered::Bool=false, borrowed::Bool=false,
                         cancel_token::MaybeCancellationToken=nothing)
     _push_subscribe(js, subject; stream, durable, queue, callback, manual_ack, config, timeout,
-                    ordered, cancel_token)
+                    ordered, borrowed, cancel_token)
 end
 
 function _mark_push_server_deleted!(psub::PushSubscription)
@@ -3721,6 +3764,11 @@ function _ack_reply_subject(msg::JetStreamMsg)::String
     msg.reply
 end
 
+function _ack_reply_subject(msg::BorrowedJetStreamMsg)::String
+    isnothing(msg.reply) && throw(JetStreamError(400, nothing, "message has no ack reply subject"))
+    msg.reply
+end
+
 _ack_terminal(kind::Symbol)::Bool = kind != :progress
 
 function _ack_already_acknowledged()
@@ -3747,19 +3795,53 @@ end
 
 _acknowledged(msg::JetStreamMsg)::Bool = (@atomic msg._ack_state) == _JS_ACK_DONE
 
+function _ack_publish_raw(client::Client, reply::String, kind::Symbol; delay=nothing,
+                          cancel_token::MaybeCancellationToken=nothing)::Nothing
+    _throw_if_cancelled(cancel_token)
+    payload = _ack_payload(kind; delay)
+    terminal = _ack_terminal(kind)
+    _publish_unchecked(client, reply, payload;
+                       buffer_on_reconnect=!terminal,
+                       force_flush=terminal,
+                       cancel_token)
+    nothing
+end
+
+function _ack_request_raw(client::Client, reply::String, kind::Symbol; delay=nothing,
+                          timeout::Real=1.0,
+                          cancel_token::MaybeCancellationToken=nothing)::Msg
+    _throw_if_cancelled(cancel_token)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    payload = _ack_payload(kind; delay)
+    mux = _ensure_request_mux(client)
+    token, waiter = _register_request_waiter!(client, mux, timeout)
+    response_subject = "$(mux.prefix).$token"
+    try
+        frame = _publish_frame(reply, response_subject, payload, EMPTY_BYTES)
+        _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true,
+                                 cancel_token)
+        response = _wait_request_reply(mux, waiter, timeout; cancel_token)
+        code = _status_header(response)
+        if code == 503
+            throw(NoRespondersError(reply))
+        elseif !isnothing(code) && code >= 400
+            throw(ProtocolError("request failed with status $code $(_status_description(response))"))
+        end
+        response
+    finally
+        _remove_request_waiter!(client, mux, token, waiter)
+    end
+end
+
 function _ack_publish(msg::JetStreamMsg, kind::Symbol; delay=nothing,
                       cancel_token::MaybeCancellationToken=nothing)::Nothing
     _throw_if_cancelled(cancel_token)
     reply = _ack_reply_subject(msg)
-    payload = _ack_payload(kind; delay)
     terminal = _ack_terminal(kind)
     _begin_ack!(msg)
     succeeded = false
     try
-        _publish_unchecked(msg._client, reply, payload;
-                           buffer_on_reconnect=!terminal,
-                           force_flush=terminal,
-                           cancel_token)
+        _ack_publish_raw(msg._client, reply, kind; delay, cancel_token)
         succeeded = true
     finally
         _finish_ack!(msg, terminal, succeeded)
@@ -3772,34 +3854,25 @@ function _ack_request(msg::JetStreamMsg, kind::Symbol; delay=nothing, timeout::R
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     reply = _ack_reply_subject(msg)
-    payload = _ack_payload(kind; delay)
     terminal = _ack_terminal(kind)
     _begin_ack!(msg)
     succeeded = false
     try
-        mux = _ensure_request_mux(msg._client)
-        token, waiter = _register_request_waiter!(msg._client, mux, timeout)
-        response_subject = "$(mux.prefix).$token"
-        response = try
-            frame = _publish_frame(reply, response_subject, payload, EMPTY_BYTES)
-            _publish_frame_unchecked(msg._client, frame; buffer_on_reconnect=false, force_flush=true,
-                                     cancel_token)
-            _wait_request_reply(mux, waiter, timeout; cancel_token)
-        finally
-            _remove_request_waiter!(msg._client, mux, token, waiter)
-        end
-        code = _status_header(response)
-        if code == 503
-            throw(NoRespondersError(reply))
-        elseif !isnothing(code) && code >= 400
-            throw(ProtocolError("request failed with status $code $(_status_description(response))"))
-        end
+        response = _ack_request_raw(msg._client, reply, kind; delay, timeout, cancel_token)
         succeeded = true
         response
     finally
         _finish_ack!(msg, terminal, succeeded)
     end
 end
+
+_ack_publish(msg::BorrowedJetStreamMsg, kind::Symbol; delay=nothing,
+             cancel_token::MaybeCancellationToken=nothing)::Nothing =
+    _ack_publish_raw(msg._client, _ack_reply_subject(msg), kind; delay, cancel_token)
+
+_ack_request(msg::BorrowedJetStreamMsg, kind::Symbol; delay=nothing, timeout::Real=1.0,
+             cancel_token::MaybeCancellationToken=nothing)::Msg =
+    _ack_request_raw(msg._client, _ack_reply_subject(msg), kind; delay, timeout, cancel_token)
 
 ack(msg::JetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
     _ack_publish(msg, :ack; cancel_token)
@@ -3810,4 +3883,15 @@ nak(msg::JetStreamMsg; delay=nothing, cancel_token::MaybeCancellationToken=nothi
 in_progress(msg::JetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
     _ack_publish(msg, :progress; cancel_token)
 term(msg::JetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
+    _ack_publish(msg, :term; cancel_token)
+
+ack(msg::BorrowedJetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
+    _ack_publish(msg, :ack; cancel_token)
+ack_sync(msg::BorrowedJetStreamMsg; timeout::Real=1.0, cancel_token::MaybeCancellationToken=nothing)::Msg =
+    _ack_request(msg, :ack; timeout, cancel_token)
+nak(msg::BorrowedJetStreamMsg; delay=nothing, cancel_token::MaybeCancellationToken=nothing)::Nothing =
+    _ack_publish(msg, :nak; delay, cancel_token)
+in_progress(msg::BorrowedJetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
+    _ack_publish(msg, :progress; cancel_token)
+term(msg::BorrowedJetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
     _ack_publish(msg, :term; cancel_token)

@@ -206,17 +206,45 @@ end
         client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=devnull)
         sub = subscribe(client, "foo")
         msg = Msg("foo", nothing, TestHelpers.bytes("x"); sid=sub.sid)
+        msg_bytes = N._msg_pending_bytes(msg)
         for _ in 1:1000
-            N._dispatch_msg(client, msg)
+            N._dispatch_owned_msg_to_sub(client, sub, msg, msg_bytes)
             ready, _ = N._take_subscription_msg_ready!(sub)
             ready || throw(AssertionError("expected ready message"))
         end
         GC.gc()
         @allocated begin
             for _ in 1:1000
-                N._dispatch_msg(client, msg)
+                N._dispatch_owned_msg_to_sub(client, sub, msg, msg_bytes)
                 ready, _ = N._take_subscription_msg_ready!(sub)
                 ready || throw(AssertionError("expected ready message"))
+            end
+        end
+    end
+
+    mutable struct BorrowedCounter
+        bytes::Int
+    end
+
+    function (counter::BorrowedCounter)(msg::BorrowedMsg)
+        counter.bytes += length(msg.data)
+        nothing
+    end
+
+    function borrowed_dispatch_alloc()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=devnull)
+        counter = BorrowedCounter(0)
+        sub = subscribe(client, "foo"; callback=counter, borrowed=true)
+        data = TestHelpers.bytes("x")
+        msg = BorrowedMsg("foo", nothing, @view(data[1:1]), nothing, sub.sid, 0)
+        msg_bytes = N._msg_pending_bytes(msg)
+        for _ in 1:1000
+            N._dispatch_borrowed_msg_to_sub(client, sub, msg, msg_bytes)
+        end
+        GC.gc()
+        @allocated begin
+            for _ in 1:1000
+                N._dispatch_borrowed_msg_to_sub(client, sub, msg, msg_bytes)
             end
         end
     end
@@ -248,6 +276,7 @@ end
 
     @test queue_put_take_alloc() == 0
     @test dispatch_take_alloc() == 0
+    @test borrowed_dispatch_alloc() == 0
     @test buffered_publish_alloc() == 0
     @test buffered_replay_snapshot() == "PUB foo 3\r\nbar\r\n"
 end
@@ -387,14 +416,17 @@ end
 
     opts = N.ConnectOptions(connect_timeout=1, ping_interval=2, max_outstanding_pings=1,
                             reconnect_jitter=0, read_buffer_size=8192, write_buffer_size=0,
-                            write_timeout=3, close_callback_timeout=4)
+                            direct_write_threshold=4096, write_timeout=3,
+                            close_callback_timeout=4)
     @test opts.connect_timeout == 1.0
     @test opts.ping_interval == 2.0
     @test opts.read_buffer_size == 8192
     @test opts.write_buffer_size == 0
+    @test opts.direct_write_threshold == 4096
     @test opts.write_timeout == 3.0
     @test opts.close_callback_timeout == 4.0
     @test opts.randomize_servers
+    @test N.CLIENT_VERSION == string(pkgversion(N))
     @test N.ConnectOptions(close_callback_timeout=0).close_callback_timeout == 0.0
     @test !ismutable(opts)
     cold_opts = N.ConnectOptions(name=SubString("client-extra", 1, 6),
@@ -560,6 +592,8 @@ end
     rejects(read_buffer_size=0)
     rejects(read_buffer_size=true)
     rejects(write_buffer_size=-1)
+    rejects(direct_write_threshold=-1)
+    rejects(read_buffer_shrink_threshold=1024, read_buffer_size=2048)
     rejects(write_timeout=0)
     rejects(write_timeout=Inf)
     rejects(close_callback_timeout=-1)
@@ -1233,7 +1267,7 @@ end
 
     publish(client, "foo", "bar")
 
-    @test transport.chunks == ["PUB foo 3\r\n", "bar", "\r\n"]
+    @test transport.chunks == ["PUB foo 3\r\nbar\r\n"]
     close(client)
 
     buffered_transport = ChunkCapture()
@@ -1245,9 +1279,18 @@ end
 
     publish(buffered_client, "foo", "bar"; direct_write=true, buffer_on_reconnect=false)
 
-    @test buffered_transport.chunks == ["PUB foo 3\r\n", "bar", "\r\n"]
+    @test buffered_transport.chunks == ["PUB foo 3\r\nbar\r\n"]
     @test N._buffered_bytes(buffered_write) == 0
     close(buffered_client)
+
+    large_transport = ChunkCapture()
+    large_client = TestHelpers.fake_client(; opts=N.ConnectOptions(write_buffer_size=0,
+                                                                   direct_write_threshold=8),
+                                           status=N.ConnectionStatus.CONNECTED,
+                                           read_io=large_transport, write_io=large_transport)
+    publish(large_client, "foo", "0123456789abcdef")
+    @test large_transport.chunks == ["PUB foo 16\r\n", "0123456789abcdef", "\r\n"]
+    close(large_client)
 end
 
 @testitem "request publish force flushes buffered writes" setup=[TestHelpers] begin

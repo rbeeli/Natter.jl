@@ -19,7 +19,7 @@ Statuses:
 | Connect handshake | Supported | Client name, no echo, server INFO parsing, TLS requirements, and typed auth. |
 | Authentication | Supported | Token, user/password, NKEY, JWT, `.creds`, callback auth, and URL userinfo for token/user-password. |
 | PUB / HPUB / SUB / UNSUB | Supported | Core publish, headers, queue groups, unsubscribe limits, local subject validation, direct-write publish calls, and opt-out reconnect replay snapshots. |
-| MSG / HMSG parsing | Supported | Core data and headers, with an explicit callback-only borrowed payload path for hot subscribers. |
+| MSG / HMSG parsing | Supported | Core data and headers, with an explicit callback-only borrowed payload path for hot subscribers. Borrowed frames use a lock-free SID snapshot and release oversized parser buffers after delivery. |
 | Wildcards | Supported | Subscription wildcards are validated; publish subjects reject wildcards. |
 | Request/reply | Supported | Shared inbox mux, timeouts, and `NoRespondersError` when supported by the server. |
 | Flush and ping | Supported | `flush`/`ping` use a server round trip. |
@@ -42,7 +42,7 @@ Statuses:
 | Consumer management | Supported | Create, create-or-update, update, info, list, delete. |
 | Typed consumer config | Supported | `ConsumerConfig` plus raw `Dict` escape hatch. Typed create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. |
 | Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded close cleanup, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, `messages`, `consume`, and priority request fields. |
-| Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, bounded close cleanup, queue groups, callbacks, manual/auto ack, flow control replies, heartbeat reporting, and bounded reconnect chaos coverage. Additional long-duration push chaos remains. |
+| Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, bounded close cleanup, queue groups, callbacks, borrowed callbacks, manual/auto ack, flow control replies, heartbeat reporting, and bounded reconnect chaos coverage. Additional long-duration push chaos remains. |
 | Acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, `term`. |
 | Metadata | Supported | Delivery metadata parsing. |
 | Ordered consumers | Supported | Public ordered ephemeral push consumers use `push_subscribe(...; ordered=true)`, with flow control, heartbeats, and automatic reset after sequence gaps. Durable names, queue groups, and binding existing consumers are intentionally rejected. |

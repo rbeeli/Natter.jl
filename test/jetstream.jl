@@ -1070,6 +1070,15 @@ end
         push!(cb.subjects, msg.subject)
         nothing
     end
+    mutable struct BorrowedJetStreamCallable
+        subjects::Vector{String}
+        borrowed::Bool
+    end
+    function (cb::BorrowedJetStreamCallable)(msg::BorrowedJetStreamMsg)
+        push!(cb.subjects, msg.subject)
+        cb.borrowed = msg.data isa SubArray
+        nothing
+    end
 
     stream = SubString("ORDERS.extra", 1, 6)
     durable = SubString("worker.extra", 1, 6)
@@ -1082,6 +1091,22 @@ end
     wrapped = N._jetstream_push_callback(js, callback, false)
     wrapped(Msg("orders.created", "\$JS.ACK.ORDERS.worker.1.1.1.0.0", TestHelpers.bytes("work")))
     @test callback.subjects == ["orders.created"]
+
+    borrowed_callback = BorrowedJetStreamCallable(String[], false)
+    borrowed_wrapped = N._jetstream_push_callback(js, borrowed_callback, false; borrowed=true)
+    data = TestHelpers.bytes("work")
+    borrowed_wrapped(BorrowedMsg("orders.created", "\$JS.ACK.ORDERS.worker.1.1.1.0.0",
+                                 @view(data[1:4]), nothing, 1, 0))
+    @test borrowed_callback.subjects == ["orders.created"]
+    @test borrowed_callback.borrowed
+
+    ack_capture = TestHelpers.WriteCapture()
+    ack_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=ack_capture)
+    ack_js = jetstream(ack_client)
+    ack_wrapped = N._jetstream_push_callback(ack_js, BorrowedJetStreamCallable(String[], false), true;
+                                             borrowed=true)
+    ack_wrapped(BorrowedMsg("orders.created", "ACK.REPLY", @view(data[1:4]), nothing, 1, 0))
+    @test TestHelpers.capture_text(ack_capture) == "PUB ACK.REPLY 0\r\n\r\n"
 
     @test_throws ConnectionClosedError pull_subscribe(js, "orders.created"; stream, durable)
     @test_throws ArgumentError push_subscribe(

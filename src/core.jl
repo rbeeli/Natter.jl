@@ -94,7 +94,8 @@ end
 
 function _write_pub_frame_direct_timed(client::Client, io::IO, frame::_AbstractPublishFrame; force_flush::Bool=false)
     _run_transport_write(client, io, "publish write") do
-        _write_pub_frame_direct(io, frame, client.write_scratch)
+        _write_pub_frame_direct(io, frame, client.write_scratch,
+                                client.options.direct_write_threshold)
         force_flush && flush(io)
     end
     nothing
@@ -426,8 +427,6 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
     borrowed = _connect_option_bool("borrowed", borrowed)
     borrowed && isnothing(callback) &&
         throw(ArgumentError("borrowed subscriptions require a callback"))
-    borrowed && !(_control_handler isa _NoSubscriptionControlHandler) &&
-        throw(ArgumentError("borrowed subscriptions cannot use internal control handlers"))
     max_msgs, pending_msgs_limit, pending_bytes_limit =
         _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
     send_now = false
@@ -516,9 +515,7 @@ struct _BorrowPayloadPolicy{C<:Client}
 end
 
 function (policy::_BorrowPayloadPolicy)(sid::Int)::Bool
-    sub = _lookup_subscription(policy.client, sid)
-    isnothing(sub) && return false
-    @lock sub.lock !sub.closed && sub.borrowed_callback
+    _borrow_payload_for_sid(policy.client, sid)
 end
 
 function _owned_msg(msg::BorrowedMsg)::Msg
@@ -526,8 +523,8 @@ function _owned_msg(msg::BorrowedMsg)::Msg
         headers=msg.headers, sid=msg.sid, header_bytes=msg.header_bytes)
 end
 
-_handle_subscription_control(::_NoSubscriptionControlHandler, _sub::Subscription, _msg::Msg)::Bool = false
-_record_subscription_data_received!(::_SubscriptionControlHandler, ::Msg) = nothing
+_handle_subscription_control(::_NoSubscriptionControlHandler, _sub::Subscription, _msg::AbstractMsg)::Bool = false
+_record_subscription_data_received!(::_SubscriptionControlHandler, ::AbstractMsg) = nothing
 _maybe_reply_to_subscription_flow_control!(::Subscription, ::_SubscriptionControlHandler) = nothing
 
 function _request_mux_token(prefix::String, subject::String)::Union{SubString{String},Nothing}
@@ -586,12 +583,17 @@ end
 
 function _dispatch_msg(client::Client, msg::Msg)
     msg_bytes = _msg_pending_bytes(msg)
-    control_handler = _NoSubscriptionControlHandler()
     sub = _lookup_subscription(client, msg.sid)
     if isnothing(sub)
         _record_drop!(client)
         return
     end
+    _dispatch_owned_msg_to_sub(client, sub, msg, msg_bytes)
+end
+
+function _dispatch_owned_msg_to_sub(client::Client, sub::Subscription, msg::Msg,
+                                    msg_bytes::Int)
+    control_handler = _NoSubscriptionControlHandler()
     closed = @lock sub.lock begin
         if sub.closed
             true
@@ -644,6 +646,17 @@ function _dispatch_msg(client::Client, msg::Msg)
     if should_close
         _close_subscription_locally!(sub; throw_errors=false)
     end
+    nothing
+end
+
+@noinline function _invoke_borrowed_callback(client::Client, callback::Callback,
+                                             msg::M) where {Callback,M<:AbstractMsg}
+    try
+        callback(msg)
+    catch err
+        _report_error(client, err)
+    end
+    nothing
 end
 
 function _dispatch_msg(client::Client, msg::BorrowedMsg)
@@ -653,40 +666,65 @@ function _dispatch_msg(client::Client, msg::BorrowedMsg)
         _record_drop!(client)
         return
     end
+    _dispatch_borrowed_msg_to_sub(client, sub, msg, msg_bytes)
+end
 
-    callback = nothing
-    should_close = false
-    accepted = @lock sub.lock begin
+function _dispatch_borrowed_msg_to_sub(client::Client, sub::Subscription, msg::BorrowedMsg,
+                                       msg_bytes::Int)
+    control_handler = _NoSubscriptionControlHandler()
+    dispatch_owned = false
+    closed = @lock sub.lock begin
         if sub.closed
-            false
+            true
         elseif !sub.borrowed_callback
-            :owned
+            dispatch_owned = true
+            false
         else
-            callback = sub.callback
-            if isnothing(callback)
-                false
-            else
-                sub.received += 1
-                sub.processing += 1
-                should_close = sub.max_msgs > 0 && sub.received >= sub.max_msgs
-                true
-            end
+            control_handler = sub.control_handler
+            false
         end
     end
 
-    if accepted === :owned
+    if closed
+        _record_drop!(client)
+        return
+    end
+    if dispatch_owned
         _dispatch_msg(client, _owned_msg(msg))
         return
-    elseif !accepted
+    end
+
+    if _handle_subscription_control(control_handler, sub, msg)
+        _record_in!(client, msg_bytes)
+        return
+    end
+    if _handle_ordered_push_data!(control_handler, client, msg)
+        _record_drop!(client)
+        return
+    end
+
+    callback = sub.callback
+    should_close = false
+    accepted = @lock sub.lock begin
+        if sub.closed || !sub.borrowed_callback || isnothing(callback)
+            false
+        else
+            sub.received += 1
+            sub.processing += 1
+            should_close = sub.max_msgs > 0 && sub.received >= sub.max_msgs
+            true
+        end
+    end
+    if !accepted
         _record_drop!(client)
         return
     end
 
     _record_in!(client, msg_bytes)
+    _record_subscription_data_received!(control_handler, msg)
+    _maybe_reply_to_subscription_flow_control!(sub, control_handler)
     try
-        callback(msg)
-    catch err
-        _report_error(client, err)
+        _invoke_borrowed_callback(client, callback, msg)
     finally
         @lock sub.lock begin
             sub.processing = max(0, sub.processing - 1)
@@ -994,6 +1032,7 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
             subs = collect(values(client.subscriptions))
             empty!(client.subscriptions)
             @atomic client.subscription_snapshot = Vector{Union{Subscription{typeof(client)},Nothing}}()
+            @atomic client.borrowed_subscription_snapshot = Bool[]
             reader = client.reader
             isnothing(reader) || empty!(reader.subject_cache)
         else

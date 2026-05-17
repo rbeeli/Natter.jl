@@ -408,59 +408,56 @@ function _tls_config(opts::ConnectOptions, authmode::Int=_tls_authmode(opts))
     conf
 end
 
+function _socket_connecting(sock::Sockets.TCPSocket)::Bool
+    lock(sock.cond)
+    try
+        sock.status == Base.StatusConnecting
+    finally
+        unlock(sock.cond)
+    end
+end
+
 function _connect_tcp(host::String, port::Int, timeout::Real,
                       cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
-    ch = Channel{Union{Sockets.TCPSocket,Exception}}(1)
-    timed_out = Threads.Atomic{Bool}(false)
-    task = @async begin
-        try
-            sock = Sockets.connect(host, port)
-            if timed_out[]
-                close_errors = Any[]
-                _close_resource!(close_errors, "close timed-out connect socket", sock)
-                _warn_timeout_cleanup_errors("connect to $host:$port", close_errors)
-            else
-                put!(ch, sock)
-            end
-        catch err
-            timed_out[] || put!(ch, err)
+    timeout = Float64(timeout)
+    timeout > 0 || throw(TimeoutError("connect to $host:$port timed out"))
+    sock = Sockets.TCPSocket()
+    connected = false
+    try
+        Sockets.connect!(sock, host, port)
+    catch
+        errors = Any[]
+        _close_resource!(errors, "close failed connect socket", sock)
+        _warn_timeout_cleanup_errors("connect to $host:$port", errors)
+        rethrow()
+    end
+    try
+        wait_result = timedwait(timeout; pollint=0.01) do
+            !_socket_connecting(sock) || iscancelled(cancel_token)
         end
-    end
-    result = timedwait(timeout; pollint=0.01) do
-        isready(ch) || iscancelled(cancel_token)
-    end
-    if iscancelled(cancel_token) && !isready(ch)
-        timed_out[] = true
-        @async begin
+        if iscancelled(cancel_token)
             errors = Any[]
-            _wait_task!(errors, "stop cancelled connect to $host:$port task", task;
-                        interrupt=true, interrupt_first=true)
-            if isready(ch)
-                late = take!(ch)
-                late isa Sockets.TCPSocket && _close_resource!(errors, "close cancelled connect socket", late)
-            end
+            _close_resource!(errors, "close cancelled connect socket", sock)
+            _warn_timeout_cleanup_errors("connect to $host:$port", errors)
+            throw(CancelledError("connect to $host:$port cancelled"))
+        end
+        if wait_result == :timed_out
+            errors = Any[]
+            _close_resource!(errors, "close timed-out connect socket", sock)
+            _warn_timeout_cleanup_errors("connect to $host:$port", errors)
+            throw(TimeoutError("connect to $host:$port timed out"))
+        end
+        Sockets.wait_connected(sock)
+        connected = true
+        return sock
+    finally
+        if !connected
+            errors = Any[]
+            _close_resource!(errors, "close failed connect socket", sock)
             _warn_timeout_cleanup_errors("connect to $host:$port", errors)
         end
-        throw(CancelledError("connect to $host:$port cancelled"))
     end
-    if result == :timed_out
-        timed_out[] = true
-        @async begin
-            errors = Any[]
-            _wait_task!(errors, "stop timed-out connect to $host:$port task", task;
-                        interrupt=true, interrupt_first=true)
-            if isready(ch)
-                late = take!(ch)
-                late isa Sockets.TCPSocket && _close_resource!(errors, "close timed-out connect socket", late)
-            end
-            _warn_timeout_cleanup_errors("connect to $host:$port", errors)
-        end
-        throw(TimeoutError("connect to $host:$port timed out"))
-    end
-    value = take!(ch)
-    value isa Exception && throw(value)
-    value
 end
 
 function _warn_timeout_cleanup_errors(operation::String, errors::Vector)
@@ -1148,6 +1145,7 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
             subs = collect(values(client.subscriptions))
             empty!(client.subscriptions)
             @atomic client.subscription_snapshot = Vector{Union{Subscription{typeof(client)},Nothing}}()
+            @atomic client.borrowed_subscription_snapshot = Bool[]
             reader = client.reader
             isnothing(reader) || empty!(reader.subject_cache)
 
@@ -1291,7 +1289,8 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     sock = _connect_tcp(host, port, _remaining_timeout(deadline), cancel_token)
     read_io = sock
     write_io = sock
-    reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size)
+    reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size,
+                            shrink_threshold=client.options.read_buffer_shrink_threshold)
     cleanup = () -> _close_transport(read_io, write_io, sock)
     report_timeout_cleanup = errors -> _report_cleanup_errors(client, errors)
     try
@@ -1303,14 +1302,15 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             end
             read_io = tls
             write_io = tls
-            reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size)
+            reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size,
+                                    shrink_threshold=client.options.read_buffer_shrink_threshold)
             tls_active = true
         end
         _throw_if_cancelled(cancel_token)
         frame = _run_interruptible_io_with_timeout("connect INFO read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
             _read_control_or_msg(reader, client.options)
         end
-        frame.op == :INFO || throw(ProtocolError("expected INFO during connect"))
+        frame isa InfoFrame || throw(ProtocolError("expected INFO during connect"))
         info = _protocol_info(frame)
         wants_tls::Bool = !tls_active && (scheme == "tls" || client.options.tls_required || info.tls_required === true)
         if wants_tls
@@ -1322,7 +1322,8 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             end
             read_io = tls
             write_io = tls
-            reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size)
+            reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size,
+                                    shrink_threshold=client.options.read_buffer_shrink_threshold)
             tls_active = true
         end
         _throw_if_cancelled(cancel_token)
@@ -1336,21 +1337,20 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             frame = _run_interruptible_io_with_timeout("connect PONG read", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                 _read_control_or_msg(reader, client.options)
             end
-            op = frame.op
-            if op == :PONG
+            if frame isa PongFrame
                 break
-            elseif op == :PING
+            elseif frame isa PingFrame
                 _throw_if_cancelled(cancel_token)
                 _run_interruptible_io_with_timeout("connect PONG write", _remaining_timeout(deadline), cleanup, report_timeout_cleanup) do
                     write(write_io, "PONG$CRLF")
                     flush(write_io)
                 end
-            elseif op == :ERR
+            elseif frame isa ErrFrame
                 throw(_server_err(_protocol_err(frame)))
-            elseif op == :OK
+            elseif frame isa OkFrame
                 continue
             else
-                throw(ProtocolError("unexpected $(op) during connect"))
+                throw(ProtocolError("unexpected $(_protocol_op(frame)) during connect"))
             end
         end
         accepted = @lock client.write_lock begin
@@ -1712,7 +1712,8 @@ function _reader_loop(client::Client, generation::Int)
     if isnothing(reader)
         read_io = @lock client.lock client.read_io
         isnothing(read_io) && return
-        reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size)
+        reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size,
+                                shrink_threshold=client.options.read_buffer_shrink_threshold)
         @lock client.lock client.reader = reader
     end
     _reader_loop_with_reader(client, generation, reader)
@@ -1725,15 +1726,14 @@ function _reader_loop_with_reader(client::Client, generation::Int,
     while _generation_matches(client, generation) && status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
             frame = _read_control_or_msg(reader, client.options, borrow_payload)
-            op = frame.op
-            if op == :MSG
+            if frame isa MsgFrame
                 msg = _protocol_msg(frame)
                 _dispatch_msg(client, msg)
-            elseif op == :PING
+            elseif frame isa PingFrame
                 _send_raw(client, "PONG$CRLF"; force_flush=true)
-            elseif op == :PONG
+            elseif frame isa PongFrame
                 _notify_pong(client)
-            elseif op == :INFO
+            elseif frame isa InfoFrame
                 info = _protocol_info(frame)
                 @lock client.lock begin
                     _merge_server_info!(client.info, info)
@@ -1744,7 +1744,7 @@ function _reader_loop_with_reader(client::Client, generation::Int,
                     _trigger_reconnect(client, ProtocolError("server entered lame duck mode"))
                     return
                 end
-            elseif op == :ERR
+            elseif frame isa ErrFrame
                 _handle_server_err!(client, generation, _protocol_err(frame)) && return
             end
         catch err

@@ -108,18 +108,35 @@ _reader_available(reader::ProtocolReader)::Int = reader.last - reader.first + 1
 
 const _READER_COMPACT_MIN_PREFIX = 8192
 
+function _replace_reader_buffer!(reader::ProtocolReader, available::Int)
+    buffer = Vector{UInt8}(undef, available)
+    available > 0 && copyto!(buffer, 1, reader.buffer, reader.first, available)
+    reader.buffer = buffer
+    reader.first = 1
+    reader.last = available
+    nothing
+end
+
 function _drop_consumed!(reader::ProtocolReader)
     reader.first == 1 && return nothing
     available = _reader_available(reader)
     if available <= 0
-        empty!(reader.buffer)
+        if length(reader.buffer) > reader.shrink_threshold
+            reader.buffer = UInt8[]
+        else
+            empty!(reader.buffer)
+        end
         reader.first = 1
         reader.last = 0
     elseif reader.first > _READER_COMPACT_MIN_PREFIX && reader.first > available
-        copyto!(reader.buffer, 1, reader.buffer, reader.first, available)
-        resize!(reader.buffer, available)
-        reader.first = 1
-        reader.last = available
+        if length(reader.buffer) > reader.shrink_threshold && available <= reader.shrink_threshold
+            _replace_reader_buffer!(reader, available)
+        else
+            copyto!(reader.buffer, 1, reader.buffer, reader.first, available)
+            resize!(reader.buffer, available)
+            reader.first = 1
+            reader.last = available
+        end
     end
     nothing
 end
@@ -415,7 +432,7 @@ function _borrow_exact_header_payload(reader::ProtocolReader, hsize::Int, total:
     end
     first == CRLF_BYTES[1] && second == CRLF_BYTES[2] ||
         throw(ProtocolError("message payload missing CRLF trailer"))
-    header = hsize == 0 ? EMPTY_BYTES : Vector{UInt8}(@view reader.buffer[header_first:(payload_first - 1)])
+    header = hsize == 0 ? EMPTY_BYTES : @view reader.buffer[header_first:(payload_first - 1)]
     payload = total == hsize ? EMPTY_BYTES : @view reader.buffer[payload_first:payload_last]
     reader.first = trailer_first + 2
     header, payload
@@ -1035,8 +1052,8 @@ function _copy_byte!(dest::Vector{UInt8}, pos::Int, byte::UInt8)::Int
     pos + 1
 end
 
-function _pub_cmd(frame::_AbstractPublishFrame)::Vector{UInt8}
-    out = Vector{UInt8}(undef, _serialized_size(frame))
+function _pub_cmd!(out::Vector{UInt8}, frame::_AbstractPublishFrame)::Vector{UInt8}
+    resize!(out, _serialized_size(frame))
     pos = 1
     if isempty(frame.headers)
         pos = _copy_codeunits!(out, pos, "PUB ")
@@ -1069,6 +1086,8 @@ function _pub_cmd(frame::_AbstractPublishFrame)::Vector{UInt8}
     pos == length(out) + 1 || throw(AssertionError("publish frame size mismatch"))
     out
 end
+
+_pub_cmd(frame::_AbstractPublishFrame)::Vector{UInt8} = _pub_cmd!(UInt8[], frame)
 
 function _pub_prefix_size(frame::_AbstractPublishFrame)::Int
     subject_len = ncodeunits(frame.subject)
@@ -1113,11 +1132,17 @@ function _pub_prefix!(out::Vector{UInt8}, frame::_AbstractPublishFrame)::Vector{
     out
 end
 
-function _write_pub_frame_direct(io, frame::_AbstractPublishFrame, scratch::Vector{UInt8})
-    write(io, _pub_prefix!(scratch, frame))
-    isempty(frame.headers) || write(io, frame.headers)
-    write(io, frame.payload)
-    write(io, CRLF)
+function _write_pub_frame_direct(io, frame::_AbstractPublishFrame, scratch::Vector{UInt8},
+                                 contiguous_threshold::Int)
+    frame_size = _serialized_size(frame)
+    if contiguous_threshold > 0 && frame_size <= contiguous_threshold
+        write(io, _pub_cmd!(scratch, frame))
+    else
+        write(io, _pub_prefix!(scratch, frame))
+        isempty(frame.headers) || write(io, frame.headers)
+        write(io, frame.payload)
+        write(io, CRLF)
+    end
     nothing
 end
 

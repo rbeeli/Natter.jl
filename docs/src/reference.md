@@ -64,7 +64,9 @@ Conventions:
 | `max_reconnect_attempts` | `-1` | `-1` means unlimited reconnect and initial-retry attempts. |
 | `pending_size` | `2 MiB` | Buffered publish bytes retained for reconnect replay; `0` disables replay buffering. |
 | `read_buffer_size` | `64 KiB` | Inbound socket read buffer used by the protocol parser. |
+| `read_buffer_shrink_threshold` | `256 KiB` | Parser buffer capacity above this size is released after oversized consumed frames. |
 | `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |
+| `direct_write_threshold` | `256 KiB` | Direct publishes at or below this size are written as one contiguous frame; larger direct publishes avoid the payload copy. |
 | `write_buffer_latency` | `0.001` | Maximum small-write coalescing delay. |
 | `write_timeout` | `10.0` | Maximum write/flush block time. |
 | `record_stats` | `false` | Enable client counters returned by `stats(client)`. |
@@ -139,6 +141,7 @@ Cancellation helpers: `CancellationSource()`, `cancellation_token(source)`, `can
 | `PubAck` | Publish acknowledgement. |
 | `JetStreamPublishFuture` | Future returned by protocol-level async JetStream publish. |
 | `JetStreamMsg` | Consumer message with acknowledgement state. |
+| `BorrowedJetStreamMsg` | Push-callback JetStream message whose bytes are borrowed for the callback call. |
 | `PullSubscription`, `PullMessageStream`, `PushSubscription` | Consumer handles. |
 
 Enums:
@@ -186,7 +189,7 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `fetch(psub, batch=1; timeout=..., expires=..., heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `Vector{JetStreamMsg}` | Fetch a bounded batch. |
 | `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | `PullMessageStream` | Start a bounded refill stream. |
 | `consume(callback, psub; kwargs...)` | `PullMessageStream` | Run a callback over `messages`. |
-| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=..., ordered=false)` | `PushSubscription` | Create or bind a push consumer, or create an ordered ephemeral push consumer with `ordered=true`. |
+| `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=..., ordered=false, borrowed=false)` | `PushSubscription` | Create or bind a push consumer, or create an ordered ephemeral push consumer with `ordered=true`. `borrowed=true` is callback-only and delivers `BorrowedJetStreamMsg`. |
 | `next(psub::PushSubscription; timeout=1.0)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
 | `ack(msg)`, `ack_sync(msg; timeout=1.0)`, `nak(msg; delay=nothing)`, `in_progress(msg)`, `term(msg)` | `nothing` or `Msg` | Acknowledge or control redelivery. |
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |

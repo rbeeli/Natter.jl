@@ -441,6 +441,49 @@ end
     @test TestHelpers.capture_text(capture) == ""
 end
 
+@testitem "KeyValue create conflict path shares one timeout deadline" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function published_replies(capture, subject)
+        replies = String[]
+        for line in split(TestHelpers.capture_text(capture), "\r\n"; keepempty=false)
+            startswith(line, "HPUB $subject ") || continue
+            parts = split(line)
+            length(parts) >= 5 && push!(replies, String(parts[3]))
+        end
+        replies
+    end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     read_io=capture, write_io=capture)
+    kv = KeyValue(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
+    subject = "\$KV.bucket.beta"
+
+    task = @async try
+        kv_create_key(kv, "beta", "value"; timeout=0.5)
+    catch err
+        err
+    end
+
+    @test timedwait(1.0; pollint=0.001) do
+        !isempty(published_replies(capture, subject))
+    end != :timed_out
+    reply = first(published_replies(capture, subject))
+    sleep(0.45)
+    mux = client.request_mux
+    err_payload = """{"error":{"code":400,"err_code":10071,"description":"wrong last sequence"}}"""
+    elapsed = @elapsed begin
+        N._dispatch_msg(client, Msg(reply, nothing, TestHelpers.bytes(err_payload); sid=mux.sub.sid))
+        result = fetch(task)
+        @test result isa TimeoutError
+    end
+    @test elapsed < 0.35
+    close(client)
+end
+
 @testitem "KeyValue watcher options map to consumer config" setup=[TestHelpers] begin
     using Natter
 

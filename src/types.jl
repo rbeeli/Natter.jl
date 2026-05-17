@@ -157,14 +157,15 @@ Base.copy(headers::Headers) = _headers_from_pairs(name => copy(values) for (name
 
 Headers(pairs::Pair...) = _headers_from_pairs(pairs)
 
-mutable struct LazyHeaders <: AbstractDict{String,Vector{String}}
-    raw::Vector{UInt8}
+mutable struct LazyHeaders{R<:AbstractVector{UInt8}} <: AbstractDict{String,Vector{String}}
+    raw::R
     parsed::Union{Headers,Nothing}
 end
 
-LazyHeaders(raw::Vector{UInt8}) = LazyHeaders(raw, nothing)
+LazyHeaders(raw::R) where {R<:AbstractVector{UInt8}} = LazyHeaders{R}(raw, nothing)
 
-const HeaderStorage = Union{Headers,LazyHeaders,Nothing}
+const AnyLazyHeaders = LazyHeaders{<:AbstractVector{UInt8}}
+const HeaderStorage = Union{Headers,AnyLazyHeaders,Nothing}
 
 abstract type AbstractNatterClient end
 abstract type AbstractMsg end
@@ -670,7 +671,9 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
     max_reconnect_attempts::Int
     pending_size::Int
     read_buffer_size::Int
+    read_buffer_shrink_threshold::Int
     write_buffer_size::Int
+    direct_write_threshold::Int
     write_buffer_latency::Float64
     write_timeout::Float64
     record_stats::Bool
@@ -692,7 +695,8 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
         reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
-        pending_size, read_buffer_size, write_buffer_size, write_buffer_latency, write_timeout, record_stats,
+        pending_size, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
+        write_buffer_latency, write_timeout, record_stats,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
         sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
         inbox_prefix,
@@ -728,7 +732,12 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         max_reconnect_attempts = _connect_option_reconnect_attempts(max_reconnect_attempts)
         pending_size = _connect_option_nonnegative_int("pending_size", pending_size)
         read_buffer_size = _connect_option_positive_int("read_buffer_size", read_buffer_size)
+        read_buffer_shrink_threshold = _connect_option_positive_int("read_buffer_shrink_threshold",
+                                                                    read_buffer_shrink_threshold)
+        read_buffer_shrink_threshold >= read_buffer_size ||
+            throw(ArgumentError("read_buffer_shrink_threshold must be greater than or equal to read_buffer_size"))
         write_buffer_size = _connect_option_nonnegative_int("write_buffer_size", write_buffer_size)
+        direct_write_threshold = _connect_option_nonnegative_int("direct_write_threshold", direct_write_threshold)
         write_buffer_latency = _connect_option_nonnegative_float("write_buffer_latency", write_buffer_latency)
         write_timeout = _connect_option_positive_float("write_timeout", write_timeout)
         record_stats = _connect_option_bool("record_stats", record_stats)
@@ -747,7 +756,8 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
             tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
             reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
-            pending_size, read_buffer_size, write_buffer_size, write_buffer_latency, write_timeout, record_stats,
+            pending_size, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
+            write_buffer_latency, write_timeout, record_stats,
             max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
             sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
             inbox_prefix,
@@ -815,7 +825,9 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                         max_reconnect_attempts=-1,
                         pending_size=2 * 1024 * 1024,
                         read_buffer_size=DEFAULT_READ_BUFFER_SIZE,
+                        read_buffer_shrink_threshold=4 * read_buffer_size,
                         write_buffer_size=DEFAULT_WRITE_BUFFER_SIZE,
+                        direct_write_threshold=DEFAULT_DIRECT_WRITE_THRESHOLD,
                         write_buffer_latency=0.001, write_timeout=DEFAULT_WRITE_TIMEOUT,
                         record_stats=false,
                         max_control_line=DEFAULT_MAX_CONTROL_LINE,
@@ -832,7 +844,8 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                    ping_interval, max_outstanding_pings, allow_reconnect,
                    retry_on_initial_connect, reconnect_wait, reconnect_max_wait,
                    reconnect_jitter, max_reconnect_attempts, pending_size,
-                   read_buffer_size, write_buffer_size, write_buffer_latency, write_timeout,
+                   read_buffer_size, read_buffer_shrink_threshold, write_buffer_size,
+                   direct_write_threshold, write_buffer_latency, write_timeout,
                    record_stats, max_control_line, max_inbound_payload,
                    max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
                    sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
@@ -914,34 +927,65 @@ mutable struct ProtocolReader{I}
     first::Int
     last::Int
     scratch::Vector{UInt8}
+    shrink_threshold::Int
     subject_cache::Dict{Int,String}
 end
 
-ProtocolReader(io::I; read_size::Int=DEFAULT_READ_BUFFER_SIZE) where {I} =
-    ProtocolReader{I}(io; read_size)
+ProtocolReader(io::I; read_size::Int=DEFAULT_READ_BUFFER_SIZE,
+               shrink_threshold::Int=4 * read_size) where {I} =
+    ProtocolReader{I}(io; read_size, shrink_threshold)
 
-ProtocolReader{I}(io; read_size::Int=DEFAULT_READ_BUFFER_SIZE) where {I} =
+ProtocolReader{I}(io; read_size::Int=DEFAULT_READ_BUFFER_SIZE,
+                  shrink_threshold::Int=4 * read_size) where {I} =
     ProtocolReader{I}(io, UInt8[], 1, 0,
                       Vector{UInt8}(undef, _connect_option_positive_int("read_size", read_size)),
+                      max(_connect_option_positive_int("shrink_threshold", shrink_threshold),
+                          _connect_option_positive_int("read_size", read_size)),
                       Dict{Int,String}())
 
 const _ProtocolMsg = Union{Msg,BorrowedMsg}
 
-struct _ProtocolFrame
-    op::Symbol
-    msg::Union{_ProtocolMsg,Nothing}
-    info::Union{ServerInfo,Nothing}
-    err::Union{String,Nothing}
+abstract type _ProtocolFrame end
+
+struct MsgFrame{M<:_ProtocolMsg} <: _ProtocolFrame
+    msg::M
 end
 
-@inline _protocol_msg_frame(msg::_ProtocolMsg) = _ProtocolFrame(:MSG, msg, nothing, nothing)
-@inline _protocol_info_frame(info::ServerInfo) = _ProtocolFrame(:INFO, nothing, info, nothing)
-@inline _protocol_err_frame(err::AbstractString) = _ProtocolFrame(:ERR, nothing, nothing, String(err))
-@inline _protocol_control_frame(op::Symbol) = _ProtocolFrame(op, nothing, nothing, nothing)
+struct InfoFrame <: _ProtocolFrame
+    info::ServerInfo
+end
 
-@inline _protocol_msg(frame::_ProtocolFrame)::_ProtocolMsg = something(frame.msg)
-@inline _protocol_info(frame::_ProtocolFrame)::ServerInfo = something(frame.info)
-@inline _protocol_err(frame::_ProtocolFrame)::String = something(frame.err)
+struct ErrFrame <: _ProtocolFrame
+    err::String
+end
+
+struct PingFrame <: _ProtocolFrame end
+struct PongFrame <: _ProtocolFrame end
+struct OkFrame <: _ProtocolFrame end
+
+@inline _protocol_msg_frame(msg::_ProtocolMsg) = MsgFrame(msg)
+@inline _protocol_info_frame(info::ServerInfo) = InfoFrame(info)
+@inline _protocol_err_frame(err::AbstractString) = ErrFrame(String(err))
+@inline _protocol_control_frame(::Val{:PING}) = PingFrame()
+@inline _protocol_control_frame(::Val{:PONG}) = PongFrame()
+@inline _protocol_control_frame(::Val{:OK}) = OkFrame()
+@inline _protocol_control_frame(op::Symbol) = _protocol_control_frame(Val(op))
+
+@inline _protocol_msg(frame::MsgFrame) = frame.msg
+@inline _protocol_info(frame::InfoFrame)::ServerInfo = frame.info
+@inline _protocol_err(frame::ErrFrame)::String = frame.err
+
+@inline _protocol_op(::MsgFrame) = :MSG
+@inline _protocol_op(::InfoFrame) = :INFO
+@inline _protocol_op(::ErrFrame) = :ERR
+@inline _protocol_op(::PingFrame) = :PING
+@inline _protocol_op(::PongFrame) = :PONG
+@inline _protocol_op(::OkFrame) = :OK
+
+function Base.getproperty(frame::_ProtocolFrame, name::Symbol)
+    name === :op && return _protocol_op(frame)
+    getfield(frame, name)
+end
 
 mutable struct BufferedWriteIO{I} <: IO
     io::I
@@ -1331,14 +1375,14 @@ function Base.take!(q::MsgQueue{T}) where {T}
     msg
 end
 
-mutable struct Subscription{C<:AbstractNatterClient}
+mutable struct Subscription{C<:AbstractNatterClient,Callback}
     client::C
     lock::ReentrantLock
     sid::Int
     subject::String
     queue::Union{String,Nothing}
     has_callback::Bool
-    callback::Any
+    callback::Callback
     borrowed_callback::Bool
     messages::MsgQueue{Msg}
     condition::Base.GenericCondition{ReentrantLock}
@@ -1362,10 +1406,10 @@ function Subscription(client::C, sid::Int, subject::String, queue::Union{String,
                       pending_msgs_limit::Int, pending_bytes_limit::Int, pending_bytes::Int,
                       received::Int, max_msgs::Int, closed::Bool, processor::Union{Task,Nothing},
                       server_active::Bool, processing::Int) where {C<:AbstractNatterClient}
-    Subscription{C}(client, lock, sid, subject, queue, !isnothing(callback), callback,
-                    borrowed_callback, messages, condition, control_handler,
-                    pending_msgs_limit, pending_bytes_limit, pending_bytes, received,
-                    max_msgs, closed, processor, server_active, processing)
+    Subscription{C,typeof(callback)}(client, lock, sid, subject, queue, !isnothing(callback), callback,
+                                     borrowed_callback, messages, condition, control_handler,
+                                     pending_msgs_limit, pending_bytes_limit, pending_bytes, received,
+                                     max_msgs, closed, processor, server_active, processing)
 end
 
 mutable struct PongWaiter
@@ -1500,6 +1544,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     sid::Int
     subscriptions::Dict{Int,Subscription{Client{Options,ReadIO,WriteIO}}}
     @atomic subscription_snapshot::Vector{Union{Subscription{Client{Options,ReadIO,WriteIO}},Nothing}}
+    @atomic borrowed_subscription_snapshot::Vector{Bool}
     @atomic request_mux::Union{RequestMux{Client{Options,ReadIO,WriteIO}},Nothing}
     request_mux_lock::ReentrantLock
     pending::PendingBuffer
@@ -1538,9 +1583,14 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
         max_sid = max(max_sid, sub_sid)
     end
     subscription_snapshot = Vector{Union{Subscription{client_type},Nothing}}(undef, max_sid)
+    borrowed_subscription_snapshot = Vector{Bool}(undef, max_sid)
     fill!(subscription_snapshot, nothing)
+    fill!(borrowed_subscription_snapshot, false)
     for (sub_sid, sub) in typed_subscriptions
-        sub_sid > 0 && (subscription_snapshot[sub_sid] = sub)
+        if sub_sid > 0
+            subscription_snapshot[sub_sid] = sub
+            borrowed_subscription_snapshot[sub_sid] = sub.borrowed_callback
+        end
     end
     typed_request_mux = if isnothing(request_mux)
         nothing
@@ -1558,7 +1608,8 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
         end
         RequestMux{client_type}(request_mux.prefix, sub, waiters, Base.Threads.Condition(ReentrantLock()), nothing)
     end
-    reader = isnothing(read_io) ? nothing : ProtocolReader(read_io; read_size=options.read_buffer_size)
+    reader = isnothing(read_io) ? nothing : ProtocolReader(read_io; read_size=options.read_buffer_size,
+                                                           shrink_threshold=options.read_buffer_shrink_threshold)
     pending = _pending_buffer_from(pending)
     atomic_stats = stats isa AtomicStats ? stats : AtomicStats(stats)
     Client{Options,ReadIO,WriteIO}(options, servers, current_server, connected_url, status,
@@ -1570,6 +1621,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                    Threads.Atomic{Int}(0), Ref{Any}(nothing), Ref(""), nothing,
                                    flush_signal, flusher_task,
                                    sid, typed_subscriptions, subscription_snapshot,
+                                   borrowed_subscription_snapshot,
                                    typed_request_mux, request_mux_lock,
                                    pending, pending_bytes, pongs,
                                    reader_task, ping_task, reconnect_task, pings_out, atomic_stats,
@@ -1580,8 +1632,14 @@ function _set_subscription_snapshot_locked!(client::C, sid::Int,
                                             sub::Union{Subscription{C},Nothing}) where {C<:Client}
     sid > 0 || return nothing
     current = @atomic client.subscription_snapshot
-    isnothing(sub) && sid > length(current) && return nothing
-    if sid <= length(current) && current[sid] === sub
+    borrowed_current = @atomic client.borrowed_subscription_snapshot
+    borrowed = !isnothing(sub) && sub.borrowed_callback
+    if isnothing(sub) && sid > length(current) && sid > length(borrowed_current)
+        return nothing
+    end
+    current_matches = sid <= length(current) && current[sid] === sub
+    borrowed_matches = sid <= length(borrowed_current) && borrowed_current[sid] == borrowed
+    if current_matches && borrowed_matches
         return nothing
     end
     snapshot = if sid <= length(current)
@@ -1593,14 +1651,29 @@ function _set_subscription_snapshot_locked!(client::C, sid::Int,
         expanded
     end
     snapshot[sid] = sub
+    borrowed_snapshot = if sid <= length(borrowed_current)
+        copy(borrowed_current)
+    else
+        expanded = Vector{Bool}(undef, sid)
+        fill!(expanded, false)
+        isempty(borrowed_current) || copyto!(expanded, 1, borrowed_current, 1, length(borrowed_current))
+        expanded
+    end
+    borrowed_snapshot[sid] = borrowed
     if isnothing(sub)
         last = length(snapshot)
         while last > 0 && isnothing(snapshot[last])
             last -= 1
         end
         last < length(snapshot) && resize!(snapshot, last)
+        last_borrowed = length(borrowed_snapshot)
+        while last_borrowed > 0 && !borrowed_snapshot[last_borrowed]
+            last_borrowed -= 1
+        end
+        last_borrowed < length(borrowed_snapshot) && resize!(borrowed_snapshot, last_borrowed)
     end
     @atomic client.subscription_snapshot = snapshot
+    @atomic client.borrowed_subscription_snapshot = borrowed_snapshot
     nothing
 end
 
@@ -1610,6 +1683,14 @@ end
         @inbounds return snapshot[sid]
     end
     nothing
+end
+
+@inline function _borrow_payload_for_sid(client::Client, sid::Int)::Bool
+    snapshot = @atomic client.borrowed_subscription_snapshot
+    if 0 < sid <= length(snapshot)
+        @inbounds return snapshot[sid]
+    end
+    false
 end
 
 function _wait_until_condition_locked(predicate::Function, condition::Base.GenericCondition{ReentrantLock},

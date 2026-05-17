@@ -151,10 +151,24 @@ end
     hmsg = N._protocol_msg(hframe)
     @test hmsg isa BorrowedMsg
     @test hmsg.headers isa N.LazyHeaders
+    @test hmsg.headers.raw isa SubArray
+    @test parent(hmsg.headers.raw) === hreader.buffer
     @test header(hmsg, "Trace") == "abc"
     @test String(hmsg) == "body"
     @test hmsg.data isa SubArray
     @test parent(hmsg.data) === hreader.buffer
+
+    large = fill(UInt8('x'), 256)
+    large_raw = vcat(TestHelpers.bytes("MSG large 4 $(length(large))\r\n"), large, N.CRLF_BYTES)
+    large_reader = N.ProtocolReader(IOBuffer(large_raw); read_size=16, shrink_threshold=64)
+    large_frame = N._read_control_or_msg(large_reader; borrow_payload=_ -> true)
+    large_msg = N._protocol_msg(large_frame)
+    borrowed_parent = parent(large_msg.data)
+    @test borrowed_parent === large_reader.buffer
+    @test length(large_reader.buffer) > large_reader.shrink_threshold
+    N._drop_consumed!(large_reader)
+    @test isempty(large_reader.buffer)
+    @test large_reader.buffer !== borrowed_parent
 end
 
 @testitem "protocol parser boundary is inferred" setup=[TestHelpers] begin
@@ -162,20 +176,23 @@ end
 
     const N = Natter
 
-    ping = @inferred N._read_control_or_msg(IOBuffer(TestHelpers.bytes("PING\r\n")))
+    ping = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("PING\r\n")))
     @test ping isa N._ProtocolFrame
+    @test ping isa N.PingFrame
     @test ping.op == :PING
 
-    frame = @inferred N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\n")))
+    frame = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\n")))
     @test frame isa N._ProtocolFrame
+    @test frame isa N.MsgFrame{Msg}
     @test frame.op == :MSG
-    msg = N._protocol_msg(frame)
+    msg = @inferred N._protocol_msg(frame)
     @test typeof(msg) === Msg
     @test msg.subject == "foo"
     @test msg.reply == "_INBOX.1"
     @test String(msg) == "hello"
 
-    err = @inferred N._read_control_or_msg(IOBuffer(TestHelpers.bytes("-ERR 'Authorization Violation'\r\n")))
+    err = N._read_control_or_msg(IOBuffer(TestHelpers.bytes("-ERR 'Authorization Violation'\r\n")))
+    @test err isa N.ErrFrame
     @test err.op == :ERR
     @test (@inferred N._protocol_err(err)) == "Authorization Violation"
 end

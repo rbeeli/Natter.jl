@@ -489,18 +489,26 @@ function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,
                        cancel_token::MaybeCancellationToken=nothing)::Int
     key = _validate_kv_key(key)
     timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     subject = "$(kv.prefix)$key"
     hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => ["0"])
     try
-        return _kv_publish_revision(kv, subject, value; headers=hdrs, ttl, timeout,
+        return _kv_publish_revision(kv, subject, value; headers=hdrs, ttl,
+                                    timeout=_remaining_timeout_or_throw(deadline, "kv_create_key";
+                                                                        cancel_token),
                                     cancel_token)
     catch err
         _kv_wrong_last_sequence(err) || rethrow()
-        marker_revision = _kv_latest_delete_marker_revision(kv, subject; timeout, cancel_token)
+        marker_revision = _kv_latest_delete_marker_revision(
+            kv, subject;
+            timeout=_remaining_timeout_or_throw(deadline, "kv_create_key"; cancel_token),
+            cancel_token)
         isnothing(marker_revision) && throw(_kv_key_exists_error(kv, key, err))
         retry_hdrs = Headers(_KV_EXPECTED_LAST_SUBJECT_SEQUENCE => [string(marker_revision)])
         try
-            return _kv_publish_revision(kv, subject, value; headers=retry_hdrs, ttl, timeout,
+            return _kv_publish_revision(kv, subject, value; headers=retry_hdrs, ttl,
+                                        timeout=_remaining_timeout_or_throw(deadline, "kv_create_key";
+                                                                            cancel_token),
                                         cancel_token)
         catch retry_err
             _kv_wrong_last_sequence(retry_err) &&
