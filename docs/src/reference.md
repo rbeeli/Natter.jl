@@ -7,7 +7,7 @@ Conventions:
 - Timeouts and durations are seconds.
 - Status enums are namespaced, for example `ConnectionStatus.CONNECTED` and `AckPolicy.EXPLICIT`.
 - Payload inputs may be strings, byte vectors, or `nothing`; encode structured values explicitly.
-- `String(msg)` works for `Msg`, `JetStreamMsg`, and `KeyValueEntry`.
+- `String(msg)` works for `Msg`, `BorrowedMsg`, `JetStreamMsg`, and `KeyValueEntry`.
 - Blocking operations accept `cancel_token=cancellation_token(source)` where cancellation is useful.
 - Most `_async` helpers return `NatterTask`; `js_publish_async` returns `JetStreamPublishFuture`. `fetch(handle)` returns the operation result or rethrows the original error.
 
@@ -21,7 +21,8 @@ Conventions:
 | `ConnectionEventKind` | Lifecycle event kind for `event_cb`. |
 | `ConnectionEvent` | Event passed to `event_cb`; includes kind, status, URL, attempt, delay, error, and generation. |
 | `Stats` | Snapshot of message, byte, reconnect, error, and dropped-message counters. |
-| `Msg` | Core message with `subject`, `reply`, byte-vector `data`, and optional headers. |
+| `Msg` | Owned core message with `subject`, `reply`, byte-vector `data`, and optional headers. |
+| `BorrowedMsg` | Callback-only core message whose `data` is a borrowed byte view valid only for the callback call. |
 | `Headers` | Case-insensitive header dictionary of `String => Vector{String}`. |
 | `PublishFrame` | Prepared core publish frame from `prepare_publish`. |
 | `Subscription` | Core subscription handle. |
@@ -62,6 +63,7 @@ Conventions:
 | `reconnect_jitter` | `0.1` | Added reconnect jitter. |
 | `max_reconnect_attempts` | `-1` | `-1` means unlimited reconnect and initial-retry attempts. |
 | `pending_size` | `2 MiB` | Buffered publish bytes retained for reconnect replay; `0` disables replay buffering. |
+| `read_buffer_size` | `64 KiB` | Inbound socket read buffer used by the protocol parser. |
 | `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |
 | `write_buffer_latency` | `0.001` | Maximum small-write coalescing delay. |
 | `write_timeout` | `10.0` | Maximum write/flush block time. |
@@ -100,10 +102,10 @@ Parser/resource limits:
 | Function | Returns | Use |
 | :--- | :--- | :--- |
 | `connect(url_or_urls=nothing; kwargs...)` | `Client` | Connect to NATS. |
-| `publish(client, subject, data=nothing; reply=nothing, headers=nothing)` | `nothing` | Publish a core message. Payloads are `nothing`, strings, or byte vectors. |
+| `publish(client, subject, data=nothing; reply=nothing, headers=nothing, buffer_on_reconnect=true, direct_write=false)` | `nothing` | Publish a core message. `direct_write=true` bypasses the client write buffer; `buffer_on_reconnect=false` avoids per-call replay snapshots. |
 | `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | `PublishFrame` | Validate and serialize a reusable publish frame. Payloads are `nothing`, strings, or byte vectors. |
-| `publish(client, frame::PublishFrame)` | `nothing` | Publish a prepared frame. |
-| `subscribe(client, subject; queue=nothing, callback=nothing, max_msgs=0, pending_msgs_limit=..., pending_bytes_limit=...)` | `Subscription` | Create a subscription. |
+| `publish(client, frame::PublishFrame; buffer_on_reconnect=true, direct_write=false)` | `nothing` | Publish a prepared frame. |
+| `subscribe(client, subject; queue=nothing, callback=nothing, borrowed=false, max_msgs=0, pending_msgs_limit=..., pending_bytes_limit=...)` | `Subscription` | Create a subscription. `borrowed=true` requires a callback and delivers `BorrowedMsg` inline from the reader task. |
 | `subscribe(callback, client, subject; kwargs...)` | `Subscription` | Callback-first form. |
 | `next(sub; timeout=1.0)` | `Msg` | Wait for a message on a non-callback subscription. |
 | `unsubscribe(sub; max_msgs=0)` | `nothing` | Unsubscribe now or after more messages. |
@@ -188,11 +190,11 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `next(psub::PushSubscription; timeout=1.0)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
 | `ack(msg)`, `ack_sync(msg; timeout=1.0)`, `nak(msg; delay=nothing)`, `in_progress(msg)`, `term(msg)` | `nothing` or `Msg` | Acknowledge or control redelivery. |
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
-| `close(psub)`, `close(push)`, `close(stream)` | `nothing` | Close consumer/message handles. |
+| `close(psub; timeout=...)`, `close(push; timeout=...)`, `close(stream)` | `nothing` | Close consumer/message handles. Subscription close timeouts bound server cleanup. |
 
 Typed `StreamConfig` and `ConsumerConfig` create/update calls verify that requested fields are reflected in the server response, including explicit false, zero, and empty values. Raw dictionary configs are pass-through for fields outside Natter's typed API.
 
-JetStream task-backed async helpers mirror management, subscribe, fetch, close, and acknowledgement functions: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_async_complete_async`. `js_publish_async` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
+JetStream task-backed async helpers mirror management, subscribe, fetch, timeout-aware close, and acknowledgement functions: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_async_complete_async`. `js_publish_async` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
 
 ## KeyValue Types
 
@@ -224,9 +226,9 @@ JetStream task-backed async helpers mirror management, subscribe, fetch, close, 
 | `kv_keys(kv; timeout=...)` | `Vector{String}` | List active keys. |
 | `kv_watch(kv; key=">", keys=nothing, history=false, updates_only=false, ignore_deletes=false, meta_only=false, resume_revision=nothing, channel_size=256, notify_initial_done=false, timeout=...)` | `KeyValueWatcher` | Watch with a channel. |
 | `kv_watch(callback, kv; kwargs...)` | `KeyValueWatcher` | Watch with a callback. |
-| `close(watcher)` | `nothing` | Close a watcher. |
+| `close(watcher; timeout=...)` | `nothing` | Close a watcher and bound server cleanup. |
 
-KeyValue async helpers: `kv_create_async`, `kv_open_async`, `kv_delete_bucket_async`, `kv_status_async`, `kv_get_async`, `kv_put_async`, `kv_create_key_async`, `kv_update_async`, `kv_delete_async`, `kv_purge_async`, `kv_purge_deletes_async`, `kv_history_async`, `kv_keys_async`, `kv_watch_async`, and `close_async(watcher)`.
+KeyValue async helpers: `kv_create_async`, `kv_open_async`, `kv_delete_bucket_async`, `kv_status_async`, `kv_get_async`, `kv_put_async`, `kv_create_key_async`, `kv_update_async`, `kv_delete_async`, `kv_purge_async`, `kv_purge_deletes_async`, `kv_history_async`, `kv_keys_async`, `kv_watch_async`, and `close_async(watcher; timeout=...)`.
 
 ## Errors
 

@@ -372,6 +372,55 @@ function _read_payload_trailer_or_error!(io)
     nothing
 end
 
+struct _NoBorrowedPayloads end
+(::_NoBorrowedPayloads)(::Int)::Bool = false
+
+function _ensure_payload_buffered!(reader::ProtocolReader, n::Int)
+    while _reader_available(reader) < n
+        try
+            _fill_reader!(reader)
+        catch err
+            err isa EOFError || rethrow()
+            throw(ProtocolError("unexpected EOF while reading payload"))
+        end
+    end
+    nothing
+end
+
+function _borrow_exact_payload(reader::ProtocolReader, n::Int)
+    _ensure_payload_buffered!(reader, n + 2)
+    payload_first = reader.first
+    payload_last = payload_first + n - 1
+    trailer_first = payload_last + 1
+    @inbounds begin
+        first = reader.buffer[trailer_first]
+        second = reader.buffer[trailer_first + 1]
+    end
+    first == CRLF_BYTES[1] && second == CRLF_BYTES[2] ||
+        throw(ProtocolError("message payload missing CRLF trailer"))
+    reader.first = trailer_first + 2
+    n == 0 ? EMPTY_BYTES : @view reader.buffer[payload_first:payload_last]
+end
+
+function _borrow_exact_header_payload(reader::ProtocolReader, hsize::Int, total::Int)
+    hsize <= total || throw(ProtocolError("header size exceeds message size"))
+    _ensure_payload_buffered!(reader, total + 2)
+    header_first = reader.first
+    payload_first = header_first + hsize
+    payload_last = header_first + total - 1
+    trailer_first = payload_last + 1
+    @inbounds begin
+        first = reader.buffer[trailer_first]
+        second = reader.buffer[trailer_first + 1]
+    end
+    first == CRLF_BYTES[1] && second == CRLF_BYTES[2] ||
+        throw(ProtocolError("message payload missing CRLF trailer"))
+    header = hsize == 0 ? EMPTY_BYTES : Vector{UInt8}(@view reader.buffer[header_first:(payload_first - 1)])
+    payload = total == hsize ? EMPTY_BYTES : @view reader.buffer[payload_first:payload_last]
+    reader.first = trailer_first + 2
+    header, payload
+end
+
 function _skip_hspace(bytes::AbstractVector{UInt8}, pos::Int, stop::Int)::Int
     @inbounds while pos <= stop && _is_hspace(bytes[pos])
         pos += 1
@@ -423,7 +472,7 @@ function _malformed_control_line(kind::AbstractString, bytes::AbstractVector{UIn
 end
 
 function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
-                        max_payload::Int)
+                        max_payload::Int, borrow_payload)
     bytes = reader.buffer
     subject_start, subject_end, pos = _next_token(bytes, line_first + 4, line_last)
     subject_start == 0 && _malformed_control_line("MSG", bytes, line_first, line_last)
@@ -439,12 +488,16 @@ function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
     reply = fourth_start == 0 ? nothing : _bytes_string(bytes, third_start, third_end)
     size_start, size_end = fourth_start == 0 ? (third_start, third_end) : (fourth_start, fourth_end)
     size = _validate_payload_size(_parse_int_token(bytes, size_start, size_end), max_payload)
+    if borrow_payload(sid)
+        payload = _borrow_exact_payload(reader, size)
+        return _protocol_msg_frame(BorrowedMsg(subject, reply, payload, nothing, sid, 0))
+    end
     payload = _read_exact_payload(reader, size)
     _protocol_msg_frame(Msg(subject, reply, payload, nothing, sid))
 end
 
 function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
-                         max_payload::Int, max_header_bytes::Int)
+                         max_payload::Int, max_header_bytes::Int, borrow_payload)
     bytes = reader.buffer
     subject_start, subject_end, pos = _next_token(bytes, line_first + 5, line_last)
     subject_start == 0 && _malformed_control_line("HMSG", bytes, line_first, line_last)
@@ -465,15 +518,20 @@ function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int
     total_start, total_end = has_reply ? (fifth_start, fifth_end) : (fourth_start, fourth_end)
     hsize = _validate_header_size(_parse_int_token(bytes, hsize_start, hsize_end), max_header_bytes)
     total = _validate_payload_size(_parse_int_token(bytes, total_start, total_end), max_payload)
-    header_bytes, payload = _read_exact_header_payload(reader, hsize, total)
+    borrowed = borrow_payload(sid)
+    header_bytes, payload = borrowed ? _borrow_exact_header_payload(reader, hsize, total) :
+                            _read_exact_header_payload(reader, hsize, total)
     _validate_headers(header_bytes)
     hdrs = LazyHeaders(header_bytes)
-    _protocol_msg_frame(Msg(subject, reply, payload, hdrs, sid, hsize))
+    msg = borrowed ? BorrowedMsg(subject, reply, payload, hdrs, sid, hsize) :
+          Msg(subject, reply, payload, hdrs, sid, hsize)
+    _protocol_msg_frame(msg)
 end
 
 function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
                               max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
-                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)
+                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES,
+                              borrow_payload=_NoBorrowedPayloads())
     line_range = _readline_crlf_range(reader, max_control_line)
     line_first = first(line_range)
     line_last = last(line_range)
@@ -487,7 +545,7 @@ function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFA
                     bytes[line_first + 1] == UInt8('S') &&
                     bytes[line_first + 2] == UInt8('G') &&
                     bytes[line_first + 3] == UInt8(' ')
-                return _read_msg_line(reader, line_first, line_last, max_payload)
+                return _read_msg_line(reader, line_first, line_last, max_payload, borrow_payload)
             end
         elseif command == UInt8('H')
             if line_len >= 5 &&
@@ -495,7 +553,7 @@ function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFA
                     bytes[line_first + 2] == UInt8('S') &&
                     bytes[line_first + 3] == UInt8('G') &&
                     bytes[line_first + 4] == UInt8(' ')
-                return _read_hmsg_line(reader, line_first, line_last, max_payload, max_header_bytes)
+                return _read_hmsg_line(reader, line_first, line_last, max_payload, max_header_bytes, borrow_payload)
             end
         elseif command == UInt8('I')
             if line_len >= 5 &&
@@ -560,6 +618,14 @@ function _read_control_or_msg(io, opts::ConnectOptions)
                          max_header_bytes=opts.max_header_bytes)
 end
 
+function _read_control_or_msg(reader::ProtocolReader, opts::ConnectOptions, borrow_payload)
+    _read_control_or_msg(reader;
+                         max_control_line=opts.max_control_line,
+                         max_payload=opts.max_inbound_payload,
+                         max_header_bytes=opts.max_header_bytes,
+                         borrow_payload)
+end
+
 function _find_byte(bytes::AbstractVector{UInt8}, byte::UInt8, pos::Int, stop::Int)
     @inbounds while pos <= stop
         bytes[pos] == byte && return pos
@@ -594,6 +660,15 @@ function _validate_header_protocol_line(raw::AbstractVector{UInt8}, line_first::
     nothing
 end
 
+function _validate_raw_header_line(raw::AbstractVector{UInt8}, line_first::Int, colon::Int, line_last::Int)
+    line_first < colon || throw(ProtocolError("header key cannot be empty"))
+    _valid_header_field_name(raw, line_first, colon - 1) ||
+        throw(ProtocolError("header key contains an invalid character"))
+    _valid_header_value(raw, colon + 1, line_last) ||
+        throw(ProtocolError("header value contains an invalid character"))
+    nothing
+end
+
 function _validate_headers(raw::AbstractVector{UInt8})
     isempty(raw) && return nothing
     raw_first = firstindex(raw)
@@ -618,6 +693,7 @@ function _validate_headers(raw::AbstractVector{UInt8})
 
         colon = _find_byte(raw, UInt8(':'), pos, line_end)
         isnothing(colon) && throw(ProtocolError("malformed NATS header line"))
+        _validate_raw_header_line(raw, pos, colon, line_end)
         pos = newline + 1
     end
     throw(ProtocolError("NATS header block missing terminator"))
@@ -650,10 +726,7 @@ function _parse_headers(raw::AbstractVector{UInt8})
         if isnothing(colon)
             throw(ProtocolError("malformed NATS header line"))
         end
-        if colon == pos
-            pos = newline + 1
-            continue
-        end
+        _validate_raw_header_line(raw, pos, colon, line_end)
         value_start = colon + 1
         value_start = _skip_hspace(raw, value_start, line_end)
         key = _bytes_string(raw, pos, colon - 1)
@@ -689,15 +762,21 @@ end
 
 function _lazy_status_description(headers::LazyHeaders)
     raw = headers.raw
+    description_start, description_end = _lazy_status_description_range(headers)
+    description_start <= description_end ? _bytes_string(raw, description_start, description_end) : ""
+end
+
+function _lazy_status_description_range(headers::LazyHeaders)::Tuple{Int,Int}
+    raw = headers.raw
     line_first, line_last = _lazy_header_protocol_line(raw)
-    line_first <= line_last || return ""
-    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || return ""
+    line_first <= line_last || return 1, 0
+    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || return 1, 0
     pos = _skip_hspace(raw, line_first + ncodeunits("NATS/1.0"), line_last)
-    pos <= line_last || return ""
+    pos <= line_last || return 1, 0
     status_start, status_end, pos = _next_token(raw, pos, line_last)
-    _all_digits(raw, status_start, status_end) || return ""
+    _all_digits(raw, status_start, status_end) || return 1, 0
     description_start = _skip_hspace(raw, pos, line_last)
-    description_start <= line_last ? _bytes_string(raw, description_start, line_last) : ""
+    description_start <= line_last ? (description_start, line_last) : (1, 0)
 end
 
 function _ascii_equal_foldcase(a::AbstractString, b::AbstractString)::Bool
@@ -786,14 +865,35 @@ function _valid_header_field_name_char(byte::UInt8)::Bool
         byte == UInt8('`') || byte == UInt8('|') || byte == UInt8('~')
 end
 
+function _valid_header_field_name(bytes::AbstractVector{UInt8}, first::Int, last::Int)::Bool
+    first <= last || return false
+    @inbounds for pos in first:last
+        _valid_header_field_name_char(bytes[pos]) || return false
+    end
+    true
+end
+
+_valid_header_field_name(bytes::AbstractVector{UInt8}) =
+    _valid_header_field_name(bytes, firstindex(bytes), lastindex(bytes))
+
+function _valid_header_value(bytes::AbstractVector{UInt8}, first::Int, last::Int)::Bool
+    @inbounds for pos in first:last
+        byte = bytes[pos]
+        (byte == UInt8('\r') || byte == UInt8('\n')) && return false
+    end
+    true
+end
+
+_valid_header_value(bytes::AbstractVector{UInt8}) =
+    _valid_header_value(bytes, firstindex(bytes), lastindex(bytes))
+
 function _validate_header_pair(key::AbstractString, value::AbstractString)
     k = String(key)
     isempty(k) && throw(ArgumentError("header key cannot be empty"))
-    for byte in codeunits(k)
-        _valid_header_field_name_char(byte) || throw(ArgumentError("header key contains an invalid character"))
-    end
+    _valid_header_field_name(codeunits(k)) ||
+        throw(ArgumentError("header key contains an invalid character"))
     v = String(value)
-    if occursin('\r', v) || occursin('\n', v)
+    if !_valid_header_value(codeunits(v))
         throw(ArgumentError("header value contains an invalid character"))
     end
     k, v

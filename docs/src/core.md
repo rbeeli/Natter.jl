@@ -33,15 +33,57 @@ publish(client, "events.created", """{"id":1001,"status":"created"}""")
 
 Payloads may be strings, byte vectors, or `nothing`. Encode structured values explicitly before publishing. `publish` validates subjects and the active server payload limit before writing.
 
-Use `prepare_publish` when a hot path sends the same frame repeatedly:
+For hot publishers, pass byte vectors and use `direct_write=true` to bypass the client write buffer for that call. Use `buffer_on_reconnect=false` when the caller prefers no reconnect replay snapshot over best-effort replay:
+
+```julia
+payload = Vector{UInt8}(undef, 256)
+
+for metric in metrics
+    n = encode_metric!(payload, metric)
+    publish(client, "metrics.raw", @view(payload[1:n]);
+        direct_write=true,
+        buffer_on_reconnect=false,
+    )
+end
+```
+
+For a whole low-latency connection, disable the write buffer and reconnect replay buffer in the connection options:
+
+```julia
+client = connect("nats://127.0.0.1:4222";
+    write_buffer_size=0,
+    pending_size=0,
+    read_buffer_size=256 * 1024,
+)
+```
+
+Then normal publish calls on that client write directly and skip replay buffering by default:
+
+```julia
+publish(client, "metrics.raw", @view(payload[1:n]))
+```
+
+`direct_write=true` avoids copying the payload into Natter's user-space write buffer. `buffer_on_reconnect=false` avoids copying the payload into the reconnect replay buffer and means the publish fails during reconnect instead of being queued for best-effort replay. Use both only when the caller can tolerate retrying, dropping, or rebuilding the message.
+
+`prepare_publish` is a different optimization: it snapshots a reusable frame once and is best for identical messages, not for mutable payload buffers:
 
 ```julia
 frame = prepare_publish("metrics.tick", """{"service":"api","value":1}""")
 
 for _ in 1:1_000
-    publish(client, frame)
+    publish(client, frame;
+        direct_write=true,
+        buffer_on_reconnect=false,
+    )
 end
 ```
+
+The publish choices are:
+
+- Plain `publish` is safe and reconnect-friendly by default, but may copy into write and replay buffers.
+- `publish(...; direct_write=true)` skips the write-buffer copy for that call.
+- `publish(...; buffer_on_reconnect=false)` skips the replay-buffer copy for that call.
+- `prepare_publish` copies once into a safe reusable `PublishFrame`.
 
 Call `flush(client)` when the application needs a server round trip proving earlier commands were processed.
 
@@ -73,6 +115,33 @@ end
 ```
 
 Callback subscriptions are callback-only. Use `next` only with subscriptions created without a callback.
+
+Use `borrowed=true` only for callback hot paths that process bytes during the callback and do not retain the message:
+
+```julia
+sub = subscribe(client, "ticks.raw"; borrowed=true) do msg
+    value = decode_tick(msg.data)
+    record_tick!(value)
+end
+```
+
+Borrowed callbacks receive `BorrowedMsg`. Its `data` is a view into the reader buffer and is valid only until the callback returns. Copy only at the boundary where the data must outlive the callback:
+
+```julia
+jobs = Channel{Vector{UInt8}}(1024)
+
+sub = subscribe(client, "ticks.raw"; borrowed=true) do msg
+    put!(jobs, copy(msg.data))
+end
+```
+
+Borrowed callbacks run inline on the reader task. Keep them short and nonblocking; avoid `request`, `flush`, `next`, slow file or network IO, and unbounded `put!` calls from a borrowed callback. If the work can block, copy the bytes and hand them to another task. Header messages can still allocate header storage; the borrowed fast path is for payload bytes.
+
+The subscribe choices are:
+
+- `next(sub)` and normal callback subscriptions deliver owned `Msg` values that can be retained safely.
+- `subscribe(...; borrowed=true) do msg ... end` delivers callback-only `BorrowedMsg` values and avoids the payload copy.
+- Use a bounded queue plus `copy(msg.data)` when borrowed input needs asynchronous processing.
 
 ## Queue Groups
 

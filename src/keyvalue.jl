@@ -267,8 +267,9 @@ function _close_keyvalue_watcher(watcher::KeyValueWatcher; timeout::Real=watcher
     nothing
 end
 
-Base.close(watcher::KeyValueWatcher; cancel_token::MaybeCancellationToken=nothing) =
-    _close_keyvalue_watcher(watcher; cancel_token)
+Base.close(watcher::KeyValueWatcher; timeout::Real=watcher.subscription.js.timeout,
+           cancel_token::MaybeCancellationToken=nothing) =
+    _close_keyvalue_watcher(watcher; timeout, cancel_token)
 
 function Base.take!(watcher::KeyValueWatcher)
     isnothing(watcher.updates) &&

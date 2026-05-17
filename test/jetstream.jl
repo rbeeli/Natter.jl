@@ -462,7 +462,9 @@ end
     @test js_publish_async_pending(js) == 1
     @test length(client.subscriptions) == 1
     sub = only(values(client.subscriptions))
-    @test sub.has_callback
+    @test !sub.has_callback
+    @test sub.processor === nothing
+    @test sub.control_handler isa N._JetStreamAsyncPublishControlHandler
     @test sub.subject == "$(js.async_publish.prefix).*"
 
     written = TestHelpers.capture_text(capture)
@@ -471,6 +473,7 @@ end
 
     ack_payload = """{"stream":"ORDERS","seq":1,"duplicate":false}"""
     N._dispatch_msg(client, Msg(future.reply, nothing, TestHelpers.bytes(ack_payload); sid=sub.sid))
+    @test !isready(sub.messages)
     @test timedwait(1.0; pollint=0.001) do
         isready(future) && js_publish_async_pending(js) == 0
     end == :ok
@@ -482,6 +485,30 @@ end
     @test isnothing(js_publish_async_complete(js; timeout=0.1))
 
     close(client)
+end
+
+@testitem "JetStream async publish timeout monitor accepts long deadlines" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    future = js_publish_async(js, "orders.created", "payload"; timeout=1.0e20)
+    task = js.async_publish.timeout_task
+    @test task isa Task
+
+    sleep(0.02)
+    @test !istaskfailed(task)
+    @test !isready(future)
+    @test js_publish_async_pending(js) == 1
+
+    close(client)
+    @test timedwait(1.0; pollint=0.001) do
+        isready(future) && js_publish_async_pending(js) == 0
+    end == :ok
 end
 
 @testitem "JetStream async publish pending futures are cleared on reconnect" setup=[TestHelpers] begin
@@ -1621,6 +1648,29 @@ end
 
     close(push_sub)
     close(plain_sub)
+end
+
+@testitem "JetStream status controls classify lazy descriptions without allocation" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    heartbeat_raw = TestHelpers.bytes("NATS/1.0 100 \tIDLE HEARTBEAT \t\r\n\r\n")
+    heartbeat = N.Msg("_INBOX.push", nothing, UInt8[], N.LazyHeaders(heartbeat_raw), 1, length(heartbeat_raw))
+
+    @test N._jetstream_status_action(heartbeat) == (:idle_heartbeat, nothing)
+    @test isnothing(heartbeat.headers.parsed)
+    N._jetstream_status_action(heartbeat)
+    @test @allocated(N._jetstream_status_action(heartbeat)) == 0
+
+    deleted_raw = TestHelpers.bytes("NATS/1.0 409 Consumer Deleted\r\n\r\n")
+    deleted = N.Msg("_INBOX.push", nothing, UInt8[], N.LazyHeaders(deleted_raw), 1, length(deleted_raw))
+    action, err = N._jetstream_status_action(deleted)
+
+    @test action == :consumer_deleted
+    @test err isa JetStreamError
+    @test err.description == "Consumer Deleted"
+    @test isnothing(deleted.headers.parsed)
 end
 
 @testitem "JetStream push idle heartbeat replies to stalled consumers" setup=[TestHelpers] begin
@@ -3159,15 +3209,15 @@ end
 
     pull_core = subscribe(client, "_INBOX.pull")
     pull = N.PullSubscription(js, pull_core, "S", "C", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
-    close(pull)
-    close(pull)
+    close(pull; timeout=0.1)
+    close(pull; timeout=0.1)
     @test pull.closed
     @test pull_core.closed
 
     push_core = subscribe(client, "_INBOX.push")
     push = N.PushSubscription(js, push_core, "S", "C", ReentrantLock(), false, false)
-    close(push)
-    close(push)
+    close(push; timeout=0.1)
+    close(push; timeout=0.1)
     @test push.closed
     @test push_core.closed
 end

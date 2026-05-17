@@ -1291,7 +1291,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     sock = _connect_tcp(host, port, _remaining_timeout(deadline), cancel_token)
     read_io = sock
     write_io = sock
-    reader = ProtocolReader(read_io)
+    reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size)
     cleanup = () -> _close_transport(read_io, write_io, sock)
     report_timeout_cleanup = errors -> _report_cleanup_errors(client, errors)
     try
@@ -1303,7 +1303,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             end
             read_io = tls
             write_io = tls
-            reader = ProtocolReader(read_io)
+            reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size)
             tls_active = true
         end
         _throw_if_cancelled(cancel_token)
@@ -1322,7 +1322,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
             end
             read_io = tls
             write_io = tls
-            reader = ProtocolReader(read_io)
+            reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size)
             tls_active = true
         end
         _throw_if_cancelled(cancel_token)
@@ -1712,7 +1712,7 @@ function _reader_loop(client::Client, generation::Int)
     if isnothing(reader)
         read_io = @lock client.lock client.read_io
         isnothing(read_io) && return
-        reader = ProtocolReader(read_io)
+        reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size)
         @lock client.lock client.reader = reader
     end
     _reader_loop_with_reader(client, generation, reader)
@@ -1721,9 +1721,10 @@ end
 
 function _reader_loop_with_reader(client::Client, generation::Int,
                                   reader::ProtocolReader{ReadIO}) where {ReadIO}
+    borrow_payload = _BorrowPayloadPolicy(client)
     while _generation_matches(client, generation) && status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
-            frame = _read_control_or_msg(reader, client.options)
+            frame = _read_control_or_msg(reader, client.options, borrow_payload)
             op = frame.op
             if op == :MSG
                 msg = _protocol_msg(frame)

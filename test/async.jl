@@ -44,7 +44,7 @@ end
     watcher_state = N._kv_watcher_state(nothing, 1, true)
     watcher = KeyValueWatcher(push, watcher_state.updates, watcher_state)
 
-    close_task = close_async(watcher)
+    close_task = close_async(watcher; timeout=0.1)
 
     @test close_task isa NatterTask
     @test isnothing(fetch(close_task))
@@ -52,6 +52,31 @@ end
     @test push_sub.closed
     @test N._kv_watcher_closed(watcher_state)
     @test !isopen(watcher.updates)
+end
+
+@testitem "JetStream subscription async close accepts timeout" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+
+    pull_core = subscribe(client, "_INBOX.pull")
+    pull = N.PullSubscription(js, pull_core, "S", "C", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+    pull_task = close_async(pull; timeout=0.1)
+    @test pull_task isa NatterTask
+    @test isnothing(fetch(pull_task))
+    @test pull.closed
+    @test pull_core.closed
+
+    push_core = subscribe(client, "_INBOX.push")
+    push = N.PushSubscription(js, push_core, "S", "C", ReentrantLock(), false, false)
+    push_task = close_async(push; timeout=0.1)
+    @test push_task isa NatterTask
+    @test isnothing(fetch(push_task))
+    @test push.closed
+    @test push_core.closed
 end
 
 @testitem "async wrappers preserve synchronous validation failures" setup=[TestHelpers] begin

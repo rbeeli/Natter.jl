@@ -75,12 +75,11 @@ using TestItems
     @test N._status_header(lower_status) == 404
     @test N._status_description(lower_status) == "missing"
 
-    parsed_headers = N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nTrace:abc\r\nTabbed:\tvalue\r\nSpaced:   value\r\nEmpty:\r\n: skipped\r\n\r\n"))
+    parsed_headers = N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nTrace:abc\r\nTabbed:\tvalue\r\nSpaced:   value\r\nEmpty:\r\n\r\n"))
     @test parsed_headers["Trace"] == ["abc"]
     @test parsed_headers["Tabbed"] == ["value"]
     @test parsed_headers["Spaced"] == ["value"]
     @test parsed_headers["Empty"] == [""]
-    @test !haskey(parsed_headers, "")
 
     mixed_headers = Headers("Trace" => "abc", "trace" => ["def"])
     @test length(mixed_headers) == 1
@@ -98,6 +97,9 @@ using TestItems
 
     @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nMalformed\r\n\r\n"))
     @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nTrace: abc\r\n"))
+    @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\n: skipped\r\n\r\n"))
+    @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nBad Key: x\r\n\r\n"))
+    @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nGood: bad\rvalue\r\n\r\n"))
     trailing_hdr = TestHelpers.bytes("NATS/1.0\r\nA: b\r\n\r\njunk")
     @test_throws ProtocolError N._parse_headers(trailing_hdr)
     @test_throws ArgumentError N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), trailing_hdr)
@@ -121,19 +123,53 @@ using TestItems
     @test N._read_control_or_msg(reader).op == :PONG
 end
 
+@testitem "protocol parser can borrow callback payloads" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    raw = TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\nPING\r\n")
+    reader = N.ProtocolReader(IOBuffer(raw); read_size=length(raw))
+    frame = N._read_control_or_msg(reader;
+                                   borrow_payload=sid -> sid == 2)
+    msg = N._protocol_msg(frame)
+    @test msg isa BorrowedMsg
+    @test msg.subject == "foo"
+    @test msg.sid == 2
+    @test msg.reply == "_INBOX.1"
+    @test String(msg) == "hello"
+    @test msg.data isa SubArray
+    @test parent(msg.data) === reader.buffer
+    @test N._read_control_or_msg(reader).op == :PING
+
+    hdr = N._headers_bytes(Headers("Trace" => ["abc"]))
+    payload = vcat(hdr, TestHelpers.bytes("body"))
+    hraw = vcat(TestHelpers.bytes("HMSG events 9 $(length(hdr)) $(length(payload))\r\n"),
+                payload, N.CRLF_BYTES)
+    hreader = N.ProtocolReader(IOBuffer(hraw); read_size=length(hraw))
+    hframe = N._read_control_or_msg(hreader; borrow_payload=_ -> true)
+    hmsg = N._protocol_msg(hframe)
+    @test hmsg isa BorrowedMsg
+    @test hmsg.headers isa N.LazyHeaders
+    @test header(hmsg, "Trace") == "abc"
+    @test String(hmsg) == "body"
+    @test hmsg.data isa SubArray
+    @test parent(hmsg.data) === hreader.buffer
+end
+
 @testitem "protocol parser boundary is inferred" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
 
     ping = @inferred N._read_control_or_msg(IOBuffer(TestHelpers.bytes("PING\r\n")))
-    @test typeof(ping) === N._ProtocolFrame
+    @test ping isa N._ProtocolFrame
     @test ping.op == :PING
 
     frame = @inferred N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG foo 2 _INBOX.1 5\r\nhello\r\n")))
-    @test typeof(frame) === N._ProtocolFrame
+    @test frame isa N._ProtocolFrame
     @test frame.op == :MSG
-    msg = @inferred N._protocol_msg(frame)
+    msg = N._protocol_msg(frame)
     @test typeof(msg) === Msg
     @test msg.subject == "foo"
     @test msg.reply == "_INBOX.1"
@@ -324,6 +360,15 @@ end
     @test_throws ArgumentError N.PublishFrame("foo.*", nothing, TestHelpers.bytes("hi"), UInt8[])
     @test_throws ArgumentError N.PublishFrame("foo", "bar.*", TestHelpers.bytes("hi"), UInt8[])
     @test_throws ArgumentError N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), TestHelpers.bytes("bad\r\n\r\n"))
+    for raw_header in (
+            "NATS/1.0\r\n: skipped\r\n\r\n",
+            "NATS/1.0\r\nBad Key: x\r\n\r\n",
+            "NATS/1.0\r\nGood: bad\rvalue\r\n\r\n",
+        )
+        raw = TestHelpers.bytes(raw_header)
+        @test_throws ArgumentError N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), raw)
+        @test_throws ArgumentError prepare_publish("foo", "hi"; headers=raw)
+    end
 
     reply_frame = N.PublishFrame("foo", "bar", TestHelpers.bytes("hi"), UInt8[])
     header_frame = N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), N._headers_bytes(Headers("A" => ["b"])))

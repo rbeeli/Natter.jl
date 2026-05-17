@@ -9,6 +9,7 @@ using TestItems
     @test !N.ConnectOptions().retry_on_initial_connect
     @test N.ConnectOptions().max_reconnect_attempts == -1
     @test N.ConnectOptions(pending_size=0).pending_size == 0
+    @test N.ConnectOptions().read_buffer_size == 64 * 1024
     @test N.ConnectOptions().sub_pending_msgs_limit == 1024
 
     @test N._validate_subject("foo.*.bar") == "foo.*.bar"
@@ -46,6 +47,11 @@ using TestItems
     publish(binary_pending, "foo", binary_payload)
     binary_payload[1] = UInt8('B')
     @test String(take!(binary_pending.pending)) == "PUB foo 3\r\nbin\r\n"
+
+    no_replay = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    @test_throws ConnectionReconnectingError publish(no_replay, "foo", "bar";
+                                                     buffer_on_reconnect=false)
+    @test no_replay.pending_bytes == 0
 
     hot_payload = fill(UInt8('x'), 64 * 1024)
     direct_frame = N._publish_frame("foo", nothing, hot_payload, nothing)
@@ -89,6 +95,12 @@ using TestItems
     @test_throws ArgumentError publish(invalid_publish_headers, "foo", "bar"; headers=Dict("Bad Key" => "abc"))
     @test String(take!(invalid_publish_headers.write_io)) == ""
     @test invalid_publish_headers.pending_bytes == 0
+
+    invalid_raw_publish_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    invalid_raw_headers = TestHelpers.bytes("NATS/1.0\r\nBad Key: abc\r\n\r\n")
+    @test_throws ArgumentError publish(invalid_raw_publish_headers, "foo", "bar"; headers=invalid_raw_headers)
+    @test String(take!(invalid_raw_publish_headers.write_io)) == ""
+    @test invalid_raw_publish_headers.pending_bytes == 0
 
     structured_payload = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     @test_throws ArgumentError publish(structured_payload, "foo", (; id=1))
@@ -329,6 +341,34 @@ end
     close(sub)
     wait(sub.processor)
 
+    borrowed_seen = Ref{Any}(nothing)
+    borrowed_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                              write_io=IOBuffer())
+    borrowed_sub = subscribe(borrowed_client, "events.borrowed"; borrowed=true) do msg
+        borrowed_seen[] = msg
+        @test msg isa BorrowedMsg
+        @test String(msg) == "borrowed"
+    end
+    @test borrowed_sub.has_callback
+    @test borrowed_sub.borrowed_callback
+    @test isnothing(borrowed_sub.processor)
+
+    raw = TestHelpers.bytes("MSG events.borrowed $(borrowed_sub.sid) 8\r\nborrowed\r\n")
+    reader = N.ProtocolReader(IOBuffer(raw); read_size=length(raw))
+    frame = N._read_control_or_msg(reader, borrowed_client.options,
+                                   N._BorrowPayloadPolicy(borrowed_client))
+    borrowed_msg = N._protocol_msg(frame)
+    @test borrowed_msg isa BorrowedMsg
+    @test parent(borrowed_msg.data) === reader.buffer
+    N._dispatch_msg(borrowed_client, borrowed_msg)
+    @test borrowed_seen[] === borrowed_msg
+    @test borrowed_sub.received == 1
+    @test borrowed_sub.processing == 0
+    @test !isready(borrowed_sub.messages)
+    close(borrowed_sub)
+
+    @test_throws ArgumentError subscribe(borrowed_client, "events.no-callback"; borrowed=true)
+
     positional = CoreCallable(String[])
     positional_sub = subscribe(positional, client, "events.positional")
     @test positional_sub.has_callback
@@ -346,10 +386,11 @@ end
     const N = Natter
 
     opts = N.ConnectOptions(connect_timeout=1, ping_interval=2, max_outstanding_pings=1,
-                            reconnect_jitter=0, write_buffer_size=0, write_timeout=3,
-                            close_callback_timeout=4)
+                            reconnect_jitter=0, read_buffer_size=8192, write_buffer_size=0,
+                            write_timeout=3, close_callback_timeout=4)
     @test opts.connect_timeout == 1.0
     @test opts.ping_interval == 2.0
+    @test opts.read_buffer_size == 8192
     @test opts.write_buffer_size == 0
     @test opts.write_timeout == 3.0
     @test opts.close_callback_timeout == 4.0
@@ -516,6 +557,8 @@ end
     rejects(max_reconnect_attempts=-2)
     rejects(pending_size=-1)
     rejects(pending_size=true)
+    rejects(read_buffer_size=0)
+    rejects(read_buffer_size=true)
     rejects(write_buffer_size=-1)
     rejects(write_timeout=0)
     rejects(write_timeout=Inf)
@@ -1192,6 +1235,19 @@ end
 
     @test transport.chunks == ["PUB foo 3\r\n", "bar", "\r\n"]
     close(client)
+
+    buffered_transport = ChunkCapture()
+    buffered_write = N.BufferedWriteIO(buffered_transport)
+    buffered_client = TestHelpers.fake_client(; opts=N.ConnectOptions(write_buffer_size=1024),
+                                             status=N.ConnectionStatus.CONNECTED,
+                                             read_io=buffered_transport,
+                                             write_io=buffered_write)
+
+    publish(buffered_client, "foo", "bar"; direct_write=true, buffer_on_reconnect=false)
+
+    @test buffered_transport.chunks == ["PUB foo 3\r\n", "bar", "\r\n"]
+    @test N._buffered_bytes(buffered_write) == 0
+    close(buffered_client)
 end
 
 @testitem "request publish force flushes buffered writes" setup=[TestHelpers] begin
@@ -2328,6 +2384,53 @@ end
     end
 end
 
+@testitem "connect uses configured read buffer size" begin
+    using Natter
+    using Sockets
+
+    const N = Natter
+
+    listener = listen(ip"127.0.0.1", 0)
+    port = Int(getsockname(listener)[2])
+    release = Channel{Bool}(1)
+    server_task = @async begin
+        try
+            sock = accept(listener)
+            try
+                write(sock, "INFO {\"headers\":true,\"proto\":1,\"max_payload\":1048576}\r\n")
+                flush(sock)
+                readline(sock)
+                readline(sock)
+                write(sock, "PONG\r\n")
+                flush(sock)
+                take!(release)
+            finally
+                close(sock)
+            end
+        finally
+            isopen(listener) && close(listener)
+        end
+    end
+
+    client_ref = Ref{Any}(nothing)
+    try
+        client_ref[] = N.connect("nats://127.0.0.1:$port";
+                                 connect_timeout=0.5,
+                                 read_buffer_size=8192)
+        client = client_ref[]
+        @test status(client) == N.ConnectionStatus.CONNECTED
+        @test length(client.reader.scratch) == 8192
+    finally
+        client = client_ref[]
+        isnothing(client) || close(client)
+        isready(release) || put!(release, true)
+        isopen(listener) && close(listener)
+        timedwait(1.0; pollint=0.01) do
+            istaskdone(server_task)
+        end == :timed_out || wait(server_task)
+    end
+end
+
 @testitem "connect timeout covers protocol handshake" begin
     using Natter
     using Sockets
@@ -3118,6 +3221,11 @@ end
 
         @test client.reader === reader
         @test typeof(client.reader) === N.ProtocolReader{Sockets.TCPSocket}
+
+        opts = N.ConnectOptions(read_buffer_size=8192)
+        configured = TestHelpers.fake_client(; opts, read_io=sock)
+        @test typeof(configured.reader) === N.ProtocolReader{Sockets.TCPSocket}
+        @test length(configured.reader.scratch) == 8192
     finally
         close(sock)
     end

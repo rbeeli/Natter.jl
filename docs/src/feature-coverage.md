@@ -18,8 +18,8 @@ Statuses:
 | WebSocket transport | Not Planned | `ws://` and `wss://` are not implemented. |
 | Connect handshake | Supported | Client name, no echo, server INFO parsing, TLS requirements, and typed auth. |
 | Authentication | Supported | Token, user/password, NKEY, JWT, `.creds`, callback auth, and URL userinfo for token/user-password. |
-| PUB / HPUB / SUB / UNSUB | Supported | Core publish, headers, queue groups, unsubscribe limits, and local subject validation. |
-| MSG / HMSG parsing | Supported | Core data and headers. |
+| PUB / HPUB / SUB / UNSUB | Supported | Core publish, headers, queue groups, unsubscribe limits, local subject validation, direct-write publish calls, and opt-out reconnect replay snapshots. |
+| MSG / HMSG parsing | Supported | Core data and headers, with an explicit callback-only borrowed payload path for hot subscribers. |
 | Wildcards | Supported | Subscription wildcards are validated; publish subjects reject wildcards. |
 | Request/reply | Supported | Shared inbox mux, timeouts, and `NoRespondersError` when supported by the server. |
 | Flush and ping | Supported | `flush`/`ping` use a server round trip. |
@@ -41,8 +41,8 @@ Statuses:
 | Message lookup | Supported | Sequence, last-by-subject, next-by-subject, direct get, and message delete. |
 | Consumer management | Supported | Create, create-or-update, update, info, list, delete. |
 | Typed consumer config | Supported | `ConsumerConfig` plus raw `Dict` escape hatch. Typed create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. |
-| Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, `messages`, `consume`, and priority request fields. |
-| Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, queue groups, callbacks, manual/auto ack, flow control replies, heartbeat reporting, and bounded reconnect chaos coverage. Additional long-duration push chaos remains. |
+| Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded close cleanup, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, `messages`, `consume`, and priority request fields. |
+| Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, bounded close cleanup, queue groups, callbacks, manual/auto ack, flow control replies, heartbeat reporting, and bounded reconnect chaos coverage. Additional long-duration push chaos remains. |
 | Acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, `term`. |
 | Metadata | Supported | Delivery metadata parsing. |
 | Ordered consumers | Supported | Public ordered ephemeral push consumers use `push_subscribe(...; ordered=true)`, with flow control, heartbeats, and automatic reset after sequence gaps. Durable names, queue groups, and binding existing consumers are intentionally rejected. |
@@ -59,9 +59,9 @@ Statuses:
 | Get/put/create/update | Supported | Typed entries, optimistic revision checks, per-key TTL, and typed conflict errors. |
 | Delete/purge | Supported | Delete markers, purge markers, guarded delete/purge, and marker cleanup. |
 | History and keys | Partial | Common paths implemented; broader large-bucket stress coverage remains. |
-| Watch | Partial | Channel and callback watchers, filters, updates-only, history, ignore deletes, metadata-only, resume revision, ordered-consumer recovery, and bounded reconnect chaos coverage. Broader large-watch stress remains. |
+| Watch | Partial | Channel and callback watchers, filters, updates-only, history, ignore deletes, metadata-only, resume revision, bounded close cleanup, ordered-consumer recovery, and bounded reconnect chaos coverage. Broader large-watch stress remains. |
 | Direct get | Supported | `direct=true` buckets use direct reads by default. |
-| Async handles | Supported | Bucket, key, history, keys, watch, and close helpers. |
+| Async handles | Supported | Bucket, key, history, keys, watch, and timeout-aware close helpers. |
 
 ## Observability And Errors
 

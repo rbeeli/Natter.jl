@@ -1,6 +1,7 @@
 const _JS_ACK_OPEN = UInt8(0)
 const _JS_ACK_BUSY = UInt8(1)
 const _JS_ACK_DONE = UInt8(2)
+const _JS_ASYNC_PUBLISH_MAX_TIMER_DELAY = prevfloat(Float64(typemax(UInt64)) / 1000)
 
 mutable struct JetStreamMsg{C<:Client} <: AbstractMsg
     subject::String
@@ -214,7 +215,7 @@ function _jetstream_control_status(msg::Msg)
     isempty(msg.data) || return nothing
     code = _status_header(msg)
     isnothing(code) && return nothing
-    code, _status_description(msg)
+    code
 end
 
 function _jetstream_default_status_description(code::Int)::String
@@ -228,17 +229,82 @@ function _jetstream_default_status_description(code::Int)::String
     "JetStream status $code"
 end
 
+@inline _js_status_byte(bytes::AbstractVector{UInt8}, pos::Int)::UInt8 = bytes[pos]
+@inline _js_status_byte(value::AbstractString, pos::Int)::UInt8 = codeunit(value, pos)
+
+function _js_ascii_trim_hspace(value, first::Int, last::Int)::Tuple{Int,Int}
+    @inbounds while first <= last && _is_hspace(_js_status_byte(value, first))
+        first += 1
+    end
+    @inbounds while first <= last && _is_hspace(_js_status_byte(value, last))
+        last -= 1
+    end
+    first, last
+end
+
+function _js_ascii_eq_ci_stripped(value, first::Int, last::Int, expected::AbstractString)::Bool
+    first, last = _js_ascii_trim_hspace(value, first, last)
+    last - first + 1 == ncodeunits(expected) || return false
+    @inbounds for i in 1:ncodeunits(expected)
+        _ascii_lower(_js_status_byte(value, first + i - 1)) == _ascii_lower(codeunit(expected, i)) ||
+            return false
+    end
+    true
+end
+
+function _js_ascii_contains_ci(value, first::Int, last::Int, expected::AbstractString)::Bool
+    expected_len = ncodeunits(expected)
+    expected_len == 0 && return true
+    last - first + 1 >= expected_len || return false
+    expected_first = _ascii_lower(codeunit(expected, 1))
+    stop = last - expected_len + 1
+    @inbounds for pos in first:stop
+        _ascii_lower(_js_status_byte(value, pos)) == expected_first || continue
+        matched = true
+        for i in 2:expected_len
+            if _ascii_lower(_js_status_byte(value, pos + i - 1)) != _ascii_lower(codeunit(expected, i))
+                matched = false
+                break
+            end
+        end
+        matched && return true
+    end
+    false
+end
+
+function _jetstream_status_description_eq(msg::Msg, expected::AbstractString)::Bool
+    hdrs = msg.headers
+    if hdrs isa LazyHeaders
+        first, last = _lazy_status_description_range(hdrs)
+        return _js_ascii_eq_ci_stripped(hdrs.raw, first, last, expected)
+    end
+    description = _status_description(msg)
+    _js_ascii_eq_ci_stripped(description, 1, ncodeunits(description), expected)
+end
+
+function _jetstream_status_description_contains(msg::Msg, expected::AbstractString)::Bool
+    hdrs = msg.headers
+    if hdrs isa LazyHeaders
+        first, last = _lazy_status_description_range(hdrs)
+        return _js_ascii_contains_ci(hdrs.raw, first, last, expected)
+    end
+    description = _status_description(msg)
+    _js_ascii_contains_ci(description, 1, ncodeunits(description), expected)
+end
+
+function _jetstream_status_description(msg::Msg, code::Int)::String
+    description = _status_description(msg)
+    isempty(description) ? _jetstream_default_status_description(code) : description
+end
+
 function _jetstream_status_action(msg::Msg; request_subject::Union{String,Nothing}=nothing)
-    status = _jetstream_control_status(msg)
-    isnothing(status) && return :message, nothing
-    code, description = status
-    desc = isempty(description) ? _jetstream_default_status_description(code) : description
-    lower = lowercase(strip(desc))
+    code = _jetstream_control_status(msg)
+    isnothing(code) && return :message, nothing
     subject = isnothing(request_subject) ? msg.subject : request_subject
 
     if code == _JS_STATUS_CONTROL
-        lower == _JS_DESC_IDLE_HEARTBEAT && return :idle_heartbeat, nothing
-        lower == _JS_DESC_FLOW_CONTROL && return :flow_control, nothing
+        _jetstream_status_description_eq(msg, _JS_DESC_IDLE_HEARTBEAT) && return :idle_heartbeat, nothing
+        _jetstream_status_description_eq(msg, _JS_DESC_FLOW_CONTROL) && return :flow_control, nothing
         return :control, nothing
     elseif code == _JS_STATUS_NO_MESSAGES
         return :no_messages, nothing
@@ -247,23 +313,25 @@ function _jetstream_status_action(msg::Msg; request_subject::Union{String,Nothin
     elseif code == _JS_STATUS_NO_RESPONDERS
         return :no_responders, NoRespondersError(subject)
     elseif code == _JS_STATUS_PIN_ID_MISMATCH
-        return :pin_id_mismatch, JetStreamError(code, nothing, desc)
+        return :pin_id_mismatch, JetStreamError(code, nothing, _jetstream_status_description(msg, code))
     elseif code == _JS_STATUS_CONFLICT
-        if occursin(_JS_DESC_MAX_BYTES_EXCEEDED, lower) || occursin("maxbytes", lower) || occursin("exceeded", lower)
-            return :max_bytes_exceeded, JetStreamError(code, nothing, desc)
-        elseif occursin(_JS_DESC_BATCH_COMPLETED, lower)
+        if _jetstream_status_description_contains(msg, _JS_DESC_MAX_BYTES_EXCEEDED) ||
+           _jetstream_status_description_contains(msg, "maxbytes") ||
+           _jetstream_status_description_contains(msg, "exceeded")
+            return :max_bytes_exceeded, nothing
+        elseif _jetstream_status_description_contains(msg, _JS_DESC_BATCH_COMPLETED)
             return :batch_completed, nothing
-        elseif occursin(_JS_DESC_CONSUMER_DELETED, lower)
-            return :consumer_deleted, JetStreamError(code, nothing, desc)
-        elseif occursin(_JS_DESC_LEADERSHIP_CHANGE, lower)
-            return :leadership_change, JetStreamError(code, nothing, desc)
-        elseif occursin(_JS_DESC_SERVER_SHUTDOWN, lower)
-            return :server_shutdown, JetStreamError(code, nothing, desc)
+        elseif _jetstream_status_description_contains(msg, _JS_DESC_CONSUMER_DELETED)
+            return :consumer_deleted, JetStreamError(code, nothing, _jetstream_status_description(msg, code))
+        elseif _jetstream_status_description_contains(msg, _JS_DESC_LEADERSHIP_CHANGE)
+            return :leadership_change, JetStreamError(code, nothing, _jetstream_status_description(msg, code))
+        elseif _jetstream_status_description_contains(msg, _JS_DESC_SERVER_SHUTDOWN)
+            return :server_shutdown, JetStreamError(code, nothing, _jetstream_status_description(msg, code))
         else
-            return :error, JetStreamError(code, nothing, desc)
+            return :error, JetStreamError(code, nothing, _jetstream_status_description(msg, code))
         end
     elseif code >= 400
-        return :error, JetStreamError(code, nothing, desc)
+        return :error, JetStreamError(code, nothing, _jetstream_status_description(msg, code))
     end
 
     :control, nothing
@@ -601,7 +669,7 @@ function _handle_js_async_publish_ack(state::JetStreamAsyncPublishState, msg::Ms
         return nothing
     end
     future = lock(state.condition) do
-        get(state.futures, String(token), nothing)
+        get(state.futures, token, nothing)
     end
     if isnothing(future)
         _record_drop!(state.client)
@@ -611,6 +679,12 @@ function _handle_js_async_publish_ack(state::JetStreamAsyncPublishState, msg::Ms
     result isa NoRespondersError && _retry_js_async_publish!(future) && return nothing
     _resolve_js_publish_future!(future, result)
     nothing
+end
+
+function _handle_subscription_control(handler::_JetStreamAsyncPublishControlHandler,
+                                      _sub::Subscription, msg::Msg)::Bool
+    _handle_js_async_publish_ack(handler.state, msg)
+    true
 end
 
 function _retry_js_async_publish!(future::JetStreamPublishFuture{C})::Bool where {C<:Client}
@@ -684,20 +758,25 @@ function _js_async_publish_timeout_loop(state::JetStreamAsyncPublishState{C}) wh
             end
             isempty(state.futures) && continue
 
-            delay = min(0.05, max(0.0, nearest - time()))
-            delay <= 0 && continue
-            timer = Timer(delay) do _
-                lock(state.condition)
-                try
-                    notify(state.condition; all=true)
-                finally
-                    unlock(state.condition)
-                end
-            end
-            try
+            delay = nearest - time()
+            if !isfinite(delay)
                 wait(state.condition)
-            finally
-                close(timer)
+            elseif delay <= 0
+                continue
+            else
+                timer = Timer(min(delay, _JS_ASYNC_PUBLISH_MAX_TIMER_DELAY)) do _
+                    lock(state.condition)
+                    try
+                        notify(state.condition; all=true)
+                    finally
+                        unlock(state.condition)
+                    end
+                end
+                try
+                    wait(state.condition)
+                finally
+                    close(timer)
+                end
             end
         end
     finally
@@ -727,9 +806,8 @@ function _ensure_js_async_publish_subscription!(state::JetStreamAsyncPublishStat
             end
         end
 
-        callback = msg -> _handle_js_async_publish_ack(state, msg)
         sub = _subscribe(state.client, "$(state.prefix).*";
-                         callback,
+                         _control_handler=_JetStreamAsyncPublishControlHandler(state),
                          pending_msgs_limit=state.max_pending,
                          pending_bytes_limit=state.client.options.sub_pending_bytes_limit,
                          require_connected=true)
@@ -3368,8 +3446,9 @@ function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.
     nothing
 end
 
-close(psub::PullSubscription; cancel_token::MaybeCancellationToken=nothing) =
-    _close_pull_subscription(psub; cancel_token)
+close(psub::PullSubscription; timeout::Real=psub.js.timeout,
+      cancel_token::MaybeCancellationToken=nothing) =
+    _close_pull_subscription(psub; timeout, cancel_token)
 
 function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.timeout,
                                   cancel_token::MaybeCancellationToken=nothing)
@@ -3409,8 +3488,9 @@ function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.
     nothing
 end
 
-close(psub::PushSubscription; cancel_token::MaybeCancellationToken=nothing) =
-    _close_push_subscription(psub; cancel_token)
+close(psub::PushSubscription; timeout::Real=psub.js.timeout,
+      cancel_token::MaybeCancellationToken=nothing) =
+    _close_push_subscription(psub; timeout, cancel_token)
 
 const _JS_ACK_PREFIX = "\$JS.ACK."
 const _JS_ACK_NOT_MESSAGE = "message is not a JetStream message"

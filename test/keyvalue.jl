@@ -541,7 +541,7 @@ end
         put!(state.updates, KV_WATCH_INITIAL_DONE)
         @test N._kv_take!(watcher, 0.1) === KV_WATCH_INITIAL_DONE
     finally
-        close(watcher)
+        close(watcher; timeout=0.1)
     end
 end
 

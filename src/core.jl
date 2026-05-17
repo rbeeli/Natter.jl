@@ -43,15 +43,17 @@ _should_write_publish_direct(frame_size::Int, threshold::Int)::Bool =
     threshold <= 0 || frame_size >= threshold
 
 function _write_publish_frame(client::Client, io::IO, frame::_AbstractPublishFrame; replayable::Bool=false,
-                              threshold::Int=0, frame_size::Int=_serialized_size(frame))
+                              threshold::Int=0, frame_size::Int=_serialized_size(frame),
+                              direct_write::Bool=false)
     _write_pub_frame_direct_timed(client, io, frame)
     false
 end
 
 function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::_AbstractPublishFrame; replayable::Bool=false,
-                              threshold::Int=0, frame_size::Int=_serialized_size(frame))
+                              threshold::Int=0, frame_size::Int=_serialized_size(frame),
+                              direct_write::Bool=false)
     _ensure_open(io)
-    if _should_write_publish_direct(frame_size, threshold)
+    if direct_write || _should_write_publish_direct(frame_size, threshold)
         _flush_write_io(client, io)
         transport = _underlying_transport(io)
         _write_pub_frame_direct_timed(client, transport, frame; force_flush=true)
@@ -99,7 +101,8 @@ function _write_pub_frame_direct_timed(client::Client, io::IO, frame::_AbstractP
 end
 
 function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flush::Bool=false,
-                        replayable::Bool=false, frame_size::Int=_serialized_size(frame))::Bool
+                        replayable::Bool=false, frame_size::Int=_serialized_size(frame),
+                        direct_write::Bool=false)::Bool
     captured = false
     @lock client.write_lock begin
         st = status(client)
@@ -109,41 +112,48 @@ function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flus
             st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
             throw(ConnectionReconnectingError())
         end
-        captured = _write_publish_to_active_io(client, io, frame, force_flush, replayable, frame_size)
+        captured = _write_publish_to_active_io(client, io, frame, force_flush, replayable,
+                                               frame_size, direct_write)
     end
     captured
 end
 
 @noinline function _write_publish_to_active_io(client::Client, io::Union{Nothing,DefaultWriteTransportIO},
                                                frame::_AbstractPublishFrame, force_flush::Bool,
-                                               replayable::Bool, frame_size::Int)::Bool
+                                               replayable::Bool, frame_size::Int,
+                                               direct_write::Bool)::Bool
     io === nothing && throw(ConnectionClosedError("connection transport is closed"))
 
     # connect() clients keep a union-typed field so reconnect can swap plain,
     # TLS, and buffered transports. Split that small default union here so the
     # hot frame writer below is compiled for concrete IO types.
     if io isa Sockets.TCPSocket
-        return _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size)
+        return _write_publish_to_io(client, io, frame, force_flush, replayable,
+                                    frame_size, direct_write)
     elseif io isa MbedTLS.SSLContext
-        return _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size)
+        return _write_publish_to_io(client, io, frame, force_flush, replayable,
+                                    frame_size, direct_write)
     elseif io isa BufferedWriteIO{Sockets.TCPSocket}
-        return _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size)
+        return _write_publish_to_io(client, io, frame, force_flush, replayable,
+                                    frame_size, direct_write)
     else
         return _write_publish_to_io(client, io::BufferedWriteIO{MbedTLS.SSLContext},
-                                    frame, force_flush, replayable, frame_size)
+                                    frame, force_flush, replayable, frame_size, direct_write)
     end
 end
 
 function _write_publish_to_active_io(client::Client, io, frame::_AbstractPublishFrame,
-                                     force_flush::Bool, replayable::Bool, frame_size::Int)::Bool
+                                     force_flush::Bool, replayable::Bool, frame_size::Int,
+                                     direct_write::Bool)::Bool
     io === nothing && throw(ConnectionClosedError("connection transport is closed"))
-    _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size)
+    _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size, direct_write)
 end
 
 function _write_publish_to_io(client::Client, io::WriteIO, frame::_AbstractPublishFrame, force_flush::Bool,
-                              replayable::Bool, frame_size::Int) where {WriteIO<:IO}
+                              replayable::Bool, frame_size::Int, direct_write::Bool) where {WriteIO<:IO}
     threshold = max(0, client.options.write_buffer_size)
-    captured = _write_publish_frame(client, io, frame; replayable, threshold, frame_size)
+    captured = _write_publish_frame(client, io, frame; replayable, threshold, frame_size,
+                                    direct_write)
     _flush_or_signal_locked(client, io; force_flush)
     captured
 end
@@ -164,13 +174,15 @@ end
 function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
                        force_flush::Bool=false,
                        frame_size::Int=_serialized_size(frame),
-                       st::ConnectionStatus.T=status(client))
+                       st::ConnectionStatus.T=status(client),
+                       direct_write::Bool=false)
     can_buffer_reconnect = buffer_on_reconnect && _reconnect_buffer_enabled(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         replayable_captured = false
         try
             replayable_captured = _write_publish(client, frame; force_flush,
-                                                 replayable=can_buffer_reconnect, frame_size)
+                                                 replayable=can_buffer_reconnect, frame_size,
+                                                 direct_write)
         catch err
             err isa OutboundBufferLimitError && rethrow()
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
@@ -329,50 +341,57 @@ function _validate_pending_replay_for_client(client::Client, entries::AbstractVe
 end
 
 function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
-                           force_flush::Bool=false, cancel_token::MaybeCancellationToken=nothing)
+                           force_flush::Bool=false, direct_write::Bool=false,
+                           cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     payload_size = _pub_payload_size(frame)
     frame_size = _serialized_size(frame)
     st = status(client)
     _ensure_usable_status_for_publish(st)
     _validate_publish_frame_for_client(client, frame, payload_size)
-    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size, st)
+    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size, st, direct_write)
     _record_out!(client, payload_size)
     nothing
 end
 
 function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
                   headers=nothing, buffer_on_reconnect::Bool=true, force_flush::Bool=false,
+                  direct_write::Bool=false,
                   cancel_token::MaybeCancellationToken=nothing)
     _publish_prepared(client, _publish_frame(subject, reply, data, headers);
-                      buffer_on_reconnect, force_flush, cancel_token)
+                      buffer_on_reconnect, force_flush, direct_write, cancel_token)
 end
 
 function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
-                                  force_flush::Bool=false, cancel_token::MaybeCancellationToken=nothing)
+                                  force_flush::Bool=false, direct_write::Bool=false,
+                                  cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     frame_size = _serialized_size(frame)
     st = status(client)
     _ensure_usable_status_for_publish(st)
-    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size, st)
+    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size, st, direct_write)
     _record_out!(client, _pub_payload_size(frame))
     nothing
 end
 
 function _publish_unchecked(client::Client, subject::String, payload::AbstractVector{UInt8};
                             buffer_on_reconnect::Bool=true, force_flush::Bool=false,
+                            direct_write::Bool=false,
                             cancel_token::MaybeCancellationToken=nothing)
     _publish_frame_unchecked(client, _publish_frame(subject, nothing, payload, EMPTY_BYTES);
-                             buffer_on_reconnect, force_flush, cancel_token)
+                             buffer_on_reconnect, force_flush, direct_write, cancel_token)
 end
 
 function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
-                 headers=nothing, cancel_token::MaybeCancellationToken=nothing)
-    _publish(client, subject, data; reply, headers, cancel_token)
+                 headers=nothing, buffer_on_reconnect::Bool=true, direct_write::Bool=false,
+                 cancel_token::MaybeCancellationToken=nothing)
+    _publish(client, subject, data; reply, headers, buffer_on_reconnect, direct_write,
+             cancel_token)
 end
 
-function publish(client::Client, frame::PublishFrame; cancel_token::MaybeCancellationToken=nothing)
-    _publish_prepared(client, frame; cancel_token)
+function publish(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true,
+                 direct_write::Bool=false, cancel_token::MaybeCancellationToken=nothing)
+    _publish_prepared(client, frame; buffer_on_reconnect, direct_write, cancel_token)
 end
 
 function _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
@@ -397,12 +416,18 @@ function _start_subscription_processor!(sub::Subscription, callback::Callback) w
 end
 
 function _subscribe(client::Client, subject::AbstractString; queue::Union{AbstractString,Nothing}=nothing, callback=nothing,
+                    borrowed::Bool=false,
                     max_msgs=0, pending_msgs_limit=client.options.sub_pending_msgs_limit,
                     pending_bytes_limit=client.options.sub_pending_bytes_limit,
                     _control_handler::_SubscriptionControlHandler=_NoSubscriptionControlHandler(),
                     require_connected::Bool=false)
     subject = _validate_subject(subject)
     queue = _validate_queue(queue)
+    borrowed = _connect_option_bool("borrowed", borrowed)
+    borrowed && isnothing(callback) &&
+        throw(ArgumentError("borrowed subscriptions require a callback"))
+    borrowed && !(_control_handler isa _NoSubscriptionControlHandler) &&
+        throw(ArgumentError("borrowed subscriptions cannot use internal control handlers"))
     max_msgs, pending_msgs_limit, pending_bytes_limit =
         _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
     send_now = false
@@ -417,7 +442,9 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
         ch = MsgQueue{Msg}(pending_msgs_limit)
         sub_lock = ReentrantLock()
         condition = Base.Threads.Condition(sub_lock)
-        sub = Subscription(client, sid, subject, queue, callback, sub_lock, ch, condition, _control_handler, pending_msgs_limit, pending_bytes_limit, 0, 0, max_msgs, false, nothing, false, 0)
+        sub = Subscription(client, sid, subject, queue, callback, borrowed, sub_lock, ch,
+                           condition, _control_handler, pending_msgs_limit,
+                           pending_bytes_limit, 0, 0, max_msgs, false, nothing, false, 0)
         client.subscriptions[sid] = sub
         _set_subscription_snapshot_locked!(client, sid, sub)
         send_now = st == ConnectionStatus.CONNECTED
@@ -439,7 +466,7 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
             isempty(cleanup_errors) ? rethrow() : throw(Base.CompositeException(vcat(Any[err], cleanup_errors)))
         end
     end
-    if !isnothing(callback)
+    if !isnothing(callback) && !borrowed
         _start_subscription_processor!(sub, callback)
     end
     sub
@@ -482,6 +509,21 @@ function _subscription_processor(sub::Subscription, callback::Callback) where {C
             end
         end
     end
+end
+
+struct _BorrowPayloadPolicy{C<:Client}
+    client::C
+end
+
+function (policy::_BorrowPayloadPolicy)(sid::Int)::Bool
+    sub = _lookup_subscription(policy.client, sid)
+    isnothing(sub) && return false
+    @lock sub.lock !sub.closed && sub.borrowed_callback
+end
+
+function _owned_msg(msg::BorrowedMsg)::Msg
+    Msg(msg.subject, msg.reply, Vector{UInt8}(msg.data);
+        headers=msg.headers, sid=msg.sid, header_bytes=msg.header_bytes)
 end
 
 _handle_subscription_control(::_NoSubscriptionControlHandler, _sub::Subscription, _msg::Msg)::Bool = false
@@ -602,6 +644,59 @@ function _dispatch_msg(client::Client, msg::Msg)
     if should_close
         _close_subscription_locally!(sub; throw_errors=false)
     end
+end
+
+function _dispatch_msg(client::Client, msg::BorrowedMsg)
+    msg_bytes = _msg_pending_bytes(msg)
+    sub = _lookup_subscription(client, msg.sid)
+    if isnothing(sub)
+        _record_drop!(client)
+        return
+    end
+
+    callback = nothing
+    should_close = false
+    accepted = @lock sub.lock begin
+        if sub.closed
+            false
+        elseif !sub.borrowed_callback
+            :owned
+        else
+            callback = sub.callback
+            if isnothing(callback)
+                false
+            else
+                sub.received += 1
+                sub.processing += 1
+                should_close = sub.max_msgs > 0 && sub.received >= sub.max_msgs
+                true
+            end
+        end
+    end
+
+    if accepted === :owned
+        _dispatch_msg(client, _owned_msg(msg))
+        return
+    elseif !accepted
+        _record_drop!(client)
+        return
+    end
+
+    _record_in!(client, msg_bytes)
+    try
+        callback(msg)
+    catch err
+        _report_error(client, err)
+    finally
+        @lock sub.lock begin
+            sub.processing = max(0, sub.processing - 1)
+            _notify_subscription_waiters_locked(sub; all=true)
+        end
+    end
+    if should_close
+        _close_subscription_locally!(sub; throw_errors=false)
+    end
+    nothing
 end
 
 function _take_subscription_msg_ready!(sub::Subscription)::Tuple{Bool,Msg}

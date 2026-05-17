@@ -15,7 +15,7 @@ import Base: close, fetch, flush
 export Client, ConnectOptions, ConnectionStatus, ConnectionEventKind, ConnectionEvent, NatterTask
 export CancellationSource, CancellationToken, cancellation_token, cancel!, iscancelled
 export AbstractAuth, NoAuth, TokenAuth, UserPassAuth, NKeyAuth, JwtAuth, CredentialsAuth, CallbackAuth, AuthRequest
-export Msg, Headers, PublishFrame, Subscription, Stats
+export Msg, BorrowedMsg, Headers, PublishFrame, Subscription, Stats
 export connect, close, drain, flush, ping, publish, prepare_publish, subscribe, unsubscribe, request, next, new_inbox
 export connect_async, close_async, drain_async, flush_async, ping_async, publish_async, subscribe_async, unsubscribe_async, request_async, next_async
 export header, headers, status, stats, connected_url
@@ -53,6 +53,7 @@ const DEFAULT_INBOX_PREFIX = "_INBOX"
 const EMPTY_BYTES = UInt8[]
 const CLIENT_VERSION = "0.1.0"
 const NUID_ALPHABET = collect("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+const DEFAULT_READ_BUFFER_SIZE = 64 * 1024
 const DEFAULT_WRITE_BUFFER_SIZE = 32 * 1024
 const DEFAULT_WRITE_TIMEOUT = 10.0
 const DEFAULT_MAX_CONTROL_LINE = 16 * 1024
