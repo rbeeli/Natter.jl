@@ -417,15 +417,51 @@ function _socket_connecting(sock::Sockets.TCPSocket)::Bool
     end
 end
 
+function _resolve_connect_address(host::String, port::Int, timeout::Real,
+                                  cancel_token::MaybeCancellationToken=nothing;
+                                  resolver=Sockets.getaddrinfo)
+    operation = "connect to $host:$port"
+    _throw_if_cancelled(cancel_token)
+    timeout = Float64(timeout)
+    timeout > 0 || throw(TimeoutError("$operation timed out"))
+
+    ch = Channel{Tuple{Bool,Any}}(1)
+    timed_out = Threads.Atomic{Bool}(false)
+    task = @async begin
+        try
+            value = resolver(host)
+            timed_out[] || put!(ch, (true, value))
+        catch err
+            timed_out[] || put!(ch, (false, err))
+        end
+    end
+    result = timedwait(timeout; pollint=0.01) do
+        isready(ch) || iscancelled(cancel_token)
+    end
+    if !isready(ch)
+        timed_out[] = true
+        _schedule_timeout_cleanup("$operation DNS resolution", () -> nothing; task)
+        iscancelled(cancel_token) && throw(CancelledError("$operation cancelled"))
+        result == :timed_out && throw(TimeoutError("$operation timed out"))
+    end
+    ok, value = take!(ch)
+    ok || throw(value)
+    _throw_if_cancelled(cancel_token)
+    value
+end
+
 function _connect_tcp(host::String, port::Int, timeout::Real,
                       cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     timeout = Float64(timeout)
     timeout > 0 || throw(TimeoutError("connect to $host:$port timed out"))
+    deadline = time() + timeout
+    addr = _resolve_connect_address(host, port, _remaining_timeout(deadline),
+                                    cancel_token)
     sock = Sockets.TCPSocket()
     connected = false
     try
-        Sockets.connect!(sock, host, port)
+        Sockets.connect!(sock, addr, port)
     catch
         errors = Any[]
         _close_resource!(errors, "close failed connect socket", sock)
@@ -433,7 +469,7 @@ function _connect_tcp(host::String, port::Int, timeout::Real,
         rethrow()
     end
     try
-        wait_result = timedwait(timeout; pollint=0.01) do
+        wait_result = timedwait(_remaining_timeout(deadline); pollint=0.01) do
             !_socket_connecting(sock) || iscancelled(cancel_token)
         end
         if iscancelled(cancel_token)
@@ -1724,16 +1760,25 @@ function _reader_loop(client::Client, generation::Int)
     nothing
 end
 
+struct _ReaderMsgDispatcher{C<:Client}
+    client::C
+end
+
+@inline function (dispatcher::_ReaderMsgDispatcher)(msg::_ProtocolMsg)
+    _dispatch_msg(dispatcher.client, msg)
+    nothing
+end
+
 function _reader_loop_with_reader(client::Client, generation::Int,
                                   reader::ProtocolReader{ReadIO}) where {ReadIO}
     borrow_payload = _BorrowPayloadPolicy(client)
+    msg_dispatcher = _ReaderMsgDispatcher(client)
     while _generation_matches(client, generation) && status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
-            frame = _read_control_or_msg(reader, client.options, borrow_payload)
-            if frame isa MsgFrame
-                msg = _protocol_msg(frame)
-                _dispatch_msg(client, msg)
-            elseif frame isa PingFrame
+            frame = _read_control_or_msg_dispatch(reader, client.options, borrow_payload,
+                                                  msg_dispatcher)
+            isnothing(frame) && continue
+            if frame isa PingFrame
                 _send_raw(client, "PONG$CRLF"; force_flush=true)
             elseif frame isa PongFrame
                 _notify_pong(client)

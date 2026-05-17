@@ -36,10 +36,10 @@ Statuses:
 | :--- | :--- | :--- |
 | Context | Supported | `jetstream(client)`. |
 | Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options, including two default `NoRespondersError` retries. `js_publish_async` uses protocol-level async publish with pending ack accounting, backpressure, completion waiting, per-message ack/error futures, configurable no-responder retries, and explicit pending-future clearing on reconnect rather than replay. |
-| Stream management | Supported | Create, update, info, list, names, purge, delete. |
+| Stream management | Supported | Create, update, info, list, names, page and iterator listing, purge, delete. |
 | Typed stream config | Supported | `StreamConfig` plus nested helpers and raw `Dict` escape hatch. Typed create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. |
-| Message lookup | Supported | Sequence, last-by-subject, next-by-subject, direct get, and message delete. |
-| Consumer management | Supported | Create, create-or-update, update, info, list, delete. |
+| Message lookup | Supported | Sequence, last-by-subject, next-by-subject, direct get with validated metadata headers, stored-message sequence/timestamp metadata, and message delete. |
+| Consumer management | Supported | Create, create-or-update, update, info, list, page and iterator listing, delete. |
 | Typed consumer config | Supported | `ConsumerConfig` plus raw `Dict` escape hatch. Typed create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. |
 | Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded close cleanup, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, `messages`, `consume`, and priority request fields. |
 | Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, bounded close cleanup, queue groups, callbacks, borrowed callbacks, manual/auto ack, flow control replies, heartbeat reporting, and bounded reconnect chaos coverage. Additional long-duration push chaos remains. |

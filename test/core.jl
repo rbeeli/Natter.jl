@@ -247,6 +247,63 @@ end
         end
     end
 
+    mutable struct BorrowedReaderCounter
+        count::Int
+        bytes::Int
+        dispatch_views::Bool
+    end
+
+    function (counter::BorrowedReaderCounter)(msg::BorrowedMsg)
+        counter.count += 1
+        counter.bytes += length(msg.data)
+        counter.dispatch_views &= msg.data isa N._BorrowedDispatchData
+        nothing
+    end
+
+    function borrowed_reader_dispatch_alloc(payload::AbstractString)
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=devnull)
+        counter = BorrowedReaderCounter(0, 0, true)
+        sub = subscribe(client, "events"; callback=counter, borrowed=true)
+        n = 1000
+        raw = UInt8[]
+        for _ in 1:n
+            append!(raw, codeunits("MSG events $(sub.sid) $(ncodeunits(payload))\r\n"))
+            append!(raw, codeunits(payload))
+            append!(raw, N.CRLF_BYTES)
+        end
+        reader = N.ProtocolReader(IOBuffer(UInt8[]))
+        sizehint!(reader.buffer, length(raw))
+        policy = N._BorrowPayloadPolicy(client)
+        handler = N._ReaderMsgDispatcher(client)
+
+        function prefill!()
+            empty!(reader.buffer)
+            append!(reader.buffer, raw)
+            reader.first = 1
+            reader.last = length(raw)
+            reader.subject_cache[sub.sid] = "events"
+            nothing
+        end
+
+        function drain!()
+            for _ in 1:n
+                frame = N._read_control_or_msg_dispatch(reader, client.options, policy, handler)
+                isnothing(frame) || throw(AssertionError("unexpected control frame"))
+            end
+            nothing
+        end
+
+        prefill!()
+        drain!()
+        counter.count = 0
+        counter.bytes = 0
+        counter.dispatch_views = true
+
+        prefill!()
+        allocated = @allocated drain!()
+        (allocated, counter.count, counter.bytes, counter.dispatch_views)
+    end
+
     function buffered_publish_alloc()
         opts = N.ConnectOptions(write_buffer_size=1024)
         write_io = N.BufferedWriteIO(devnull)
@@ -277,6 +334,16 @@ end
     @test !(Any in fieldtypes(N.Subscription{N.Client}))
     @test dispatch_take_alloc() == 0
     @test borrowed_dispatch_alloc() == 0
+    nonempty_reader_alloc, nonempty_count, nonempty_bytes, nonempty_views = borrowed_reader_dispatch_alloc("x")
+    @test nonempty_reader_alloc <= 1024
+    @test nonempty_count == 1000
+    @test nonempty_bytes == 1000
+    @test nonempty_views
+    empty_reader_alloc, empty_count, empty_bytes, empty_views = borrowed_reader_dispatch_alloc("")
+    @test empty_reader_alloc <= 1024
+    @test empty_count == 1000
+    @test empty_bytes == 0
+    @test empty_views
     @test buffered_publish_alloc() == 0
     @test buffered_replay_snapshot() == "PUB foo 3\r\nbar\r\n"
 end
@@ -2512,6 +2579,32 @@ end
     end
 end
 
+@testitem "connect timeout covers DNS resolution" setup=[TestHelpers] begin
+    using Natter
+    using Sockets
+
+    const N = Natter
+
+    started = Channel{Bool}(1)
+    release = Channel{Bool}(1)
+    resolver = _host -> begin
+        put!(started, true)
+        take!(release)
+        ip"127.0.0.1"
+    end
+
+    start = time()
+    err = TestHelpers.thrown_exception() do
+        N._resolve_connect_address("blocked.invalid", 4222, 0.05; resolver)
+    end
+    elapsed = time() - start
+
+    @test err isa TimeoutError
+    @test elapsed < 1.0
+    @test isready(started)
+    isready(release) || put!(release, true)
+end
+
 @testitem "connect timeout bounds auth callbacks" setup=[TestHelpers] begin
     using Natter
     using Sockets
@@ -2549,7 +2642,7 @@ end
     try
         err = TestHelpers.thrown_exception() do
             N.connect("nats://127.0.0.1:$port";
-                      connect_timeout=0.1,
+                      connect_timeout=1.0,
                       auth=N.CallbackAuth(_ -> begin
                           put!(started, true)
                           take!(blocker)

@@ -235,6 +235,8 @@ Read stored messages by sequence or subject:
 ```julia
 by_sequence = stream_message_get(js, "ORDERS"; seq=42)
 latest_order = stream_message_get(js, "ORDERS"; subject="orders.events.created")
+
+@info "stored message" sequence=by_sequence.seq created=by_sequence.created
 ```
 
 For streams created with `allow_direct=true`, direct reads avoid the normal management response envelope:
@@ -255,6 +257,14 @@ stream_message_delete(js, "ORDERS", 42)
 info = stream_info(js, "ORDERS")
 names = stream_names(js; subject="orders.events.created")
 streams = stream_list(js)
+
+for page in stream_list_pages(js)
+    @info "stream page" offset=page.offset total=page.total count=length(page)
+end
+
+for consumer in consumer_list_iter(js, "ORDERS")
+    @info "consumer" name=consumer.name
+end
 
 consumer_create(js, "ORDERS", ConsumerConfig(
     durable_name="audit-reader",

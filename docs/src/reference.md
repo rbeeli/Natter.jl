@@ -139,6 +139,8 @@ Cancellation helpers: `CancellationSource()`, `cancellation_token(source)`, `can
 | `StreamInfo`, `StreamState`, `StreamLostData` | Typed stream info responses. |
 | `ConsumerInfo`, `ConsumerSequenceInfo` | Typed consumer info responses. |
 | `PubAck` | Publish acknowledgement. |
+| `StoredMsg` | Stored stream message with message fields plus `seq` and `created`. |
+| `JetStreamPage` | One paged management response with `items`, `offset`, `total`, and `limit`. |
 | `JetStreamPublishFuture` | Future returned by protocol-level async JetStream publish. |
 | `AbstractJetStreamMsg` | Shared supertype for ackable JetStream consumer messages. |
 | `JetStreamMsg` | Consumer message with acknowledgement state. |
@@ -175,16 +177,22 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `stream_update(js, config; timeout=...)` | `StreamInfo` | Update a stream. |
 | `stream_info(js, name; timeout=...)` | `StreamInfo` | Fetch stream info. |
 | `stream_list(js; offset=0, timeout=...)` | `Vector{StreamInfo}` | List streams. |
-| `stream_names(js; subject=nothing, timeout=...)` | `Vector{String}` | List stream names. |
+| `stream_list_page(js; offset=0, timeout=...)` | `JetStreamPage{StreamInfo}` | Fetch one stream list page. |
+| `stream_list_pages(js; offset=0, timeout=...)`, `stream_list_iter(js; offset=0, timeout=...)` | iterator | Iterate stream pages or stream infos lazily. |
+| `stream_names(js; subject=nothing, offset=0, timeout=...)` | `Vector{String}` | List stream names. |
+| `stream_names_page(js; subject=nothing, offset=0, timeout=...)` | `JetStreamPage{String}` | Fetch one stream-name page. |
+| `stream_names_pages(js; subject=nothing, offset=0, timeout=...)`, `stream_names_iter(js; subject=nothing, offset=0, timeout=...)` | iterator | Iterate stream-name pages or names lazily. |
 | `stream_purge(js, name; filter_subject=nothing, keep=nothing, timeout=...)` | `Bool` | Purge a stream or subject subset. |
 | `stream_delete(js, name; timeout=...)` | `Bool` | Delete a stream. |
-| `stream_message_get(js, stream; seq=nothing, subject=nothing, direct=false, next_by_subject=false, timeout=...)` | `Msg` | Read a stored message. |
+| `stream_message_get(js, stream; seq=nothing, subject=nothing, direct=false, next_by_subject=false, timeout=...)` | `StoredMsg` | Read a stored message with `seq` and `created` metadata. |
 | `stream_message_delete(js, stream, seq; timeout=...)` | `Bool` | Delete one stored message. |
 | `consumer_create(js, stream, config; timeout=...)` | `ConsumerInfo` | Strict create. |
 | `consumer_create_or_update(js, stream, config; timeout=...)` | `ConsumerInfo` | Explicit upsert. |
 | `consumer_update(js, stream, config; timeout=...)` | `ConsumerInfo` | Strict update. |
 | `consumer_info(js, stream, consumer; timeout=...)` | `ConsumerInfo` | Fetch consumer info. |
 | `consumer_list(js, stream; offset=0, timeout=...)` | `Vector{ConsumerInfo}` | List consumers. |
+| `consumer_list_page(js, stream; offset=0, timeout=...)` | `JetStreamPage{ConsumerInfo}` | Fetch one consumer list page. |
+| `consumer_list_pages(js, stream; offset=0, timeout=...)`, `consumer_list_iter(js, stream; offset=0, timeout=...)` | iterator | Iterate consumer pages or consumer infos lazily. |
 | `consumer_delete(js, stream, consumer; timeout=...)` | `Bool` | Delete a consumer. |
 | `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig(), timeout=...)` | `PullSubscription` | Create or bind a pull consumer. |
 | `fetch(psub, batch=1; timeout=..., expires=..., heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `Vector{JetStreamMsg}` | Fetch a bounded batch. |

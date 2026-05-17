@@ -360,17 +360,21 @@ end
             js_publish(js, subject, "payload2"; stream=stream)
             direct_seq = stream_message_get(js, stream; seq=pa.seq, direct=true)
             @test direct_seq.subject == subject
+            @test direct_seq.seq == pa.seq
             @test String(direct_seq) == "payload"
             @test header(direct_seq, "X-Test") == "direct"
             direct_subject = stream_message_get(js, stream; subject, direct=true)
             @test direct_subject.subject == subject
+            @test direct_subject.seq == 3
             @test String(direct_subject) == "payload2"
             direct_next = stream_message_get(js, stream; seq=pa.seq + 1, subject, next_by_subject=true, direct=true)
             @test direct_next.subject == subject
+            @test direct_next.seq == 3
             @test String(direct_next) == "payload2"
             pa_async = fetch(js_publish_async(js, subject, "async-payload"; stream=stream))
             @test pa_async.stream == stream
             async_direct = fetch(stream_message_get_async(js, stream; seq=pa_async.seq, direct=true))
+            @test async_direct.seq == pa_async.seq
             @test String(async_direct) == "async-payload"
 
             durable = "DUR_$(randstring(6))"

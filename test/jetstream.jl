@@ -358,8 +358,11 @@ end
         @test isempty(client.subscriptions)
 
         @test_throws ArgumentError stream_list(js; timeout=invalid_timeout)
+        @test_throws ArgumentError stream_list_page(js; timeout=invalid_timeout)
         @test_throws ArgumentError stream_names(js; timeout=invalid_timeout)
+        @test_throws ArgumentError stream_names_page(js; timeout=invalid_timeout)
         @test_throws ArgumentError consumer_list(js, "ORDERS"; timeout=invalid_timeout)
+        @test_throws ArgumentError consumer_list_page(js, "ORDERS"; timeout=invalid_timeout)
         @test TestHelpers.capture_text(capture) == ""
         @test isempty(client.subscriptions)
 
@@ -382,9 +385,112 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
     @test_throws ArgumentError stream_list(js; offset=-1)
+    @test_throws ArgumentError stream_list_page(js; offset=-1)
     @test_throws ArgumentError consumer_list(js, "ORDERS"; offset=-1)
+    @test_throws ArgumentError consumer_list_page(js, "ORDERS"; offset=-1)
+    @test_throws ArgumentError stream_names(js; offset=-1)
+    @test_throws ArgumentError stream_names_page(js; offset=-1)
     @test TestHelpers.capture_text(capture) == ""
     @test isempty(client.subscriptions)
+end
+
+@testitem "JetStream list page and iterator APIs page lazily" setup=[TestHelpers] begin
+    using JSON3
+    using Natter
+
+    const N = Natter
+
+    function respond_next_request!(client, payload::AbstractString)
+        result = timedwait(1.0; pollint=0.001) do
+            @lock client.lock begin
+                mux = client.request_mux
+                !isnothing(mux) && !isempty(mux.waiters)
+            end
+        end
+        @test result != :timed_out
+        subject, sid = @lock client.lock begin
+            mux = client.request_mux
+            token = first(keys(mux.waiters))
+            "$(mux.prefix).$token", mux.sub.sid
+        end
+        N._dispatch_msg(client, Msg(subject, nothing, TestHelpers.bytes(payload); sid))
+    end
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    js = jetstream(client)
+
+    stream_payload = JSON3.write(Dict(
+        "streams" => [
+            Dict("config" => Dict("name" => "ORDERS"), "state" => Dict()),
+        ],
+        "offset" => 2,
+        "total" => 3,
+        "limit" => 1,
+    ))
+    stream_task = @async stream_list_page(js; offset=2)
+    respond_next_request!(client, stream_payload)
+    stream_page = fetch(stream_task)
+    @test stream_page isa JetStreamPage{StreamInfo}
+    @test stream_page.offset == 2
+    @test stream_page.total == 3
+    @test stream_page.limit == 1
+    @test only(stream_page.items).name == "ORDERS"
+
+    consumer_payload = JSON3.write(Dict(
+        "consumers" => [
+            Dict("stream_name" => "ORDERS", "name" => "worker",
+                 "config" => Dict("durable_name" => "worker")),
+        ],
+        "offset" => 0,
+        "total" => 1,
+        "limit" => 1,
+    ))
+    consumer_task = @async consumer_list_page(js, "ORDERS")
+    respond_next_request!(client, consumer_payload)
+    consumer_page = fetch(consumer_task)
+    @test consumer_page isa JetStreamPage{ConsumerInfo}
+    @test only(consumer_page).name == "worker"
+
+    names_task = @async collect(stream_names_iter(js))
+    respond_next_request!(client, JSON3.write(Dict(
+        "streams" => ["A", "B"],
+        "offset" => 0,
+        "total" => 3,
+        "limit" => 2,
+    )))
+    respond_next_request!(client, JSON3.write(Dict(
+        "streams" => ["C"],
+        "offset" => 2,
+        "total" => 3,
+        "limit" => 2,
+    )))
+    @test fetch(names_task) == ["A", "B", "C"]
+
+    lazy_iter = stream_names_pages(js)
+    first_task = @async iterate(lazy_iter)
+    respond_next_request!(client, JSON3.write(Dict(
+        "streams" => ["D"],
+        "offset" => 0,
+        "total" => 2,
+        "limit" => 1,
+    )))
+    first_result = fetch(first_task)
+    @test !isnothing(first_result)
+    first_page, state = first_result
+    @test first_page.items == ["D"]
+    @test (@lock client.lock isempty(client.request_mux.waiters))
+
+    second_task = @async iterate(lazy_iter, state)
+    respond_next_request!(client, JSON3.write(Dict(
+        "streams" => ["E"],
+        "offset" => 1,
+        "total" => 2,
+        "limit" => 1,
+    )))
+    second_result = fetch(second_task)
+    @test !isnothing(second_result)
+    second_page, _ = second_result
+    @test second_page.items == ["E"]
 end
 
 @testitem "JetStream publish options serialize supported headers" setup=[TestHelpers] begin
@@ -2319,14 +2425,15 @@ end
     @test String(take!(delete_client.write_io)) == ""
     @test isempty(delete_client.subscriptions)
 
-    api_msg, api_seq, api_created = N._stream_message_from_api_payload(Dict{String,Any}(
+    api_msg = N._stream_message_from_api_payload(Dict{String,Any}(
         "subject" => "orders.created",
         "seq" => 7,
         "data" => "cGF5bG9hZA==",
         "time" => "2026-01-01T00:00:00.123456789Z",
     ))
-    @test api_seq == 7
-    @test api_created == DateTime(2026, 1, 1, 0, 0, 0, 123)
+    @test api_msg isa StoredMsg
+    @test api_msg.seq == 7
+    @test api_msg.created == DateTime(2026, 1, 1, 0, 0, 0, 123)
     @test api_msg.subject == "orders.created"
     @test String(api_msg) == "payload"
 
@@ -2338,20 +2445,114 @@ end
                        "Nats-Time-Stamp" => ["2026-01-01T00:00:00Z"],
                        "x-test" => ["ok"],
                    ))
-    msg, _seq, _created = N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", response)
+    msg = N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", response)
     @test msg.subject == "orders.created"
     @test String(msg) == "payload"
     @test header(msg, "X-Test") == "ok"
     @test isnothing(header(msg, "Nats-Sequence"))
-    info_msg, info_seq, info_created = N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", response)
+    info_msg = N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", response)
+    @test info_msg isa StoredMsg
     @test info_msg.subject == "orders.created"
-    @test info_seq == 7
-    @test info_created == DateTime(2026, 1, 1)
+    @test info_msg.seq == 7
+    @test info_msg.created == DateTime(2026, 1, 1)
+
+    missing_stream = Msg("_INBOX.reply", nothing, Vector{UInt8}(codeunits("payload"));
+                         headers=Headers(
+                             "nats-subject" => ["orders.created"],
+                             "nats-sequence" => ["7"],
+                             "Nats-Time-Stamp" => ["2026-01-01T00:00:00Z"],
+                         ))
+    @test_throws ProtocolError N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", missing_stream)
 
     not_found = Msg("_INBOX.reply", nothing, UInt8[]; headers=Headers("Status" => ["404"], "Description" => ["no message found"]))
     @test_throws JetStreamError N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", not_found)
     no_responders = Msg("_INBOX.reply", nothing, UInt8[]; headers=Headers("Status" => ["503"]))
     @test_throws NoRespondersError N._direct_message_response_info("\$JS.API.DIRECT.GET.MISSING", no_responders)
+end
+
+@testitem "JetStream public stored message get returns metadata" setup=[TestHelpers] begin
+    using JSON3
+    using Dates
+    using Natter
+
+    const N = Natter
+
+    function next_request(client)
+        result = timedwait(1.0; pollint=0.001) do
+            @lock client.lock begin
+                mux = client.request_mux
+                !isnothing(mux) && !isempty(mux.waiters)
+            end
+        end
+        @test result != :timed_out
+        @lock client.lock begin
+            mux = client.request_mux
+            token = first(keys(mux.waiters))
+            ("$(mux.prefix).$token", mux.sub.sid)
+        end
+    end
+
+    function respond_next_request!(client, payload::AbstractString)
+        subject, sid = next_request(client)
+        N._dispatch_msg(client, Msg(subject, nothing, TestHelpers.bytes(payload); sid))
+    end
+
+    function respond_next_request!(client, msg::Msg)
+        subject, sid = next_request(client)
+        N._dispatch_msg(client, Msg(subject, msg.reply, msg.data, msg.headers, sid))
+    end
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     info=N.ServerInfo(; headers=true),
+                                     write_io=IOBuffer())
+    js = jetstream(client)
+
+    api_task = @async stream_message_get(js, "ORDERS"; seq=7)
+    respond_next_request!(client, JSON3.write(Dict(
+        "message" => Dict(
+            "subject" => "orders.created",
+            "seq" => 7,
+            "data" => "cGF5bG9hZA==",
+            "time" => "2026-01-01T00:00:00.123456789Z",
+        ),
+    )))
+    api_msg = fetch(api_task)
+    @test api_msg isa StoredMsg
+    @test api_msg.subject == "orders.created"
+    @test api_msg.seq == 7
+    @test api_msg.created == DateTime(2026, 1, 1, 0, 0, 0, 123)
+    @test String(api_msg) == "payload"
+
+    direct_task = @async stream_message_get(js, "ORDERS"; seq=8, direct=true)
+    direct_response = Msg("_INBOX.reply", nothing, TestHelpers.bytes("fast");
+                          headers=Headers(
+                              "Nats-Stream" => ["ORDERS"],
+                              "Nats-Subject" => ["orders.created"],
+                              "Nats-Sequence" => ["8"],
+                              "Nats-Time-Stamp" => ["2026-01-01T00:00:01Z"],
+                          ))
+    respond_next_request!(client, direct_response)
+    direct_msg = fetch(direct_task)
+    @test direct_msg isa StoredMsg
+    @test direct_msg.subject == "orders.created"
+    @test direct_msg.seq == 8
+    @test direct_msg.created == DateTime(2026, 1, 1, 0, 0, 1)
+    @test String(direct_msg) == "fast"
+
+    async_task = stream_message_get_async(js, "ORDERS"; seq=9)
+    respond_next_request!(client, JSON3.write(Dict(
+        "message" => Dict(
+            "subject" => "orders.created",
+            "seq" => 9,
+            "data" => "YXN5bmM=",
+            "time" => "2026-01-01T00:00:02Z",
+        ),
+    )))
+    async_msg = fetch(async_task)
+    @test async_msg isa StoredMsg
+    @test async_msg.seq == 9
+    @test async_msg.created == DateTime(2026, 1, 1, 0, 0, 2)
+    @test String(async_msg) == "async"
 end
 
 @testitem "JetStream metadata" begin

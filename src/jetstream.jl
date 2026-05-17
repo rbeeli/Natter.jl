@@ -52,6 +52,23 @@ struct PubAck
     domain::Union{String,Nothing}
 end
 
+struct StoredMsg <: AbstractMsg
+    subject::String
+    reply::Union{String,Nothing}
+    data::Vector{UInt8}
+    headers::HeaderStorage
+    sid::Int
+    header_bytes::Int
+    seq::Int
+    created::DateTime
+end
+
+StoredMsg(msg::Msg, seq::Integer, created::DateTime) =
+    StoredMsg(msg.subject, msg.reply, msg.data, msg.headers, msg.sid, msg.header_bytes,
+              Int(seq), created)
+
+Base.String(msg::StoredMsg) = _bytes_to_string(msg.data)
+
 abstract type AbstractJetStreamAsyncPublishState{C<:Client} end
 
 mutable struct JetStreamPublishFuture{C<:Client,S<:AbstractJetStreamAsyncPublishState{C}}
@@ -200,6 +217,87 @@ function ConsumerInfo(stream_name::AbstractString, name::AbstractString, config:
     ConsumerInfo(String(stream_name), String(name), config, created, delivered, ack_floor,
                  Int(num_ack_pending), Int(num_redelivered), Int(num_waiting), Int(num_pending),
                  push_bound, paused, Float64(pause_remaining))
+end
+
+struct JetStreamPage{T}
+    items::Vector{T}
+    offset::Int
+    total::Int
+    limit::Int
+end
+
+Base.length(page::JetStreamPage) = length(page.items)
+Base.isempty(page::JetStreamPage) = isempty(page.items)
+Base.iterate(page::JetStreamPage, state...) = iterate(page.items, state...)
+Base.IteratorEltype(::Type{<:JetStreamPage{T}}) where {T} = Base.HasEltype()
+Base.eltype(::Type{<:JetStreamPage{T}}) where {T} = T
+
+_page_next_offset(page::JetStreamPage)::Int = page.offset + length(page.items)
+_page_complete(page::JetStreamPage)::Bool = isempty(page.items) || _page_next_offset(page) >= page.total
+
+struct JetStreamPageIterator{T,F}
+    fetch_page::F
+    offset::Int
+end
+
+JetStreamPageIterator{T}(fetch_page::F, offset::Int) where {T,F} =
+    JetStreamPageIterator{T,F}(fetch_page, offset)
+
+Base.IteratorSize(::Type{<:JetStreamPageIterator}) = Base.SizeUnknown()
+Base.IteratorEltype(::Type{<:JetStreamPageIterator{T}}) where {T} = Base.HasEltype()
+Base.eltype(::Type{<:JetStreamPageIterator{T}}) where {T} = JetStreamPage{T}
+
+function Base.iterate(iter::JetStreamPageIterator)
+    _iterate_jetstream_pages(iter, iter.offset, typemax(Int), true)
+end
+
+function Base.iterate(iter::JetStreamPageIterator, state)
+    next_offset, total = state
+    _iterate_jetstream_pages(iter, next_offset, total, false)
+end
+
+function _iterate_jetstream_pages(iter::JetStreamPageIterator, next_offset::Int,
+                                  total::Int, first_page::Bool)
+    (!first_page && next_offset >= total) && return nothing
+    page = iter.fetch_page(next_offset)
+    isempty(page) && return nothing
+    page_next = _page_next_offset(page)
+    page, (page_next, page.total)
+end
+
+struct JetStreamItemIterator{T,P}
+    pages::P
+end
+
+Base.IteratorSize(::Type{<:JetStreamItemIterator}) = Base.SizeUnknown()
+Base.IteratorEltype(::Type{<:JetStreamItemIterator{T}}) where {T} = Base.HasEltype()
+Base.eltype(::Type{<:JetStreamItemIterator{T}}) where {T} = T
+
+function Base.iterate(iter::JetStreamItemIterator)
+    _iterate_jetstream_items(iter.pages, iterate(iter.pages))
+end
+
+function Base.iterate(iter::JetStreamItemIterator, state)
+    page, item_state, page_state = state
+    item_result = iterate(page.items, item_state)
+    if !isnothing(item_result)
+        item, next_item_state = item_result
+        return item, (page, next_item_state, page_state)
+    end
+    _iterate_jetstream_items(iter.pages, iterate(iter.pages, page_state))
+end
+
+function _iterate_jetstream_items(pages, page_result)
+    while !isnothing(page_result)
+        page, page_state = page_result
+        item_result = iterate(page.items)
+        if !isnothing(item_result)
+            item, item_state = item_result
+            return item, (page, item_state, page_state)
+        end
+        page_result = iterate(pages, page_state)
+    end
+    nothing
 end
 
 function jetstream(client::Client; prefix::AbstractString="\$JS.API", timeout::Real=5.0,
@@ -1186,6 +1284,37 @@ stream_info(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout
     _stream_info(_api_request(js, "$(js.prefix).STREAM.INFO.$(_validate_api_name("stream", name))", "";
                               timeout, cancel_token))
 
+function _stream_list_page(js::JetStreamContext, offset::Int; timeout::Real,
+                           cancel_token::MaybeCancellationToken=nothing)::JetStreamPage{StreamInfo}
+    obj = _api_request(js, "$(js.prefix).STREAM.LIST", JSON3.write((offset=offset,));
+                       timeout, cancel_token)
+    items = StreamInfo[_stream_info(item) for item in _json_get(obj, :streams, ())]
+    page_offset = _json_int(_json_get(obj, :offset, offset))
+    total = _json_int(_json_get(obj, :total, page_offset + length(items)))
+    limit = _json_int(_json_get(obj, :limit, length(items)))
+    JetStreamPage(items, page_offset, total, limit)
+end
+
+function stream_list_page(js::JetStreamContext; offset=0, timeout::Real=js.timeout,
+                          cancel_token::MaybeCancellationToken=nothing)
+    offset = _nonnegative_integer_option("stream list offset", offset)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    _stream_list_page(js, offset; timeout, cancel_token)
+end
+
+function stream_list_pages(js::JetStreamContext; offset=0, timeout::Real=js.timeout,
+                           cancel_token::MaybeCancellationToken=nothing)
+    offset = _nonnegative_integer_option("stream list offset", offset)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    JetStreamPageIterator{StreamInfo}(next_offset -> _stream_list_page(
+        js, next_offset; timeout, cancel_token), offset)
+end
+
+function stream_list_iter(js::JetStreamContext; kwargs...)
+    pages = stream_list_pages(js; kwargs...)
+    JetStreamItemIterator{StreamInfo,typeof(pages)}(pages)
+end
+
 function stream_list(js::JetStreamContext; offset=0, timeout::Real=js.timeout,
                      cancel_token::MaybeCancellationToken=nothing)
     offset = _nonnegative_integer_option("stream list offset", offset)
@@ -1194,37 +1323,71 @@ function stream_list(js::JetStreamContext; offset=0, timeout::Real=js.timeout,
     streams = StreamInfo[]
     next_offset = offset
     while true
-        obj = _api_request(js, "$(js.prefix).STREAM.LIST", JSON3.write((offset=next_offset,));
-                           timeout=_remaining_timeout_or_throw(deadline, "stream list"; cancel_token),
-                           cancel_token)
-        items = _json_get(obj, :streams, ())
-        append!(streams, (_stream_info(item) for item in items))
-        total = _json_int(_json_get(obj, :total, offset + length(streams)))
-        page_offset = _json_int(_json_get(obj, :offset, next_offset))
-        next_offset = page_offset + length(items)
-        (isempty(items) || next_offset >= total) && break
+        page = _stream_list_page(js, next_offset;
+                                 timeout=_remaining_timeout_or_throw(deadline, "stream list";
+                                                                     cancel_token),
+                                 cancel_token)
+        append!(streams, page.items)
+        _page_complete(page) && break
+        next_offset = _page_next_offset(page)
     end
     streams
 end
 
-function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothing}=nothing,
-                      timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing)
+function _stream_names_page(js::JetStreamContext, offset::Int,
+                            subject::Union{String,Nothing}; timeout::Real,
+                            cancel_token::MaybeCancellationToken=nothing)::JetStreamPage{String}
+    req = isnothing(subject) ? (offset=offset,) : (subject=subject, offset=offset)
+    obj = _api_request(js, "$(js.prefix).STREAM.NAMES", JSON3.write(req);
+                       timeout, cancel_token)
+    items = String[String(item) for item in _json_get(obj, :streams, String[])]
+    page_offset = _json_int(_json_get(obj, :offset, offset))
+    total = _json_int(_json_get(obj, :total, page_offset + length(items)))
+    limit = _json_int(_json_get(obj, :limit, length(items)))
+    JetStreamPage(items, page_offset, total, limit)
+end
+
+function stream_names_page(js::JetStreamContext; subject::Union{AbstractString,Nothing}=nothing,
+                           offset=0, timeout::Real=js.timeout,
+                           cancel_token::MaybeCancellationToken=nothing)
     subject = isnothing(subject) ? nothing : _validate_subject(subject)
+    offset = _nonnegative_integer_option("stream names offset", offset)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    _stream_names_page(js, offset, subject; timeout, cancel_token)
+end
+
+function stream_names_pages(js::JetStreamContext; subject::Union{AbstractString,Nothing}=nothing,
+                            offset=0, timeout::Real=js.timeout,
+                            cancel_token::MaybeCancellationToken=nothing)
+    subject = isnothing(subject) ? nothing : _validate_subject(subject)
+    offset = _nonnegative_integer_option("stream names offset", offset)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    JetStreamPageIterator{String}(next_offset -> _stream_names_page(
+        js, next_offset, subject; timeout, cancel_token), offset)
+end
+
+function stream_names_iter(js::JetStreamContext; kwargs...)
+    pages = stream_names_pages(js; kwargs...)
+    JetStreamItemIterator{String,typeof(pages)}(pages)
+end
+
+function stream_names(js::JetStreamContext; subject::Union{AbstractString,Nothing}=nothing,
+                      offset=0, timeout::Real=js.timeout,
+                      cancel_token::MaybeCancellationToken=nothing)
+    subject = isnothing(subject) ? nothing : _validate_subject(subject)
+    offset = _nonnegative_integer_option("stream names offset", offset)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
     names = String[]
-    next_offset = 0
+    next_offset = offset
     while true
-        req = isnothing(subject) ? (offset=next_offset,) : (subject=subject, offset=next_offset)
-        obj = _api_request(js, "$(js.prefix).STREAM.NAMES", JSON3.write(req);
-                           timeout=_remaining_timeout_or_throw(deadline, "stream names"; cancel_token),
-                           cancel_token)
-        items = String.(_json_get(obj, :streams, String[]))
-        append!(names, items)
-        total = _json_int(_json_get(obj, :total, length(names)))
-        page_offset = _json_int(_json_get(obj, :offset, next_offset))
-        next_offset = page_offset + length(items)
-        (isempty(items) || next_offset >= total) && break
+        page = _stream_names_page(js, next_offset, subject;
+                                  timeout=_remaining_timeout_or_throw(deadline, "stream names";
+                                                                      cancel_token),
+                                  cancel_token)
+        append!(names, page.items)
+        _page_complete(page) && break
+        next_offset = _page_next_offset(page)
     end
     names
 end
@@ -1357,6 +1520,7 @@ function _direct_message_response_info(request_subject::String, response::Msg)
         throw(JetStreamError(code, nothing, description))
     end
 
+    _direct_metadata_header(response, "Nats-Stream")
     subject = _direct_metadata_header(response, "Nats-Subject")
     sequence = _parse_direct_sequence(response)
     created = _parse_rfc3339_datetime(_direct_metadata_header(response, "Nats-Time-Stamp"))
@@ -1364,7 +1528,7 @@ function _direct_message_response_info(request_subject::String, response::Msg)
     for name in _DIRECT_GET_METADATA_HEADERS
         _delete_header!(headers, name)
     end
-    Msg(subject, nothing, copy(response.data); headers), sequence, created
+    StoredMsg(Msg(subject, nothing, copy(response.data); headers), sequence, created)
 end
 
 function _stream_message_get_direct_info(js::JetStreamContext, stream::String, req::Dict{String,Any};
@@ -1384,9 +1548,9 @@ end
 function _stream_message_from_api_payload(raw_msg)
     data = _json_haskey(raw_msg, :data) ? base64decode(String(_json_get(raw_msg, :data, ""))) : UInt8[]
     hdrs = _json_haskey(raw_msg, :hdrs) ? _parse_headers(base64decode(String(_json_get(raw_msg, :hdrs, "")))) : Headers()
-    created = _json_datetime(_json_get(raw_msg, :time, nothing))
-    Msg(String(_json_get_required(raw_msg, :subject)), nothing, data; headers=hdrs),
-        _json_int(_json_get_required(raw_msg, :seq)), created
+    created = _json_datetime(_json_get_required(raw_msg, :time))::DateTime
+    msg = Msg(String(_json_get_required(raw_msg, :subject)), nothing, data; headers=hdrs)
+    StoredMsg(msg, _json_int(_json_get_required(raw_msg, :seq)), created)
 end
 
 function _stream_message_get_api(js::JetStreamContext, stream::AbstractString, req::Dict{String,Any};
@@ -1408,9 +1572,7 @@ function stream_message_get(js::JetStreamContext, stream::AbstractString; seq::U
                             cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     req = _stream_message_get_request(seq, subject, next_by_subject)
-    msg, _seq, _created = _stream_message_get_info(js, stream, req; direct, timeout,
-                                                   cancel_token)
-    msg
+    _stream_message_get_info(js, stream, req; direct, timeout, cancel_token)
 end
 
 function stream_message_delete(js::JetStreamContext, stream::AbstractString, seq::Integer;
@@ -1517,6 +1679,42 @@ consumer_info(js::JetStreamContext, stream::AbstractString, consumer::AbstractSt
     _consumer_info(_api_request(js, "$(js.prefix).CONSUMER.INFO.$(_validate_api_name("stream", stream)).$(_validate_api_name("consumer", consumer))", "";
                                 timeout, cancel_token))
 
+function _consumer_list_page(js::JetStreamContext, stream::String, offset::Int;
+                             timeout::Real,
+                             cancel_token::MaybeCancellationToken=nothing)::JetStreamPage{ConsumerInfo}
+    obj = _api_request(js, "$(js.prefix).CONSUMER.LIST.$stream", JSON3.write((offset=offset,));
+                       timeout, cancel_token)
+    items = ConsumerInfo[_consumer_info(item) for item in _json_get(obj, :consumers, ())]
+    page_offset = _json_int(_json_get(obj, :offset, offset))
+    total = _json_int(_json_get(obj, :total, page_offset + length(items)))
+    limit = _json_int(_json_get(obj, :limit, length(items)))
+    JetStreamPage(items, page_offset, total, limit)
+end
+
+function consumer_list_page(js::JetStreamContext, stream::AbstractString; offset=0,
+                            timeout::Real=js.timeout,
+                            cancel_token::MaybeCancellationToken=nothing)
+    stream = _validate_api_name("stream", stream)
+    offset = _nonnegative_integer_option("consumer list offset", offset)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    _consumer_list_page(js, stream, offset; timeout, cancel_token)
+end
+
+function consumer_list_pages(js::JetStreamContext, stream::AbstractString; offset=0,
+                             timeout::Real=js.timeout,
+                             cancel_token::MaybeCancellationToken=nothing)
+    stream = _validate_api_name("stream", stream)
+    offset = _nonnegative_integer_option("consumer list offset", offset)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    JetStreamPageIterator{ConsumerInfo}(next_offset -> _consumer_list_page(
+        js, stream, next_offset; timeout, cancel_token), offset)
+end
+
+function consumer_list_iter(js::JetStreamContext, stream::AbstractString; kwargs...)
+    pages = consumer_list_pages(js, stream; kwargs...)
+    JetStreamItemIterator{ConsumerInfo,typeof(pages)}(pages)
+end
+
 function consumer_list(js::JetStreamContext, stream::AbstractString; offset=0, timeout::Real=js.timeout,
                        cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
@@ -1526,15 +1724,13 @@ function consumer_list(js::JetStreamContext, stream::AbstractString; offset=0, t
     consumers = ConsumerInfo[]
     next_offset = offset
     while true
-        obj = _api_request(js, "$(js.prefix).CONSUMER.LIST.$stream", JSON3.write((offset=next_offset,));
-                           timeout=_remaining_timeout_or_throw(deadline, "consumer list"; cancel_token),
-                           cancel_token)
-        items = _json_get(obj, :consumers, ())
-        append!(consumers, (_consumer_info(item) for item in items))
-        total = _json_int(_json_get(obj, :total, offset + length(consumers)))
-        page_offset = _json_int(_json_get(obj, :offset, next_offset))
-        next_offset = page_offset + length(items)
-        (isempty(items) || next_offset >= total) && break
+        page = _consumer_list_page(js, stream, next_offset;
+                                   timeout=_remaining_timeout_or_throw(deadline, "consumer list";
+                                                                       cancel_token),
+                                   cancel_token)
+        append!(consumers, page.items)
+        _page_complete(page) && break
+        next_offset = _page_next_offset(page)
     end
     consumers
 end

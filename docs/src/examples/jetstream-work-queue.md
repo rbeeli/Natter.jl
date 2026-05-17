@@ -59,7 +59,7 @@ Inspect stored data when an operator or replay tool needs it:
 
 ```julia
 stored = stream_message_get(js, "JOBS"; seq=1)
-@info "first stored job" data=String(stored)
+@info "first stored job" sequence=stored.seq created=stored.created data=String(stored)
 ```
 
 Process a fetched batch concurrently when handlers are I/O-heavy:

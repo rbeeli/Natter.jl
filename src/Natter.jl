@@ -20,18 +20,18 @@ export Msg, BorrowedMsg, Headers, PublishFrame, Subscription, Stats
 export connect, close, drain, flush, ping, publish, prepare_publish, subscribe, unsubscribe, request, next, new_inbox
 export connect_async, close_async, drain_async, flush_async, ping_async, publish_async, subscribe_async, unsubscribe_async, request_async, next_async
 export header, headers, status, stats, connected_url
-export JetStreamContext, StreamLostData, StreamState, StreamInfo, ConsumerSequenceInfo, ConsumerInfo, PubAck, JetStreamPublishFuture, AbstractJetStreamMsg, JetStreamMsg, BorrowedJetStreamMsg, PullSubscription, PullMessageStream, PushSubscription
+export JetStreamContext, StreamLostData, StreamState, StreamInfo, ConsumerSequenceInfo, ConsumerInfo, PubAck, StoredMsg, JetStreamPage, JetStreamPublishFuture, AbstractJetStreamMsg, JetStreamMsg, BorrowedJetStreamMsg, PullSubscription, PullMessageStream, PushSubscription
 export RetentionPolicy, StorageType, DiscardPolicy, StoreCompression, PersistMode
 export AckPolicy, DeliverPolicy, ReplayPolicy, PriorityPolicy
 export Placement, ExternalStreamSource, SubjectTransform, StreamSource, StreamConsumerLimits, RePublish
 export StreamConfig, ConsumerConfig
 export jetstream, js_publish, js_publish_async, js_publish_async_pending, js_publish_async_complete, js_publish_async_complete_async
-export stream_create, stream_update, stream_info, stream_list, stream_names, stream_purge, stream_delete
+export stream_create, stream_update, stream_info, stream_list, stream_list_page, stream_list_pages, stream_list_iter, stream_names, stream_names_page, stream_names_pages, stream_names_iter, stream_purge, stream_delete
 export stream_message_get, stream_message_delete
-export stream_create_async, stream_update_async, stream_info_async, stream_list_async, stream_names_async, stream_purge_async, stream_delete_async
+export stream_create_async, stream_update_async, stream_info_async, stream_list_async, stream_list_page_async, stream_names_async, stream_names_page_async, stream_purge_async, stream_delete_async
 export stream_message_get_async, stream_message_delete_async
-export consumer_create, consumer_create_or_update, consumer_update, consumer_info, consumer_list, consumer_delete
-export consumer_create_async, consumer_create_or_update_async, consumer_update_async, consumer_info_async, consumer_list_async, consumer_delete_async
+export consumer_create, consumer_create_or_update, consumer_update, consumer_info, consumer_list, consumer_list_page, consumer_list_pages, consumer_list_iter, consumer_delete
+export consumer_create_async, consumer_create_or_update_async, consumer_update_async, consumer_info_async, consumer_list_async, consumer_list_page_async, consumer_delete_async
 export pull_subscribe, push_subscribe, fetch, messages, consume
 export pull_subscribe_async, push_subscribe_async, fetch_async
 export ack, ack_sync, nak, in_progress, term, metadata

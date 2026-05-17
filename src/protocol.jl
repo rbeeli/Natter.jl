@@ -273,7 +273,7 @@ function _read_exact_bytes_no_drop(reader::ProtocolReader, n::Int)::Vector{UInt8
     data
 end
 
-function _readline_crlf_range(reader::ProtocolReader, max_control_line::Int)::UnitRange{Int}
+function _readline_crlf_bounds(reader::ProtocolReader, max_control_line::Int)::Tuple{Int,Int}
     while true
         newline = _find_byte(reader.buffer, UInt8('\n'), reader.first, reader.last)
         if !isnothing(newline)
@@ -285,7 +285,7 @@ function _readline_crlf_range(reader::ProtocolReader, max_control_line::Int)::Un
                 data_end -= 1
             end
             reader.first = newline + 1
-            return line_first:data_end
+            return line_first, data_end
         end
         _reader_available(reader) > max_control_line && throw(ProtocolError("protocol line exceeds configured limit of $max_control_line bytes"))
         try
@@ -409,6 +409,7 @@ function _borrow_exact_payload(reader::ProtocolReader, n::Int)
     payload_first = reader.first
     payload_last = payload_first + n - 1
     trailer_first = payload_last + 1
+    payload = @view reader.buffer[payload_first:payload_last]
     @inbounds begin
         first = reader.buffer[trailer_first]
         second = reader.buffer[trailer_first + 1]
@@ -416,7 +417,7 @@ function _borrow_exact_payload(reader::ProtocolReader, n::Int)
     first == CRLF_BYTES[1] && second == CRLF_BYTES[2] ||
         throw(ProtocolError("message payload missing CRLF trailer"))
     reader.first = trailer_first + 2
-    n == 0 ? EMPTY_BYTES : @view reader.buffer[payload_first:payload_last]
+    payload
 end
 
 function _borrow_exact_header_payload(reader::ProtocolReader, hsize::Int, total::Int)
@@ -432,8 +433,8 @@ function _borrow_exact_header_payload(reader::ProtocolReader, hsize::Int, total:
     end
     first == CRLF_BYTES[1] && second == CRLF_BYTES[2] ||
         throw(ProtocolError("message payload missing CRLF trailer"))
-    header = hsize == 0 ? EMPTY_BYTES : @view reader.buffer[header_first:(payload_first - 1)]
-    payload = total == hsize ? EMPTY_BYTES : @view reader.buffer[payload_first:payload_last]
+    header = @view reader.buffer[header_first:(payload_first - 1)]
+    payload = @view reader.buffer[payload_first:payload_last]
     reader.first = trailer_first + 2
     header, payload
 end
@@ -488,8 +489,8 @@ function _malformed_control_line(kind::AbstractString, bytes::AbstractVector{UIn
     throw(ProtocolError("malformed $kind control line: $(_bytes_string(bytes, first, last))"))
 end
 
-function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
-                        max_payload::Int, borrow_payload)
+function _read_msg_line_handle(reader::ProtocolReader, line_first::Int, line_last::Int,
+                               max_payload::Int, borrow_payload, msg_handler)
     bytes = reader.buffer
     subject_start, subject_end, pos = _next_token(bytes, line_first + 4, line_last)
     subject_start == 0 && _malformed_control_line("MSG", bytes, line_first, line_last)
@@ -507,14 +508,20 @@ function _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
     size = _validate_payload_size(_parse_int_token(bytes, size_start, size_end), max_payload)
     if borrow_payload(sid)
         payload = _borrow_exact_payload(reader, size)
-        return _protocol_msg_frame(BorrowedMsg(subject, reply, payload, nothing, sid, 0))
+        return msg_handler(BorrowedMsg(subject, reply, payload, nothing, sid, 0))
     end
     payload = _read_exact_payload(reader, size)
-    _protocol_msg_frame(Msg(subject, reply, payload, nothing, sid))
+    msg_handler(Msg(subject, reply, payload, nothing, sid))
 end
 
-function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
-                         max_payload::Int, max_header_bytes::Int, borrow_payload)
+_read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
+               max_payload::Int, borrow_payload) =
+    _read_msg_line_handle(reader, line_first, line_last, max_payload, borrow_payload,
+                          _ProtocolMsgFrameHandler())
+
+function _read_hmsg_line_handle(reader::ProtocolReader, line_first::Int, line_last::Int,
+                                max_payload::Int, max_header_bytes::Int, borrow_payload,
+                                msg_handler)
     bytes = reader.buffer
     subject_start, subject_end, pos = _next_token(bytes, line_first + 5, line_last)
     subject_start == 0 && _malformed_control_line("HMSG", bytes, line_first, line_last)
@@ -542,16 +549,21 @@ function _read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int
     hdrs = LazyHeaders(header_bytes)
     msg = borrowed ? BorrowedMsg(subject, reply, payload, hdrs, sid, hsize) :
           Msg(subject, reply, payload, hdrs, sid, hsize)
-    _protocol_msg_frame(msg)
+    msg_handler(msg)
 end
 
-function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
-                              max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
-                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES,
-                              borrow_payload=_NoBorrowedPayloads())
-    line_range = _readline_crlf_range(reader, max_control_line)
-    line_first = first(line_range)
-    line_last = last(line_range)
+_read_hmsg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
+                max_payload::Int, max_header_bytes::Int, borrow_payload) =
+    _read_hmsg_line_handle(reader, line_first, line_last, max_payload, max_header_bytes,
+                           borrow_payload, _ProtocolMsgFrameHandler())
+
+struct _ProtocolMsgFrameHandler end
+@inline (::_ProtocolMsgFrameHandler)(msg::_ProtocolMsg) = _protocol_msg_frame(msg)
+
+function _read_control_or_msg_impl(reader::ProtocolReader, max_control_line::Int,
+                                   max_payload::Int, max_header_bytes::Int,
+                                   borrow_payload, msg_handler)
+    line_first, line_last = _readline_crlf_bounds(reader, max_control_line)
     line_last >= line_first || throw(ProtocolError("empty protocol line"))
     bytes = reader.buffer
     line_len = line_last - line_first + 1
@@ -562,7 +574,8 @@ function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFA
                     bytes[line_first + 1] == UInt8('S') &&
                     bytes[line_first + 2] == UInt8('G') &&
                     bytes[line_first + 3] == UInt8(' ')
-                return _read_msg_line(reader, line_first, line_last, max_payload, borrow_payload)
+                return _read_msg_line_handle(reader, line_first, line_last, max_payload,
+                                             borrow_payload, msg_handler)
             end
         elseif command == UInt8('H')
             if line_len >= 5 &&
@@ -570,7 +583,8 @@ function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFA
                     bytes[line_first + 2] == UInt8('S') &&
                     bytes[line_first + 3] == UInt8('G') &&
                     bytes[line_first + 4] == UInt8(' ')
-                return _read_hmsg_line(reader, line_first, line_last, max_payload, max_header_bytes, borrow_payload)
+                return _read_hmsg_line_handle(reader, line_first, line_last, max_payload,
+                                              max_header_bytes, borrow_payload, msg_handler)
             end
         elseif command == UInt8('I')
             if line_len >= 5 &&
@@ -619,6 +633,14 @@ function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFA
     throw(ProtocolError("unknown protocol line: $line"))
 end
 
+function _read_control_or_msg(reader::ProtocolReader; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
+                              max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
+                              max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES,
+                              borrow_payload=_NoBorrowedPayloads())
+    _read_control_or_msg_impl(reader, max_control_line, max_payload, max_header_bytes,
+                              borrow_payload, _ProtocolMsgFrameHandler())
+end
+
 function _read_control_or_msg(io; max_control_line::Int=DEFAULT_MAX_CONTROL_LINE,
                               max_payload::Int=DEFAULT_MAX_INBOUND_PAYLOAD,
                               max_header_bytes::Int=DEFAULT_MAX_HEADER_BYTES)
@@ -641,6 +663,12 @@ function _read_control_or_msg(reader::ProtocolReader, opts::ConnectOptions, borr
                          max_payload=opts.max_inbound_payload,
                          max_header_bytes=opts.max_header_bytes,
                          borrow_payload)
+end
+
+function _read_control_or_msg_dispatch(reader::ProtocolReader, opts::ConnectOptions,
+                                       borrow_payload, msg_handler)
+    _read_control_or_msg_impl(reader, opts.max_control_line, opts.max_inbound_payload,
+                              opts.max_header_bytes, borrow_payload, msg_handler)
 end
 
 function _find_byte(bytes::AbstractVector{UInt8}, byte::UInt8, pos::Int, stop::Int)

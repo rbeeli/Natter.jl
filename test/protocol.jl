@@ -158,6 +158,28 @@ end
     @test hmsg.data isa SubArray
     @test parent(hmsg.data) === hreader.buffer
 
+    empty_raw = TestHelpers.bytes("MSG empty 11 0\r\n\r\n")
+    empty_reader = N.ProtocolReader(IOBuffer(empty_raw); read_size=length(empty_raw))
+    empty_frame = N._read_control_or_msg(empty_reader; borrow_payload=_ -> true)
+    empty_msg = N._protocol_msg(empty_frame)
+    @test empty_msg isa BorrowedMsg
+    @test isempty(empty_msg.data)
+    @test empty_msg.data isa N._BorrowedDispatchData
+    @test parent(empty_msg.data) === empty_reader.buffer
+
+    empty_hdr = N._headers_bytes(Headers("Trace" => ["empty"]))
+    empty_hraw = vcat(TestHelpers.bytes("HMSG empty.headers 12 $(length(empty_hdr)) $(length(empty_hdr))\r\n"),
+                      empty_hdr, N.CRLF_BYTES)
+    empty_hreader = N.ProtocolReader(IOBuffer(empty_hraw); read_size=length(empty_hraw))
+    empty_hframe = N._read_control_or_msg(empty_hreader; borrow_payload=_ -> true)
+    empty_hmsg = N._protocol_msg(empty_hframe)
+    @test empty_hmsg isa BorrowedMsg
+    @test empty_hmsg.headers.raw isa N._BorrowedDispatchData
+    @test empty_hmsg.data isa N._BorrowedDispatchData
+    @test parent(empty_hmsg.headers.raw) === empty_hreader.buffer
+    @test parent(empty_hmsg.data) === empty_hreader.buffer
+    @test isempty(empty_hmsg.data)
+
     large = fill(UInt8('x'), 256)
     large_raw = vcat(TestHelpers.bytes("MSG large 4 $(length(large))\r\n"), large, N.CRLF_BYTES)
     large_reader = N.ProtocolReader(IOBuffer(large_raw); read_size=16, shrink_threshold=64)

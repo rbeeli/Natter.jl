@@ -175,6 +175,9 @@ function _kv_entry_from_stored_msg(kv::KeyValue, msg::AbstractMsg, revision::Int
     _kv_entry(kv, msg, revision, created, 0)
 end
 
+_kv_entry_from_stored_msg(kv::KeyValue, msg::StoredMsg)::KeyValueEntry =
+    _kv_entry(kv, msg, msg.seq, msg.created, 0)
+
 _kv_created_from_timestamp_ns(timestamp_ns::Int)::DateTime =
     DateTime(1970, 1, 1) + Millisecond(timestamp_ns ÷ 1_000_000)
 
@@ -431,7 +434,7 @@ function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integ
     timeout = _positive_timeout_seconds("timeout", timeout)
     subject = "$(kv.prefix)$key"
     use_direct = isnothing(direct) ? kv.direct : direct
-    msg, sequence, created = try
+    msg = try
         req = isnothing(revision) ?
               _stream_message_get_request(nothing, subject, false) :
               _stream_message_get_request(revision, nothing, false)
@@ -442,7 +445,7 @@ function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integ
     end
     msg.subject == subject ||
         throw(_kv_not_found_error(kv, key, "expected subject $subject, got $(msg.subject)"))
-    entry = _kv_entry_from_stored_msg(kv, msg, sequence, created)
+    entry = _kv_entry_from_stored_msg(kv, msg)
     _kv_is_delete_marker(entry.operation) && throw(_kv_deleted_error(kv, entry))
     entry
 end
@@ -474,14 +477,14 @@ _kv_delete_marker_revision(msg::AbstractMsg, sequence::Int) =
 function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String; timeout::Real=kv.js.timeout,
                                            cancel_token::MaybeCancellationToken=nothing)
     req = _stream_message_get_request(nothing, subject, false)
-    msg, sequence, _created = try
+    msg = try
         _stream_message_get_api(kv.js, kv.stream, req; timeout, cancel_token)
     catch err
         err isa JetStreamError && err.code == 404 && return nothing
         rethrow()
     end
     msg.subject == subject || return nothing
-    _kv_delete_marker_revision(msg, sequence)
+    _kv_delete_marker_revision(msg, msg.seq)
 end
 
 function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,

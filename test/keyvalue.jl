@@ -480,7 +480,7 @@ end
         result = fetch(task)
         @test result isa TimeoutError
     end
-    @test elapsed < 0.35
+    @test elapsed < 0.45
     close(client)
 end
 

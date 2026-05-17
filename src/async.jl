@@ -113,8 +113,14 @@ stream_info_async(js::JetStreamContext, name::AbstractString; kwargs...)::Natter
 stream_list_async(js::JetStreamContext; kwargs...)::NatterTask =
     _natter_async(stream_list, js; kwargs...)
 
+stream_list_page_async(js::JetStreamContext; kwargs...)::NatterTask =
+    _natter_async(stream_list_page, js; kwargs...)
+
 stream_names_async(js::JetStreamContext; kwargs...)::NatterTask =
     _natter_async(stream_names, js; kwargs...)
+
+stream_names_page_async(js::JetStreamContext; kwargs...)::NatterTask =
+    _natter_async(stream_names_page, js; kwargs...)
 
 stream_purge_async(js::JetStreamContext, name::AbstractString; kwargs...)::NatterTask =
     _natter_async(stream_purge, js, name; kwargs...)
@@ -142,6 +148,9 @@ consumer_info_async(js::JetStreamContext, stream::AbstractString, consumer::Abst
 
 consumer_list_async(js::JetStreamContext, stream::AbstractString; kwargs...)::NatterTask =
     _natter_async(consumer_list, js, stream; kwargs...)
+
+consumer_list_page_async(js::JetStreamContext, stream::AbstractString; kwargs...)::NatterTask =
+    _natter_async(consumer_list_page, js, stream; kwargs...)
 
 consumer_delete_async(js::JetStreamContext, stream::AbstractString, consumer::AbstractString; kwargs...)::NatterTask =
     _natter_async(consumer_delete, js, stream, consumer; kwargs...)
