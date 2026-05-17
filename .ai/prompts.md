@@ -6,4 +6,8 @@ Do a full review of the Natter.jl library. Review for correctness, sufficient co
 
 ---
 
-Proceed with implementation. use clean code, clear separation of concerns, type stable functions and data structures. do not maintain backwards compatibility in the Natter.jl public API, just refactor to the best solution.
+Proceed with implementation. use clean code, clear separation of concerns, type stable functions and data structures. do not maintain backwards compatibility in the Natter.jl public API, just refactor to the best solution. Existing Go/Rust/C NATS client libraries can be found in the /mnt/data/repos/ folder.
+
+---
+
+fix/address the review findings. use clean code, clear separation of concerns, type stable functions and data structures. do not maintain backwards compatibility in the Natter.jl public API, just refactor to the best solution. Existing Go/Rust/C NATS client libraries can be found in the /mnt/data/repos/ folder.
