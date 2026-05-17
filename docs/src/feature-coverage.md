@@ -24,8 +24,8 @@ Statuses:
 | Request/reply | Supported | Shared inbox mux, timeouts, and `NoRespondersError` when supported by the server. |
 | Flush and ping | Supported | `flush`/`ping` use a server round trip. |
 | Drain and close | Supported | Subscription/client drain and deterministic close paths. |
-| Reconnect | Supported | Automatic reconnect, optional initial-connect retry, randomized server-pool attempts with ordered opt-out, discovered servers, subscription replay, bounded publish replay, lifecycle events, delay callbacks, and bounded live-server chaos CI are implemented. Broader cluster chaos and auth failover scenarios remain as additional hardening coverage. |
-| Publish replay | Partial | Buffered core publishes are replayed best-effort and can duplicate after ambiguous network failures. Use JetStream `msg_id` for durable idempotent publish paths. |
+| Reconnect | Supported | Automatic reconnect, optional initial-connect retry, randomized server-pool attempts with ordered opt-out, discovered servers, subscription replay, optional bounded publish replay, lifecycle events, delay callbacks, and bounded live-server chaos CI are implemented. Broader cluster chaos and auth failover scenarios remain as additional hardening coverage. |
+| Publish replay | Partial | Buffered core publishes are replayed best-effort when `pending_size > 0` and can duplicate after ambiguous network failures. Use `pending_size=0` to disable replay buffering, or JetStream `msg_id` for durable idempotent publish paths. |
 | Slow consumer handling | Supported | Per-subscription pending limits report `SlowConsumerError`. |
 | Runtime inspection | Supported | `status`, `stats`, and `connected_url`. |
 | Async handles | Supported | Task-backed `_async` helpers return `NatterTask`; blocking calls accept cooperative cancellation tokens and async handles rethrow `CancelledError` from cancelled operations. JetStream publish has a protocol async publisher with `JetStreamPublishFuture`. |

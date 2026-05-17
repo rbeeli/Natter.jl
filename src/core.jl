@@ -10,13 +10,14 @@ function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; bu
                    cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     st = status(client)
+    can_buffer_reconnect = buffer_on_reconnect && _reconnect_buffer_enabled(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
             _write_raw(client, data; force_flush, deadline, write_mode=_RAW_WRITE_DRAIN,
                        cancel_token)
         catch err
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
-                if buffer_on_reconnect
+                if can_buffer_reconnect
                     _enqueue_pending(client, data)
                     return nothing
                 end
@@ -25,7 +26,7 @@ function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; bu
             rethrow()
         end
     elseif st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING)
-        if buffer_on_reconnect
+        if can_buffer_reconnect
             _enqueue_pending(client, data)
         else
             throw(ConnectionReconnectingError())
@@ -164,15 +165,16 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
                        force_flush::Bool=false,
                        frame_size::Int=_serialized_size(frame),
                        st::ConnectionStatus.T=status(client))
+    can_buffer_reconnect = buffer_on_reconnect && _reconnect_buffer_enabled(client)
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         replayable_captured = false
         try
             replayable_captured = _write_publish(client, frame; force_flush,
-                                                 replayable=buffer_on_reconnect, frame_size)
+                                                 replayable=can_buffer_reconnect, frame_size)
         catch err
             err isa OutboundBufferLimitError && rethrow()
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
-                if buffer_on_reconnect
+                if can_buffer_reconnect
                     replayable_captured || _enqueue_pending(client, frame)
                     return nothing
                 end
@@ -181,7 +183,7 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
             rethrow()
         end
     elseif st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING)
-        if buffer_on_reconnect
+        if can_buffer_reconnect
             _enqueue_pending(client, frame)
         else
             throw(ConnectionReconnectingError())
@@ -272,7 +274,10 @@ _pending_chunk(frame::_AbstractPublishFrame) =
 
 function _ensure_pending_enqueue_allowed_locked(client::Client)
     st = client.status
-    st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING) && return nothing
+    if st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING)
+        _reconnect_buffer_enabled(client) || throw(ConnectionReconnectingError())
+        return nothing
+    end
     st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
     st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
     st == ConnectionStatus.DRAINING && throw(ConnectionDrainingError())

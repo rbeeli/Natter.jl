@@ -8,6 +8,7 @@ using TestItems
     @test N.ConnectOptions().allow_reconnect
     @test !N.ConnectOptions().retry_on_initial_connect
     @test N.ConnectOptions().max_reconnect_attempts == -1
+    @test N.ConnectOptions(pending_size=0).pending_size == 0
     @test N.ConnectOptions().sub_pending_msgs_limit == 1024
 
     @test N._validate_subject("foo.*.bar") == "foo.*.bar"
@@ -119,6 +120,14 @@ using TestItems
 
     small = TestHelpers.fake_client(; opts=N.ConnectOptions(pending_size=3), status=N.ConnectionStatus.RECONNECTING)
     @test_throws OutboundBufferLimitError N._send_raw(small, TestHelpers.bytes("abcd"); buffer_on_reconnect=true)
+
+    disabled = TestHelpers.fake_client(; opts=N.ConnectOptions(pending_size=0),
+                                       status=N.ConnectionStatus.RECONNECTING)
+    @test_throws ConnectionReconnectingError publish(disabled, "foo", "bar")
+    @test_throws ConnectionReconnectingError N._send_raw(disabled, TestHelpers.bytes("PING\r\n");
+                                                        buffer_on_reconnect=true)
+    @test disabled.pending_bytes == 0
+    @test isempty(take!(disabled.pending))
 
     closed = TestHelpers.fake_client(; status=N.ConnectionStatus.DISCONNECTED)
     @test_throws ConnectionClosedError publish(closed, "foo", "bar")
@@ -505,7 +514,8 @@ end
     rejects(reconnect_wait=2.0, reconnect_max_wait=1.0)
     rejects(reconnect_jitter=-0.1)
     rejects(max_reconnect_attempts=-2)
-    rejects(pending_size=0)
+    rejects(pending_size=-1)
+    rejects(pending_size=true)
     rejects(write_buffer_size=-1)
     rejects(write_timeout=0)
     rejects(write_timeout=Inf)
@@ -1348,6 +1358,33 @@ end
     @test stats(client).out_msgs == 1
 
     close(client)
+end
+
+@testitem "pending_size zero disables reconnect publish replay" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    opts = N.ConnectOptions(pending_size=0, write_buffer_size=1024 * 1024)
+    transport = TestHelpers.WriteCapture()
+    write_io = N.BufferedWriteIO(transport)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io)
+
+    publish(client, "foo", "bar")
+
+    expected = "PUB foo 3\r\nbar\r\n"
+    @test N._buffered_bytes(write_io) == ncodeunits(expected)
+    @test isempty(write_io.replayable_entries)
+    @test client.pending_bytes == 0
+
+    N._take_transport!(client; preserve_replayable=true)
+
+    @test N._buffered_bytes(write_io) == 0
+    @test client.pending_bytes == 0
+    @test isempty(take!(client.pending))
+
+    close(transport)
 end
 
 @testitem "reconnect preserves replayable buffered publishes after flusher failure" setup=[TestHelpers] begin

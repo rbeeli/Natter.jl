@@ -715,7 +715,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
             throw(ArgumentError("reconnect_max_wait must be greater than or equal to reconnect_wait"))
         reconnect_jitter = _connect_option_nonnegative_float("reconnect_jitter", reconnect_jitter)
         max_reconnect_attempts = _connect_option_reconnect_attempts(max_reconnect_attempts)
-        pending_size = _connect_option_positive_int("pending_size", pending_size)
+        pending_size = _connect_option_nonnegative_int("pending_size", pending_size)
         write_buffer_size = _connect_option_nonnegative_int("write_buffer_size", write_buffer_size)
         write_buffer_latency = _connect_option_nonnegative_float("write_buffer_latency", write_buffer_latency)
         write_timeout = _connect_option_positive_float("write_timeout", write_timeout)

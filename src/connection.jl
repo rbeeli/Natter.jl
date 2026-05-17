@@ -860,6 +860,8 @@ function _reserve_pending_bytes_locked!(client::Client, bytes::Int)
     end
 end
 
+_reconnect_buffer_enabled(client::Client)::Bool = client.options.pending_size > 0
+
 function _reserve_pending_bytes!(client::Client, bytes::Int)
     _reserve_pending_bytes_locked!(client, bytes)
     nothing

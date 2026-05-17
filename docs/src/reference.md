@@ -61,7 +61,7 @@ Conventions:
 | `reconnect_max_wait` | `5.0` | Maximum reconnect wait. |
 | `reconnect_jitter` | `0.1` | Added reconnect jitter. |
 | `max_reconnect_attempts` | `-1` | `-1` means unlimited reconnect and initial-retry attempts. |
-| `pending_size` | `2 MiB` | Buffered publish bytes retained for reconnect replay. |
+| `pending_size` | `2 MiB` | Buffered publish bytes retained for reconnect replay; `0` disables replay buffering. |
 | `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |
 | `write_buffer_latency` | `0.001` | Maximum small-write coalescing delay. |
 | `write_timeout` | `10.0` | Maximum write/flush block time. |
