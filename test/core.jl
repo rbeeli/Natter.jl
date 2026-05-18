@@ -1731,6 +1731,87 @@ end
     @test st == N.ConnectionStatus.CONNECTED
 end
 
+@testitem "raw command cancellation interrupts write lock waits" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function cancel_during_write_lock(call, client)
+        source = CancellationSource()
+        token = cancellation_token(source)
+        lock(client.write_lock)
+        task = @async TestHelpers.thrown_exception(() -> call(token))
+        try
+            @test timedwait(1.0; pollint=0.001) do
+                client.write_waiters[] > 0
+            end == :ok
+            @test cancel!(source)
+            finished = timedwait(1.0; pollint=0.001) do
+                istaskdone(task)
+            end
+            @test finished == :ok
+            return finished == :ok ? fetch(task) : nothing
+        finally
+            iscancelled(token) || cancel!(source)
+            unlock(client.write_lock)
+            istaskdone(task) || wait(task)
+        end
+    end
+
+    flush_transport = TestHelpers.WriteCapture()
+    flush_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                           write_io=flush_transport)
+    flush_err = cancel_during_write_lock(flush_client) do token
+        flush(flush_client; timeout=30.0, cancel_token=token)
+    end
+    @test flush_err isa CancelledError
+    @test N.status(flush_client) == N.ConnectionStatus.CONNECTED
+    @test TestHelpers.capture_text(flush_transport) == ""
+    @test length(flush_client.pongs) == 0
+
+    sub_transport = TestHelpers.WriteCapture()
+    sub_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                         write_io=sub_transport)
+    sub_err = cancel_during_write_lock(sub_client) do token
+        subscribe(sub_client, "cancel.subscribe"; cancel_token=token)
+    end
+    @test sub_err isa CancelledError
+    @test N.status(sub_client) == N.ConnectionStatus.CONNECTED
+    @test TestHelpers.capture_text(sub_transport) == ""
+    @test isempty(sub_client.subscriptions)
+
+    request_transport = TestHelpers.WriteCapture()
+    request_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                             write_io=request_transport)
+    request_err = cancel_during_write_lock(request_client) do token
+        request(request_client, "svc.cancel", "body"; timeout=30.0, cancel_token=token)
+    end
+    @test request_err isa CancelledError
+    @test N.status(request_client) == N.ConnectionStatus.CONNECTED
+    @test TestHelpers.capture_text(request_transport) == ""
+    @test isempty(request_client.subscriptions)
+
+    drain_transport = TestHelpers.WriteCapture()
+    drain_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                           write_io=drain_transport)
+    sub = subscribe(drain_client, "cancel.drain")
+    @test (@lock sub.lock sub.server_active)
+    TestHelpers.clear_capture!(drain_transport)
+    drain_err = cancel_during_write_lock(drain_client) do token
+        drain(sub; timeout=30.0, cancel_token=token)
+    end
+    @test drain_err isa CancelledError
+    @test N.status(drain_client) == N.ConnectionStatus.CONNECTED
+    @test TestHelpers.capture_text(drain_transport) == ""
+    @test !sub.closed
+    @test (@lock sub.lock sub.server_active)
+
+    close(flush_client)
+    close(sub_client)
+    close(request_client)
+    close(drain_client)
+end
+
 @testitem "cancelled flush leaves a stale waiter tombstone" setup=[TestHelpers] begin
     using Natter
 

@@ -1102,13 +1102,16 @@ function _js_async_publish_timeout_loop(state::JetStreamAsyncPublishState{C}) wh
     end
 end
 
-function _ensure_js_async_publish_subscription!(state::JetStreamAsyncPublishState{C}) where {C<:Client}
+function _ensure_js_async_publish_subscription!(state::JetStreamAsyncPublishState{C};
+                                                cancel_token::MaybeCancellationToken=nothing) where {C<:Client}
+    _throw_if_cancelled(cancel_token)
     sub = lock(state.condition) do
         state.sub
     end
     _js_async_publish_subscription_active(sub) && return sub::Subscription{C}
 
     @lock state.setup_lock begin
+        _throw_if_cancelled(cancel_token)
         sub = lock(state.condition) do
             state.sub
         end
@@ -1118,7 +1121,7 @@ function _ensure_js_async_publish_subscription!(state::JetStreamAsyncPublishStat
         if !isnothing(sub)
             closed = @lock sub.lock sub.closed
             if !closed
-                _send_subscription_now!(sub) || throw(ConnectionReconnectingError())
+                _send_subscription_now!(sub; cancel_token) || throw(ConnectionReconnectingError())
                 _js_async_publish_subscription_active(sub) && return sub::Subscription{C}
                 throw(ConnectionReconnectingError())
             end
@@ -1128,7 +1131,8 @@ function _ensure_js_async_publish_subscription!(state::JetStreamAsyncPublishStat
                          _control_handler=_JetStreamAsyncPublishControlHandler(state),
                          pending_msgs_limit=state.max_pending,
                          pending_bytes_limit=state.client.options.sub_pending_bytes_limit,
-                         require_connected=true)
+                         require_connected=true,
+                         cancel_token)
         lock(state.condition)
         try
             state.sub = sub
@@ -1248,7 +1252,7 @@ function js_publish_future(js::JetStreamContext, subject::AbstractString, data=n
                                schedule_target, schedule_source, schedule_ttl, schedule_timezone)
     frame = _publish_frame(subject, nothing, data, hdrs)
     _validate_publish_frame_for_client(js.client, frame)
-    _ensure_js_async_publish_subscription!(js.publish_futures)
+    _ensure_js_async_publish_subscription!(js.publish_futures; cancel_token)
 
     deadline = time() + timeout
     generation = _load_generation(js.client)
@@ -4585,7 +4589,7 @@ function _ack_request_raw(client::Client, reply::String, kind::Symbol; delay=not
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     payload = _ack_payload(kind; delay)
-    mux = _ensure_request_mux(client)
+    mux = _ensure_request_mux(client; cancel_token)
     token, waiter = _register_request_waiter!(client, mux, timeout)
     response_subject = waiter.reply
     try

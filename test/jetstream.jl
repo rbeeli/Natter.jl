@@ -672,6 +672,44 @@ end
     end
 end
 
+@testitem "JetStream publish future setup honors cancellation while waiting for write lock" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+
+    source = CancellationSource()
+    token = cancellation_token(source)
+    lock(client.write_lock)
+    task = @async TestHelpers.thrown_exception() do
+        js_publish_future(js, "orders.created", "payload"; cancel_token=token)
+    end
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            client.write_waiters[] > 0
+        end == :ok
+        @test cancel!(source)
+        finished = timedwait(1.0; pollint=0.001) do
+            istaskdone(task)
+        end
+        @test finished == :ok
+        err = finished == :ok ? fetch(task) : nothing
+        @test err isa CancelledError
+        @test js_publish_future_pending(js) == 0
+        @test TestHelpers.capture_text(capture) == ""
+        @test isempty(client.subscriptions)
+        @test N.status(client) == N.ConnectionStatus.CONNECTED
+    finally
+        iscancelled(token) || cancel!(source)
+        unlock(client.write_lock)
+        istaskdone(task) || wait(task)
+        close(client)
+    end
+end
+
 @testitem "JetStream async publish timeout monitor accepts long deadlines" setup=[TestHelpers] begin
     using Natter
 

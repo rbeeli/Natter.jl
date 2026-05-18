@@ -16,6 +16,7 @@ function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; bu
             _write_raw(client, data; force_flush, deadline, write_mode=_RAW_WRITE_DRAIN,
                        cancel_token)
         catch err
+            err isa CancelledError && rethrow()
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
                 if can_buffer_reconnect
                     _enqueue_pending(client, data)
@@ -274,7 +275,8 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
     nothing
 end
 
-function _send_subscription_now!(sub::Subscription)
+function _send_subscription_now!(sub::Subscription; cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     sid, subject, queue, max_msgs, delivered = @lock sub.lock begin
         (sub.sid, sub.subject, sub.queue, sub.max_msgs, sub.delivered)
     end
@@ -284,13 +286,14 @@ function _send_subscription_now!(sub::Subscription)
         return false
     end
     try
-        _write_raw(sub.client, _sub_cmd(subject, queue, sid))
+        _write_raw(sub.client, _sub_cmd(subject, queue, sid); cancel_token)
         if remaining > 0
-            _write_raw(sub.client, _unsub_cmd(sid, remaining))
+            _write_raw(sub.client, _unsub_cmd(sid, remaining); cancel_token)
         end
         @lock sub.lock sub.server_active = true
         return true
     catch err
+        err isa CancelledError && rethrow()
         if _recover_after_write_failure!(sub.client, err)
             @lock sub.lock sub.server_active = false
             return false
@@ -508,7 +511,9 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
                     max_msgs=0, pending_msgs_limit=client.options.sub_pending_msgs_limit,
                     pending_bytes_limit=client.options.sub_pending_bytes_limit,
                     _control_handler::_SubscriptionControlHandler=_NoSubscriptionControlHandler(),
-                    require_connected::Bool=false)
+                    require_connected::Bool=false,
+                    cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     subject = _validate_subject(subject)
     queue = _validate_queue(queue)
     borrowed = _connect_option_bool("borrowed", borrowed)
@@ -538,7 +543,7 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
     end
     if send_now
         try
-            _send_subscription_now!(sub)
+            _send_subscription_now!(sub; cancel_token)
         catch err
             cleanup_errors = Any[]
             @lock client.lock begin
@@ -561,7 +566,7 @@ end
 function subscribe(client::Client, subject::AbstractString; cancel_token::MaybeCancellationToken=nothing,
                    kwargs...)
     _throw_if_cancelled(cancel_token)
-    _subscribe(client, subject; kwargs...)
+    _subscribe(client, subject; cancel_token, kwargs...)
 end
 
 function subscribe(callback, client::Client, subject::AbstractString;
@@ -1250,6 +1255,7 @@ function _drain_send_unsub!(sub::Subscription, deadline::Float64;
                 sub.closed || (sub.server_active = false)
             end
         catch err
+            err isa CancelledError && rethrow()
             _drain_timed_out(err) && rethrow()
             _recover_after_write_failure!(sub.client, err) || rethrow()
             throw(ConnectionReconnectingError())
@@ -1586,18 +1592,21 @@ function _close_inactive_request_mux_subscription!(client::Client, sub::Subscrip
     nothing
 end
 
-function _ensure_request_mux(client::Client)
+function _ensure_request_mux(client::Client; cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
     _ensure_usable_status_for_request(status(client))
     mux = @lock client.lock _request_mux_usable_locked(client)
     isnothing(mux) || return mux
 
     @lock client.request_mux_lock begin
+        _throw_if_cancelled(cancel_token)
         _ensure_usable_status_for_request(status(client))
         mux = @lock client.lock _request_mux_usable_locked(client)
         isnothing(mux) || return mux
 
         prefix = new_inbox(client)
-        sub = _subscribe(client, "$prefix.*"; _control_handler=_RequestMuxControlHandler())
+        sub = _subscribe(client, "$prefix.*"; _control_handler=_RequestMuxControlHandler(),
+                         cancel_token)
         if !_request_mux_usable_for_new_sub(client, sub)
             _close_inactive_request_mux_subscription!(client, sub)
             throw(ConnectionReconnectingError())
@@ -1799,7 +1808,7 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     st = status(client)
     _ensure_request_publish_ready(client, st)
     _validate_publish_frame_for_client(client, request_frame)
-    mux = _ensure_request_mux(client)
+    mux = _ensure_request_mux(client; cancel_token)
     token, waiter = _register_request_waiter!(client, mux, timeout)
     reply = waiter.reply
     try
