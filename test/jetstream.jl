@@ -3254,9 +3254,10 @@ end
     queue_lock = ReentrantLock()
     queue_condition = Base.Threads.Condition(queue_lock)
     queue = N.MsgQueue{Msg}(1)
+    stream_task = @async nothing
     stream = N.PullMessageStream{typeof(client),typeof(psub)}(
         psub, delivery, queue, queue_lock, queue_condition, config, UInt8[],
-        Task(() -> nothing), nothing, state)
+        stream_task, nothing, state)
 
     first = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("first"))
     second = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.2.2.0.0", TestHelpers.bytes("second"))
@@ -3338,6 +3339,19 @@ end
 
     missing = Msg("_INBOX.pull.token", nothing, UInt8[])
     @test N._pull_stream_status_pending(missing) == (0, 0)
+
+    state = N._PullMessageStreamState()
+    config = N._PullStreamConfig(2, nothing, 1.0, 0.0, 2, nothing,
+                                 nothing, nothing, nothing, nothing, nothing, 4)
+    @test !isnothing(N._reserve_pull_stream_request!(config, state))
+    delivered = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one"))
+    @lock state.lock N._pull_stream_decrement_requested!(state, delivered)
+    @test state.requested_messages == 1
+    @lock state.lock begin
+        @test N._pull_stream_release_terminal_request!(state, missing)
+        @test state.requested_messages == 0
+        @test isempty(state.requests)
+    end
 
     invalid_messages = Msg("_INBOX.pull.token", nothing, UInt8[];
                            headers=Headers("Nats-Pending-Messages" => ["abc"]))

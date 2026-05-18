@@ -3,8 +3,6 @@ using TestItems
 @testmodule ChaosTestHelpers begin
     using Natter
 
-    const N = Natter
-
     chaos_enabled() =
         get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" &&
         get(ENV, "NATTER_RUN_CHAOS", "false") == "true"
@@ -15,13 +13,13 @@ using TestItems
 
     function wait_reconnecting(client; timeout::Real)
         timedwait(timeout; pollint=0.01) do
-            N.status(client) == N.ConnectionStatus.RECONNECTING
+            status(client) == ConnectionStatus.RECONNECTING
         end != :timed_out
     end
 
     function wait_reconnected(client, expected_reconnects::Int; timeout::Real)
         timedwait(timeout; pollint=0.02) do
-            N.status(client) == N.ConnectionStatus.CONNECTED &&
+            status(client) == ConnectionStatus.CONNECTED &&
                 stats(client).reconnects >= expected_reconnects
         end != :timed_out
     end
@@ -68,7 +66,7 @@ end
                 end
 
                 IntegrationHelpers.publish_and_flush(client, subject, "before"; timeout=io_timeout)
-                @test String(N.next(sub[]; timeout=io_timeout)) == "before"
+                @test String(next(sub[]; timeout=io_timeout)) == "before"
 
                 for i in 1:IntegrationHelpers.chaos_iterations()
                     expected_reconnects = stats(client).reconnects + 1
@@ -82,7 +80,7 @@ end
                                                             timeout=max(io_timeout, 5.0))
 
                     flush(client; timeout=io_timeout)
-                    @test String(N.next(sub[]; timeout=io_timeout)) == "during-$i"
+                    @test String(next(sub[]; timeout=io_timeout)) == "during-$i"
                     @test String(request(client, "$subject.req", "$i"; timeout=io_timeout)) == "reply-$i"
                 end
             finally
@@ -139,13 +137,13 @@ end
                 @test saw_slow
                 @test stats(client).dropped_msgs > 0
 
-                @test startswith(String(N.next(sub; timeout=io_timeout)), "msg-")
+                @test startswith(String(next(sub; timeout=io_timeout)), "msg-")
 
                 healthy_subject = "$subject.healthy"
                 healthy = subscribe(client, healthy_subject)
                 try
                     IntegrationHelpers.publish_and_flush(client, healthy_subject, "ok"; timeout=io_timeout)
-                    @test String(N.next(healthy; timeout=io_timeout)) == "ok"
+                    @test String(next(healthy; timeout=io_timeout)) == "ok"
                 finally
                     close(healthy)
                 end
@@ -216,8 +214,8 @@ end
             finally
                 try
                     try
-                        !isnothing(psub[]) && N.status(client) == N.ConnectionStatus.CONNECTED && close(psub[])
-                        stream_created[] && N.status(client) == N.ConnectionStatus.CONNECTED &&
+                        !isnothing(psub[]) && status(client) == ConnectionStatus.CONNECTED && close(psub[])
+                        stream_created[] && status(client) == ConnectionStatus.CONNECTED &&
                             stream_delete(js, stream; timeout=io_timeout)
                     finally
                         close(client)
@@ -284,8 +282,8 @@ end
             finally
                 try
                     try
-                        !isnothing(watcher[]) && N.status(client) == N.ConnectionStatus.CONNECTED && close(watcher[])
-                        !isnothing(kv[]) && N.status(client) == N.ConnectionStatus.CONNECTED &&
+                        !isnothing(watcher[]) && status(client) == ConnectionStatus.CONNECTED && close(watcher[])
+                        !isnothing(kv[]) && status(client) == ConnectionStatus.CONNECTED &&
                             kv_delete_bucket(kv[]; timeout=io_timeout)
                     finally
                         close(client)
@@ -339,7 +337,7 @@ end
                     try
                         while !stop[]
                             try
-                                N.next(sub[]; timeout=0.1)
+                                next(sub[]; timeout=0.1)
                                 received[] += 1
                             catch err
                                 if err isa TimeoutError
@@ -375,7 +373,7 @@ end
                         while drop_count == 0 || time() < deadline
                             sleep(0.4)
                             connected_before_drop = timedwait(5.0; pollint=0.02) do
-                                N.status(client) == N.ConnectionStatus.CONNECTED
+                                status(client) == ConnectionStatus.CONNECTED
                             end
                             if connected_before_drop == :timed_out
                                 put!(task_errors, ErrorException("stress client did not become connected before drop"))

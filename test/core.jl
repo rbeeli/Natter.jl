@@ -1553,7 +1553,7 @@ end
     close(transport)
 end
 
-@testitem "reconnect preserves replayable buffered publishes after flusher failure" setup=[TestHelpers] begin
+@testitem "flusher failure discards ambiguous buffered publishes" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -1583,14 +1583,14 @@ end
     @test_throws ErrorException N._flush_buffered_writes(client)
     N._trigger_reconnect(client, ErrorException("flush failed"))
 
-    @test client.pending_bytes == ncodeunits(expected)
-    @test String(take!(client.pending)) == expected
+    @test client.pending_bytes == 0
+    @test isempty(take!(client.pending))
     @test isnothing(client.write_io)
     @test transport.closed
     !isnothing(client.reconnect_task) && wait(client.reconnect_task)
 end
 
-@testitem "foreground buffered publish flush failure is pending once" setup=[TestHelpers] begin
+@testitem "foreground direct publish write failure is not replayed" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -1612,12 +1612,12 @@ end
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io=N.BufferedWriteIO(transport))
 
-    publish(client, "foo", "bar")
+    err = TestHelpers.thrown_exception(() -> publish(client, "foo", "bar"))
 
-    expected = "PUB foo 3\r\nbar\r\n"
-    @test client.pending_bytes == ncodeunits(expected)
-    @test String(take!(client.pending)) == expected
-    @test stats(client).out_msgs == 1
+    @test err isa ConnectionReconnectingError
+    @test client.pending_bytes == 0
+    @test isempty(take!(client.pending))
+    @test stats(client).out_msgs == 0
     !isnothing(client.reconnect_task) && wait(client.reconnect_task)
 end
 
@@ -1820,7 +1820,7 @@ end
     @test isnothing(client.reconnect_task) || istaskdone(client.reconnect_task)
 end
 
-@testitem "foreground publish write failure starts reconnect and buffers" setup=[TestHelpers] begin
+@testitem "foreground publish write failure starts reconnect without replaying ambiguous data" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -1835,10 +1835,11 @@ end
                                      status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io=transport)
 
-    publish(client, "foo", "bar")
+    @test_throws ConnectionReconnectingError publish(client, "foo", "bar")
     @test N.status(client) == N.ConnectionStatus.RECONNECTING
-    @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
-    @test stats(client).out_msgs == 1
+    @test client.pending_bytes == 0
+    @test isempty(take!(client.pending))
+    @test stats(client).out_msgs == 0
     close(client)
 end
 
@@ -2218,6 +2219,28 @@ end
     N._trigger_reconnect(client, ErrorException("already reconnecting"))
     @test N.status(client) == N.ConnectionStatus.RECONNECTING
     @test closes[] == 0
+end
+
+@testitem "reconnect intent blocks foreground writes before transport swap" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    transport = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+    client.write_reconnect_pending[] = true
+
+    publish(client, "foo", "bar")
+    expected = "PUB foo 3\r\nbar\r\n"
+    @test TestHelpers.capture_text(transport) == ""
+    @test client.pending_bytes == ncodeunits(expected)
+    @test String(take!(client.pending)) == expected
+
+    client.write_reconnect_pending[] = true
+    @test_throws ConnectionReconnectingError publish(client, "foo", "bar";
+                                                     buffer_on_reconnect=false)
+    @test TestHelpers.capture_text(transport) == ""
 end
 
 @testitem "reconnect exhaustion closes subscriptions and wakes consumers" setup=[TestHelpers] begin

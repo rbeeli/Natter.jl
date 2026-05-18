@@ -2203,8 +2203,8 @@ _pull_fetch_next_subject(js::JetStreamContext, stream::AbstractString, consumer:
     string(js.prefix, ".CONSUMER.MSG.NEXT.", stream, ".", consumer)
 
 mutable struct _PullStreamRequest
-    reserved_messages::Int
-    reserved_bytes::Int
+    remaining_messages::Int
+    remaining_bytes::Int
 end
 
 struct _PullStreamReservation
@@ -3423,8 +3423,8 @@ _pull_stream_reserved_bytes(max_bytes::Union{Int,Nothing})::Int =
 
 function _pull_stream_reserve_counters!(state::_PullMessageStreamState,
                                         request::_PullStreamRequest)
-    state.requested_messages += request.reserved_messages
-    state.requested_bytes += request.reserved_bytes
+    state.requested_messages += request.remaining_messages
+    state.requested_bytes += request.remaining_bytes
     nothing
 end
 
@@ -3478,7 +3478,7 @@ function _unreserve_pull_stream_request!(state::_PullMessageStreamState, request
         index = _pull_stream_request_index(state.requests, request)
         if index != 0
             deleteat!(state.requests, index)
-            _pull_stream_release_counters!(state, request.reserved_messages, request.reserved_bytes)
+            _pull_stream_release_counters!(state, request.remaining_messages, request.remaining_bytes)
         end
     end
     nothing
@@ -3511,7 +3511,14 @@ function _pull_stream_msg_bytes(msg::AbstractMsg)::Int
 end
 
 function _pull_stream_decrement_requested!(state::_PullMessageStreamState, msg::Msg)
-    _pull_stream_release_counters!(state, 1, _pull_stream_msg_bytes(msg))
+    bytes = _pull_stream_msg_bytes(msg)
+    _pull_stream_release_counters!(state, 1, bytes)
+    if !isempty(state.requests)
+        request = first(state.requests)
+        request.remaining_messages = max(0, request.remaining_messages - 1)
+        request.remaining_bytes = max(0, request.remaining_bytes - bytes)
+        request.remaining_messages == 0 && deleteat!(state.requests, 1)
+    end
     nothing
 end
 
@@ -3522,14 +3529,17 @@ function _pull_stream_clear_requests!(state::_PullMessageStreamState)
     nothing
 end
 
-function _pull_stream_pending_header(msg::Msg, name::AbstractString)::Int
+function _pull_stream_pending_header_value(msg::Msg, name::AbstractString)::Union{Int,Nothing}
     value = header(msg, name)
-    (isnothing(value) || isempty(value)) && return 0
+    (isnothing(value) || isempty(value)) && return nothing
     parsed = tryparse(Int, value)
     isnothing(parsed) && throw(ProtocolError("invalid $name header: $value"))
     parsed >= 0 || throw(ProtocolError("invalid $name header: $value"))
     parsed
 end
+
+_pull_stream_pending_header(msg::Msg, name::AbstractString)::Int =
+    something(_pull_stream_pending_header_value(msg, name), 0)
 
 function _pull_stream_status_pending(msg::Msg)::Tuple{Int,Int}
     _pull_stream_pending_header(msg, "Nats-Pending-Messages"),
@@ -3539,8 +3549,11 @@ end
 function _pull_stream_release_terminal_request!(state::_PullMessageStreamState,
                                                 msg::Msg)::Bool
     isempty(state.requests) && return false
-    messages, bytes = _pull_stream_status_pending(msg)
-    deleteat!(state.requests, 1)
+    request = popfirst!(state.requests)
+    messages = something(_pull_stream_pending_header_value(msg, "Nats-Pending-Messages"),
+                         request.remaining_messages)
+    bytes = something(_pull_stream_pending_header_value(msg, "Nats-Pending-Bytes"),
+                      request.remaining_bytes)
     _pull_stream_release_counters!(state, messages, bytes)
     true
 end
@@ -3719,7 +3732,11 @@ function consume(callback, psub::PullSubscription; kwargs...)
     stream
 end
 
-function Base.close(stream::PullMessageStream)
+function Base.close(stream::PullMessageStream; timeout::Real=stream.subscription.js.timeout,
+                    cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
+    timeout = _positive_timeout_seconds("timeout", timeout)
+    deadline = time() + timeout
     already_closed = _pull_stream_close_state!(stream.state)
     errors = Any[]
     if !already_closed
@@ -3734,6 +3751,15 @@ function Base.close(stream::PullMessageStream)
         isopen(stream.messages) && close(stream.messages)
         notify(stream.message_condition; all=true)
     end
+    _wait_task!(errors, "stop pull message stream $(stream.subscription.consumer)",
+                stream.task; timeout, interrupt=true, deadline)
+    callback_task = stream.callback_task
+    if !isnothing(callback_task) && callback_task !== current_task()
+        _wait_task!(errors, "stop pull consume callback $(stream.subscription.consumer)",
+                    callback_task; timeout, interrupt=true, deadline)
+    end
+    err = _pull_stream_error(stream.state)
+    isnothing(err) || push!(errors, err)
     _throw_errors(errors)
     nothing
 end

@@ -68,6 +68,17 @@ end
     @test isnothing(fetch(pull_task))
     @test pull.closed
 
+    stream_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                            write_io=TestHelpers.WriteCapture())
+    stream_js = jetstream(stream_client)
+    stream_pull = N.PullSubscription(stream_js, "S", "C", ReentrantLock(), ReentrantLock(), false, false)
+    stream = messages(stream_pull; batch=1, expires=1.0, heartbeat=0, stop_after=1)
+    stream_task = close_async(stream; timeout=1.0)
+    @test stream_task isa NatterTask
+    @test isnothing(fetch(stream_task))
+    @test !(@lock stream_pull.close_lock stream_pull.active_stream)
+    close(stream_pull)
+
     push_core = subscribe(client, "_INBOX.push")
     push = N.PushSubscription(js, push_core, "S", "C", ReentrantLock(), false, false)
     push_task = close_async(push; timeout=0.1)

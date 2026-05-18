@@ -1578,6 +1578,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     @atomic write_io::Union{WriteIO,Nothing}
     lock::ReentrantLock
     write_lock::ReentrantLock
+    write_reconnect_pending::Threads.Atomic{Bool}
     write_scratch::Vector{UInt8}
     write_deadline::Threads.Atomic{Float64}
     write_epoch::Threads.Atomic{Int}
@@ -1665,6 +1666,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                    info, Threads.Atomic{Int}(something(info.max_payload, typemax(Int))),
                                    Threads.Atomic{Bool}(info.headers === true),
                                    socket, read_io, reader, write_io, lock, write_lock,
+                                   Threads.Atomic{Bool}(false),
                                    UInt8[], Threads.Atomic{Float64}(Inf), Threads.Atomic{Int}(0),
                                    Threads.Atomic{Int}(0), Ref{Any}(nothing), Ref(""), nothing,
                                    flush_signal, flusher_task,
@@ -1818,8 +1820,12 @@ function _resolve_request_waiter_locked!(waiter::RequestWaiter{C},
 end
 
 @inline _load_status(client::Client)::ConnectionStatus.T = ConnectionStatus.T(client.status_code[])
-@inline _store_status_locked!(client::Client, value::ConnectionStatus.T) =
-    (client.status = value; client.status_code[] = Int(value); value)
+@inline function _store_status_locked!(client::Client, value::ConnectionStatus.T)
+    value == ConnectionStatus.CONNECTED || (client.write_reconnect_pending[] = false)
+    client.status = value
+    client.status_code[] = Int(value)
+    value
+end
 @inline _load_generation(client::Client)::Int = client.generation_value[]
 
 @inline function _replace_flush_signal_locked!(client::Client)

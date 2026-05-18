@@ -167,6 +167,9 @@ fetch_async(psub::PullSubscription, batch=1; kwargs...)::NatterTask =
 close_async(psub::PullSubscription; kwargs...)::NatterTask =
     _natter_async(close, psub; kwargs...)
 
+close_async(stream::PullMessageStream; kwargs...)::NatterTask =
+    _natter_async(close, stream; kwargs...)
+
 close_async(psub::PushSubscription; kwargs...)::NatterTask =
     _natter_async(close, psub; kwargs...)
 

@@ -938,9 +938,14 @@ function _flush_write_io(client::Client, io::BufferedWriteIO)
     replayed = _replayable_bytes(io)
     n = position(io.buffer)
     transport = _underlying_transport(io)
-    _run_transport_write(client, transport, "transport flush") do
-        n > 0 && _write_buffered_bytes(transport, io.buffer.data, n)
-        flush(transport)
+    try
+        _run_transport_write(client, transport, "transport flush") do
+            n > 0 && _write_buffered_bytes(transport, io.buffer.data, n)
+            flush(transport)
+        end
+    catch
+        _release_pending_bytes!(client, _take_replayable_bytes!(io))
+        rethrow()
     end
     truncate(io.buffer, 0)
     seekstart(io.buffer)
@@ -950,10 +955,21 @@ function _flush_write_io(client::Client, io::BufferedWriteIO)
     nothing
 end
 
-function _flush_or_signal_locked(client::Client, io; force_flush::Bool=false)
+_should_flush_write_io(client::Client, io; force_flush::Bool=false)::Bool =
+    _should_flush_write_io(client, io, force_flush)
+
+function _should_flush_write_io(client::Client, io, force_flush::Bool)::Bool
     buffered = _buffered_bytes(io)
     threshold = max(0, client.options.write_buffer_size)
-    if force_flush || (buffered > 0 && threshold == 0) || (threshold > 0 && buffered >= threshold)
+    force_flush || (buffered > 0 && threshold == 0) || (threshold > 0 && buffered >= threshold)
+end
+
+_flush_or_signal_locked(client::Client, io; force_flush::Bool=false) =
+    _flush_or_signal_locked(client, io, force_flush)
+
+function _flush_or_signal_locked(client::Client, io, force_flush::Bool)
+    buffered = _buffered_bytes(io)
+    if _should_flush_write_io(client, io, force_flush)
         _flush_write_io(client, io)
     elseif buffered > 0
         _signal_flusher(client)
@@ -989,8 +1005,11 @@ function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; f
                     deadline=nothing, write_mode::_RawWriteMode=_RAW_WRITE_CONNECTED,
                     cancel_token::MaybeCancellationToken=nothing)
     _with_write_lock(client, "write protocol command"; deadline, cancel_token) do
-        st = @lock client.lock client.status
+        st = status(client)
         io = @atomic client.write_io
+        reconnect_pending = client.write_reconnect_pending[]
+        reconnect_pending && st == ConnectionStatus.CONNECTED &&
+            write_mode != _RAW_WRITE_RECONNECT_REPLAY && throw(ConnectionReconnectingError())
         _ensure_raw_write_status(st, write_mode)
         isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
         _write_raw_to_io(client, io, data; force_flush)
@@ -1855,21 +1874,56 @@ function _notify_pong(client::Client)
     nothing
 end
 
-function _trigger_reconnect(client::Client, reason)
+function _mark_reconnect_pending!(client::Client)::Bool
+    @lock client.lock begin
+        client.status == ConnectionStatus.CONNECTED || return false
+        client.write_reconnect_pending[] && return false
+        client.write_reconnect_pending[] = true
+        true
+    end
+end
+
+function _begin_reconnect_transition!(client::Client)
     opts = client.options
     should_start = false
     generation = 0
     notify_subs = Subscription[]
-    @lock client.lock begin
-        if client.status == ConnectionStatus.CONNECTED
-            _bump_generation_locked!(client)
-            generation = client.generation
-            _store_status_locked!(client, opts.allow_reconnect ? ConnectionStatus.RECONNECTING : ConnectionStatus.DISCONNECTED)
-            client.flusher_task = nothing
-            should_start = opts.allow_reconnect
-            notify_subs = collect(values(client.subscriptions))
+    replayable = _PendingEntry[]
+    dropped_replayable = 0
+    transports = (nothing, nothing, nothing)
+
+    _with_write_lock(client, "begin reconnect") do
+        read_io, write_io, sock, preserve = @lock client.lock begin
+            if client.status == ConnectionStatus.CONNECTED && client.write_reconnect_pending[]
+                _bump_generation_locked!(client)
+                generation = client.generation
+                should_start = opts.allow_reconnect
+                _store_status_locked!(client, should_start ? ConnectionStatus.RECONNECTING : ConnectionStatus.DISCONNECTED)
+                client.flusher_task = nothing
+                notify_subs = collect(values(client.subscriptions))
+                read_io, write_io, sock = _take_transport_fields_locked!(client)
+                read_io, write_io, sock, should_start
+            else
+                client.write_reconnect_pending[] = false
+                nothing, nothing, nothing, false
+            end
+        end
+        transports = (read_io, write_io, sock)
+        if preserve && !isnothing(write_io)
+            replayable = _take_replayable_writes!(write_io)
+        elseif !isnothing(write_io)
+            dropped_replayable = _take_replayable_bytes!(write_io)
         end
     end
+
+    isempty(replayable) || _prepend_pending!(client, replayable; already_counted=true)
+    _release_pending_bytes!(client, dropped_replayable)
+    generation, should_start, notify_subs, transports
+end
+
+function _trigger_reconnect(client::Client, reason)
+    _mark_reconnect_pending!(client) || return nothing
+    generation, should_start, notify_subs, transports = _begin_reconnect_transition!(client)
     generation == 0 && return nothing
     for sub in notify_subs
         @lock sub.lock begin
@@ -1882,7 +1936,7 @@ function _trigger_reconnect(client::Client, reason)
         _signal_flusher(client)
         _report_cleanup_errors(client, _notify_request_waiters!(client, ConnectionReconnectingError()))
         _report_cleanup_errors(client, _notify_pong_waiters!(client, false))
-        _close_transport_report_errors!(client; preserve_replayable=true)
+        _close_transport_report_errors!(client, transports...)
         _emit_connection_event(client, ConnectionEventKind.DISCONNECTED; err=reason,
                                generation)
         should_spawn = @lock client.lock client.generation == generation && client.status == ConnectionStatus.RECONNECTING
@@ -1898,13 +1952,16 @@ function _trigger_reconnect(client::Client, reason)
         end
         assigned || return nothing
     else
+        _close_transport_report_errors!(client, transports...)
         _terminal_disconnect!(client, generation, reason)
     end
     nothing
 end
 
 function _recover_after_write_failure!(client::Client, err)
-    st, generation = @lock client.lock (client.status, client.generation)
+    st, generation, reconnect_pending =
+        @lock client.lock (client.status, client.generation, client.write_reconnect_pending[])
+    reconnect_pending && st == ConnectionStatus.CONNECTED && return true
     if st == ConnectionStatus.CONNECTED
         if client.options.allow_reconnect
             _report_error(client, err)

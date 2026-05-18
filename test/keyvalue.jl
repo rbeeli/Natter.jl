@@ -457,13 +457,14 @@ end
     end
 
     capture = TestHelpers.WriteCapture()
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+    client = TestHelpers.fake_client(; status=ConnectionStatus.CONNECTED,
                                      read_io=capture, write_io=capture)
     kv = KeyValue(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
     subject = "\$KV.bucket.beta"
+    operation_timeout = 1.0
 
     task = @async try
-        kv_create_key(kv, "beta", "value"; timeout=0.5)
+        kv_create_key(kv, "beta", "value"; timeout=operation_timeout)
     catch err
         err
     end
@@ -472,7 +473,7 @@ end
         !isempty(published_replies(capture, subject))
     end != :timed_out
     reply = first(published_replies(capture, subject))
-    sleep(0.45)
+    sleep(0.9 * operation_timeout)
     mux = client.request_mux
     err_payload = """{"error":{"code":400,"err_code":10071,"description":"wrong last sequence"}}"""
     elapsed = @elapsed begin
@@ -480,7 +481,7 @@ end
         result = fetch(task)
         @test result isa TimeoutError
     end
-    @test elapsed < 0.45
+    @test elapsed < operation_timeout / 2
     close(client)
 end
 

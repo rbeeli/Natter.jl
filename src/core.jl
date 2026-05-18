@@ -39,27 +39,18 @@ function _send_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; bu
     nothing
 end
 
+struct _PublishWriteFailure <: Exception
+    cause::Any
+    captured::Bool
+    attempted::Bool
+end
+
 _should_write_publish_direct(frame_size::Int, threshold::Int)::Bool =
     threshold <= 0 || frame_size >= threshold
 
-function _write_publish_frame(client::Client, io::IO, frame::_AbstractPublishFrame; replayable::Bool=false,
-                              threshold::Int=0, frame_size::Int=_serialized_size(frame),
-                              direct_write::Bool=false)
-    _write_pub_frame_direct_timed(client, io, frame)
-    false
-end
-
-function _write_publish_frame(client::Client, io::BufferedWriteIO, frame::_AbstractPublishFrame; replayable::Bool=false,
-                              threshold::Int=0, frame_size::Int=_serialized_size(frame),
-                              direct_write::Bool=false)
+function _buffer_publish_frame(client::Client, io::BufferedWriteIO, frame::_AbstractPublishFrame,
+                               replayable::Bool, frame_size::Int)
     _ensure_open(io)
-    if direct_write || _should_write_publish_direct(frame_size, threshold)
-        _flush_write_io(client, io)
-        transport = _underlying_transport(io)
-        _write_pub_frame_direct_timed(client, transport, frame; force_flush=true)
-        return false
-    end
-
     start = position(io.buffer) + 1
     entry_count = length(io.replayable_entries)
     replayable_bytes = io.replayable_bytes
@@ -101,30 +92,36 @@ function _write_pub_frame_direct_timed(client::Client, io::IO, frame::_AbstractP
     nothing
 end
 
+function _publish_write_reconnecting_message()
+    "publish write failed during reconnect before it could be safely buffered"
+end
+
 function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flush::Bool=false,
                         replayable::Bool=false, frame_size::Int=_serialized_size(frame),
                         direct_write::Bool=false,
-                        payload_size::Int=_pub_payload_size(frame))::Bool
-    captured = false
+                        payload_size::Int=_pub_payload_size(frame))::Tuple{Bool,Bool}
+    captured, attempted = false, false
     @lock client.write_lock begin
         st = status(client)
         io = @atomic client.write_io
+        reconnect_pending = client.write_reconnect_pending[]
+        reconnect_pending && st == ConnectionStatus.CONNECTED && throw(ConnectionReconnectingError())
         if !(st == ConnectionStatus.CONNECTED || st == ConnectionStatus.DRAINING)
             st == ConnectionStatus.CLOSED && throw(ConnectionClosedError())
             st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
             throw(ConnectionReconnectingError())
         end
         _validate_publish_frame_for_client(client, frame, payload_size)
-        captured = _write_publish_to_active_io(client, io, frame, force_flush, replayable,
-                                               frame_size, direct_write)
+        captured, attempted = _write_publish_to_active_io(client, io, frame, force_flush,
+                                                          replayable, frame_size, direct_write)
     end
-    captured
+    captured, attempted
 end
 
 @noinline function _write_publish_to_active_io(client::Client, io::Union{Nothing,DefaultWriteTransportIO},
                                                frame::_AbstractPublishFrame, force_flush::Bool,
                                                replayable::Bool, frame_size::Int,
-                                               direct_write::Bool)::Bool
+                                               direct_write::Bool)::Tuple{Bool,Bool}
     io === nothing && throw(ConnectionClosedError("connection transport is closed"))
 
     # connect() clients keep a union-typed field so reconnect can swap plain,
@@ -147,18 +144,45 @@ end
 
 function _write_publish_to_active_io(client::Client, io, frame::_AbstractPublishFrame,
                                      force_flush::Bool, replayable::Bool, frame_size::Int,
-                                     direct_write::Bool)::Bool
+                                     direct_write::Bool)::Tuple{Bool,Bool}
     io === nothing && throw(ConnectionClosedError("connection transport is closed"))
     _write_publish_to_io(client, io, frame, force_flush, replayable, frame_size, direct_write)
 end
 
 function _write_publish_to_io(client::Client, io::WriteIO, frame::_AbstractPublishFrame, force_flush::Bool,
-                              replayable::Bool, frame_size::Int, direct_write::Bool) where {WriteIO<:IO}
+                              replayable::Bool, frame_size::Int, direct_write::Bool)::Tuple{Bool,Bool} where {WriteIO<:IO}
+    attempted = false
+    try
+        attempted = true
+        _write_pub_frame_direct_timed(client, io, frame; force_flush)
+        return false, attempted
+    catch err
+        throw(_PublishWriteFailure(err, false, attempted))
+    end
+end
+
+function _write_publish_to_io(client::Client, io::BufferedWriteIO, frame::_AbstractPublishFrame,
+                              force_flush::Bool, replayable::Bool, frame_size::Int,
+                              direct_write::Bool)::Tuple{Bool,Bool}
     threshold = max(0, client.options.write_buffer_size)
-    captured = _write_publish_frame(client, io, frame; replayable, threshold, frame_size,
-                                    direct_write)
-    _flush_or_signal_locked(client, io; force_flush)
-    captured
+    captured, attempted = false, false
+    try
+        if direct_write || _should_write_publish_direct(frame_size, threshold)
+            _flush_write_io(client, io)
+            transport = _underlying_transport(io)
+            attempted = true
+            _write_pub_frame_direct_timed(client, transport, frame; force_flush=true)
+            return false, attempted
+        end
+
+        captured = _buffer_publish_frame(client, io, frame, replayable, frame_size)
+        attempted = _should_flush_write_io(client, io, force_flush)
+        _flush_or_signal_locked(client, io, force_flush)
+        return captured, attempted
+    catch err
+        err isa OutboundBufferLimitError && rethrow()
+        throw(_PublishWriteFailure(err, captured, attempted))
+    end
 end
 
 function _throw_not_connected_for_request(st::ConnectionStatus.T)
@@ -181,22 +205,31 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
                        st::ConnectionStatus.T=status(client),
                        direct_write::Bool=false)
     can_buffer_reconnect = buffer_on_reconnect && _reconnect_buffer_enabled(client)
+    if st == ConnectionStatus.CONNECTED && client.write_reconnect_pending[]
+        can_buffer_reconnect || throw(ConnectionReconnectingError())
+        _enqueue_pending(client, frame)
+        return nothing
+    end
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
-        replayable_captured = false
         try
-            replayable_captured = _write_publish(client, frame; force_flush,
-                                                 replayable=can_buffer_reconnect, frame_size,
-                                                 direct_write, payload_size)
+            _write_publish(client, frame; force_flush, replayable=can_buffer_reconnect,
+                           frame_size, direct_write, payload_size)
         catch err
-            err isa OutboundBufferLimitError && rethrow()
-            if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
+            failure = err isa _PublishWriteFailure ? err : _PublishWriteFailure(err, false, false)
+            cause = failure.cause
+            cause isa OutboundBufferLimitError && throw(cause)
+            if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, cause)
                 if can_buffer_reconnect
-                    replayable_captured || _enqueue_pending(client, frame)
+                    if failure.attempted
+                        throw(ConnectionReconnectingError(_publish_write_reconnecting_message()))
+                    elseif !failure.captured
+                        _enqueue_pending(client, frame)
+                    end
                     return nothing
                 end
                 throw(ConnectionReconnectingError())
             end
-            rethrow()
+            throw(cause)
         end
     elseif st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING)
         if can_buffer_reconnect
@@ -290,7 +323,8 @@ _pending_chunk(frame::_AbstractPublishFrame) =
 
 function _ensure_pending_enqueue_allowed_locked(client::Client)
     st = client.status
-    if st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING)
+    if st in (ConnectionStatus.RECONNECTING, ConnectionStatus.CONNECTING) ||
+       (st == ConnectionStatus.CONNECTED && client.write_reconnect_pending[])
         _reconnect_buffer_enabled(client) || throw(ConnectionReconnectingError())
         return nothing
     end
