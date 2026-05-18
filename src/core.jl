@@ -513,13 +513,13 @@ function _start_subscription_processor!(sub::Subscription, callback::Callback) w
     nothing
 end
 
-function _subscribe(client::Client, subject::AbstractString; queue::Union{AbstractString,Nothing}=nothing, callback=nothing,
-                    borrowed::Bool=false,
-                    max_msgs=0, pending_msgs_limit=client.options.sub_pending_msgs_limit,
-                    pending_bytes_limit=client.options.sub_pending_bytes_limit,
-                    _control_handler::_SubscriptionControlHandler=_NoSubscriptionControlHandler(),
-                    require_connected::Bool=false,
-                    cancel_token::MaybeCancellationToken=nothing)
+function _subscribe_unlocked(client::Client, subject::AbstractString; queue::Union{AbstractString,Nothing}=nothing, callback=nothing,
+                             borrowed::Bool=false,
+                             max_msgs=0, pending_msgs_limit=client.options.sub_pending_msgs_limit,
+                             pending_bytes_limit=client.options.sub_pending_bytes_limit,
+                             _control_handler::_SubscriptionControlHandler=_NoSubscriptionControlHandler(),
+                             require_connected::Bool=false,
+                             cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     subject = _validate_subject(subject)
     queue = _validate_queue(queue)
@@ -569,6 +569,15 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
         _start_subscription_processor!(sub, callback)
     end
     sub
+end
+
+function _subscribe(client::Client, subject::AbstractString; kwargs...)
+    lock(client.subscription_replay_lock)
+    try
+        _subscribe_unlocked(client, subject; kwargs...)
+    finally
+        unlock(client.subscription_replay_lock)
+    end
 end
 
 function subscribe(client::Client, subject::AbstractString; cancel_token::MaybeCancellationToken=nothing,

@@ -991,6 +991,62 @@ end
     @test sub.server_delivered_base == 0
 end
 
+@testitem "replay serializes with foreground subscribe writes" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct SubscribeGateCapture <: IO
+        bytes::Vector{UInt8}
+        entered::Channel{Bool}
+        release::Channel{Bool}
+        writes::Int
+        closed::Bool
+    end
+
+    SubscribeGateCapture() = SubscribeGateCapture(UInt8[], Channel{Bool}(1), Channel{Bool}(1), 0, false)
+
+    function Base.write(t::SubscribeGateCapture, data::Union{String,SubString{String}})
+        t.writes += 1
+        if t.writes == 1
+            isready(t.entered) || put!(t.entered, true)
+            take!(t.release)
+        end
+        append!(t.bytes, codeunits(data))
+        ncodeunits(data)
+    end
+    Base.write(t::SubscribeGateCapture, data::Base.CodeUnits{UInt8}) =
+        write(t, String(data))
+    Base.write(t::SubscribeGateCapture, data::Vector{UInt8}) =
+        write(t, String(data))
+    Base.flush(::SubscribeGateCapture) = nothing
+    Base.close(t::SubscribeGateCapture) = (t.closed = true; nothing)
+
+    transport = SubscribeGateCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     write_io=transport)
+
+    subscribe_task = @async subscribe(client, "race.subscribe")
+    entered = timedwait(1.0; pollint=0.001) do
+        isready(transport.entered)
+    end
+    @test entered == :ok
+    entered == :ok || fetch(subscribe_task)
+    @test take!(transport.entered)
+
+    replay_task = @async N._replay_subscriptions(client)
+    sleep(0.02)
+    put!(transport.release, true)
+
+    sub = fetch(subscribe_task)
+    fetch(replay_task)
+
+    @test String(transport.bytes) == "SUB race.subscribe $(sub.sid)\r\n"
+    @test transport.writes == 1
+    @test sub.server_active
+    @test sub.server_delivered_base == 0
+end
+
 @testitem "limited subscribe setup uses one cancellation boundary" setup=[TestHelpers] begin
     using Natter
 
