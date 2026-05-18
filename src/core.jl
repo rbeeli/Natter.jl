@@ -275,6 +275,15 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
     nothing
 end
 
+_subscription_wire_max(max_msgs::Int, delivered_base::Int)::Int =
+    max_msgs > 0 ? max_msgs - delivered_base : 0
+
+function _set_subscription_server_active_locked!(sub::Subscription, delivered_base::Int)
+    sub.server_delivered_base = delivered_base
+    sub.server_active = true
+    nothing
+end
+
 function _send_subscription_now!(sub::Subscription; cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     sid, subject, queue, max_msgs, delivered = @lock sub.lock begin
@@ -288,7 +297,7 @@ function _send_subscription_now!(sub::Subscription; cancel_token::MaybeCancellat
     try
         _write_raw(sub.client, _subscription_setup_cmd(subject, queue, sid, remaining);
                    cancel_token)
-        @lock sub.lock sub.server_active = true
+        @lock sub.lock _set_subscription_server_active_locked!(sub, delivered)
         return true
     catch err
         err isa CancelledError && rethrow()
@@ -533,7 +542,8 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
         condition = Base.Threads.Condition(sub_lock)
         sub = Subscription(client, sid, subject, queue, callback, borrowed, sub_lock, ch,
                            condition, _control_handler, pending_msgs_limit,
-                           pending_bytes_limit, 0, 0, 0, 0, max_msgs, false, nothing, false, 0)
+                           pending_bytes_limit, 0, 0, 0, 0, max_msgs, false, nothing,
+                           false, 0, 0)
         client.subscriptions[sid] = sub
         _set_subscription_snapshot_locked!(client, sid, sub)
         send_now = st == ConnectionStatus.CONNECTED
@@ -1192,30 +1202,43 @@ function _restore_unsubscribe_target!(sub::Subscription, max_msgs::Int, target::
     nothing
 end
 
-function unsubscribe(sub::Subscription; max_msgs=0, cancel_token::MaybeCancellationToken=nothing)
+function _unsubscribe_write_mode(st::ConnectionStatus.T, active::Bool)
+    st == ConnectionStatus.CONNECTED && return _RAW_WRITE_CONNECTED
+    st == ConnectionStatus.RECONNECTING && active && return _RAW_WRITE_RECONNECT_REPLAY
+    nothing
+end
+
+function _unsubscribe(sub::Subscription; max_msgs=0,
+                      cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     max_msgs = _validate_core_max_msgs(max_msgs)
     st = status(sub.client)
-    closed, active, sid, target, previous_max = @lock sub.lock begin
+    closed, active, sid, target, wire_target, previous_max = @lock sub.lock begin
         if sub.closed
-            (true, false, sub.sid, 0, sub.max_msgs)
+            (true, false, sub.sid, 0, 0, sub.max_msgs)
         else
             target = 0
+            wire_target = 0
             previous_max = sub.max_msgs
             if max_msgs > 0
                 st in (ConnectionStatus.CLOSED, ConnectionStatus.DISCONNECTED) &&
                     throw(ConnectionClosedError("connection is disconnected"))
                 st == ConnectionStatus.DRAINING && throw(ConnectionDrainingError())
                 target = _unsubscribe_target(sub.delivered, max_msgs)
+                wire_target = sub.server_active ?
+                              _subscription_wire_max(target, sub.server_delivered_base) :
+                              0
                 sub.max_msgs = target
             end
-            (false, sub.server_active, sub.sid, target, previous_max)
+            (false, sub.server_active, sub.sid, target, wire_target, previous_max)
         end
     end
     closed && return nothing
-    if st == ConnectionStatus.CONNECTED && active
+    write_mode = _unsubscribe_write_mode(st, active)
+    if !isnothing(write_mode)
         try
-            _write_raw(sub.client, _unsub_cmd(sid, target); cancel_token)
+            _write_raw(sub.client, _unsub_cmd(sid, wire_target);
+                       write_mode, cancel_token)
         catch err
             if err isa CancelledError
                 _restore_unsubscribe_target!(sub, max_msgs, target, previous_max)
@@ -1236,6 +1259,15 @@ function unsubscribe(sub::Subscription; max_msgs=0, cancel_token::MaybeCancellat
         _close_subscription_locally!(sub)
     end
     nothing
+end
+
+function unsubscribe(sub::Subscription; max_msgs=0, cancel_token::MaybeCancellationToken=nothing)
+    lock(sub.client.subscription_replay_lock)
+    try
+        _unsubscribe(sub; max_msgs, cancel_token)
+    finally
+        unlock(sub.client.subscription_replay_lock)
+    end
 end
 
 close(sub::Subscription; cancel_token::MaybeCancellationToken=nothing) =

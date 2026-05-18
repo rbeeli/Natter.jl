@@ -922,6 +922,73 @@ end
     @test exhausted.closed
     @test !(exhausted.sid in keys(replay_client.subscriptions))
     @test !isopen(exhausted.messages)
+
+    replayed_active = subscribe(client, "replayed.active")
+    replayed_active.delivered = 3
+    replayed_active.server_delivered_base = 3
+    TestHelpers.clear_capture!(transport)
+    unsubscribe(replayed_active; max_msgs=2)
+    @test TestHelpers.capture_text(transport) == "UNSUB $(replayed_active.sid) 2\r\n"
+    @test replayed_active.max_msgs == 5
+end
+
+@testitem "replay serializes with unsubscribe limit changes" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct ReplayGateCapture <: IO
+        bytes::Vector{UInt8}
+        entered::Channel{Bool}
+        release::Channel{Bool}
+        writes::Int
+        closed::Bool
+    end
+
+    ReplayGateCapture() = ReplayGateCapture(UInt8[], Channel{Bool}(1), Channel{Bool}(1), 0, false)
+
+    function Base.write(t::ReplayGateCapture, data::Union{String,SubString{String}})
+        t.writes += 1
+        if t.writes == 1
+            isready(t.entered) || put!(t.entered, true)
+            take!(t.release)
+        end
+        append!(t.bytes, codeunits(data))
+        ncodeunits(data)
+    end
+    Base.write(t::ReplayGateCapture, data::Base.CodeUnits{UInt8}) =
+        write(t, String(data))
+    Base.write(t::ReplayGateCapture, data::Vector{UInt8}) =
+        write(t, String(data))
+    Base.flush(::ReplayGateCapture) = nothing
+    Base.close(t::ReplayGateCapture) = (t.closed = true; nothing)
+
+    transport = ReplayGateCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+                                     write_io=transport)
+    sub = subscribe(client, "race.replay")
+    replay_task = @async N._replay_subscriptions(client; reconnect_replay=true)
+    entered = timedwait(1.0; pollint=0.001) do
+        isready(transport.entered)
+    end
+    @test entered == :ok
+    entered == :ok || fetch(replay_task)
+    @test take!(transport.entered)
+
+    unsub_task = @async unsubscribe(sub; max_msgs=2)
+    @test timedwait(1.0; pollint=0.001) do
+        !istaskdone(unsub_task)
+    end == :ok
+
+    put!(transport.release, true)
+    wait(replay_task)
+    wait(unsub_task)
+
+    @test String(transport.bytes) ==
+          "SUB race.replay $(sub.sid)\r\nUNSUB $(sub.sid) 2\r\n"
+    @test sub.max_msgs == 2
+    @test sub.server_active
+    @test sub.server_delivered_base == 0
 end
 
 @testitem "limited subscribe setup uses one cancellation boundary" setup=[TestHelpers] begin

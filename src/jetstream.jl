@@ -2897,6 +2897,7 @@ function _send_ordered_subscription_reset!(sub::Subscription, remap::_OrderedSub
               force_flush=true)
     @lock sub.lock begin
         if !sub.closed && sub.sid == remap.new_sid
+            sub.server_delivered_base = sub.delivered
             sub.server_active = true
         end
     end
@@ -2917,6 +2918,7 @@ function _rollback_ordered_subscription_reset!(sub::Subscription, remap::_Ordere
               force_flush=true)
     @lock sub.lock begin
         if !sub.closed && sub.sid == remap.old_sid && sub.subject == remap.old_subject
+            sub.server_delivered_base = sub.delivered
             sub.server_active = true
         end
     end

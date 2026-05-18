@@ -48,6 +48,7 @@ function _connect_with_options(opts::ConnectOptions; cancel_token::MaybeCancella
         nothing,
         0,
         Dict{Int,Subscription}(),
+        ReentrantLock(),
         nothing,
         ReentrantLock(),
         IOBuffer(),
@@ -2083,21 +2084,29 @@ function _reconnect_loop(client::Client, generation::Int)
                                attempt=attempts, reconnect=true)
                 _start_flusher_task!(client, generation)
                 _record_reconnect!(client)
-                _replay_subscriptions(client; reconnect_replay=true)
-                _flush_pending_buffer(client; generation=generation, reconnect_replay=true)
-                committed = @lock client.lock begin
-                    if client.generation == generation && client.status == ConnectionStatus.RECONNECTING
-                        _store_status_locked!(client, ConnectionStatus.CONNECTED)
-                        true
-                    else
-                        false
+                committed = false
+                lock(client.subscription_replay_lock)
+                try
+                    _replay_subscriptions_unlocked(client; reconnect_replay=true)
+                    _flush_pending_buffer(client; generation=generation, reconnect_replay=true)
+                    committed = @lock client.lock begin
+                        if client.generation == generation && client.status == ConnectionStatus.RECONNECTING
+                            _store_status_locked!(client, ConnectionStatus.CONNECTED)
+                            true
+                        else
+                            false
+                        end
                     end
+                    if committed
+                        _replay_subscriptions_unlocked(client)
+                    end
+                finally
+                    unlock(client.subscription_replay_lock)
                 end
                 committed || begin
                     _close_transport_report_errors!(client)
                     return
                 end
-                _replay_subscriptions(client)
                 _flush_pending_buffer(client; generation=generation)
                 _flush_buffered_writes(client)
                 _start_background_tasks!(client, generation)
@@ -2139,7 +2148,7 @@ function _reconnect_loop(client::Client, generation::Int)
     end
 end
 
-function _replay_subscriptions(client::Client; reconnect_replay::Bool=false)
+function _replay_subscriptions_unlocked(client::Client; reconnect_replay::Bool=false)
     write_mode = reconnect_replay ? _RAW_WRITE_RECONNECT_REPLAY : _RAW_WRITE_CONNECTED
     subs = @lock client.lock collect(values(client.subscriptions))
     for sub in subs
@@ -2148,8 +2157,10 @@ function _replay_subscriptions(client::Client; reconnect_replay::Bool=false)
             if !present || sub.closed || sub.server_active
                 nothing
             else
-                remaining = sub.max_msgs > 0 ? sub.max_msgs - sub.delivered : 0
-                sub.max_msgs > 0 && remaining <= 0 ? :close : (sub.sid, sub.subject, sub.queue, remaining)
+                delivered_base = sub.delivered
+                remaining = sub.max_msgs > 0 ? sub.max_msgs - delivered_base : 0
+                sub.max_msgs > 0 && remaining <= 0 ? :close :
+                (sub.sid, sub.subject, sub.queue, remaining, delivered_base)
             end
         end
         isnothing(state) && continue
@@ -2157,11 +2168,12 @@ function _replay_subscriptions(client::Client; reconnect_replay::Bool=false)
             _close_subscription_locally!(sub; throw_errors=false)
             continue
         end
-        sid, subject, queue, remaining = state
+        sid, subject, queue, remaining, delivered_base = state
         _write_raw(client, _subscription_setup_cmd(subject, queue, sid, remaining); write_mode)
         present = @lock client.lock get(client.subscriptions, sid, nothing) === sub
         active = @lock sub.lock begin
             if present && !sub.closed
+                sub.server_delivered_base = delivered_base
                 sub.server_active = true
                 true
             else
@@ -2169,6 +2181,15 @@ function _replay_subscriptions(client::Client; reconnect_replay::Bool=false)
             end
         end
         active || _write_raw(client, _unsub_cmd(sid); write_mode)
+    end
+end
+
+function _replay_subscriptions(client::Client; reconnect_replay::Bool=false)
+    lock(client.subscription_replay_lock)
+    try
+        _replay_subscriptions_unlocked(client; reconnect_replay)
+    finally
+        unlock(client.subscription_replay_lock)
     end
 end
 

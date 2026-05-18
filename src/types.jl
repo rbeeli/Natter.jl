@@ -1511,6 +1511,7 @@ mutable struct Subscription{C<:AbstractNatterClient}
     closed::Bool
     processor::Union{Task,Nothing}
     server_active::Bool
+    server_delivered_base::Int
     processing::Int
 end
 
@@ -1522,13 +1523,13 @@ function Subscription(client::C, sid::Int, subject::String, queue::Union{String,
                       pending_msgs_limit::Int, pending_bytes_limit::Int, pending_bytes::Int,
                       received::Int, delivered::Int, dropped_msgs::Int, max_msgs::Int,
                       closed::Bool, processor::Union{Task,Nothing}, server_active::Bool,
-                      processing::Int) where {C<:AbstractNatterClient}
+                      server_delivered_base::Int, processing::Int) where {C<:AbstractNatterClient}
     Subscription{C}(client, lock, sid, subject, queue, !isnothing(callback),
                     borrowed_callback, _borrowed_callback_handler(client, borrowed_callback ? callback : nothing),
                     messages, condition, control_handler,
                     pending_msgs_limit, pending_bytes_limit, pending_bytes, received,
                     delivered, dropped_msgs, max_msgs, closed, processor, server_active,
-                    processing)
+                    server_delivered_base, processing)
 end
 
 struct _SubscriptionSnapshotEntry{C<:AbstractNatterClient}
@@ -1749,6 +1750,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     sid::Int
     subscriptions::Dict{Int,Subscription{Client{Options,ReadIO,WriteIO}}}
     @atomic subscription_snapshot::Dict{Int,_SubscriptionSnapshotEntry{Client{Options,ReadIO,WriteIO}}}
+    subscription_replay_lock::ReentrantLock
     @atomic request_mux::Union{RequestMux{Client{Options,ReadIO,WriteIO}},Nothing}
     request_mux_lock::ReentrantLock
     pending::PendingBuffer
@@ -1771,6 +1773,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                 lock::ReentrantLock, write_lock::ReentrantLock,
                 write_condition::Base.GenericCondition{ReentrantLock}, flush_signal::FlushSignal,
                 flusher_task::Union{Task,Nothing}, sid::Int, subscriptions,
+                subscription_replay_lock::ReentrantLock,
                 request_mux::Union{RequestMux,Nothing}, request_mux_lock::ReentrantLock,
                 pending, pending_bytes::Int, pongs::PongWaiterQueue,
                 reader_task::Union{Task,Nothing}, ping_task::Union{Task,Nothing},
@@ -1828,7 +1831,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                    Threads.Atomic{Int}(0), Ref{Any}(nothing), Ref(""), nothing,
                                    flush_signal, flusher_task,
                                    sid, typed_subscriptions, subscription_snapshot,
-                                   typed_request_mux, request_mux_lock,
+                                   subscription_replay_lock, typed_request_mux, request_mux_lock,
                                    pending, pending_bytes, pongs,
                                    reader_task, ping_task, reconnect_task, pings_out, atomic_stats,
                                    rng, generation, Threads.Atomic{Int}(generation), WeakRef[])

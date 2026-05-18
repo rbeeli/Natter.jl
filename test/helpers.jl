@@ -82,6 +82,7 @@ using TestItems
             nothing,
             0,
             Dict{Int,N.Subscription}(),
+            ReentrantLock(),
             nothing,
             ReentrantLock(),
             IOBuffer(),
