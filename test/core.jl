@@ -307,7 +307,7 @@ end
         end
         reader = N.ProtocolReader(IOBuffer(UInt8[]))
         sizehint!(reader.buffer, length(raw))
-        policy = N._BorrowPayloadPolicy(client)
+        route_resolver = N._ReaderMsgRouteResolver(client)
         handler = N._ReaderMsgDispatcher(client)
 
         function prefill!()
@@ -321,7 +321,8 @@ end
 
         function drain!()
             for _ in 1:n
-                frame = N._read_control_or_msg_dispatch(reader, client.options, policy, handler)
+                frame = N._read_control_or_msg_dispatch(reader, client.options,
+                                                        route_resolver, handler)
                 isnothing(frame) || throw(AssertionError("unexpected control frame"))
             end
             nothing
@@ -380,6 +381,45 @@ end
     @test empty_views
     @test buffered_publish_alloc() == 0
     @test buffered_replay_snapshot() == "PUB foo 3\r\nbar\r\n"
+end
+
+@testitem "reader dispatch resolves subscription route once per message" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct CountingRouteResolver{R}
+        inner::R
+        count::Int
+    end
+
+    function (resolver::CountingRouteResolver)(sid::Int)
+        resolver.count += 1
+        N._resolve_message_route(resolver.inner, sid)
+    end
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=devnull)
+    sub = subscribe(client, "route.once"; pending_msgs_limit=4)
+    hdr = N._headers_bytes(Headers("Trace" => ["abc"]))
+    payload = vcat(hdr, TestHelpers.bytes("two"))
+    raw = UInt8[]
+    append!(raw, TestHelpers.bytes("MSG route.once $(sub.sid) 3\r\none\r\n"))
+    append!(raw, TestHelpers.bytes("HMSG route.once $(sub.sid) $(length(hdr)) $(length(payload))\r\n"))
+    append!(raw, payload)
+    append!(raw, N.CRLF_BYTES)
+
+    reader = N.ProtocolReader(IOBuffer(raw); read_size=length(raw))
+    resolver = CountingRouteResolver(N._ReaderMsgRouteResolver(client), 0)
+    handler = N._ReaderMsgDispatcher(client)
+
+    @test isnothing(N._read_control_or_msg_dispatch(reader, client.options, resolver, handler))
+    @test isnothing(N._read_control_or_msg_dispatch(reader, client.options, resolver, handler))
+    @test resolver.count == 2
+    @test String(N.next(sub; timeout=0.1)) == "one"
+    hmsg = N.next(sub; timeout=0.1)
+    @test String(hmsg) == "two"
+    @test header(hmsg, "Trace") == "abc"
+    close(sub)
 end
 
 @testitem "empty subscription ready helper returns a typed empty result" setup=[TestHelpers] begin
@@ -486,7 +526,7 @@ end
     raw = TestHelpers.bytes("MSG events.borrowed $(borrowed_sub.sid) 8\r\nborrowed\r\n")
     reader = N.ProtocolReader(IOBuffer(raw); read_size=length(raw))
     frame = N._read_control_or_msg(reader, borrowed_client.options,
-                                   N._BorrowPayloadPolicy(borrowed_client))
+                                   N._ReaderMsgRouteResolver(borrowed_client))
     borrowed_msg = N._protocol_msg(frame)
     @test borrowed_msg isa BorrowedMsg
     @test parent(borrowed_msg.data) === reader.buffer

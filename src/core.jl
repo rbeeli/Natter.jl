@@ -568,13 +568,32 @@ function _subscription_processor(sub::Subscription, callback::Callback) where {C
     end
 end
 
-struct _BorrowPayloadPolicy{C<:Client}
+mutable struct _ReaderMsgRouteResolver{C<:Client}
     client::C
+    sub::Union{Subscription{C},Nothing}
+    borrow_payload::Bool
+    fast_control::Bool
 end
 
-function (policy::_BorrowPayloadPolicy)(sid::Int)::Bool
-    _borrow_payload_for_sid(policy.client, sid)
+_ReaderMsgRouteResolver(client::C) where {C<:Client} =
+    _ReaderMsgRouteResolver{C}(client, nothing, false, false)
+
+@inline function _resolve_message_route(resolver::_ReaderMsgRouteResolver{C},
+                                        sid::Int)::_ReaderMsgRouteResolver{C} where {C<:Client}
+    entry = _lookup_subscription_snapshot_entry(resolver.client, sid)
+    if isnothing(entry)
+        resolver.sub = nothing
+        resolver.borrow_payload = false
+        resolver.fast_control = false
+    else
+        resolver.sub = entry.sub
+        resolver.borrow_payload = entry.borrow_payload
+        resolver.fast_control = entry.fast_control
+    end
+    resolver
 end
+
+@inline _route_borrow_payload(route::_ReaderMsgRouteResolver)::Bool = route.borrow_payload
 
 function _owned_msg(msg::BorrowedMsg)::Msg
     Msg(msg.subject, msg.reply, Vector{UInt8}(msg.data);
@@ -665,15 +684,15 @@ _try_handle_subscription_hmsg_control(_handler::_SubscriptionControlHandler, _cl
                                       _reply_start::Int, _reply_end::Int,
                                       _hsize::Int, _total::Int)::Bool = false
 
-function _try_handle_msg_control(dispatcher::_ReaderMsgDispatcher, reader::ProtocolReader,
+function _try_handle_msg_control(dispatcher::_ReaderMsgDispatcher{C},
+                                 route::_ReaderMsgRouteResolver{C}, reader::ProtocolReader,
                                  sid::Int, subject_start::Int, subject_end::Int,
                                  reply_start::Int, reply_end::Int,
-                                 size::Int, borrowed::Bool)::Bool
+                                 size::Int, borrowed::Bool)::Bool where {C<:Client}
     borrowed && return false
     client = dispatcher.client
-    entry = _lookup_subscription_snapshot_entry(client, sid)
-    (isnothing(entry) || !entry.fast_control) && return false
-    sub = entry.sub
+    sub = route.sub
+    (isnothing(sub) || !route.fast_control) && return false
     closed = false
     control_handler = _NoSubscriptionControlHandler()
     @lock sub.lock begin
@@ -685,15 +704,15 @@ function _try_handle_msg_control(dispatcher::_ReaderMsgDispatcher, reader::Proto
                                          subject_end, reply_start, reply_end, size)
 end
 
-function _try_handle_hmsg_control(dispatcher::_ReaderMsgDispatcher, reader::ProtocolReader,
+function _try_handle_hmsg_control(dispatcher::_ReaderMsgDispatcher{C},
+                                  route::_ReaderMsgRouteResolver{C}, reader::ProtocolReader,
                                   sid::Int, subject_start::Int, subject_end::Int,
                                   reply_start::Int, reply_end::Int,
-                                  hsize::Int, total::Int, borrowed::Bool)::Bool
+                                  hsize::Int, total::Int, borrowed::Bool)::Bool where {C<:Client}
     borrowed && return false
     client = dispatcher.client
-    entry = _lookup_subscription_snapshot_entry(client, sid)
-    (isnothing(entry) || !entry.fast_control) && return false
-    sub = entry.sub
+    sub = route.sub
+    (isnothing(sub) || !route.fast_control) && return false
     closed = false
     control_handler = _NoSubscriptionControlHandler()
     @lock sub.lock begin
@@ -845,14 +864,32 @@ function _handle_subscription_control(::_RequestMuxControlHandler, sub::Subscrip
     true
 end
 
-function _dispatch_msg(client::Client, msg::Msg)
+@inline function _dispatch_protocol_msg(dispatcher::_ReaderMsgDispatcher{C},
+                                        route::_ReaderMsgRouteResolver{C},
+                                        msg::Msg) where {C<:Client}
+    _dispatch_msg(dispatcher.client, route.sub, msg)
+    nothing
+end
+
+@inline function _dispatch_protocol_msg(dispatcher::_ReaderMsgDispatcher{C},
+                                        route::_ReaderMsgRouteResolver{C},
+                                        msg::BorrowedMsg) where {C<:Client}
+    _dispatch_msg(dispatcher.client, route.sub, msg)
+    nothing
+end
+
+@inline function _dispatch_msg(client::C, sub::Union{Subscription{C},Nothing},
+                               msg::Msg) where {C<:Client}
     msg_bytes = _msg_pending_bytes(msg)
-    sub = _lookup_subscription(client, msg.sid)
     if isnothing(sub)
         _record_drop!(client)
         return
     end
     _dispatch_owned_msg_to_sub(client, sub, msg, msg_bytes)
+end
+
+@inline function _dispatch_msg(client::C, msg::Msg) where {C<:Client}
+    _dispatch_msg(client, _lookup_subscription(client, msg.sid), msg)
 end
 
 function _dispatch_owned_msg_to_sub(client::Client, sub::Subscription, msg::Msg,
@@ -959,9 +996,9 @@ end
     nothing
 end
 
-function _dispatch_msg(client::Client, msg::BorrowedMsg)
+@inline function _dispatch_msg(client::C, sub::Union{Subscription{C},Nothing},
+                               msg::BorrowedMsg) where {C<:Client}
     msg_bytes = _msg_pending_bytes(msg)
-    sub = _lookup_subscription(client, msg.sid)
     if isnothing(sub)
         _record_drop!(client)
         return
@@ -969,8 +1006,12 @@ function _dispatch_msg(client::Client, msg::BorrowedMsg)
     _dispatch_borrowed_msg_to_sub(client, sub, msg, msg_bytes)
 end
 
-function _dispatch_borrowed_msg_to_sub(client::Client, sub::Subscription, msg::BorrowedMsg,
-                                       msg_bytes::Int)
+@inline function _dispatch_msg(client::C, msg::BorrowedMsg) where {C<:Client}
+    _dispatch_msg(client, _lookup_subscription(client, msg.sid), msg)
+end
+
+function _dispatch_borrowed_msg_to_sub(client::C, sub::Subscription{C}, msg::BorrowedMsg,
+                                       msg_bytes::Int) where {C<:Client}
     control_handler = _NoSubscriptionControlHandler()
     dispatch_owned = false
     closed = @lock sub.lock begin
@@ -990,7 +1031,7 @@ function _dispatch_borrowed_msg_to_sub(client::Client, sub::Subscription, msg::B
         return
     end
     if dispatch_owned
-        _dispatch_msg(client, _owned_msg(msg))
+        _dispatch_msg(client, sub, _owned_msg(msg))
         return
     end
 

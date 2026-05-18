@@ -1800,11 +1800,11 @@ end
 
 function _reader_loop_with_reader(client::Client, generation::Int,
                                   reader::ProtocolReader{ReadIO}) where {ReadIO}
-    borrow_payload = _BorrowPayloadPolicy(client)
+    route_resolver = _ReaderMsgRouteResolver(client)
     msg_dispatcher = _ReaderMsgDispatcher(client)
     while _generation_matches(client, generation) && status(client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
-            frame = _read_control_or_msg_dispatch(reader, client.options, borrow_payload,
+            frame = _read_control_or_msg_dispatch(reader, client.options, route_resolver,
                                                   msg_dispatcher)
             isnothing(frame) && continue
             if frame isa PingFrame
