@@ -17,6 +17,17 @@ using TestItems
         throw(AssertionError("expected exception"))
     end
 
+    function fetch_task_result(task::Task)
+        try
+            return fetch(task)
+        catch err
+            err isa TaskFailedException || rethrow()
+            exceptions = Base.current_exceptions(task)
+            isempty(exceptions) && rethrow()
+            throw(first(exceptions).exception)
+        end
+    end
+
     mutable struct WriteCapture <: IO
         bytes::Vector{UInt8}
         closed::Bool
@@ -34,6 +45,23 @@ using TestItems
 
     capture_text(t::WriteCapture) = String(copy(t.bytes))
     clear_capture!(t::WriteCapture) = (empty!(t.bytes); nothing)
+
+    function active_pull_deliveries(psub)
+        @lock psub.close_lock copy(psub.active_deliveries)
+    end
+
+    function active_pull_delivery(psub)
+        deliveries = active_pull_deliveries(psub)
+        length(deliveries) == 1 || throw(AssertionError("expected exactly one active pull delivery"))
+        only(deliveries)
+    end
+
+    function wait_for_pull_delivery(psub; timeout::Real=1.0)
+        timedwait(timeout; pollint=0.001) do
+            !isempty(active_pull_deliveries(psub))
+        end == :timed_out && throw(AssertionError("timed out waiting for pull delivery"))
+        active_pull_delivery(psub)
+    end
 
     function fake_client(; opts=N.ConnectOptions(), status=N.ConnectionStatus.DISCONNECTED,
                          info=N.ServerInfo(; headers=true), read_io=nothing, write_io=nothing)

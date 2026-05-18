@@ -406,7 +406,7 @@ end
                 ack_policy=AckPolicy.EXPLICIT,
             ))
             @test_throws ArgumentError fetch(psub, 1; timeout=0.0)
-            @test endswith(psub.deliver, ".*")
+            @test isempty(TestHelpers.active_pull_deliveries(psub))
             msgs = fetch(psub, 1; timeout=2.0)
             @test length(msgs) == 1
             @test String(first(msgs)) == "payload"

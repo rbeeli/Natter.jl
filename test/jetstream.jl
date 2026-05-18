@@ -2753,9 +2753,7 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull")
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull",
-                              ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     @test_throws ArgumentError fetch(psub, 0; timeout=1.0)
     @test client.pending_bytes == 0
@@ -2806,9 +2804,7 @@ end
     @test_throws ArgumentError fetch(psub, 1; timeout=1.0, min_pending=1)
     @test client.pending_bytes == 0
 
-    priority_sub = subscribe(client, "_INBOX.priority")
-    overflow_psub = N.PullSubscription(js, priority_sub, "ORDERS", "PRIORITY", "_INBOX.priority",
-                                       ReentrantLock(), ReentrantLock(), false, false,
+    overflow_psub = N.PullSubscription(js, "ORDERS", "PRIORITY", ReentrantLock(), ReentrantLock(), false, false,
                                        PriorityPolicy.OVERFLOW, ["fast", "slow"])
     @test_throws ArgumentError fetch(overflow_psub, 1; timeout=1.0)
     @test client.pending_bytes == 0
@@ -2817,8 +2813,7 @@ end
     @test_throws ArgumentError fetch(overflow_psub, 1; timeout=1.0, priority_group="fast", priority=1)
     @test client.pending_bytes == 0
 
-    prioritized_psub = N.PullSubscription(js, priority_sub, "ORDERS", "PRIORITIZED", "_INBOX.priority",
-                                          ReentrantLock(), ReentrantLock(), false, false,
+    prioritized_psub = N.PullSubscription(js, "ORDERS", "PRIORITIZED", ReentrantLock(), ReentrantLock(), false, false,
                                           PriorityPolicy.PRIORITIZED, ["fast"])
     validated = N._validate_pull_fetch(prioritized_psub, 1, 1.0, 0.9, 0, nothing,
                                        false, nothing, nothing, "fast", 1)
@@ -2826,12 +2821,6 @@ end
 
     close(psub)
     @test_throws ConnectionClosedError fetch(psub, 1; timeout=1.0)
-    @test client.pending_bytes == 0
-
-    underlying = subscribe(client, "_INBOX.underlying")
-    underlying_psub = N.PullSubscription(js, underlying, "ORDERS", "WORKER", "_INBOX.underlying", ReentrantLock(), ReentrantLock(), false, false)
-    close(underlying)
-    @test_throws ConnectionClosedError fetch(underlying_psub, 1; timeout=1.0)
     @test client.pending_bytes == 0
 end
 
@@ -2842,30 +2831,32 @@ end
     const N = Natter
 
     function pull_request_payload(frame::AbstractString)
-        header, rest = split(frame, "\r\n"; limit=2)
-        parts = split(header)
-        @test parts[1] == "PUB"
-        len = parse(Int, parts[end])
-        payload, trailer = split(rest, "\r\n"; limit=2)
-        @test ncodeunits(payload) == len
-        @test trailer == ""
-        JSON3.read(payload)
+        lines = split(frame, "\r\n"; keepempty=true)
+        for i in 1:(length(lines) - 1)
+            parts = split(lines[i])
+            isempty(parts) && continue
+            parts[1] == "PUB" || continue
+            len = parse(Int, parts[end])
+            payload = lines[i + 1]
+            @test ncodeunits(payload) == len
+            return JSON3.read(payload)
+        end
+        throw(AssertionError("PUB frame not found"))
     end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull")
-    take!(client.write_io)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull",
-                              ReentrantLock(), ReentrantLock(), false, false,
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false,
                               PriorityPolicy.OVERFLOW, ["workers"])
 
     try
-        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+        task = @async fetch(psub, big(10); timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true,
+                            min_pending=4, min_ack_pending=5, priority_group="workers")
+        delivery = TestHelpers.wait_for_pull_delivery(psub)
+        N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    sid=core_sub.sid))
-        @test isempty(fetch(psub, big(10); timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true,
-                            min_pending=4, min_ack_pending=5, priority_group="workers"))
+                                    sid=delivery.sid))
+        @test isempty(fetch(task))
         payload = pull_request_payload(String(take!(client.write_io)))
         @test payload["batch"] == 10
         @test payload["max_bytes"] == 256
@@ -2886,36 +2877,41 @@ end
     const N = Natter
 
     function pull_request_payload(frame::AbstractString)
-        header, rest = split(frame, "\r\n"; limit=2)
-        parts = split(header)
-        @test parts[1] == "PUB"
-        len = parse(Int, parts[end])
-        payload, trailer = split(rest, "\r\n"; limit=2)
-        @test ncodeunits(payload) == len
-        @test trailer == ""
-        JSON3.read(payload)
+        lines = split(frame, "\r\n"; keepempty=true)
+        for i in 1:(length(lines) - 1)
+            parts = split(lines[i])
+            isempty(parts) && continue
+            parts[1] == "PUB" || continue
+            len = parse(Int, parts[end])
+            payload = lines[i + 1]
+            @test ncodeunits(payload) == len
+            return JSON3.read(payload)
+        end
+        throw(AssertionError("PUB frame not found"))
     end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull")
-    take!(client.write_io)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     try
-        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+        task = @async fetch(psub, 1; timeout=10.0, heartbeat=0)
+        delivery = TestHelpers.wait_for_pull_delivery(psub)
+        N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    sid=core_sub.sid))
-        @test isempty(fetch(psub, 1; timeout=10.0, heartbeat=0))
+                                    sid=delivery.sid))
+        @test isempty(fetch(task))
         default_payload = pull_request_payload(String(take!(client.write_io)))
         @test default_payload["batch"] == 1
         @test default_payload["expires"] == 9_000_000_000
         @test !haskey(default_payload, "idle_heartbeat")
 
-        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+        task = @async fetch(psub, 1; timeout=10.0, expires=2.5, heartbeat=0)
+        delivery = TestHelpers.wait_for_pull_delivery(psub)
+        N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    sid=core_sub.sid))
-        @test isempty(fetch(psub, 1; timeout=10.0, expires=2.5, heartbeat=0))
+                                    sid=delivery.sid))
+        @test isempty(fetch(task))
         explicit_payload = pull_request_payload(String(take!(client.write_io)))
         @test explicit_payload["expires"] == 2_500_000_000
     finally
@@ -2935,10 +2931,8 @@ end
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull.*")
     TestHelpers.clear_capture!(capture)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*",
-                              ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     first = @async fetch(psub, 1; timeout=0.75, heartbeat=0)
     try
@@ -2968,9 +2962,8 @@ end
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull.*")
     TestHelpers.clear_capture!(capture)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     @test_throws ArgumentError messages(psub; batch=0)
     @test_throws ArgumentError messages(psub; batch=true)
@@ -2987,8 +2980,7 @@ end
     @test_throws ArgumentError messages(psub; batch=1, priority_group="workers")
     @test_throws ArgumentError messages(psub; batch=1, priority=-1, priority_group="workers")
 
-    priority_psub = N.PullSubscription(js, core_sub, "ORDERS", "PRIORITY", "_INBOX.pull.*",
-                                       ReentrantLock(), ReentrantLock(), false, false,
+    priority_psub = N.PullSubscription(js, "ORDERS", "PRIORITY", ReentrantLock(), ReentrantLock(), false, false,
                                        PriorityPolicy.PINNED_CLIENT, ["workers"])
     @test_throws ArgumentError messages(priority_psub; batch=1)
     @test_throws ArgumentError messages(priority_psub; batch=1, priority_group="other")
@@ -3031,7 +3023,8 @@ end
                                      Channel{Nothing}(1), false, false)
 
     function blocking_request_write(t::BlockingPullRequestTransport, data)
-        if t.enabled && !t.blocked
+        text = data isa UInt8 ? string(Char(data)) : data isa Char ? string(data) : String(data)
+        if t.enabled && !t.blocked && occursin("CONSUMER.MSG.NEXT", text)
             t.blocked = true
             put!(t.started, nothing)
             take!(t.release)
@@ -3056,28 +3049,33 @@ end
     transport = BlockingPullRequestTransport()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=transport)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull.*")
     TestHelpers.clear_capture!(transport.capture)
 
     transport.enabled = true
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*",
-                              ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     stream = messages(psub; batch=1, expires=1.0, heartbeat=0, stop_after=1)
     stream_done = Ref(:timed_out)
+    close_task = Ref{Union{Task,Nothing}}(nothing)
     try
         @test timedwait(1.0; pollint=0.001) do
             isready(transport.started)
         end != :timed_out
 
-        close_task = @async close(stream)
+        close_task[] = @async close(stream)
         @test timedwait(0.2; pollint=0.001) do
-            istaskdone(close_task)
+            N._pull_stream_closed(stream.state)
         end != :timed_out
-        @test fetch(close_task) === nothing
+        release_transport!(transport)
+        @test timedwait(1.0; pollint=0.001) do
+            istaskdone(close_task[]::Task)
+        end != :timed_out
+        @test fetch(close_task[]::Task) === nothing
     finally
         release_transport!(transport)
-        close(stream)
+        if isnothing(close_task[]) || istaskdone(close_task[]::Task)
+            close(stream)
+        end
         stream_done[] = timedwait(1.0; pollint=0.001) do
             istaskdone(stream.task)
         end
@@ -3099,9 +3097,8 @@ end
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull.*")
     TestHelpers.clear_capture!(capture)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     stream = messages(psub; batch=2, expires=1.0, heartbeat=0, threshold_messages=1,
                       channel_size=4, stop_after=3)
@@ -3110,16 +3107,16 @@ end
             request_count(capture) >= 1
         end != :timed_out
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one");
-                                    sid=core_sub.sid))
+                                    sid=stream.delivery.sid))
         @test String(take!(stream)) == "one"
         @test timedwait(1.0; pollint=0.001) do
             request_count(capture) >= 2
         end != :timed_out
 
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.2.2.0.0", TestHelpers.bytes("two");
-                                    sid=core_sub.sid))
+                                    sid=stream.delivery.sid))
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.3.3.0.0", TestHelpers.bytes("three");
-                                    sid=core_sub.sid))
+                                    sid=stream.delivery.sid))
         @test String(take!(stream)) == "two"
         @test String(take!(stream)) == "three"
         wait(stream)
@@ -3142,10 +3139,8 @@ end
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull")
     TestHelpers.clear_capture!(capture)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull",
-                              ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     stream = messages(psub; batch=1, max_bytes=8, expires=1.0, heartbeat=0, channel_size=1)
     try
@@ -3153,12 +3148,12 @@ end
             request_count(capture) >= 1
         end != :timed_out
 
-        max_bytes = Msg("_INBOX.pull", nothing, UInt8[];
+        max_bytes = Msg(stream.delivery.subject, nothing, UInt8[];
                         headers=Headers("Status" => ["409"],
                                         "Description" => ["Message Size Exceeds MaxBytes"],
                                         "Nats-Pending-Messages" => ["1"],
                                         "Nats-Pending-Bytes" => ["8"]),
-                        sid=core_sub.sid)
+                        sid=stream.delivery.sid)
         N._dispatch_msg(client, max_bytes)
 
         @test timedwait(1.0; pollint=0.001) do
@@ -3181,7 +3176,7 @@ end
     config = N._PullStreamConfig(2, nothing, 1.0, 0.0, 2, nothing,
                                  nothing, nothing, nothing, nothing, nothing, 4)
 
-    first = N._reserve_pull_stream_request!(config, state, 1)
+    first = N._reserve_pull_stream_request!(config, state)
     @test !isnothing(first)
     @test state.requested_messages == 2
     @test state.requested_bytes == 0
@@ -3192,29 +3187,18 @@ end
     @test state.requested_messages == 1
     @test length(state.requests) == 1
 
-    second = N._reserve_pull_stream_request!(config, state, 2)
+    second = N._reserve_pull_stream_request!(config, state)
     @test !isnothing(second)
     @test state.requested_messages == 3
     @test length(state.requests) == 2
-
-    stale = Msg("_INBOX.pull.stale", nothing, UInt8[];
-                headers=Headers("Status" => ["404"], "Description" => ["No Messages"],
-                                "Nats-Pending-Messages" => ["1"]))
-    @lock state.lock begin
-        @test N._pull_stream_find_request(state.requests, stale.subject) == 0
-        @test state.requested_messages == 3
-    end
 
     terminal = Msg("_INBOX.pull.1", nothing, UInt8[];
                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"],
                                    "Nats-Pending-Messages" => ["1"]))
     @lock state.lock begin
-        request_index = N._pull_stream_find_request(state.requests, terminal.subject)
-        @test request_index == 1
-        N._pull_stream_release_terminal_request!(state, request_index, terminal)
+        @test N._pull_stream_release_terminal_request!(state, terminal)
         @test state.requested_messages == 2
         @test length(state.requests) == 1
-        @test state.requests[1].token == 2
     end
 end
 
@@ -3227,7 +3211,7 @@ end
     config = N._PullStreamConfig(4, 20, 1.0, 0.0, 0, 10,
                                  nothing, nothing, nothing, nothing, nothing, 4)
 
-    first = N._reserve_pull_stream_request!(config, state, 1)
+    first = N._reserve_pull_stream_request!(config, state)
     @test !isnothing(first)
     @test state.requested_messages == 4
     @test state.requested_bytes == 20
@@ -3237,7 +3221,7 @@ end
     @test state.requested_messages == 3
     @test state.requested_bytes == 8
 
-    second = N._reserve_pull_stream_request!(config, state, 2)
+    second = N._reserve_pull_stream_request!(config, state)
     @test !isnothing(second)
     @test state.requested_messages == 4
     @test state.requested_bytes == 20
@@ -3247,12 +3231,9 @@ end
                                    "Nats-Pending-Messages" => ["3"],
                                    "Nats-Pending-Bytes" => ["8"]))
     @lock state.lock begin
-        request_index = N._pull_stream_find_request(state.requests, terminal.subject)
-        @test request_index == 1
-        N._pull_stream_release_terminal_request!(state, request_index, terminal)
+        @test N._pull_stream_release_terminal_request!(state, terminal)
         @test state.requested_messages == 1
         @test state.requested_bytes == 12
-        @test state.requests[1].token == 2
     end
 end
 
@@ -3264,9 +3245,8 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
                                      write_io=TestHelpers.WriteCapture())
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull.*")
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*",
-                              ReentrantLock(), ReentrantLock(), false, false)
+    delivery = subscribe(client, "_INBOX.pull")
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     state = N._PullMessageStreamState()
     config = N._PullStreamConfig(2, 32, 1.0, 0.0, 1, 16,
@@ -3275,7 +3255,8 @@ end
     queue_condition = Base.Threads.Condition(queue_lock)
     queue = N.MsgQueue{Msg}(1)
     stream = N.PullMessageStream{typeof(client),typeof(psub)}(
-        psub, queue, queue_lock, queue_condition, config, Task(() -> nothing), nothing, state)
+        psub, delivery, queue, queue_lock, queue_condition, config, UInt8[],
+        Task(() -> nothing), nothing, state)
 
     first = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("first"))
     second = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.2.2.0.0", TestHelpers.bytes("second"))
@@ -3380,10 +3361,8 @@ end
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull.*")
     TestHelpers.clear_capture!(capture)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*",
-                              ReentrantLock(), ReentrantLock(), false, false,
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false,
                               PriorityPolicy.OVERFLOW, ["workers"])
 
     stream = messages(psub; batch=2, expires=1.0, heartbeat=0, threshold_messages=1,
@@ -3400,7 +3379,7 @@ end
         @test first_payload["group"] == "workers"
 
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one");
-                                    sid=core_sub.sid))
+                                    sid=stream.delivery.sid))
         @test timedwait(1.0; pollint=0.001) do
             isready(stream.messages)
         end != :timed_out
@@ -3427,9 +3406,8 @@ end
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull.*")
     TestHelpers.clear_capture!(capture)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
     received = Channel{String}(2)
 
     stream = consume(msg -> put!(received, String(msg)), psub;
@@ -3439,9 +3417,9 @@ end
             occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))
         end != :timed_out
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one");
-                                    sid=core_sub.sid))
+                                    sid=stream.delivery.sid))
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.2.2.0.0", TestHelpers.bytes("two");
-                                    sid=core_sub.sid))
+                                    sid=stream.delivery.sid))
         @test timedwait(1.0; pollint=0.001) do
             isready(received)
         end != :timed_out
@@ -3464,8 +3442,7 @@ end
 
     reconnecting_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     reconnecting_js = jetstream(reconnecting_client)
-    reconnecting_sub = subscribe(reconnecting_client, "_INBOX.reconnecting")
-    reconnecting_psub = N.PullSubscription(reconnecting_js, reconnecting_sub, "ORDERS", "WORKER", "_INBOX.reconnecting", ReentrantLock(), ReentrantLock(), false, false)
+    reconnecting_psub = N.PullSubscription(reconnecting_js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     @test_throws FetchDisconnectedError fetch(reconnecting_psub, 1; timeout=0.1, heartbeat=0)
     @test reconnecting_client.pending_bytes == 0
@@ -3484,36 +3461,36 @@ end
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull")
     TestHelpers.clear_capture!(capture)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     fetch_task = @async fetch(psub, 1; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))
     end != :timed_out
+    delivery = TestHelpers.active_pull_delivery(psub)
     @lock client.lock N._store_status_locked!(client, N.ConnectionStatus.RECONNECTING)
-    N._notify_subscription_waiters!(core_sub; all=true)
+    N._notify_subscription_waiters!(delivery; all=true)
     @test task_error(fetch_task) isa FetchDisconnectedError
     close(psub)
 
     terminal_capture = TestHelpers.WriteCapture()
     terminal_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=terminal_capture)
     terminal_js = jetstream(terminal_client)
-    terminal_core_sub = subscribe(terminal_client, "_INBOX.terminal")
     TestHelpers.clear_capture!(terminal_capture)
-    terminal_psub = N.PullSubscription(terminal_js, terminal_core_sub, "ORDERS", "WORKER", "_INBOX.terminal", ReentrantLock(), ReentrantLock(), false, false)
+    terminal_psub = N.PullSubscription(terminal_js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     terminal_task = @async fetch(terminal_psub, 1; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(terminal_capture))
     end != :timed_out
+    terminal_delivery = TestHelpers.active_pull_delivery(terminal_psub)
     @lock terminal_client.lock begin
         N._store_status_locked!(terminal_client, N.ConnectionStatus.DISCONNECTED)
     end
-    @lock terminal_core_sub.lock begin
-        terminal_core_sub.closed = true
-        N._notify_subscription_waiters_locked(terminal_core_sub; all=true)
+    @lock terminal_delivery.lock begin
+        terminal_delivery.closed = true
+        N._notify_subscription_waiters_locked(terminal_delivery; all=true)
     end
     @test task_error(terminal_task) isa FetchDisconnectedError
     close(terminal_psub)
@@ -3521,91 +3498,74 @@ end
     partial_capture = TestHelpers.WriteCapture()
     partial_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=partial_capture)
     partial_js = jetstream(partial_client)
-    partial_core_sub = subscribe(partial_client, "_INBOX.partial")
     TestHelpers.clear_capture!(partial_capture)
-    partial_psub = N.PullSubscription(partial_js, partial_core_sub, "ORDERS", "WORKER", "_INBOX.partial", ReentrantLock(), ReentrantLock(), false, false)
-    N._dispatch_msg(partial_client, Msg("_INBOX.partial", nothing, TestHelpers.bytes("payload"); sid=partial_core_sub.sid))
+    partial_psub = N.PullSubscription(partial_js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     partial_task = @async fetch(partial_psub, 2; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(partial_capture))
     end != :timed_out
+    partial_delivery = TestHelpers.active_pull_delivery(partial_psub)
+    N._dispatch_msg(partial_client, Msg("orders.created", nothing, TestHelpers.bytes("payload");
+                                        sid=partial_delivery.sid))
     @lock partial_client.lock N._store_status_locked!(partial_client, N.ConnectionStatus.RECONNECTING)
-    N._notify_subscription_waiters!(partial_core_sub; all=true)
+    N._notify_subscription_waiters!(partial_delivery; all=true)
     msgs = fetch(partial_task)
     @test length(msgs) == 1
     @test String(first(msgs)) == "payload"
     close(partial_psub)
 end
 
-@testitem "JetStream pull fetch correlates statuses to the active request" setup=[TestHelpers] begin
+@testitem "JetStream pull fetch isolates concurrent request deliveries" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
 
-    function fetch_reply(capture)
-        line = first(split(TestHelpers.capture_text(capture), "\r\n"))
-        parts = split(line)
-        @test parts[1] == "PUB"
-        String(parts[3])
+    function fetch_replies(capture)
+        replies = String[]
+        for line in split(TestHelpers.capture_text(capture), "\r\n")
+            parts = split(line)
+            length(parts) >= 4 || continue
+            parts[1] == "PUB" || continue
+            occursin("CONSUMER.MSG.NEXT", parts[2]) || continue
+            push!(replies, String(parts[3]))
+        end
+        replies
     end
 
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull.*")
     TestHelpers.clear_capture!(capture)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     try
-        N._dispatch_msg(client, Msg("_INBOX.pull.old404", nothing, UInt8[];
-                                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    sid=core_sub.sid))
-        N._dispatch_msg(client, Msg("_INBOX.pull.old408", nothing, UInt8[];
-                                    headers=Headers("Status" => ["408"], "Description" => ["Request Timeout"]),
-                                    sid=core_sub.sid))
-        N._dispatch_msg(client, Msg("_INBOX.pull.old409", nothing, UInt8[];
-                                    headers=Headers("Status" => ["409"], "Description" => ["Batch Completed"]),
-                                    sid=core_sub.sid))
-        N._dispatch_msg(client, Msg("_INBOX.pull.01", nothing, UInt8[];
-                                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    sid=core_sub.sid))
-        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("payload");
-                                    sid=core_sub.sid))
+        first_task = @async fetch(psub, 1; timeout=2.0, heartbeat=0)
+        first_delivery = TestHelpers.wait_for_pull_delivery(psub)
+        second_task = @async fetch(psub, 1; timeout=2.0, heartbeat=0)
+        @test timedwait(1.0; pollint=0.001) do
+            length(TestHelpers.active_pull_deliveries(psub)) == 2
+        end != :timed_out
+        second_delivery = only(filter(delivery -> delivery !== first_delivery,
+                                      TestHelpers.active_pull_deliveries(psub)))
 
-        msgs = fetch(psub, 1; timeout=0.2, heartbeat=0)
-        @test length(msgs) == 1
-        @test String(first(msgs)) == "payload"
+        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.2.2.0.0",
+                                    TestHelpers.bytes("second"); sid=second_delivery.sid))
+        second_msgs = fetch(second_task)
+        @test length(second_msgs) == 1
+        @test String(first(second_msgs)) == "second"
+        @test !istaskdone(first_task)
 
-        reply = fetch_reply(capture)
-        @test startswith(reply, "_INBOX.pull.")
-        @test reply != psub.deliver
-        @test !endswith(reply, ".*")
-        @test N._pull_fetch_status_matches_request("_INBOX.pull.1", 1)
-        @test !N._pull_fetch_status_matches_request("_INBOX.pull.01", 1)
+        N._dispatch_msg(client, Msg(first_delivery.subject, nothing, UInt8[];
+                                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
+                                    sid=first_delivery.sid))
+        @test isempty(fetch(first_task))
+
+        replies = fetch_replies(capture)
+        @test length(unique(replies)) >= 2
+        @test all(!endswith(reply, ".*") for reply in replies)
     finally
         close(psub)
-    end
-
-    active_capture = TestHelpers.WriteCapture()
-    active_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=active_capture)
-    active_js = jetstream(active_client)
-    active_core_sub = subscribe(active_client, "_INBOX.active.*")
-    TestHelpers.clear_capture!(active_capture)
-    active_psub = N.PullSubscription(active_js, active_core_sub, "ORDERS", "WORKER", "_INBOX.active.*", ReentrantLock(), ReentrantLock(), false, false)
-
-    try
-        fetch_task = @async fetch(active_psub, 1; timeout=1.0, heartbeat=0)
-        @test timedwait(1.0; pollint=0.001) do
-            occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(active_capture))
-        end != :timed_out
-        reply = fetch_reply(active_capture)
-        N._dispatch_msg(active_client, Msg(reply, nothing, UInt8[];
-                                          headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                          sid=active_core_sub.sid))
-        @test isempty(fetch(fetch_task))
-    finally
-        close(active_psub)
     end
 end
 
@@ -3617,12 +3577,13 @@ end
     function run_fetch(headers::Headers; data=UInt8[])
         client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
         js = jetstream(client)
-        core_sub = subscribe(client, "_INBOX.pull")
-        take!(client.write_io)
-        psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
-        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, data; headers, sid=core_sub.sid))
+        psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
         try
-            fetch(psub, 1; timeout=0.1, heartbeat=0)
+            task = @async fetch(psub, 1; timeout=1.0, heartbeat=0)
+            delivery = TestHelpers.wait_for_pull_delivery(psub)
+            subject = isempty(data) ? delivery.subject : "orders.created"
+            N._dispatch_msg(client, Msg(subject, nothing, data; headers, sid=delivery.sid))
+            TestHelpers.fetch_task_result(task)
         finally
             close(psub)
         end
@@ -3652,21 +3613,19 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull")
-    take!(client.write_io)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
-    N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
+    task = @async fetch(psub, 1; timeout=1.0, heartbeat=0.02)
+    delivery = TestHelpers.wait_for_pull_delivery(psub)
+    N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                 headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                sid=core_sub.sid))
-    @test isempty(fetch(psub, 1; timeout=0.1, heartbeat=0.02))
+                                sid=delivery.sid))
+    @test isempty(fetch(task))
     @test occursin("\"idle_heartbeat\":20000000", String(take!(client.write_io)))
     close(psub)
 
     timeout_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     timeout_js = jetstream(timeout_client)
-    timeout_sub = subscribe(timeout_client, "_INBOX.timeout")
-    take!(timeout_client.write_io)
-    timeout_psub = N.PullSubscription(timeout_js, timeout_sub, "ORDERS", "WORKER", "_INBOX.timeout", ReentrantLock(), ReentrantLock(), false, false)
+    timeout_psub = N.PullSubscription(timeout_js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
     try
         @test_throws JetStreamError fetch(timeout_psub, 1; timeout=0.12, heartbeat=0.02)
     finally
@@ -3681,30 +3640,34 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     js = jetstream(client)
-    core_sub = subscribe(client, "_INBOX.pull")
-    take!(client.write_io)
-    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     try
-        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, TestHelpers.bytes("payload");
+        task = @async fetch(psub, 1; timeout=1.0, heartbeat=0)
+        delivery = TestHelpers.wait_for_pull_delivery(psub)
+        N._dispatch_msg(client, Msg("orders.created", nothing, TestHelpers.bytes("payload");
                                     headers=Headers("Nats-Pin-Id" => ["pin-a"]),
-                                    sid=core_sub.sid))
-        @test String(first(fetch(psub, 1; timeout=0.1, heartbeat=0))) == "payload"
+                                    sid=delivery.sid))
+        @test String(first(fetch(task))) == "payload"
         @test psub.pin_id == "pin-a"
         take!(client.write_io)
 
-        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+        task = @async fetch(psub, 1; timeout=1.0, heartbeat=0)
+        delivery = TestHelpers.wait_for_pull_delivery(psub)
+        N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
-                                    sid=core_sub.sid))
-        @test isempty(fetch(psub, 1; timeout=0.1, heartbeat=0))
+                                    sid=delivery.sid))
+        @test isempty(fetch(task))
         request = String(take!(client.write_io))
         @test occursin("\"id\":\"pin-a\"", request)
         @test !occursin("pin_id", request)
 
-        N._dispatch_msg(client, Msg("_INBOX.pull", nothing, UInt8[];
+        task = @async fetch(psub, 1; timeout=1.0, heartbeat=0)
+        delivery = TestHelpers.wait_for_pull_delivery(psub)
+        N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                     headers=Headers("Status" => ["423"], "Description" => ["Pin ID Mismatch"]),
-                                    sid=core_sub.sid))
-        @test_throws JetStreamError fetch(psub, 1; timeout=0.1, heartbeat=0)
+                                    sid=delivery.sid))
+        @test_throws JetStreamError TestHelpers.fetch_task_result(task)
         @test isnothing(psub.pin_id)
     finally
         close(psub)
@@ -3719,12 +3682,10 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     js = jetstream(client)
 
-    pull_core = subscribe(client, "_INBOX.pull")
-    pull = N.PullSubscription(js, pull_core, "S", "C", "_INBOX.pull", ReentrantLock(), ReentrantLock(), false, false)
+    pull = N.PullSubscription(js, "S", "C", ReentrantLock(), ReentrantLock(), false, false)
     close(pull; timeout=0.1)
     close(pull; timeout=0.1)
     @test pull.closed
-    @test pull_core.closed
 
     push_core = subscribe(client, "_INBOX.push")
     push = N.PushSubscription(js, push_core, "S", "C", ReentrantLock(), false, false)
@@ -3774,13 +3735,10 @@ end
     pull_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
                                           write_io=IOBuffer())
     pull_js = jetstream(pull_client)
-    pull_core = subscribe(pull_client, "_INBOX.pull")
-    pull = N.PullSubscription(pull_js, pull_core, "S", "C", "_INBOX.pull",
-                              ReentrantLock(), ReentrantLock(), true, false)
+    pull = N.PullSubscription(pull_js, "S", "C", ReentrantLock(), ReentrantLock(), true, false)
 
     retry_delete_after_reconnect!(pull_client, () -> close(pull))
     @test pull.closed
-    @test pull_core.closed
     @test pull.server_deleted
     @test close(pull) === nothing
     @test String(take!(pull_client.write_io)) == ""
@@ -3811,12 +3769,12 @@ end
     js = jetstream(client)
     sub = subscribe(client, "_INBOX.typed")
     msg = JetStreamMsg(Msg("_INBOX.typed", "\$JS.ACK.S.C.1.1.1.0.0", UInt8[]; sid=sub.sid), client)
-    pull = N.PullSubscription(js, sub, "S", "C", "_INBOX.typed", ReentrantLock(), ReentrantLock(), false, false)
+    pull = N.PullSubscription(js, "S", "C", ReentrantLock(), ReentrantLock(), false, false)
     push = N.PushSubscription(js, sub, "S", "C", ReentrantLock(), false, false)
 
     @test fieldtype(typeof(msg), :_client) === typeof(client)
     @test fieldtype(typeof(js), :client) === typeof(client)
-    @test fieldtype(typeof(pull), :sub) === typeof(sub)
+    @test fieldtype(typeof(pull), :active_deliveries) === Vector{typeof(sub)}
     @test fieldtype(typeof(push), :sub) === typeof(sub)
     @test only(Base.return_types(ack, Tuple{typeof(msg)})) === Nothing
     @test only(Base.return_types(ack_sync, Tuple{typeof(msg)})) === Msg
