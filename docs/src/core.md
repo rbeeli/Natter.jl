@@ -157,7 +157,7 @@ one = subscribe(client, "startup.ready"; max_msgs=1)
 msg = next(one; timeout=5.0)
 ```
 
-`unsubscribe(sub; max_msgs=n)` keeps an existing subscription open for `n` more messages.
+`unsubscribe(sub; max_msgs=n)` keeps an existing subscription open for `n` more protocol deliveries. `stats(sub)` reports both `delivered` and user-visible `received` counts, which can differ when slow-consumer limits drop messages.
 
 ## Request Reply
 
@@ -173,7 +173,7 @@ A simple service handler:
 ```julia
 service = subscribe(client, "users.lookup") do msg
     isnothing(msg.reply) && return
-    publish(client, msg.reply, lookup_user(String(msg)))
+    respond(client, msg, lookup_user(String(msg)))
 end
 ```
 

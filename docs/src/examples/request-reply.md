@@ -10,7 +10,7 @@ client = connect("nats://127.0.0.1:4222"; name="time-service")
 
 service = subscribe(client, "time.now") do msg
     isnothing(msg.reply) && return
-    publish(client, msg.reply, string(now(Dates.UTC)))
+    respond(client, msg, string(now(Dates.UTC)))
 end
 
 response = request(client, "time.now", ""; timeout=1.0)

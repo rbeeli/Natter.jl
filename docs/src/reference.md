@@ -9,18 +9,19 @@ Conventions:
 - Payload inputs may be strings, byte vectors, or `nothing`; encode structured values explicitly.
 - `String(msg)` works for `Msg`, `BorrowedMsg`, `JetStreamMsg`, `BorrowedJetStreamMsg`, and `KeyValueEntry`.
 - Blocking operations accept `cancel_token=cancellation_token(source)` where cancellation is useful.
-- Most `_async` helpers return `NatterTask`; `js_publish_async` returns `JetStreamPublishFuture`. `fetch(handle)` returns the operation result or rethrows the original error.
+- Most `_async` helpers return `NatterTask`; `js_publish_future` returns `JetStreamPublishFuture`. `fetch(handle)` returns the operation result or rethrows the original error.
 
 ## Core Types
 
 | Type | Purpose |
 | :--- | :--- |
 | `Client` | Active connection with reader, ping, reconnect, request, and subscription state. |
-| `ConnectOptions` | Immutable connection configuration built by `connect` or directly. |
+| `ConnectOptions` | Connection configuration built by `connect` or directly. |
 | `ConnectionStatus` | `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
 | `ConnectionEventKind` | Lifecycle event kind for `event_cb`. |
 | `ConnectionEvent` | Event passed to `event_cb`; includes kind, status, URL, attempt, delay, error, and generation. |
 | `Stats` | Snapshot of message, byte, reconnect, error, and dropped-message counters. |
+| `SubscriptionStats` | Snapshot of one subscription's queued, processing, delivered, received, and dropped counters. |
 | `Msg` | Owned core message with `subject`, `reply`, byte-vector `data`, and optional headers. |
 | `BorrowedMsg` | Callback-only core message whose `data` is a borrowed byte view valid only for the callback call. |
 | `Headers` | Case-insensitive header dictionary of `String => Vector{String}`. |
@@ -45,7 +46,7 @@ Conventions:
 
 ## Connect Options
 
-`connect(url_or_urls=nothing; kwargs...)` accepts one URL, a vector/tuple of URLs, or no URL for `nats://localhost:4222`. Multi-server pools are randomized by default for initial connect and reconnect; set `randomize_servers=false` when ordered failover is required.
+`connect(url_or_urls=nothing; kwargs...)` accepts one URL, a vector/tuple of URLs, or no URL for `nats://localhost:4222`. You can also build `ConnectOptions(...)` explicitly and pass it to `connect(options)`. Multi-server pools are randomized by default for initial connect and reconnect; set `randomize_servers=false` when ordered failover is required.
 
 | Option | Default | Purpose |
 | :--- | :--- | :--- |
@@ -103,10 +104,11 @@ Parser/resource limits:
 
 | Function | Returns | Use |
 | :--- | :--- | :--- |
-| `connect(url_or_urls=nothing; kwargs...)` | `Client` | Connect to NATS. |
+| `connect(url_or_urls=nothing; kwargs...)`, `connect(options::ConnectOptions)` | `Client` | Connect to NATS. |
 | `publish(client, subject, data=nothing; reply=nothing, headers=nothing, buffer_on_reconnect=false, direct_write=false)` | `nothing` | Publish a core message. `direct_write=true` bypasses the client write buffer; `buffer_on_reconnect=true` opts into best-effort reconnect replay. |
 | `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | `PublishFrame` | Validate and serialize a reusable publish frame. Payloads are `nothing`, strings, or byte vectors. |
 | `publish(client, frame::PublishFrame; buffer_on_reconnect=false, direct_write=false)` | `nothing` | Publish a prepared frame. |
+| `respond(client, msg, data=nothing; headers=nothing, buffer_on_reconnect=false, direct_write=false)` | `nothing` | Reply to `msg.reply`, or throw `ArgumentError` when the message has no reply subject. |
 | `subscribe(client, subject; queue=nothing, callback=nothing, borrowed=false, max_msgs=0, pending_msgs_limit=..., pending_bytes_limit=...)` | `Subscription` | Create a subscription. `borrowed=true` requires a callback and delivers `BorrowedMsg` inline from the reader task. |
 | `subscribe(callback, client, subject; kwargs...)` | `Subscription` | Callback-first form. |
 | `next(sub; timeout=1.0)` | `Msg` | Wait for a message on a non-callback subscription. |
@@ -123,9 +125,10 @@ Parser/resource limits:
 | `headers(msg)` | `Headers` | Copy all message headers. |
 | `status(client)` | `ConnectionStatus.T` | Current connection status. |
 | `stats(client)` | `Stats` | Counter snapshot; byte counters include payload and header bytes. |
+| `stats(sub)` | `SubscriptionStats` | Per-subscription pending, processing, received, delivered, dropped, and active-state snapshot. |
 | `connected_url(client)` | `Union{String,Nothing}` | Current server URL. |
 
-Core async helpers: `connect_async`, `publish_async`, `subscribe_async`, `unsubscribe_async`, `next_async`, `request_async`, `flush_async`, `ping_async`, `drain_async`, and `close_async`.
+Core async helpers: `connect_async`, `publish_async`, `respond_async`, `subscribe_async`, `unsubscribe_async`, `next_async`, `request_async`, `flush_async`, `ping_async`, `drain_async`, and `close_async`.
 
 Cancellation helpers: `CancellationSource()`, `cancellation_token(source)`, `cancel!(source)`, and `iscancelled(token)`. Cancelled operations throw `CancelledError`; `_async` helpers rethrow the same error from `fetch(handle)`.
 
@@ -167,12 +170,12 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 
 | Function | Returns | Use |
 | :--- | :--- | :--- |
-| `jetstream(client; prefix="$JS.API", timeout=5.0, publish_async_max_pending=256)` | `JetStreamContext` | Create a context. |
+| `jetstream(client; prefix="$JS.API", timeout=5.0, publish_future_max_pending=256)` | `JetStreamContext` | Create a context. |
 | `js_publish(js, subject, data=nothing; kwargs...)` | `PubAck` | Publish and wait for an ack. |
-| `js_publish_async(js, subject, data=nothing; kwargs...)` | `JetStreamPublishFuture` | Publish with the context async publisher and return an ack future. Pending futures are failed, not replayed, on reconnect. |
+| `js_publish_future(js, subject, data=nothing; kwargs...)` | `JetStreamPublishFuture` | Publish with the context async publisher and return an ack future. Pending futures are failed, not replayed, on reconnect. |
 | `fetch(future::JetStreamPublishFuture)` | `PubAck` | Wait for the async publish ack or rethrow its error. |
-| `js_publish_async_pending(js)` | `Int` | Count async publishes still waiting for acks. |
-| `js_publish_async_complete(js; timeout=...)` | `nothing` | Wait until all pending async publishes on the context complete. |
+| `js_publish_future_pending(js)` | `Int` | Count async publishes still waiting for acks. |
+| `js_publish_future_complete(js; timeout=...)` | `nothing` | Wait until all pending async publishes on the context complete. |
 | `stream_create(js, config; timeout=...)` | `StreamInfo` | Create a stream. |
 | `stream_update(js, config; timeout=...)` | `StreamInfo` | Update a stream. |
 | `stream_info(js, name; timeout=...)` | `StreamInfo` | Fetch stream info. |
@@ -206,7 +209,7 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 
 Typed `StreamConfig`, typed `ConsumerConfig`, and raw dictionary create/update calls verify that requested fields are reflected in the server response, including explicit false, zero, and empty values. Raw dictionary configs remain available for fields outside Natter's typed API, but they are not a weaker verification escape hatch. For unknown raw fields, Natter requires requested nested values to be present and tolerates additional nested defaults returned by the server.
 
-JetStream task-backed async helpers mirror management, subscribe, fetch, timeout-aware close, and acknowledgement functions, including acknowledgement kwargs and borrowed messages: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_async_complete_async`. `js_publish_async` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
+JetStream task-backed async helpers mirror management, subscribe, fetch, timeout-aware close, and acknowledgement functions, including acknowledgement kwargs and borrowed messages: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_future_complete_async`. `js_publish_future` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
 
 ## KeyValue Types
 

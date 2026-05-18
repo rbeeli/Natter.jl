@@ -29,9 +29,8 @@ end
 _write_transport_for_options(io, opts::ConnectOptions) =
     max(0, opts.write_buffer_size) == 0 ? io : BufferedWriteIO(io)
 
-function connect(url_or_urls=nothing; cancel_token::MaybeCancellationToken=nothing, kwargs...)
+function _connect_with_options(opts::ConnectOptions; cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
-    opts = _parse_options(url_or_urls; kwargs...)
     client = Client(
         opts,
         [Server(s) for s in opts.servers],
@@ -44,6 +43,7 @@ function connect(url_or_urls=nothing; cancel_token::MaybeCancellationToken=nothi
         nothing,
         ReentrantLock(),
         ReentrantLock(),
+        Base.Threads.Condition(ReentrantLock()),
         FlushSignal(),
         nothing,
         0,
@@ -63,6 +63,14 @@ function connect(url_or_urls=nothing; cancel_token::MaybeCancellationToken=nothi
     )
     _connect_initial!(client; cancel_token)
     client
+end
+
+function connect(options::ConnectOptions; cancel_token::MaybeCancellationToken=nothing)
+    _connect_with_options(options; cancel_token)
+end
+
+function connect(url_or_urls=nothing; cancel_token::MaybeCancellationToken=nothing, kwargs...)
+    _connect_with_options(_parse_options(url_or_urls; kwargs...); cancel_token)
 end
 
 function _server_attempt_order!(client::Client)::Vector{Server}
@@ -666,6 +674,37 @@ function _remaining_timeout_or_throw(deadline::Float64, operation::AbstractStrin
     remaining
 end
 
+function _wait_write_lock_signal_locked(condition::Base.GenericCondition{ReentrantLock},
+                                        timeout::Real;
+                                        cancel_token::MaybeCancellationToken=nothing)::Bool
+    _throw_if_cancelled(cancel_token)
+    seconds = Float64(timeout)
+    seconds > 0 || return false
+    registration = _register_cancellation_waiter(cancel_token, condition)
+    timed_out = Ref(false)
+    timer = isfinite(seconds) ? Timer(seconds) do _
+        lock(condition)
+        try
+            timed_out[] = true
+            notify(condition; all=true)
+        finally
+            unlock(condition)
+        end
+    end : nothing
+    try
+        while !timed_out[]
+            wait(condition)
+            _throw_if_cancelled(cancel_token)
+            timed_out[] && return false
+            return true
+        end
+        false
+    finally
+        _deregister_cancellation_waiter!(cancel_token, registration)
+        isnothing(timer) || close(timer)
+    end
+end
+
 function _lock_write!(client::Client, operation::String, deadline,
                       cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
@@ -674,17 +713,43 @@ function _lock_write!(client::Client, operation::String, deadline,
         return nothing
     end
 
-    while true
-        trylock(client.write_lock) && return nothing
-        _throw_if_cancelled(cancel_token)
-        if isnothing(deadline)
-            sleep(0.005)
-            continue
+    Threads.atomic_add!(client.write_waiters, 1)
+    try
+        lock(client.write_condition)
+        try
+            while !trylock(client.write_lock)
+                _throw_if_cancelled(cancel_token)
+                if isnothing(deadline)
+                    _wait_write_lock_signal_locked(client.write_condition, Inf; cancel_token)
+                else
+                    remaining = _remaining_timeout(deadline)
+                    remaining <= 0 && throw(TimeoutError("$operation timed out"))
+                    _wait_write_lock_signal_locked(client.write_condition, remaining; cancel_token) ||
+                        throw(TimeoutError("$operation timed out"))
+                end
+            end
+        finally
+            unlock(client.write_condition)
         end
-        remaining = _remaining_timeout(deadline)
-        remaining <= 0 && throw(TimeoutError("$operation timed out"))
-        sleep(min(remaining, 0.005))
+    finally
+        Threads.atomic_sub!(client.write_waiters, 1)
     end
+    nothing
+end
+
+function _unlock_write!(client::Client)
+    if client.write_waiters[] <= 0
+        unlock(client.write_lock)
+        return nothing
+    end
+    lock(client.write_condition)
+    try
+        unlock(client.write_lock)
+        notify(client.write_condition; all=true)
+    finally
+        unlock(client.write_condition)
+    end
+    nothing
 end
 
 function _with_write_lock(f::Function, client::Client, operation::String; deadline=nothing,
@@ -693,7 +758,7 @@ function _with_write_lock(f::Function, client::Client, operation::String; deadli
     try
         return f()
     finally
-        unlock(client.write_lock)
+        _unlock_write!(client)
     end
 end
 
@@ -1422,7 +1487,7 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
                 throw(ProtocolError("unexpected $(_protocol_op(frame)) during connect"))
             end
         end
-        accepted = @lock client.write_lock begin
+        accepted = _with_write_lock(client, "activate transport") do
             @lock client.lock begin
                 if !isnothing(generation) && (client.generation != generation || client.status == ConnectionStatus.CLOSED)
                     false
@@ -2083,7 +2148,7 @@ function _replay_subscriptions(client::Client; reconnect_replay::Bool=false)
             if !present || sub.closed || sub.server_active
                 nothing
             else
-                remaining = sub.max_msgs > 0 ? sub.max_msgs - sub.received : nothing
+                remaining = sub.max_msgs > 0 ? sub.max_msgs - sub.delivered : nothing
                 !isnothing(remaining) && remaining <= 0 ? :close : (sub.sid, sub.subject, sub.queue, remaining)
             end
         end

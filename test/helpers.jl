@@ -77,6 +77,7 @@ using TestItems
             write_io,
             ReentrantLock(),
             ReentrantLock(),
+            Base.Threads.Condition(ReentrantLock()),
             N.FlushSignal(),
             nothing,
             0,

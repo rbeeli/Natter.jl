@@ -306,19 +306,19 @@ end
                 stream_create(js, StreamConfig(name=stream, subjects=[subject], storage=StorageType.MEMORY))
                 stream_created[] = true
 
-                warm = fetch(js_publish_async(js, subject, "warm"; stream, timeout=io_timeout))
+                warm = fetch(js_publish_future(js, subject, "warm"; stream, timeout=io_timeout))
                 @test warm.stream == stream
                 flush(client; timeout=io_timeout)
 
                 primary.pause_downstream()
-                future = js_publish_async(js, subject, "pending-during-reconnect"; stream, timeout=io_timeout)
-                @test js_publish_async_pending(js) == 1
+                future = js_publish_future(js, subject, "pending-during-reconnect"; stream, timeout=io_timeout)
+                @test js_publish_future_pending(js) == 1
                 @test !isready(future)
 
                 primary.stop()
                 @test timedwait(5.0; pollint=0.01) do
                     isready(future) &&
-                        js_publish_async_pending(js) == 0 &&
+                        js_publish_future_pending(js) == 0 &&
                         (disconnected[] || N.status(client) == N.ConnectionStatus.RECONNECTING)
                 end != :timed_out
 
@@ -395,7 +395,7 @@ end
             @test direct_next.subject == subject
             @test direct_next.seq == 3
             @test String(direct_next) == "payload2"
-            pa_async = fetch(js_publish_async(js, subject, "async-payload"; stream=stream))
+            pa_async = fetch(js_publish_future(js, subject, "async-payload"; stream=stream))
             @test pa_async.stream == stream
             async_direct = fetch(stream_message_get_async(js, stream; seq=pa_async.seq, direct=true))
             @test async_direct.seq == pa_async.seq

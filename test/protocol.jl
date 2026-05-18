@@ -511,11 +511,13 @@ end
     @test auth_request[].nonce == "nonce"
     @test auth_request[].attempt == 1
     @test !auth_request[].reconnect
+    @test typeof(dynamic_auth_client.options.auth) === N.CallbackAuth
 
     invalid_callback_client = TestHelpers.fake_client(; opts=N.ConnectOptions(
         auth=N.CallbackAuth(_ -> "bad"),
     ))
     @test_throws ArgumentError connect_command(invalid_callback_client, N.ServerInfo())
+    @test typeof(invalid_callback_client.options.auth) === N.CallbackAuth
 
     function encoded_seed(public_prefix::UInt8)
         data = Vector{UInt8}(undef, 34)

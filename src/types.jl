@@ -17,6 +17,18 @@ Base.@kwdef mutable struct Stats
     dropped_msgs::Int = 0
 end
 
+Base.@kwdef struct SubscriptionStats
+    pending_msgs::Int = 0
+    pending_bytes::Int = 0
+    processing::Int = 0
+    received::Int = 0
+    delivered::Int = 0
+    dropped_msgs::Int = 0
+    max_msgs::Int = 0
+    closed::Bool = false
+    server_active::Bool = false
+end
+
 struct AtomicCounter
     shards::Vector{Threads.Atomic{Int}}
 end
@@ -66,6 +78,43 @@ end
 function _default_error_cb(err)
     @warn "Natter client error" exception=err
     nothing
+end
+
+const _ErrorCallback = FunctionWrappers.FunctionWrapper{Nothing,Tuple{Any}}
+const _EventCallback = FunctionWrappers.FunctionWrapper{Nothing,Tuple{Any}}
+const _ReconnectDelayCallback = FunctionWrappers.FunctionWrapper{Any,Tuple{Any}}
+const _AuthCallback = FunctionWrappers.FunctionWrapper{Any,Tuple{Any}}
+const _SignatureCallback = FunctionWrappers.FunctionWrapper{Any,Tuple{Vector{UInt8}}}
+
+function _wrap_error_callback(callback)::_ErrorCallback
+    callback = isnothing(callback) ? _default_error_cb : callback
+    _ErrorCallback(err -> begin
+        callback(err)
+        nothing
+    end)
+end
+
+function _wrap_event_callback(callback)::_EventCallback
+    callback = isnothing(callback) ? _default_noop_event_cb : callback
+    _EventCallback(event -> begin
+        callback(event)
+        nothing
+    end)
+end
+
+function _wrap_reconnect_delay_callback(callback)::_ReconnectDelayCallback
+    callback = isnothing(callback) ? _default_reconnect_delay_cb : callback
+    _ReconnectDelayCallback(event -> callback(event))
+end
+
+function _wrap_auth_callback(callback)::_AuthCallback
+    isnothing(callback) && throw(ArgumentError("CallbackAuth requires a callback"))
+    _AuthCallback(request -> callback(request))
+end
+
+function _wrap_signature_callback(callback)
+    isnothing(callback) && return nothing
+    _SignatureCallback(nonce -> callback(nonce))
 end
 
 struct _HeaderEntry
@@ -408,9 +457,13 @@ _bytes_to_string(bytes::AbstractVector{UInt8})::String = String(copy(bytes))
 Base.String(msg::Msg) = _bytes_to_string(msg.data)
 Base.String(msg::BorrowedMsg) = _bytes_to_string(msg.data)
 
-function _connect_option_servers(servers)
+function _connect_option_servers(servers)::Vector{String}
     servers isa Union{AbstractVector,Tuple} || throw(ArgumentError("servers must be a vector or tuple of strings"))
-    result = Tuple(String.(servers))
+    result = String[]
+    for raw in servers
+        raw isa AbstractString || throw(ArgumentError("servers must be a vector or tuple of strings"))
+        push!(result, strip(String(raw)))
+    end
     isempty(result) && throw(ArgumentError("at least one server URL is required"))
     any(isempty, result) && throw(ArgumentError("server URL cannot be empty"))
     result
@@ -584,42 +637,40 @@ struct UserPassAuth <: AbstractAuth
     end
 end
 
-struct NKeyAuth{SignatureCallback} <: AbstractAuth
+struct NKeyAuth <: AbstractAuth
     nkey::Union{String,Nothing}
     seed::Union{SecretBytes,Nothing}
     seed_path::Union{String,Nothing}
-    signature_cb::SignatureCallback
-    function NKeyAuth{SignatureCallback}(nkey, seed, seed_path,
-                                         signature_cb) where {SignatureCallback}
+    signature_cb::Union{_SignatureCallback,Nothing}
+    function NKeyAuth(nkey, seed, seed_path, signature_cb)
         normalized_nkey = _connect_option_optional_string("nkey", nkey)
         normalized_seed = _secret_bytes(seed)
         normalized_seed_path = _connect_option_optional_string("seed_path", seed_path)
+        normalized_signature_cb = _wrap_signature_callback(signature_cb)
         seed_sources = _connect_option_count_present(normalized_seed, normalized_seed_path)
         seed_sources <= 1 ||
             throw(ArgumentError("NKeyAuth must use either seed or seed_path, not both"))
-        signature_sources = seed_sources + (isnothing(signature_cb) ? 0 : 1)
+        signature_sources = seed_sources + (isnothing(normalized_signature_cb) ? 0 : 1)
         signature_sources == 1 ||
             throw(ArgumentError("NKeyAuth requires exactly one of seed, seed_path, or signature_cb"))
-        if !isnothing(signature_cb) && isnothing(normalized_nkey)
+        if !isnothing(normalized_signature_cb) && isnothing(normalized_nkey)
             throw(ArgumentError("NKeyAuth with signature_cb requires nkey"))
         end
-        new{SignatureCallback}(normalized_nkey, normalized_seed, normalized_seed_path,
-                               signature_cb)
+        new(normalized_nkey, normalized_seed, normalized_seed_path, normalized_signature_cb)
     end
 end
 function NKeyAuth(; nkey=nothing, seed=nothing, seed_path=nothing, signature_cb=nothing)
-    NKeyAuth{typeof(signature_cb)}(nkey, seed, seed_path, signature_cb)
+    NKeyAuth(nkey, seed, seed_path, signature_cb)
 end
 
-struct JwtAuth{SignatureCallback} <: AbstractAuth
+struct JwtAuth <: AbstractAuth
     jwt::Union{SecretBytes,Nothing}
     jwt_path::Union{String,Nothing}
     nkey::Union{String,Nothing}
     seed::Union{SecretBytes,Nothing}
     seed_path::Union{String,Nothing}
-    signature_cb::SignatureCallback
-    function JwtAuth{SignatureCallback}(jwt, jwt_path, nkey, seed, seed_path,
-                                        signature_cb) where {SignatureCallback}
+    signature_cb::Union{_SignatureCallback,Nothing}
+    function JwtAuth(jwt, jwt_path, nkey, seed, seed_path, signature_cb)
         normalized_jwt = _secret_bytes(jwt)
         normalized_jwt_path = _connect_option_optional_string("jwt_path", jwt_path)
         jwt_sources = _connect_option_count_present(normalized_jwt, normalized_jwt_path)
@@ -629,19 +680,20 @@ struct JwtAuth{SignatureCallback} <: AbstractAuth
         normalized_nkey = _connect_option_optional_string("nkey", nkey)
         normalized_seed = _secret_bytes(seed)
         normalized_seed_path = _connect_option_optional_string("seed_path", seed_path)
+        normalized_signature_cb = _wrap_signature_callback(signature_cb)
         seed_sources = _connect_option_count_present(normalized_seed, normalized_seed_path)
         seed_sources <= 1 ||
             throw(ArgumentError("JwtAuth must use either seed or seed_path, not both"))
-        signature_sources = seed_sources + (isnothing(signature_cb) ? 0 : 1)
+        signature_sources = seed_sources + (isnothing(normalized_signature_cb) ? 0 : 1)
         signature_sources == 1 ||
             throw(ArgumentError("JwtAuth requires exactly one of seed, seed_path, or signature_cb"))
-        new{SignatureCallback}(normalized_jwt, normalized_jwt_path, normalized_nkey,
-                               normalized_seed, normalized_seed_path, signature_cb)
+        new(normalized_jwt, normalized_jwt_path, normalized_nkey,
+            normalized_seed, normalized_seed_path, normalized_signature_cb)
     end
 end
 function JwtAuth(; jwt=nothing, jwt_path=nothing, nkey=nothing, seed=nothing,
                  seed_path=nothing, signature_cb=nothing)
-    JwtAuth{typeof(signature_cb)}(jwt, jwt_path, nkey, seed, seed_path, signature_cb)
+    JwtAuth(jwt, jwt_path, nkey, seed, seed_path, signature_cb)
 end
 
 struct CredentialsAuth <: AbstractAuth
@@ -659,11 +711,10 @@ end
 CredentialsAuth(; credentials=nothing, path=nothing) = CredentialsAuth(credentials, path)
 CredentialsAuth(credentials) = CredentialsAuth(; credentials)
 
-struct CallbackAuth{Callback} <: AbstractAuth
-    callback::Callback
+struct CallbackAuth <: AbstractAuth
+    callback::_AuthCallback
     function CallbackAuth(callback)
-        isnothing(callback) && throw(ArgumentError("CallbackAuth requires a callback"))
-        new{typeof(callback)}(callback)
+        new(_wrap_auth_callback(callback))
     end
 end
 
@@ -678,8 +729,10 @@ Base.show(io::IO, ::CallbackAuth) = print(io, "CallbackAuth(...)")
 _default_noop_event_cb(_event) = nothing
 _default_reconnect_delay_cb(_event) = nothing
 
-struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCallback,EventCallback,ReconnectDelayCallback}
-    servers::Servers
+struct ConnectOptions{Auth<:AbstractAuth}
+    # Deliberately mutable: ConnectOptions is a configuration handle, and
+    # connect(options) snapshots the current server list into Client.servers.
+    servers::Vector{String}
     randomize_servers::Bool
     name::Union{String,Nothing}
     verbose::Bool
@@ -719,9 +772,9 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
     drain_timeout::Float64
     close_callback_timeout::Float64
     inbox_prefix::String
-    error_cb::ErrorCallback
-    event_cb::EventCallback
-    reconnect_delay_cb::ReconnectDelayCallback
+    error_cb::_ErrorCallback
+    event_cb::_EventCallback
+    reconnect_delay_cb::_ReconnectDelayCallback
 
     function ConnectOptions(
         servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
@@ -749,8 +802,6 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         tls_ca_path = _connect_option_optional_string("tls_ca_path", tls_ca_path)
         tls_cert_path = _connect_option_optional_string("tls_cert_path", tls_cert_path)
         tls_key_path = _connect_option_optional_string("tls_key_path", tls_key_path)
-        event_cb = isnothing(event_cb) ? _default_noop_event_cb : event_cb
-        reconnect_delay_cb = isnothing(reconnect_delay_cb) ? _default_reconnect_delay_cb : reconnect_delay_cb
         _validate_connect_option_tls(tls_cert_path, tls_key_path)
         connect_timeout = _connect_option_positive_float("connect_timeout", connect_timeout)
         ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
@@ -784,7 +835,11 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         close_callback_timeout = _connect_option_nonnegative_float("close_callback_timeout", close_callback_timeout)
         inbox_prefix = _validate_inbox_prefix(inbox_prefix)
 
-        new{typeof(servers),typeof(auth),typeof(error_cb),typeof(event_cb),typeof(reconnect_delay_cb)}(
+        error_cb = _wrap_error_callback(error_cb)
+        event_cb = _wrap_event_callback(event_cb)
+        reconnect_delay_cb = _wrap_reconnect_delay_callback(reconnect_delay_cb)
+
+        new{typeof(auth)}(
             servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
             tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
@@ -826,6 +881,8 @@ end
 function _show_connect_option_value(io::IO, name::Symbol, value)
     if name === :servers
         show(io, map(_redacted_server_url, value))
+    elseif name in (:error_cb, :event_cb, :reconnect_delay_cb)
+        print(io, "<callback>")
     else
         show(io, value)
     end
@@ -1448,6 +1505,8 @@ mutable struct Subscription{C<:AbstractNatterClient}
     pending_bytes_limit::Int
     pending_bytes::Int
     received::Int
+    delivered::Int
+    dropped_msgs::Int
     max_msgs::Int
     closed::Bool
     processor::Union{Task,Nothing}
@@ -1461,13 +1520,15 @@ function Subscription(client::C, sid::Int, subject::String, queue::Union{String,
                       messages::MsgQueue{Msg}, condition::Base.GenericCondition{ReentrantLock},
                       control_handler::_SubscriptionControlHandler,
                       pending_msgs_limit::Int, pending_bytes_limit::Int, pending_bytes::Int,
-                      received::Int, max_msgs::Int, closed::Bool, processor::Union{Task,Nothing},
-                      server_active::Bool, processing::Int) where {C<:AbstractNatterClient}
+                      received::Int, delivered::Int, dropped_msgs::Int, max_msgs::Int,
+                      closed::Bool, processor::Union{Task,Nothing}, server_active::Bool,
+                      processing::Int) where {C<:AbstractNatterClient}
     Subscription{C}(client, lock, sid, subject, queue, !isnothing(callback),
                     borrowed_callback, _borrowed_callback_handler(client, borrowed_callback ? callback : nothing),
                     messages, condition, control_handler,
                     pending_msgs_limit, pending_bytes_limit, pending_bytes, received,
-                    max_msgs, closed, processor, server_active, processing)
+                    delivered, dropped_msgs, max_msgs, closed, processor, server_active,
+                    processing)
 end
 
 struct _SubscriptionSnapshotEntry{C<:AbstractNatterClient}
@@ -1673,6 +1734,8 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     @atomic write_io::Union{WriteIO,Nothing}
     lock::ReentrantLock
     write_lock::ReentrantLock
+    write_condition::Base.GenericCondition{ReentrantLock}
+    write_waiters::Threads.Atomic{Int}
     write_reconnect_pending::Threads.Atomic{Bool}
     write_scratch::Vector{UInt8}
     write_deadline::Threads.Atomic{Float64}
@@ -1705,7 +1768,8 @@ end
 function Client(options::Options, servers::Vector{Server}, current_server::Union{Server,Nothing},
                 connected_url::Union{String,Nothing}, status::ConnectionStatus.T,
                 info::ServerInfo, socket::Union{Sockets.TCPSocket,Nothing}, read_io, write_io,
-                lock::ReentrantLock, write_lock::ReentrantLock, flush_signal::FlushSignal,
+                lock::ReentrantLock, write_lock::ReentrantLock,
+                write_condition::Base.GenericCondition{ReentrantLock}, flush_signal::FlushSignal,
                 flusher_task::Union{Task,Nothing}, sid::Int, subscriptions,
                 request_mux::Union{RequestMux,Nothing}, request_mux_lock::ReentrantLock,
                 pending, pending_bytes::Int, pongs::PongWaiterQueue,
@@ -1758,6 +1822,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                    info, Threads.Atomic{Int}(something(info.max_payload, typemax(Int))),
                                    Threads.Atomic{Bool}(info.headers === true),
                                    socket, read_io, reader, write_io, lock, write_lock,
+                                   write_condition, Threads.Atomic{Int}(0),
                                    Threads.Atomic{Bool}(false),
                                    UInt8[], Threads.Atomic{Float64}(Inf), Threads.Atomic{Int}(0),
                                    Threads.Atomic{Int}(0), Ref{Any}(nothing), Ref(""), nothing,
@@ -1951,4 +2016,17 @@ stats(client::Client) = Stats(; in_msgs=_stat_get(client.stats.in_msgs),
                               reconnects=_stat_get(client.stats.reconnects),
                               errors=_stat_get(client.stats.errors),
                               dropped_msgs=_stat_get(client.stats.dropped_msgs))
+function stats(sub::Subscription)
+    @lock sub.lock begin
+        SubscriptionStats(; pending_msgs=Base.n_avail(sub.messages),
+                          pending_bytes=sub.pending_bytes,
+                          processing=sub.processing,
+                          received=sub.received,
+                          delivered=sub.delivered,
+                          dropped_msgs=sub.dropped_msgs,
+                          max_msgs=sub.max_msgs,
+                          closed=sub.closed,
+                          server_active=sub.server_active)
+    end
+end
 connected_url(client::Client) = (@lock client.lock client.connected_url)

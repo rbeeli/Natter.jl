@@ -70,26 +70,26 @@ acks = Vector{PubAck}(undef, 2)
 end
 ```
 
-For high-volume publishing where you want protocol-level async acks, use `js_publish_async`. The context owns one reply subscription, tracks pending acks, and applies backpressure at `publish_async_max_pending`.
+For high-volume publishing where you want protocol-level async acks, use `js_publish_future`. The context owns one reply subscription, tracks pending acks, and applies backpressure at `publish_future_max_pending`.
 
 ```julia
-js = jetstream(client; timeout=5.0, publish_async_max_pending=512)
+js = jetstream(client; timeout=5.0, publish_future_max_pending=512)
 
 futures = [
-    js_publish_async(js, "orders.events.created", """{"id":$id}""";
+    js_publish_future(js, "orders.events.created", """{"id":$id}""";
         stream="ORDERS",
         msg_id="order-$id",
     )
     for id in 1001:1100
 ]
 
-js_publish_async_complete(js; timeout=5.0)
+js_publish_future_complete(js; timeout=5.0)
 acks = fetch.(futures)
 ```
 
-`fetch(future)` returns `PubAck` or throws the publish error for that message. Use `js_publish_async_pending(js)` to inspect the current pending count.
+`fetch(future)` returns `PubAck` or throws the publish error for that message. Use `js_publish_future_pending(js)` to inspect the current pending count.
 
-Pending `js_publish_async` futures are not replayed after a reconnect. If the connection enters reconnect, the context clears outstanding async publish futures with `ConnectionReconnectingError`; publish again after reconnect and use `msg_id` when duplicate effects matter. JetStream publish retries server `NoRespondersError` responses twice by default with a 250 ms wait; `retry_attempts` and `retry_wait` tune that behavior and only apply while the same connection generation is still active.
+Pending `js_publish_future` futures are not replayed after a reconnect. If the connection enters reconnect, the context clears outstanding async publish futures with `ConnectionReconnectingError`; publish again after reconnect and use `msg_id` when duplicate effects matter. JetStream publish retries server `NoRespondersError` responses twice by default with a 250 ms wait; `retry_attempts` and `retry_wait` tune that behavior and only apply while the same connection generation is still active.
 
 ## Durable Pull Worker
 

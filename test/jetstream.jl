@@ -548,8 +548,8 @@ end
     @test_throws ArgumentError js_publish(js, "orders.created", "payload"; ttl=0.5)
     @test_throws ArgumentError js_publish(js, "orders.created", "payload"; schedule="x", schedule_every=1.0)
     @test_throws ArgumentError js_publish(js, "orders.created", "payload"; retry_attempts=-1)
-    @test_throws ArgumentError js_publish_async(js, "orders.created", "payload"; retry_attempts=-1)
-    @test_throws ArgumentError js_publish_async(js, "orders.created", "payload"; retry_wait=0)
+    @test_throws ArgumentError js_publish_future(js, "orders.created", "payload"; retry_attempts=-1)
+    @test_throws ArgumentError js_publish_future(js, "orders.created", "payload"; retry_wait=0)
     @test TestHelpers.capture_text(capture) == ""
 end
 
@@ -597,40 +597,79 @@ end
 
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
-    js = jetstream(client; publish_async_max_pending=8)
+    js = jetstream(client; publish_future_max_pending=8)
 
-    future = js_publish_async(js, "orders.created", "payload"; timeout=1.0)
+    future = js_publish_future(js, "orders.created", "payload"; timeout=1.0)
 
     @test future isa JetStreamPublishFuture
     @test !(future isa NatterTask)
     @test !isready(future)
     @test future.retry_attempts == N.DEFAULT_JS_PUBLISH_RETRY_ATTEMPTS
-    @test js_publish_async_pending(js) == 1
+    @test js_publish_future_pending(js) == 1
     @test length(client.subscriptions) == 1
     sub = only(values(client.subscriptions))
     @test !sub.has_callback
     @test sub.processor === nothing
     @test sub.control_handler isa N._JetStreamAsyncPublishControlHandler
-    @test sub.subject == "$(js.async_publish.prefix).*"
+    @test sub.subject == "$(js.publish_futures.prefix).*"
 
     written = TestHelpers.capture_text(capture)
-    @test occursin("SUB $(js.async_publish.prefix).* $(sub.sid)\r\n", written)
+    @test occursin("SUB $(js.publish_futures.prefix).* $(sub.sid)\r\n", written)
     @test occursin("PUB orders.created $(future.reply) 7\r\npayload\r\n", written)
 
     ack_payload = """{"stream":"ORDERS","seq":1,"duplicate":false}"""
     N._dispatch_msg(client, Msg(future.reply, nothing, TestHelpers.bytes(ack_payload); sid=sub.sid))
     @test !isready(sub.messages)
     @test timedwait(1.0; pollint=0.001) do
-        isready(future) && js_publish_async_pending(js) == 0
+        isready(future) && js_publish_future_pending(js) == 0
     end == :ok
 
     ack = fetch(future)
     @test ack.stream == "ORDERS"
     @test ack.seq == 1
     @test !ack.duplicate
-    @test isnothing(js_publish_async_complete(js; timeout=0.1))
+    @test isnothing(js_publish_future_complete(js; timeout=0.1))
 
     close(client)
+end
+
+@testitem "JetStream publish futures honor cancellation while waiting for write lock" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    N._ensure_js_async_publish_subscription!(js.publish_futures)
+    TestHelpers.clear_capture!(capture)
+
+    source = CancellationSource()
+    token = cancellation_token(source)
+    lock(client.write_lock)
+    task = @async TestHelpers.thrown_exception() do
+        js_publish_future(js, "orders.created", "payload"; cancel_token=token)
+    end
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            client.write_waiters[] > 0
+        end == :ok
+        @test cancel!(source)
+        finished = timedwait(1.0; pollint=0.001) do
+            istaskdone(task)
+        end
+        @test finished == :ok
+        err = finished == :ok ? fetch(task) : nothing
+        @test err isa CancelledError
+        @test js_publish_future_pending(js) == 0
+        @test TestHelpers.capture_text(capture) == ""
+        @test N.status(client) == N.ConnectionStatus.CONNECTED
+    finally
+        iscancelled(token) || cancel!(source)
+        unlock(client.write_lock)
+        istaskdone(task) || wait(task)
+        close(client)
+    end
 end
 
 @testitem "JetStream async publish timeout monitor accepts long deadlines" setup=[TestHelpers] begin
@@ -642,18 +681,18 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
 
-    future = js_publish_async(js, "orders.created", "payload"; timeout=1.0e20)
-    task = js.async_publish.timeout_task
+    future = js_publish_future(js, "orders.created", "payload"; timeout=1.0e20)
+    task = js.publish_futures.timeout_task
     @test task isa Task
 
     sleep(0.02)
     @test !istaskfailed(task)
     @test !isready(future)
-    @test js_publish_async_pending(js) == 1
+    @test js_publish_future_pending(js) == 1
 
     close(client)
     @test timedwait(1.0; pollint=0.001) do
-        isready(future) && js_publish_async_pending(js) == 0
+        isready(future) && js_publish_future_pending(js) == 0
     end == :ok
 end
 
@@ -666,14 +705,14 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
 
-    future = js_publish_async(js, "orders.created", "payload"; timeout=1.0)
-    @test js_publish_async_pending(js) == 1
+    future = js_publish_future(js, "orders.created", "payload"; timeout=1.0)
+    @test js_publish_future_pending(js) == 1
     @test !isempty(client.jetstream_async_publish_states)
 
     TestHelpers.clear_capture!(capture)
     N._trigger_reconnect(client, ErrorException("transport failed"))
     @test timedwait(1.0; pollint=0.001) do
-        isready(future) && js_publish_async_pending(js) == 0
+        isready(future) && js_publish_future_pending(js) == 0
     end == :ok
 
     err = TestHelpers.thrown_exception(() -> fetch(future))
@@ -693,18 +732,18 @@ end
 
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
-    js = jetstream(client; publish_async_max_pending=1)
+    js = jetstream(client; publish_future_max_pending=1)
 
-    first = js_publish_async(js, "orders.created", "one"; timeout=1.0)
-    @test js_publish_async_pending(js) == 1
+    first = js_publish_future(js, "orders.created", "one"; timeout=1.0)
+    @test js_publish_future_pending(js) == 1
 
     backpressure_err = TestHelpers.thrown_exception() do
-        js_publish_async(js, "orders.created", "two"; timeout=0.01)
+        js_publish_future(js, "orders.created", "two"; timeout=0.01)
     end
     @test backpressure_err isa TimeoutError
-    @test js_publish_async_pending(js) == 1
+    @test js_publish_future_pending(js) == 1
 
-    complete_task = @async js_publish_async_complete(js; timeout=1.0)
+    complete_task = @async js_publish_future_complete(js; timeout=1.0)
     sleep(0.02)
     @test !istaskdone(complete_task)
 
@@ -712,7 +751,7 @@ end
     N._dispatch_msg(client, Msg(first.reply, nothing,
                                TestHelpers.bytes("""{"stream":"ORDERS","seq":1}"""); sid=sub.sid))
     @test isnothing(fetch(complete_task))
-    @test js_publish_async_pending(js) == 0
+    @test js_publish_future_pending(js) == 0
 
     close(client)
 end
@@ -726,7 +765,7 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
 
-    failed = js_publish_async(js, "orders.created", "bad"; timeout=1.0)
+    failed = js_publish_future(js, "orders.created", "bad"; timeout=1.0)
     sub = only(values(client.subscriptions))
     err_payload = """{"error":{"code":400,"err_code":10071,"description":"wrong stream"}}"""
     N._dispatch_msg(client, Msg(failed.reply, nothing, TestHelpers.bytes(err_payload); sid=sub.sid))
@@ -736,7 +775,7 @@ end
     failed_err = TestHelpers.thrown_exception(() -> fetch(failed))
     @test failed_err isa JetStreamError
     @test failed_err.code == 400
-    @test js_publish_async_pending(js) == 0
+    @test js_publish_future_pending(js) == 0
 
     ack_error_payload = """{"stream":"ORDERS","seq":2,"error":{"code":400,"err_code":10071,"description":"wrong last sequence"}}"""
     ack_error = TestHelpers.thrown_exception() do
@@ -746,7 +785,7 @@ end
     @test ack_error.code == 400
     @test ack_error.err_code == 10071
 
-    no_responders = js_publish_async(js, "orders.created", "missing"; timeout=1.0,
+    no_responders = js_publish_future(js, "orders.created", "missing"; timeout=1.0,
                                      retry_attempts=0)
     status_headers = Headers("Status" => ["503"], "Description" => ["No Responders"])
     N._dispatch_msg(client, Msg(no_responders.reply, nothing, UInt8[];
@@ -756,10 +795,10 @@ end
     end == :ok
     no_responders_err = TestHelpers.thrown_exception(() -> fetch(no_responders))
     @test no_responders_err isa NoRespondersError
-    @test js_publish_async_pending(js) == 0
+    @test js_publish_future_pending(js) == 0
 
     TestHelpers.clear_capture!(capture)
-    retried = js_publish_async(js, "orders.created", "retry"; timeout=5.0,
+    retried = js_publish_future(js, "orders.created", "retry"; timeout=5.0,
                                retry_attempts=1, retry_wait=0.001)
     retry_reply = retried.reply
     N._dispatch_msg(client, Msg(retry_reply, nothing, UInt8[];
@@ -777,12 +816,12 @@ end
     retry_ack = fetch(retried)
     @test retry_ack.stream == "ORDERS"
     @test retry_ack.seq == 3
-    @test js_publish_async_pending(js) == 0
+    @test js_publish_future_pending(js) == 0
 
-    timed_out = js_publish_async(js, "orders.created", "slow"; timeout=0.01)
+    timed_out = js_publish_future(js, "orders.created", "slow"; timeout=0.01)
     timeout_err = TestHelpers.thrown_exception(() -> fetch(timed_out))
     @test timeout_err isa TimeoutError
-    @test js_publish_async_pending(js) == 0
+    @test js_publish_future_pending(js) == 0
 
     close(client)
 end

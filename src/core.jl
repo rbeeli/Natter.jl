@@ -100,9 +100,16 @@ function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flus
                         replayable::Bool=false, frame_size::Int=_serialized_size(frame),
                         direct_write::Bool=false,
                         payload_size::Int=_pub_payload_size(frame),
-                        validate_frame::Bool=true)::Tuple{Bool,Bool}
+                        validate_frame::Bool=true,
+                        cancel_token::MaybeCancellationToken=nothing)::Tuple{Bool,Bool}
     captured, attempted = false, false
-    @lock client.write_lock begin
+    if isnothing(cancel_token)
+        lock(client.write_lock)
+    else
+        _lock_write!(client, "publish", nothing, cancel_token)
+    end
+    try
+        _throw_if_cancelled(cancel_token)
         st = status(client)
         io = @atomic client.write_io
         reconnect_pending = client.write_reconnect_pending[]
@@ -115,6 +122,8 @@ function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flus
         validate_frame && _validate_publish_frame_for_client(client, frame, payload_size)
         captured, attempted = _write_publish_to_active_io(client, io, frame, force_flush,
                                                           replayable, frame_size, direct_write)
+    finally
+        _unlock_write!(client)
     end
     captured, attempted
 end
@@ -218,8 +227,10 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
                        payload_size::Int=_pub_payload_size(frame),
                        st::ConnectionStatus.T=status(client),
                        direct_write::Bool=false,
-                       validate_frame::Bool=true)
+                       validate_frame::Bool=true,
+                       cancel_token::MaybeCancellationToken=nothing)
     validate_frame && _validate_publish_frame_for_client(client, frame, payload_size)
+    _throw_if_cancelled(cancel_token)
     can_buffer_reconnect = buffer_on_reconnect && _reconnect_buffer_enabled(client)
     if st == ConnectionStatus.CONNECTED && client.write_reconnect_pending[]
         can_buffer_reconnect || throw(ConnectionReconnectingError())
@@ -229,10 +240,12 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
             _write_publish(client, frame; force_flush, replayable=can_buffer_reconnect,
-                           frame_size, direct_write, payload_size, validate_frame=false)
+                           frame_size, direct_write, payload_size, validate_frame=false,
+                           cancel_token)
         catch err
             failure = err isa _PublishWriteFailure ? err : _PublishWriteFailure(err, false, false)
             cause = failure.cause
+            cause isa CancelledError && throw(cause)
             cause isa OutboundBufferLimitError && throw(cause)
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, cause)
                 if can_buffer_reconnect
@@ -262,11 +275,18 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
 end
 
 function _send_subscription_now!(sub::Subscription)
-    sid, subject, queue, max_msgs = @lock sub.lock (sub.sid, sub.subject, sub.queue, sub.max_msgs)
+    sid, subject, queue, max_msgs, delivered = @lock sub.lock begin
+        (sub.sid, sub.subject, sub.queue, sub.max_msgs, sub.delivered)
+    end
+    remaining = max_msgs > 0 ? max_msgs - delivered : 0
+    if max_msgs > 0 && remaining <= 0
+        _close_subscription_locally!(sub; throw_errors=false)
+        return false
+    end
     try
         _write_raw(sub.client, _sub_cmd(subject, queue, sid))
-        if max_msgs > 0
-            _write_raw(sub.client, _unsub_cmd(sid, max_msgs))
+        if remaining > 0
+            _write_raw(sub.client, _unsub_cmd(sid, remaining))
         end
         @lock sub.lock sub.server_active = true
         return true
@@ -404,7 +424,7 @@ function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_
     _ensure_usable_status_for_publish(st)
     _validate_publish_frame_for_client(client, frame, payload_size)
     _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
-                  payload_size, st, direct_write, validate_frame=false)
+                  payload_size, st, direct_write, validate_frame=false, cancel_token)
     _record_out!(client, payload_size)
     nothing
 end
@@ -428,7 +448,7 @@ function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; 
     _ensure_usable_status_for_publish(st)
     validate_frame && _validate_publish_frame_for_client(client, frame, payload_size)
     _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
-                  payload_size, st, direct_write, validate_frame=false)
+                  payload_size, st, direct_write, validate_frame=false, cancel_token)
     _record_out!(client, payload_size)
     nothing
 end
@@ -451,6 +471,15 @@ end
 function publish(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=false,
                  direct_write::Bool=false, cancel_token::MaybeCancellationToken=nothing)
     _publish_prepared(client, frame; buffer_on_reconnect, direct_write, cancel_token)
+end
+
+function respond(client::Client, msg::AbstractMsg, data=nothing; headers=nothing,
+                 buffer_on_reconnect::Bool=false, direct_write::Bool=false,
+                 cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
+    reply = msg.reply
+    isnothing(reply) && throw(ArgumentError("message has no reply subject"))
+    publish(client, reply, data; headers, buffer_on_reconnect, direct_write, cancel_token)
 end
 
 function _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
@@ -501,7 +530,7 @@ function _subscribe(client::Client, subject::AbstractString; queue::Union{Abstra
         condition = Base.Threads.Condition(sub_lock)
         sub = Subscription(client, sid, subject, queue, callback, borrowed, sub_lock, ch,
                            condition, _control_handler, pending_msgs_limit,
-                           pending_bytes_limit, 0, 0, max_msgs, false, nothing, false, 0)
+                           pending_bytes_limit, 0, 0, 0, 0, max_msgs, false, nothing, false, 0)
         client.subscriptions[sid] = sub
         _set_subscription_snapshot_locked!(client, sid, sub)
         send_now = st == ConnectionStatus.CONNECTED
@@ -693,13 +722,15 @@ function _try_handle_msg_control(dispatcher::_ReaderMsgDispatcher{C},
     client = dispatcher.client
     sub = route.sub
     (isnothing(sub) || !route.fast_control) && return false
-    closed = false
+    active = false
     control_handler = _NoSubscriptionControlHandler()
     @lock sub.lock begin
-        closed = sub.closed
-        control_handler = sub.control_handler
+        if !sub.closed && sub.sid == sid
+            active = true
+            control_handler = sub.control_handler
+        end
     end
-    closed && return false
+    active || return false
     _try_handle_subscription_msg_control(control_handler, client, sub, reader, subject_start,
                                          subject_end, reply_start, reply_end, size)
 end
@@ -713,13 +744,15 @@ function _try_handle_hmsg_control(dispatcher::_ReaderMsgDispatcher{C},
     client = dispatcher.client
     sub = route.sub
     (isnothing(sub) || !route.fast_control) && return false
-    closed = false
+    active = false
     control_handler = _NoSubscriptionControlHandler()
     @lock sub.lock begin
-        closed = sub.closed
-        control_handler = sub.control_handler
+        if !sub.closed && sub.sid == sid
+            active = true
+            control_handler = sub.control_handler
+        end
     end
-    closed && return false
+    active || return false
     _try_handle_subscription_hmsg_control(control_handler, client, sub, reader, subject_start,
                                           subject_end, reply_start, reply_end, hsize, total)
 end
@@ -895,41 +928,47 @@ end
 function _dispatch_owned_msg_to_sub(client::Client, sub::Subscription, msg::Msg,
                                     msg_bytes::Int)
     control_handler = _NoSubscriptionControlHandler()
-    closed = @lock sub.lock begin
-        if sub.closed
+    should_close = false
+    inactive = @lock sub.lock begin
+        if sub.closed || sub.sid != msg.sid
             true
         else
+            sub.delivered += 1
+            should_close = sub.max_msgs > 0 && sub.delivered >= sub.max_msgs
             control_handler = sub.control_handler
             false
         end
     end
-    if closed
+    if inactive
         _record_drop!(client)
         return
     end
 
     if _handle_subscription_control(control_handler, sub, msg)
         _record_in!(client, msg_bytes)
+        should_close && _close_subscription_locally!(sub; throw_errors=false)
         return
     end
     if _handle_ordered_push_data!(control_handler, client, msg)
+        @lock sub.lock sub.dropped_msgs += 1
         _record_drop!(client)
+        should_close && _close_subscription_locally!(sub; throw_errors=false)
         return
     end
 
-    should_close = false
     report_slow = false
     accepted = @lock sub.lock begin
         if sub.closed
             report_slow = false
+            sub.dropped_msgs += 1
             false
         elseif sub.pending_bytes + msg_bytes > sub.pending_bytes_limit || Base.n_avail(sub.messages) >= sub.pending_msgs_limit
             report_slow = true
+            sub.dropped_msgs += 1
             false
         else
             sub.received += 1
             sub.pending_bytes += msg_bytes
-            should_close = sub.max_msgs > 0 && sub.received >= sub.max_msgs
             put!(sub.messages, msg)
             _notify_subscription_waiters_locked(sub)
             true
@@ -940,6 +979,7 @@ function _dispatch_owned_msg_to_sub(client::Client, sub::Subscription, msg::Msg,
         if report_slow
             _report_error(client, SlowConsumerError(msg.subject, msg.sid, "subscription pending limits exceeded"))
         end
+        should_close && _close_subscription_locally!(sub; throw_errors=false)
         return
     end
     _record_in!(client, msg_bytes)
@@ -980,6 +1020,11 @@ function _borrowed_dispatch_msg(msg::BorrowedMsg)::_BorrowedDispatchMsg
                 msg.header_bytes)
 end
 
+function _borrowed_dispatch_msg(msg::BorrowedMsg{Vector{UInt8}})::_BorrowedDispatchMsg
+    BorrowedMsg(msg.subject, msg.reply, @view(msg.data[1:length(msg.data)]), msg.headers, msg.sid,
+                msg.header_bytes)
+end
+
 function _invoke_borrowed_handler(client::Client, handler::_BorrowedCallback,
                                   msg::BorrowedMsg)
     handler.invoke(client, _borrowed_dispatch_msg(msg))
@@ -1014,19 +1059,22 @@ function _dispatch_borrowed_msg_to_sub(client::C, sub::Subscription{C}, msg::Bor
                                        msg_bytes::Int) where {C<:Client}
     control_handler = _NoSubscriptionControlHandler()
     dispatch_owned = false
-    closed = @lock sub.lock begin
-        if sub.closed
+    should_close = false
+    inactive = @lock sub.lock begin
+        if sub.closed || sub.sid != msg.sid
             true
         elseif !sub.borrowed_callback
             dispatch_owned = true
             false
         else
+            sub.delivered += 1
+            should_close = sub.max_msgs > 0 && sub.delivered >= sub.max_msgs
             control_handler = sub.control_handler
             false
         end
     end
 
-    if closed
+    if inactive
         _record_drop!(client)
         return
     end
@@ -1037,27 +1085,30 @@ function _dispatch_borrowed_msg_to_sub(client::C, sub::Subscription{C}, msg::Bor
 
     if _handle_subscription_control(control_handler, sub, msg)
         _record_in!(client, msg_bytes)
+        should_close && _close_subscription_locally!(sub; throw_errors=false)
         return
     end
     if _handle_ordered_push_data!(control_handler, client, msg)
+        @lock sub.lock sub.dropped_msgs += 1
         _record_drop!(client)
+        should_close && _close_subscription_locally!(sub; throw_errors=false)
         return
     end
 
     handler = sub.borrowed_callback_handler
-    should_close = false
     accepted = @lock sub.lock begin
         if sub.closed || !sub.borrowed_callback || !sub.has_callback
+            sub.dropped_msgs += 1
             false
         else
             sub.received += 1
             sub.processing += 1
-            should_close = sub.max_msgs > 0 && sub.received >= sub.max_msgs
             true
         end
     end
     if !accepted
         _record_drop!(client)
+        should_close && _close_subscription_locally!(sub; throw_errors=false)
         return
     end
 
@@ -1121,10 +1172,10 @@ function next(sub::Subscription; timeout::Real=1.0, cancel_token::MaybeCancellat
     end
 end
 
-function _unsubscribe_target(received::Int, additional::Int)
-    received > typemax(Int) - additional &&
+function _unsubscribe_target(delivered::Int, additional::Int)
+    delivered > typemax(Int) - additional &&
         throw(ArgumentError("max_msgs is too large for subscription message count"))
-    received + additional
+    delivered + additional
 end
 
 function unsubscribe(sub::Subscription; max_msgs=0, cancel_token::MaybeCancellationToken=nothing)
@@ -1141,7 +1192,7 @@ function unsubscribe(sub::Subscription; max_msgs=0, cancel_token::MaybeCancellat
                 st in (ConnectionStatus.CLOSED, ConnectionStatus.DISCONNECTED) &&
                     throw(ConnectionClosedError("connection is disconnected"))
                 st == ConnectionStatus.DRAINING && throw(ConnectionDrainingError())
-                target = _unsubscribe_target(sub.received, max_msgs)
+                target = _unsubscribe_target(sub.delivered, max_msgs)
                 sub.max_msgs = target
             end
             (false, sub.server_active, sub.sid, target, previous_max)
@@ -1185,39 +1236,74 @@ _drain_timed_out(err)::Bool =
     (err isa Base.CompositeException && any(_drain_timed_out, err.exceptions))
 _drain_timed_out(errors::Vector)::Bool = any(_drain_timed_out, errors)
 
-function _drain(sub::Subscription, deadline::Float64; cancel_token::MaybeCancellationToken=nothing)
+function _drain_send_unsub!(sub::Subscription, deadline::Float64;
+                            cancel_token::MaybeCancellationToken=nothing)::Bool
     _throw_if_cancelled(cancel_token)
     closed, active, sid = @lock sub.lock (sub.closed, sub.server_active, sub.sid)
-    closed && return nothing
+    closed && return false
     status(sub.client) in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING) || throw(ConnectionReconnectingError())
     if active
         try
             _write_raw(sub.client, _unsub_cmd(sid); deadline=deadline, write_mode=_RAW_WRITE_DRAIN,
                        cancel_token)
+            @lock sub.lock begin
+                sub.closed || (sub.server_active = false)
+            end
         catch err
             _drain_timed_out(err) && rethrow()
             _recover_after_write_failure!(sub.client, err) || rethrow()
             throw(ConnectionReconnectingError())
         end
     end
-    _flush(sub.client; timeout=_remaining_timeout(deadline), deadline=deadline, cancel_token)
+    true
+end
+
+function _drain_wait_subscription!(sub::Subscription, deadline::Float64;
+                                   cancel_token::MaybeCancellationToken=nothing)
     ready = @lock sub.lock begin
         _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline); cancel_token) do
             !isready(sub.messages) && sub.processing == 0
         end
     end
     ready || throw(TimeoutError("subscription drain timed out"))
-    @lock sub.lock begin
-        sub.closed = true
-        sub.server_active = false
-        _notify_subscription_waiters_locked(sub; all=true)
+    nothing
+end
+
+function _finish_drained_subscription!(sub::Subscription)
+    sid, already_closed = @lock sub.lock begin
+        already_closed = sub.closed
+        if !already_closed
+            sub.closed = true
+            sub.server_active = false
+            _notify_subscription_waiters_locked(sub; all=true)
+        end
+        (sub.sid, already_closed)
     end
+    already_closed && return nothing
     @lock sub.client.lock begin
         _delete_subscription_locked!(sub.client, sid, sub)
     end
     errors = Any[]
     _close_subscription_channel!(errors, sub)
     _throw_errors(errors)
+    nothing
+end
+
+function _drain(sub::Subscription, deadline::Float64; cancel_token::MaybeCancellationToken=nothing)
+    active = _drain_send_unsub!(sub, deadline; cancel_token)
+    active || return nothing
+    _flush(sub.client; timeout=_remaining_timeout(deadline), deadline=deadline, cancel_token)
+    _drain_wait_subscription!(sub, deadline; cancel_token)
+    _finish_drained_subscription!(sub)
+    nothing
+end
+
+function _drain_client_subscription_wait!(sub::Subscription, deadline::Float64;
+                                          cancel_token::MaybeCancellationToken=nothing)
+    (@lock sub.lock sub.closed) && return nothing
+    _drain_wait_subscription!(sub, deadline; cancel_token)
+    (@lock sub.lock sub.closed) && return nothing
+    _finish_drained_subscription!(sub)
     nothing
 end
 
@@ -1322,7 +1408,7 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout,
     subs = @lock client.lock collect(values(client.subscriptions))
     for sub in subs
         try
-            _drain(sub, deadline; cancel_token)
+            _drain_send_unsub!(sub, deadline; cancel_token)
         catch err
             push!(errors, err)
             _report_error(client, err)
@@ -1335,6 +1421,17 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout,
         catch err
             push!(errors, err)
             _report_error(client, err)
+        end
+    end
+    if !_drain_timed_out(errors)
+        for sub in subs
+            try
+                _drain_client_subscription_wait!(sub, deadline; cancel_token)
+            catch err
+                push!(errors, err)
+                _report_error(client, err)
+                _drain_timed_out(err) && break
+            end
         end
     end
     try

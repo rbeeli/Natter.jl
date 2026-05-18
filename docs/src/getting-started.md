@@ -93,7 +93,7 @@ end
 ```julia
 service = subscribe(client, "orders.lookup") do msg
     isnothing(msg.reply) && return
-    publish(client, msg.reply, lookup_order(String(msg)))
+    respond(client, msg, lookup_order(String(msg)))
 end
 
 response = request(client, "orders.lookup", "order-1001"; timeout=1.0)

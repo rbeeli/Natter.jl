@@ -27,7 +27,7 @@ Statuses:
 | Reconnect | Supported | Automatic reconnect, optional initial-connect retry, randomized server-pool attempts with ordered opt-out, discovered servers, subscription and request mux replay, optional bounded publish replay, lifecycle events, delay callbacks, and bounded live-server chaos CI are implemented. Broader cluster chaos and auth failover scenarios remain as additional hardening coverage. |
 | Publish replay | Partial | Core publishes opt into reconnect replay with `buffer_on_reconnect=true` and are replayed only while they remain in the client buffer and have not been handed to the transport. Ambiguous write failures start reconnect but are not replayed automatically; use `pending_size=0` to disable replay buffering, or JetStream `msg_id` for durable idempotent publish paths. |
 | Slow consumer handling | Supported | Per-subscription pending limits report `SlowConsumerError`. |
-| Runtime inspection | Supported | `status`, `stats`, and `connected_url`. |
+| Runtime inspection | Supported | `status`, `stats(client)`, `stats(sub)`, and `connected_url`. |
 | Async handles | Supported | Task-backed `_async` helpers return `NatterTask`; blocking calls accept cooperative cancellation tokens and async handles rethrow `CancelledError` from cancelled operations. JetStream publish has a protocol async publisher with `JetStreamPublishFuture`. |
 
 ## JetStream
@@ -35,7 +35,7 @@ Statuses:
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
 | Context | Supported | `jetstream(client)`. |
-| Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options, including two default `NoRespondersError` retries. `js_publish_async` uses protocol-level async publish with pending ack accounting, backpressure, completion waiting, per-message ack/error futures, configurable no-responder retries, and explicit pending-future clearing on reconnect rather than replay. |
+| Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options, including two default `NoRespondersError` retries. `js_publish_future` uses protocol-level async publish with pending ack accounting, backpressure, completion waiting, per-message ack/error futures, configurable no-responder retries, and explicit pending-future clearing on reconnect rather than replay. |
 | Stream management | Supported | Create, update, info, list, names, page and iterator listing, purge, delete. |
 | Stream config | Supported | `StreamConfig`, nested helpers, and raw `Dict` payloads. Create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. Unknown raw fields tolerate additional nested defaults returned by the server. |
 | Message lookup | Supported | Sequence, last-by-subject, next-by-subject, direct get with validated metadata headers, stored-message sequence/timestamp metadata, and message delete. |

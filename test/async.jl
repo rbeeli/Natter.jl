@@ -12,6 +12,13 @@ using TestItems
     @test isnothing(fetch(publish_task))
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
 
+    response_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    response_task = respond_async(response_client, Msg("svc", "_INBOX.reply", UInt8[]), "ok";
+                                  buffer_on_reconnect=true)
+    @test response_task isa NatterTask
+    @test isnothing(fetch(response_task))
+    @test String(take!(response_client.pending)) == "PUB _INBOX.reply 2\r\nok\r\n"
+
     sub = fetch(subscribe_async(client, "foo"))
     @test sub isa Subscription
     put!(sub.messages, Msg("foo", nothing, TestHelpers.bytes("hello"); sid=sub.sid))

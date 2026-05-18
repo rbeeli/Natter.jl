@@ -116,6 +116,14 @@ end
     @test_throws MethodError push!(empty_prepared.payload, 0x41)
     @test isempty(prepare_publish("prepared.empty.again").payload)
 
+    response_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
+    response_msg = Msg("svc.time", "_INBOX.reply", UInt8[])
+    respond(response_client, response_msg, "ok"; headers=Headers("Trace" => "abc"))
+    response_frame = String(take!(response_client.write_io))
+    @test startswith(response_frame, "HPUB _INBOX.reply ")
+    @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nok\r\n", response_frame)
+    @test_throws ArgumentError respond(response_client, Msg("svc.time", nothing, UInt8[]), "ok")
+
     unsupported_headers = TestHelpers.fake_client(;
         status=N.ConnectionStatus.CONNECTED,
         info=N.ServerInfo(; headers=false),
@@ -593,22 +601,24 @@ end
     @test cold_opts.retry_on_initial_connect
     @test !cold_opts.randomize_servers
     @test cold_opts.record_stats
-    @test opts.servers isa Tuple{Vararg{String}}
+    @test opts.servers isa Vector{String}
     source_servers = ["nats://one.example:4222"]
     frozen = N.ConnectOptions(; servers=source_servers)
     source_servers[1] = "nats://two.example:4222"
     push!(source_servers, "nats://three.example:4222")
-    @test frozen.servers == ("nats://one.example:4222",)
-    @test N._parse_options(" nats://one.example:4222, nats://two.example:4223 , ").servers == (
+    @test frozen.servers == ["nats://one.example:4222"]
+    @test N._parse_options(" nats://one.example:4222, nats://two.example:4223 , ").servers == [
         "nats://one.example:4222",
         "nats://two.example:4223",
-    )
-    @test N._parse_options([" nats://one.example:4222 "]).servers == ("nats://one.example:4222",)
+    ]
+    @test N._parse_options([" nats://one.example:4222 "]).servers == ["nats://one.example:4222"]
     tuple_opts = N._parse_options((" nats://one.example:4222 ", "nats://two.example:4222"))
-    @test tuple_opts.servers == (
+    @test tuple_opts.servers == [
         "nats://one.example:4222",
         "nats://two.example:4222",
-    )
+    ]
+    direct_strip_opts = N.ConnectOptions(; servers=[" nats://direct.example:4222 "])
+    @test direct_strip_opts.servers == ["nats://direct.example:4222"]
     @test_throws ArgumentError N._parse_options(" , ")
     @test_throws ArgumentError N._parse_options(["nats://one.example:4222", " "])
     @test_throws ArgumentError N._parse_options(("nats://one.example:4222", " "))
@@ -690,6 +700,7 @@ end
 
     rejects(servers=String[])
     rejects(servers=[""])
+    rejects(servers=[" "])
     rejects(randomize_servers=1)
     rejects_with("tls_cert_path and tls_key_path must be provided together"; tls_cert_path="client.pem")
     rejects_with("tls_cert_path and tls_key_path must be provided together"; tls_key_path="client-key.pem")
@@ -870,6 +881,7 @@ end
     TestHelpers.clear_capture!(transport)
 
     sub.received = 3
+    sub.delivered = 3
     unsubscribe(sub; max_msgs=2)
     @test TestHelpers.capture_text(transport) == "UNSUB $(sub.sid) 5\r\n"
     @test sub.max_msgs == 5
@@ -896,20 +908,47 @@ end
     replay_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
                                             read_io=replay_transport, write_io=replay_transport)
     replay_sub = subscribe(replay_client, "replay"; max_msgs=5)
-    replay_sub.received = 3
+    replay_sub.delivered = 3
     N._replay_subscriptions(replay_client; reconnect_replay=true)
     @test TestHelpers.capture_text(replay_transport) ==
           "SUB replay $(replay_sub.sid)\r\nUNSUB $(replay_sub.sid) 2\r\n"
     @test replay_sub.server_active
 
     exhausted = subscribe(replay_client, "done"; max_msgs=2)
-    exhausted.received = 2
+    exhausted.delivered = 2
     TestHelpers.clear_capture!(replay_transport)
     N._replay_subscriptions(replay_client; reconnect_replay=true)
     @test TestHelpers.capture_text(replay_transport) == ""
     @test exhausted.closed
     @test !(exhausted.sid in keys(replay_client.subscriptions))
     @test !isopen(exhausted.messages)
+end
+
+@testitem "subscription delivered stats include slow-consumer drops" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    reported = Any[]
+    transport = TestHelpers.WriteCapture()
+    opts = N.ConnectOptions(; error_cb=err -> push!(reported, err))
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+    sub = subscribe(client, "slow"; pending_msgs_limit=1, pending_bytes_limit=1024)
+    TestHelpers.clear_capture!(transport)
+
+    N._dispatch_msg(client, Msg("slow", nothing, TestHelpers.bytes("one"); sid=sub.sid))
+    @test isready(sub.messages)
+    unsubscribe(sub; max_msgs=1)
+    @test TestHelpers.capture_text(transport) == "UNSUB $(sub.sid) 2\r\n"
+
+    N._dispatch_msg(client, Msg("slow", nothing, TestHelpers.bytes("two"); sid=sub.sid))
+    sub_stats = stats(sub)
+    @test sub_stats.delivered == 2
+    @test sub_stats.received == 1
+    @test sub_stats.dropped_msgs == 1
+    @test sub.closed
+    @test any(err -> err isa SlowConsumerError, reported)
 end
 
 @testitem "subscription pending byte limits include HMSG headers" setup=[TestHelpers] begin
@@ -1012,6 +1051,96 @@ end
     close(request_mux)
     @test !N._fast_control_subscription_for_sid(client, request_mux.sid)
     @test N._fast_control_subscription_for_sid(client, async_publish.sid)
+
+    close(client)
+end
+
+@testitem "reader cached route rejects stale sid after subscription remap" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct RemappingRouteResolver{R,S}
+        inner::R
+        sub::S
+        new_subject::String
+        remapped::Bool
+    end
+
+    function (resolver::RemappingRouteResolver)(sid::Int)
+        route = N._resolve_message_route(resolver.inner, sid)
+        if !resolver.remapped
+            resolver.remapped = true
+            N._remap_ordered_subscription!(resolver.sub, resolver.new_subject)
+        end
+        route
+    end
+
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(record_stats=true),
+                                     status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "route.old"; pending_msgs_limit=4)
+    old_sid = sub.sid
+    raw = TestHelpers.bytes("MSG route.old $old_sid 3\r\nold\r\n")
+    reader = N.ProtocolReader(IOBuffer(raw); read_size=length(raw))
+    resolver = RemappingRouteResolver(N._ReaderMsgRouteResolver(client), sub, "route.new",
+                                      false)
+    handler = N._ReaderMsgDispatcher(client)
+
+    @test isnothing(N._read_control_or_msg_dispatch(reader, client.options, resolver, handler))
+    @test resolver.remapped
+    @test sub.sid != old_sid
+    @test !isready(sub.messages)
+    @test sub.delivered == 0
+    @test stats(client).dropped_msgs == 1
+
+    close(client)
+end
+
+@testitem "stale fast control route does not consume request mux reply" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct RemappingRouteResolver{R,S}
+        inner::R
+        sub::S
+        new_subject::String
+        remapped::Bool
+    end
+
+    function (resolver::RemappingRouteResolver)(sid::Int)
+        route = N._resolve_message_route(resolver.inner, sid)
+        if !resolver.remapped
+            resolver.remapped = true
+            N._remap_ordered_subscription!(resolver.sub, resolver.new_subject)
+        end
+        route
+    end
+
+    client = TestHelpers.fake_client(; opts=N.ConnectOptions(record_stats=true),
+                                     status=N.ConnectionStatus.RECONNECTING)
+    prefix = "_INBOX.req"
+    sub = N._subscribe(client, "$prefix.*"; _control_handler=N._RequestMuxControlHandler())
+    old_sid = sub.sid
+    waiter = N.RequestWaiter{typeof(client)}(time() + 60, "$prefix.1")
+    mux_lock = ReentrantLock()
+    mux = N.RequestMux(prefix, sub, Dict{Int,N.RequestWaiter{typeof(client)}}(1 => waiter),
+                       Base.Threads.Condition(mux_lock), Base.Threads.Condition(mux_lock),
+                       0, N._DeadlineQueue{N.RequestWaiter{typeof(client)}}(), nothing)
+    @atomic client.request_mux = mux
+
+    raw = TestHelpers.bytes("MSG $prefix.1 $old_sid 2\r\nok\r\n")
+    reader = N.ProtocolReader(IOBuffer(raw); read_size=length(raw))
+    resolver = RemappingRouteResolver(N._ReaderMsgRouteResolver(client), sub, "$prefix.new",
+                                      false)
+    handler = N._ReaderMsgDispatcher(client)
+
+    @test isnothing(N._read_control_or_msg_dispatch(reader, client.options, resolver, handler))
+    @test resolver.remapped
+    @test sub.sid != old_sid
+    @test !waiter.ready
+    @test haskey(mux.waiters, 1)
+    @test stats(client).dropped_msgs == 1
 
     close(client)
 end
@@ -1554,6 +1683,52 @@ end
     cancel!(async_source)
     async_err = TestHelpers.thrown_exception(() -> fetch(handle))
     @test async_err isa CancelledError
+end
+
+@testitem "publish cancellation interrupts write lock waits" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function cancelled_contended_write(call)
+        output = IOBuffer()
+        client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                         write_io=output)
+        source = CancellationSource()
+        token = cancellation_token(source)
+        lock(client.write_lock)
+        task = @async TestHelpers.thrown_exception(() -> call(client, token))
+        try
+            @test timedwait(1.0; pollint=0.001) do
+                client.write_waiters[] > 0
+            end == :ok
+            @test cancel!(source)
+            finished = timedwait(1.0; pollint=0.001) do
+                istaskdone(task)
+            end
+            @test finished == :ok
+            err = finished == :ok ? fetch(task) : nothing
+            return err, String(take!(output)), N.status(client)
+        finally
+            iscancelled(token) || cancel!(source)
+            unlock(client.write_lock)
+            istaskdone(task) || wait(task)
+        end
+    end
+
+    err, written, st = cancelled_contended_write() do client, token
+        publish(client, "cancel.publish", "data"; cancel_token=token)
+    end
+    @test err isa CancelledError
+    @test written == ""
+    @test st == N.ConnectionStatus.CONNECTED
+
+    err, written, st = cancelled_contended_write() do client, token
+        respond(client, Msg("service", "_INBOX.reply", UInt8[]), "data"; cancel_token=token)
+    end
+    @test err isa CancelledError
+    @test written == ""
+    @test st == N.ConnectionStatus.CONNECTED
 end
 
 @testitem "cancelled flush leaves a stale waiter tombstone" setup=[TestHelpers] begin
@@ -3247,7 +3422,7 @@ end
     close(client)
 end
 
-@testitem "client drain shares timeout across subscriptions" setup=[TestHelpers] begin
+@testitem "client drain sends all subscription unsubscribes before waiting" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -3283,7 +3458,7 @@ end
     else
         @test err isa TimeoutError
     end
-    @test count(startswith("UNSUB "), transport.writes) == 1
+    @test count(startswith("UNSUB "), transport.writes) == 2
     @test count(==("PING\r\n"), transport.writes) == 1
     @test length(reported) == 1
     @test N.status(client) == N.ConnectionStatus.CLOSED

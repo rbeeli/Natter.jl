@@ -155,7 +155,7 @@ struct JetStreamContext{C<:Client,S<:JetStreamAsyncPublishState{C}}
     client::C
     prefix::String
     timeout::Float64
-    async_publish::S
+    publish_futures::S
 end
 
 const _JS_MSG_ID_HEADER = "Nats-Msg-Id"
@@ -317,8 +317,8 @@ function _iterate_jetstream_items(pages, page_result)
 end
 
 function jetstream(client::Client; prefix::AbstractString="\$JS.API", timeout::Real=5.0,
-                   publish_async_max_pending::Integer=256)
-    max_pending = _positive_integer_option("publish_async_max_pending", publish_async_max_pending)
+                   publish_future_max_pending::Integer=256)
+    max_pending = _positive_integer_option("publish_future_max_pending", publish_future_max_pending)
     JetStreamContext(client, String(prefix), _positive_timeout_seconds("timeout", timeout),
                      JetStreamAsyncPublishState(client, max_pending))
 end
@@ -1227,7 +1227,7 @@ Base.show(io::IO, future::JetStreamPublishFuture) =
     print(io, "JetStreamPublishFuture(", future.subject, ", ",
           isready(future) ? "ready" : "pending", ")")
 
-function js_publish_async(js::JetStreamContext, subject::AbstractString, data=nothing; timeout::Real=js.timeout,
+function js_publish_future(js::JetStreamContext, subject::AbstractString, data=nothing; timeout::Real=js.timeout,
                           stream::Union{AbstractString,Nothing}=nothing, headers=nothing,
                           expected_stream::Union{AbstractString,Nothing}=nothing, msg_id=nothing,
                           expected_last_sequence=nothing, expected_last_subject_sequence=nothing,
@@ -1248,11 +1248,11 @@ function js_publish_async(js::JetStreamContext, subject::AbstractString, data=no
                                schedule_target, schedule_source, schedule_ttl, schedule_timezone)
     frame = _publish_frame(subject, nothing, data, hdrs)
     _validate_publish_frame_for_client(js.client, frame)
-    _ensure_js_async_publish_subscription!(js.async_publish)
+    _ensure_js_async_publish_subscription!(js.publish_futures)
 
     deadline = time() + timeout
     generation = _load_generation(js.client)
-    future = _reserve_js_async_publish_future!(js.async_publish, frame.subject, deadline, generation,
+    future = _reserve_js_async_publish_future!(js.publish_futures, frame.subject, deadline, generation,
                                                attempts, wait_seconds, nothing, cancel_token)
     publish_frame = _PublishFrame(frame.subject, future.reply, frame.payload, frame.headers)
     if attempts > 0
@@ -1267,21 +1267,21 @@ function js_publish_async(js::JetStreamContext, subject::AbstractString, data=no
     future
 end
 
-function js_publish_async_pending(js::JetStreamContext)::Int
-    lock(js.async_publish.condition)
+function js_publish_future_pending(js::JetStreamContext)::Int
+    lock(js.publish_futures.condition)
     try
-        js.async_publish.pending
+        js.publish_futures.pending
     finally
-        unlock(js.async_publish.condition)
+        unlock(js.publish_futures.condition)
     end
 end
 
-function js_publish_async_complete(js::JetStreamContext; timeout::Real=js.timeout,
-                                   cancel_token::MaybeCancellationToken=nothing)
+function js_publish_future_complete(js::JetStreamContext; timeout::Real=js.timeout,
+                                     cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
-    state = js.async_publish
+    state = js.publish_futures
     lock(state.condition)
     try
         while state.pending > 0
@@ -3904,7 +3904,9 @@ function messages(psub::PullSubscription{C}; batch=100, max_bytes=nothing,
                   threshold_messages=nothing, threshold_bytes=nothing,
                   channel_size=batch, stop_after=nothing,
                   min_pending=nothing, min_ack_pending=nothing,
-                                     priority_group=nothing, priority=nothing) where {C}
+                  priority_group=nothing, priority=nothing,
+                  cancel_token::MaybeCancellationToken=nothing) where {C}
+    _throw_if_cancelled(cancel_token)
     config, channel_size = _validate_pull_messages(psub, batch, max_bytes, expires, heartbeat,
                                                    threshold_messages, threshold_bytes,
                                                    channel_size, stop_after,
@@ -3914,7 +3916,7 @@ function messages(psub::PullSubscription{C}; batch=100, max_bytes=nothing,
     delivery = nothing
     try
         delivery_batch = _saturating_add_int(channel_size, config.batch)
-        delivery = _subscribe_pull_delivery!(psub, delivery_batch, config.max_bytes)
+        delivery = _subscribe_pull_delivery!(psub, delivery_batch, config.max_bytes; cancel_token)
         state = _PullMessageStreamState()
         queue_lock = ReentrantLock()
         queue_condition = Base.Threads.Condition(queue_lock)

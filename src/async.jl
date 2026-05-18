@@ -56,11 +56,16 @@ end
 
 connect_async(url_or_urls=nothing; kwargs...)::NatterTask = _natter_async(connect, url_or_urls; kwargs...)
 
+connect_async(options::ConnectOptions; kwargs...)::NatterTask = _natter_async(connect, options; kwargs...)
+
 publish_async(client::Client, subject::AbstractString, data=nothing; kwargs...)::NatterTask =
     _natter_async(publish, client, subject, data; kwargs...)
 
 publish_async(client::Client, frame::PublishFrame; kwargs...)::NatterTask =
     _natter_async(publish, client, frame; kwargs...)
+
+respond_async(client::Client, msg::AbstractMsg, data=nothing; kwargs...)::NatterTask =
+    _natter_async(respond, client, msg, data; kwargs...)
 
 subscribe_async(client::Client, subject::AbstractString; kwargs...)::NatterTask =
     _natter_async(subscribe, client, subject; kwargs...)
@@ -98,8 +103,8 @@ close_async(client::Client; kwargs...)::NatterTask =
 close_async(sub::Subscription; kwargs...)::NatterTask =
     _natter_async(close, sub; kwargs...)
 
-js_publish_async_complete_async(js::JetStreamContext; kwargs...)::NatterTask =
-    _natter_async(js_publish_async_complete, js; kwargs...)
+js_publish_future_complete_async(js::JetStreamContext; kwargs...)::NatterTask =
+    _natter_async(js_publish_future_complete, js; kwargs...)
 
 stream_create_async(js::JetStreamContext, config; kwargs...)::NatterTask =
     _natter_async(stream_create, js, config; kwargs...)
