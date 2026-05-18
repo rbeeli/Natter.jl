@@ -1,5 +1,38 @@
 using TestItems
 
+@testitem "deadline queue tracks earliest insertions" begin
+    using Natter
+
+    const N = Natter
+
+    queue = N._DeadlineQueue{String}()
+    @test N._deadline_queue_push!(queue, 1, 10.0, "ten")
+    @test !N._deadline_queue_push!(queue, 2, 20.0, "twenty")
+    @test N._deadline_queue_push!(queue, 3, 5.0, "five")
+
+    first = N._deadline_queue_pop!(queue)
+    @test first.token == 3
+    @test first.deadline == 5.0
+    @test first.value == "five"
+
+    second = N._deadline_queue_pop!(queue)
+    @test second.token == 1
+    @test second.deadline == 10.0
+    @test second.value == "ten"
+
+    third = N._deadline_queue_pop!(queue)
+    @test third.token == 2
+    @test third.deadline == 20.0
+    @test third.value == "twenty"
+    @test isnothing(N._deadline_queue_pop!(queue))
+
+    for i in 1:65
+        N._deadline_queue_push!(queue, i, Float64(i), string(i))
+    end
+    @test N._deadline_queue_compaction_due(queue, 1)
+    @test !N._deadline_queue_compaction_due(queue, 65)
+end
+
 @testitem "validation and buffering" setup=[TestHelpers] begin
     using Natter
 
@@ -494,6 +527,7 @@ end
     @test opts.close_callback_timeout == 4.0
     @test opts.randomize_servers
     @test N.CLIENT_VERSION == string(pkgversion(N))
+    @test N.ConnectOptions(write_timeout=Inf).write_timeout == Inf
     @test N.ConnectOptions(close_callback_timeout=0).close_callback_timeout == 0.0
     @test !ismutable(opts)
     cold_opts = N.ConnectOptions(name=SubString("client-extra", 1, 6),
@@ -662,7 +696,6 @@ end
     rejects(direct_write_threshold=-1)
     rejects(read_buffer_shrink_threshold=1024, read_buffer_size=2048)
     rejects(write_timeout=0)
-    rejects(write_timeout=Inf)
     rejects(close_callback_timeout=-1)
     rejects(close_callback_timeout=Inf)
     rejects(max_control_line=0)
@@ -912,6 +945,32 @@ end
 
     close(sub2)
     @test length(@atomic client.subscription_snapshot) == sub1.sid
+
+    close(client)
+end
+
+@testitem "fast control snapshot only marks pre-payload control subscriptions" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    ordinary = subscribe(client, "events")
+    push_control = N._subscribe(client, "push";
+                                _control_handler=N._JetStreamPushControlHandler())
+    request_mux = N._subscribe(client, "_INBOX.request.*";
+                               _control_handler=N._RequestMuxControlHandler())
+    async_publish = N._subscribe(client, "_INBOX.publish.*";
+                                 _control_handler=N._JetStreamAsyncPublishControlHandler(nothing))
+
+    @test !N._fast_control_subscription_for_sid(client, ordinary.sid)
+    @test !N._fast_control_subscription_for_sid(client, push_control.sid)
+    @test N._fast_control_subscription_for_sid(client, request_mux.sid)
+    @test N._fast_control_subscription_for_sid(client, async_publish.sid)
+
+    close(request_mux)
+    @test !N._fast_control_subscription_for_sid(client, request_mux.sid)
+    @test N._fast_control_subscription_for_sid(client, async_publish.sid)
 
     close(client)
 end
@@ -1308,6 +1367,36 @@ end
         istaskdone(close_task)
     end != :timed_out
     wait(close_task)
+end
+
+@testitem "disabled and memory write timeouts skip watchdog state" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    disabled_transport = TestHelpers.WriteCapture()
+    disabled = TestHelpers.fake_client(; opts=N.ConnectOptions(write_buffer_size=0, write_timeout=Inf),
+                                       status=N.ConnectionStatus.CONNECTED,
+                                       write_io=disabled_transport)
+    N._write_raw(disabled, TestHelpers.bytes("PING\r\n"))
+
+    @test TestHelpers.capture_text(disabled_transport) == "PING\r\n"
+    @test disabled.write_epoch[] == 0
+    @test disabled.write_deadline[] == Inf
+    @test isnothing(disabled.write_timeout_task)
+    close(disabled)
+
+    memory_io = IOBuffer()
+    memory = TestHelpers.fake_client(; opts=N.ConnectOptions(write_buffer_size=0, write_timeout=0.02),
+                                     status=N.ConnectionStatus.CONNECTED,
+                                     write_io=memory_io)
+    N._write_raw(memory, TestHelpers.bytes("PONG\r\n"))
+
+    @test String(take!(memory_io)) == "PONG\r\n"
+    @test memory.write_epoch[] == 0
+    @test memory.write_deadline[] == Inf
+    @test isnothing(memory.write_timeout_task)
+    close(memory)
 end
 
 @testitem "direct publish writes use coalesced frame chunks" setup=[TestHelpers] begin
@@ -1905,17 +1994,32 @@ end
     @test isempty(take!(raw_client.pending))
 end
 
-@testitem "request does not buffer while reconnecting" setup=[TestHelpers] begin
+@testitem "request buffers while reconnecting" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
 
-    @test_throws ConnectionReconnectingError request(client, "foo", "bar"; timeout=0.001)
-    @test isempty(client.subscriptions)
-    @test client.sid == 0
-    @test client.pending_bytes == 0
+    @test_throws TimeoutError request(client, "foo", "bar"; timeout=0.001)
+    @test length(client.subscriptions) == 1
+    @test client.sid == 1
+    mux = client.request_mux
+    @test !isnothing(mux)
+    @test mux.sub.sid in keys(client.subscriptions)
+    @test !mux.sub.server_active
+    @test isempty(mux.waiters)
+    pending = String(take!(client.pending))
+    @test startswith(pending, "PUB foo _INBOX.")
+    @test endswith(pending, " 3\r\nbar\r\n")
+    @test client.pending_bytes == ncodeunits(pending)
+
+    disabled = TestHelpers.fake_client(; opts=N.ConnectOptions(pending_size=0),
+                                       status=N.ConnectionStatus.RECONNECTING)
+    @test_throws ConnectionReconnectingError request(disabled, "foo", "bar"; timeout=0.001)
+    @test isempty(disabled.subscriptions)
+    @test disabled.sid == 0
+    @test disabled.pending_bytes == 0
 end
 
 @testitem "request accepts pair-style header input" setup=[TestHelpers] begin
@@ -2125,7 +2229,7 @@ end
     close(client)
 end
 
-@testitem "request mux reconnect behavior clears waiters without replaying requests" setup=[TestHelpers] begin
+@testitem "request mux reconnect behavior keeps waiters and replays queued requests" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -2145,40 +2249,56 @@ end
     end
 
     transport = TestHelpers.WriteCapture()
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
+    opts = N.ConnectOptions(; connect_timeout=0.05, reconnect_wait=1.0,
+                            reconnect_max_wait=1.0, reconnect_jitter=0.0)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io=transport)
+    push!(client.servers, N.Server("nats://127.0.0.1:1"))
 
     task = @async request(client, "svc", "pending"; timeout=1.0)
     result = timedwait(1.0; pollint=0.001) do
         length(request_publishes(transport)) == 1
     end
     @test result != :timed_out
+    reply = only(request_publishes(transport))[1]
     mux = client.request_mux
     @test length(mux.waiters) == 1
 
     N._trigger_reconnect(client, ErrorException("lost"))
-    err = try
-        fetch(task)
-        nothing
-    catch caught
-        caught isa TaskFailedException ? first(Base.current_exceptions(task)).exception : caught
-    end
-    @test err isa ConnectionReconnectingError
-    @test isempty(mux.waiters)
+    @test N.status(client) == N.ConnectionStatus.RECONNECTING
+    @test length(mux.waiters) == 1
     @test client.pending_bytes == 0
+    @test !istaskdone(task)
+
+    N._dispatch_msg(client, Msg(reply, nothing, TestHelpers.bytes("after-reconnect"); sid=mux.sub.sid))
+    @test String(fetch(task)) == "after-reconnect"
+    @test isempty(mux.waiters)
     close(client)
 
     replay_transport = TestHelpers.WriteCapture()
-    replay_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=replay_transport, write_io=replay_transport)
-    @test_throws TimeoutError request(replay_client, "svc", "timed-out"; timeout=0.001)
+    replay_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+                                            read_io=replay_transport,
+                                            write_io=replay_transport)
+    replay_task = @async request(replay_client, "svc", "queued"; timeout=1.0)
+    result = timedwait(1.0; pollint=0.001) do
+        mux = replay_client.request_mux
+        !isnothing(mux) && length(mux.waiters) == 1 && replay_client.pending_bytes > 0
+    end
+    @test result != :timed_out
     replay_mux = replay_client.request_mux
-    @test isempty(replay_mux.waiters)
-    TestHelpers.clear_capture!(replay_transport)
-    N._store_status_locked!(replay_client, N.ConnectionStatus.RECONNECTING)
-    @lock replay_mux.sub.lock replay_mux.sub.server_active = false
     N._replay_subscriptions(replay_client; reconnect_replay=true)
+    N._flush_pending_buffer(replay_client; reconnect_replay=true)
     replayed = TestHelpers.capture_text(replay_transport)
-    @test replayed == N._sub_cmd(replay_mux.sub.subject, nothing, replay_mux.sub.sid)
-    @test !occursin("PUB svc", replayed)
+    @test startswith(replayed, N._sub_cmd(replay_mux.sub.subject, nothing, replay_mux.sub.sid))
+    replay_publishes = request_publishes(replay_transport)
+    @test length(replay_publishes) == 1
+    replay_reply, payload = only(replay_publishes)
+    @test payload == "queued"
+    @test replay_client.pending_bytes == 0
+
+    N._dispatch_msg(replay_client, Msg(replay_reply, nothing, TestHelpers.bytes("replayed"); sid=replay_mux.sub.sid))
+    @test String(fetch(replay_task)) == "replayed"
+    @test isempty(replay_mux.waiters)
     close(replay_client)
 end
 

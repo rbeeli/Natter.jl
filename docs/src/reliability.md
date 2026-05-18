@@ -40,6 +40,8 @@ client = connect([
 
 `retry_on_initial_connect=true` makes startup tolerate NATS not being reachable yet. `max_reconnect_attempts=-1` means unlimited reconnect attempts, including initial retries when that mode is enabled. When several URLs are configured, Natter randomizes the server attempt order for both initial connect and reconnect so new clients spread across the pool. Set `randomize_servers=false` only when the listed order is the intended failover policy.
 
+`write_timeout` bounds blocking transport writes and flushes. Set `write_timeout=Inf` to disable the write watchdog for workloads that prefer the lowest write-path overhead and handle stalled transports externally.
+
 ## Reconnect Semantics
 
 After a transient disconnect the client:
@@ -47,10 +49,10 @@ After a transient disconnect the client:
 - marks the connection as `ConnectionStatus.RECONNECTING`;
 - tries configured and server-discovered URLs, randomized unless `randomize_servers=false`;
 - replays active subscriptions;
-- flushes buffered publishes up to `pending_size`, unless `pending_size=0`;
+- flushes buffered publishes and request/reply calls up to `pending_size`, unless `pending_size=0`;
 - emits `ConnectionEvent` values through `event_cb`.
 
-Core publish replay is best-effort and should be treated as at-least-once for retained frames. If duplicate effects matter, use JetStream `js_publish(...; msg_id=...)` and idempotent application storage.
+Core publish and request replay is best-effort and should be treated as at-least-once for retained frames. Request waiters stay active across reconnect until their normal timeout or cancellation. If duplicate effects matter, use JetStream `js_publish(...; msg_id=...)` and idempotent application storage.
 
 JetStream protocol async publishes are stricter: pending `js_publish_async` futures are cleared on reconnect and are not put into the core reconnect buffer. `fetch(future)` throws `ConnectionReconnectingError` for those cleared futures. Applications that need to resend should do so after reconnect and should set `msg_id` to make the retry idempotent at the stream.
 

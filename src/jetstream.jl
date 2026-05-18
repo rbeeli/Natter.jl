@@ -1,8 +1,6 @@
 const _JS_ACK_OPEN = UInt8(0)
 const _JS_ACK_BUSY = UInt8(1)
 const _JS_ACK_DONE = UInt8(2)
-const _JS_ASYNC_PUBLISH_MAX_TIMER_DELAY = prevfloat(Float64(typemax(UInt64)) / 1000)
-
 abstract type AbstractJetStreamMsg{C<:Client} <: AbstractMsg end
 
 mutable struct JetStreamMsg{C<:Client} <: AbstractJetStreamMsg{C}
@@ -52,6 +50,20 @@ struct PubAck
     domain::Union{String,Nothing}
 end
 
+struct _JSErrorJSON
+    code::Union{Int,Nothing}
+    err_code::Union{Int,Nothing}
+    description::Union{String,Nothing}
+end
+
+struct _PubAckJSON
+    stream::Union{String,Nothing}
+    seq::Union{Int,Nothing}
+    duplicate::Union{Bool,Nothing}
+    domain::Union{String,Nothing}
+    error::Union{_JSErrorJSON,Nothing}
+end
+
 struct StoredMsg <: AbstractMsg
     subject::String
     reply::Union{String,Nothing}
@@ -91,12 +103,14 @@ mutable struct JetStreamAsyncPublishState{C<:Client} <: AbstractJetStreamAsyncPu
     client::C
     prefix::String
     condition::Base.GenericCondition{ReentrantLock}
+    timeout_condition::Base.GenericCondition{ReentrantLock}
     setup_lock::ReentrantLock
     sub::Union{Subscription{C},Nothing}
     futures::Dict{Int,JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}
     max_pending::Int
     pending::Int
     next_token::Int
+    deadline_queue::_DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}
     timeout_task::Union{Task,Nothing}
 end
 
@@ -123,12 +137,14 @@ function JetStreamAsyncPublishState(client::C, max_pending::Int) where {C<:Clien
         client,
         new_inbox(client),
         Base.Threads.Condition(lock),
+        Base.Threads.Condition(lock),
         ReentrantLock(),
         nothing,
         Dict{Int,JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}(),
         max_pending,
         0,
         0,
+        _DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}(),
         nothing,
     )
     _register_js_async_publish_state!(client, state)
@@ -559,6 +575,30 @@ function _puback(obj)
            _json_haskey(obj, :domain) ? String(_json_get(obj, :domain, "")) : nothing)
 end
 
+function _js_error_from_object(err::_JSErrorJSON)
+    JetStreamError(something(err.code, 0), err.err_code, something(err.description, ""))
+end
+
+function _puback(ack::_PubAckJSON)
+    isnothing(ack.error) || throw(_js_error_from_object(ack.error))
+    isnothing(ack.stream) && throw(ProtocolError("JetStream publish response is missing stream"))
+    isnothing(ack.seq) && throw(ProtocolError("JetStream publish response is missing seq"))
+    PubAck(ack.stream, ack.seq, something(ack.duplicate, false), ack.domain)
+end
+
+function _js_read_puback(msg::Msg)::PubAck
+    isempty(msg.data) && throw(ProtocolError("JetStream publish response is empty"))
+    ack = try
+        JSON3.read(msg.data, _PubAckJSON)
+    catch err
+        err isa InterruptException && rethrow()
+        obj = _js_read_response(msg)
+        isnothing(obj) && throw(ProtocolError("JetStream publish response is empty"))
+        return _puback(obj)
+    end
+    _puback(ack)
+end
+
 function _js_header_nonempty(name::AbstractString, value)::String
     s = String(value)
     isempty(s) && throw(ArgumentError("$name cannot be empty"))
@@ -718,9 +758,7 @@ function js_publish(js::JetStreamContext, subject::AbstractString, data=nothing;
         remaining > 0 || throw(TimeoutError("request timed out"))
         try
             msg = request(js.client, subject, data; timeout=remaining, headers=hdrs, cancel_token)
-            obj = _js_read_response(msg)
-            isnothing(obj) && throw(ProtocolError("JetStream publish response is empty"))
-            return _puback(obj)
+            return _js_read_puback(msg)
         catch err
             err isa NoRespondersError && attempt < attempts || rethrow()
             attempt += 1
@@ -751,9 +789,7 @@ function _js_async_publish_result(future::JetStreamPublishFuture, msg::Msg)::Uni
         elseif !isnothing(code) && code >= 400
             return ProtocolError("request failed with status $code $(_status_description(msg))")
         end
-        obj = _js_read_response(msg)
-        isnothing(obj) && throw(ProtocolError("JetStream publish response is empty"))
-        return _puback(obj)
+        return _js_read_puback(msg)
     catch err
         return err
     end
@@ -769,6 +805,12 @@ function _resolve_js_publish_future_locked!(future::JetStreamPublishFuture{C},
     if get(state.futures, future.token, nothing) === future
         delete!(state.futures, future.token)
         state.pending = max(0, state.pending - 1)
+        if isempty(state.futures)
+            empty!(state.deadline_queue)
+            _notify_js_async_publish_timeout_task_locked(state)
+        else
+            _compact_js_async_publish_deadline_queue_locked!(state)
+        end
     end
     notify(state.condition; all=true)
     true
@@ -790,7 +832,11 @@ function _clear_js_async_publish_pending!(state::JetStreamAsyncPublishState{C},
                                           err::Exception) where {C<:Client}
     lock(state.condition)
     try
-        isempty(state.futures) && return nothing
+        if isempty(state.futures)
+            empty!(state.deadline_queue)
+            _notify_js_async_publish_timeout_task_locked(state)
+            return nothing
+        end
         state.pending = 0
         for future in values(state.futures)
             if future.active
@@ -800,7 +846,9 @@ function _clear_js_async_publish_pending!(state::JetStreamAsyncPublishState{C},
             end
         end
         empty!(state.futures)
+        empty!(state.deadline_queue)
         notify(state.condition; all=true)
+        _notify_js_async_publish_timeout_task_locked(state)
     finally
         unlock(state.condition)
     end
@@ -951,51 +999,102 @@ function _ensure_js_async_publish_timeout_task_locked!(state::JetStreamAsyncPubl
     nothing
 end
 
+function _js_async_publish_deadline_entry_valid_locked(state::JetStreamAsyncPublishState,
+                                                       entry::_DeadlineEntry)::Bool
+    future = get(state.futures, entry.token, nothing)
+    future === entry.value && future.active && future.deadline == entry.deadline
+end
+
+function _next_js_async_publish_deadline_entry_locked!(state::JetStreamAsyncPublishState)
+    while true
+        entry = _deadline_queue_peek(state.deadline_queue)
+        isnothing(entry) && return nothing
+        _js_async_publish_deadline_entry_valid_locked(state, entry) && return entry
+        _deadline_queue_pop!(state.deadline_queue)
+    end
+end
+
+function _rebuild_js_async_publish_deadline_queue_locked!(state::JetStreamAsyncPublishState{C}) where {C<:Client}
+    queue = _DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}()
+    for (token, future) in state.futures
+        future.active && _deadline_queue_push!(queue, token, future.deadline, future)
+    end
+    state.deadline_queue = queue
+    nothing
+end
+
+function _compact_js_async_publish_deadline_queue_locked!(state::JetStreamAsyncPublishState)
+    _deadline_queue_compaction_due(state.deadline_queue, length(state.futures)) ||
+        return nothing
+    _rebuild_js_async_publish_deadline_queue_locked!(state)
+end
+
+function _notify_js_async_publish_timeout_task_locked(state::JetStreamAsyncPublishState)
+    notify(state.timeout_condition; all=true)
+    nothing
+end
+
+function _wait_js_async_publish_timeout_locked!(state::JetStreamAsyncPublishState, delay::Float64)
+    timer = Timer(min(delay, _MAX_TIMER_DELAY_SECONDS)) do _
+        lock(state.timeout_condition)
+        try
+            _notify_js_async_publish_timeout_task_locked(state)
+        finally
+            unlock(state.timeout_condition)
+        end
+    end
+    try
+        wait(state.timeout_condition)
+    finally
+        close(timer)
+    end
+    nothing
+end
+
 function _js_async_publish_timeout_loop(state::JetStreamAsyncPublishState{C}) where {C<:Client}
     lock(state.condition)
     try
         while true
             if isempty(state.futures)
+                empty!(state.deadline_queue)
                 state.timeout_task = nothing
                 return nothing
             end
-            now = time()
-            nearest = Inf
-            expired = Tuple{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}},Exception}[]
-            for future in values(state.futures)
-                err = _js_async_publish_connection_error(state.client, future.generation)
-                if !isnothing(err)
-                    push!(expired, (future, err))
-                elseif future.deadline <= now
-                    push!(expired, (future, TimeoutError("JetStream async publish ack timed out")))
-                else
-                    nearest = min(nearest, future.deadline)
-                end
-            end
-            for (future, err) in expired
-                _resolve_js_publish_future_locked!(future, err)
-            end
-            isempty(state.futures) && continue
 
-            delay = nearest - time()
-            if !isfinite(delay)
-                wait(state.condition)
-            elseif delay <= 0
+            entry = _next_js_async_publish_deadline_entry_locked!(state)
+            if isnothing(entry)
+                _rebuild_js_async_publish_deadline_queue_locked!(state)
+                entry = _next_js_async_publish_deadline_entry_locked!(state)
+                if isnothing(entry)
+                    empty!(state.futures)
+                    empty!(state.deadline_queue)
+                    state.pending = 0
+                    state.timeout_task = nothing
+                    return nothing
+                end
+            end
+
+            err = _js_async_publish_connection_error(state.client, entry.value.generation)
+            if !isnothing(err)
+                _deadline_queue_pop!(state.deadline_queue)
+                future = get(state.futures, entry.token, nothing)
+                if future === entry.value && future.active && future.deadline == entry.deadline
+                    _resolve_js_publish_future_locked!(future, err)
+                end
                 continue
+            end
+
+            delay = entry.deadline - time()
+            if !isfinite(delay)
+                wait(state.timeout_condition)
+            elseif delay <= 0
+                _deadline_queue_pop!(state.deadline_queue)
+                future = get(state.futures, entry.token, nothing)
+                if future === entry.value && future.active && future.deadline == entry.deadline
+                    _resolve_js_publish_future_locked!(future, TimeoutError("JetStream async publish ack timed out"))
+                end
             else
-                timer = Timer(min(delay, _JS_ASYNC_PUBLISH_MAX_TIMER_DELAY)) do _
-                    lock(state.condition)
-                    try
-                        notify(state.condition; all=true)
-                    finally
-                        unlock(state.condition)
-                    end
-                end
-                try
-                    wait(state.condition)
-                finally
-                    close(timer)
-                end
+                _wait_js_async_publish_timeout_locked!(state, delay)
             end
         end
     finally
@@ -1078,8 +1177,9 @@ function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
             retry_wait, 0, retry_frame, false, true, nothing)
         state.futures[token] = future
         state.pending += 1
+        wake_timeout = _deadline_queue_push!(state.deadline_queue, token, deadline, future)
         _ensure_js_async_publish_timeout_task_locked!(state)
-        notify(state.condition; all=true)
+        wake_timeout && _notify_js_async_publish_timeout_task_locked(state)
         future
     finally
         unlock(state.condition)
@@ -2458,13 +2558,22 @@ end
 function _record_subscription_data_received!(handler::_JetStreamPushControlHandler,
                                              msg::M) where {M<:AbstractMsg}
     handler.flow_control[] && Threads.atomic_add!(handler.flow_incoming, one(UInt64))
-    (handler.ordered || handler.idle_heartbeat[] > 0 || handler.flow_control[]) || return nothing
     handler.ordered && return nothing
-    parsed = _push_msg_metadata(msg)
-    isnothing(parsed) && return nothing
+    handler.idle_heartbeat[] > 0 || return nothing
     @lock handler.lock begin
-        handler.next_consumer_seq = parsed.consumer_sequence + 1
-        handler.last_stream_seq = parsed.stream_sequence
+        if handler.sequence_state_anchored
+            if handler.last_stream_seq > 0
+                handler.next_consumer_seq += 1
+                handler.last_stream_seq += 1
+            end
+        else
+            handler.sequence_state_anchored = true
+            parsed = _push_msg_metadata(msg)
+            if !isnothing(parsed)
+                handler.next_consumer_seq = parsed.consumer_sequence + 1
+                handler.last_stream_seq = parsed.stream_sequence
+            end
+        end
     end
     nothing
 end
@@ -2653,6 +2762,7 @@ function _request_ordered_push_reset!(handler::_JetStreamPushControlHandler, sta
         handler.ordered_resetting = true
         handler.next_consumer_seq = 1
         handler.last_stream_seq = max(0, start_seq - 1)
+        handler.sequence_state_anchored = false
         handler.flow_incoming[] = UInt64(0)
         handler.flow_delivered = UInt64(0)
         handler.flow_reply = nothing
@@ -3942,6 +4052,7 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
                 control_handler.ordered = true
                 control_handler.next_consumer_seq = 1
                 control_handler.last_stream_seq = 0
+                control_handler.sequence_state_anchored = false
                 control_handler.ordered_resetting = false
                 control_handler.ordered_reset_callback =
                     start_seq -> _schedule_ordered_push_reset!(psub, base_config, start_seq)

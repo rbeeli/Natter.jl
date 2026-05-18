@@ -61,6 +61,7 @@ const DEFAULT_MAX_CONTROL_LINE = 16 * 1024
 const DEFAULT_MAX_INBOUND_PAYLOAD = 64 * 1024 * 1024
 const DEFAULT_MAX_HEADER_BYTES = 64 * 1024
 const DEFAULT_DIRECT_WRITE_THRESHOLD = 256 * 1024
+const _MAX_TIMER_DELAY_SECONDS = prevfloat(Float64(typemax(UInt64)) / 1000)
 
 include("errors.jl")
 include("cancellation.jl")

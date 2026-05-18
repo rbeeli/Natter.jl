@@ -701,6 +701,11 @@ function _write_timeout_error(operation::String)
     TimeoutError("$operation timed out")
 end
 
+@inline _write_watchdog_enabled(::IO) = true
+@inline _write_watchdog_enabled(::IOBuffer) = false
+@inline _write_watchdog_enabled(client::Client, io)::Bool =
+    isfinite(client.options.write_timeout) && _write_watchdog_enabled(io)
+
 function _write_timeout_matches(active, io)::Bool
     isnothing(active) && return false
     active === io && return true
@@ -796,6 +801,7 @@ function _write_watchdog_loop(client::Client)
 end
 
 function _run_transport_write(f::Function, client::Client, io, operation::String)
+    _write_watchdog_enabled(client, io) || return f()
     epoch = @lock client.lock _begin_write_timeout_locked!(client, io, operation)
     try
         result = f()
@@ -1163,6 +1169,7 @@ function _notify_request_waiters!(client::Client, err::Exception; clear_mux::Boo
         try
             waiters = collect(values(mux.waiters))
             empty!(mux.waiters)
+            empty!(mux.deadline_queue)
             for waiter in waiters
                 try
                     _resolve_request_waiter_locked!(waiter, err, mux.condition)
@@ -1171,6 +1178,7 @@ function _notify_request_waiters!(client::Client, err::Exception; clear_mux::Boo
                 end
             end
             notify(mux.condition; all=true)
+            _notify_request_timeout_task_locked(mux)
         finally
             unlock(mux.condition)
         end
@@ -1201,6 +1209,7 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
             empty!(client.subscriptions)
             @atomic client.subscription_snapshot = Vector{Union{Subscription{typeof(client)},Nothing}}()
             @atomic client.borrowed_subscription_snapshot = Bool[]
+            @atomic client.fast_control_subscription_snapshot = Bool[]
             reader = client.reader
             isnothing(reader) || empty!(reader.subject_cache)
 
@@ -1233,6 +1242,7 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
         try
             request_waiters = collect(values(request_mux.waiters))
             empty!(request_mux.waiters)
+            empty!(request_mux.deadline_queue)
             for waiter in request_waiters
                 try
                     _resolve_request_waiter_locked!(waiter, ConnectionClosedError("connection is disconnected"),
@@ -1242,6 +1252,7 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
                 end
             end
             notify(request_mux.condition; all=true)
+            _notify_request_timeout_task_locked(request_mux)
         finally
             unlock(request_mux.condition)
         end
@@ -1934,7 +1945,6 @@ function _trigger_reconnect(client::Client, reason)
     if should_start
         _clear_js_async_publish_pending!(client, ConnectionReconnectingError())
         _signal_flusher(client)
-        _report_cleanup_errors(client, _notify_request_waiters!(client, ConnectionReconnectingError()))
         _report_cleanup_errors(client, _notify_pong_waiters!(client, false))
         _close_transport_report_errors!(client, transports...)
         _emit_connection_event(client, ConnectionEventKind.DISCONNECTED; err=reason,

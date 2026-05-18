@@ -553,6 +553,43 @@ end
     @test TestHelpers.capture_text(capture) == ""
 end
 
+@testitem "JetStream publish ack parser decodes typed ack shape" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    ack = N._js_read_puback(
+        Msg("_INBOX.reply", nothing, TestHelpers.bytes("""{"stream":"ORDERS","seq":42}""")),
+    )
+    @test ack.stream == "ORDERS"
+    @test ack.seq == 42
+    @test !ack.duplicate
+    @test isnothing(ack.domain)
+
+    duplicate = N._js_read_puback(
+        Msg("_INBOX.reply", nothing,
+            TestHelpers.bytes("""{"stream":"ORDERS","seq":43,"duplicate":true,"domain":"HUB"}""")),
+    )
+    @test duplicate.stream == "ORDERS"
+    @test duplicate.seq == 43
+    @test duplicate.duplicate
+    @test duplicate.domain == "HUB"
+
+    err_payload = """{"error":{"code":400,"err_code":10071,"description":"wrong stream"}}"""
+    err = TestHelpers.thrown_exception() do
+        N._js_read_puback(Msg("_INBOX.reply", nothing, TestHelpers.bytes(err_payload)))
+    end
+    @test err isa JetStreamError
+    @test err.code == 400
+    @test err.err_code == 10071
+
+    missing = TestHelpers.thrown_exception() do
+        N._js_read_puback(Msg("_INBOX.reply", nothing, TestHelpers.bytes("{}")))
+    end
+    @test missing isa ProtocolError
+    @test occursin("stream", missing.message)
+end
+
 @testitem "JetStream async publish uses protocol futures" setup=[TestHelpers] begin
     using Natter
 
@@ -700,6 +737,14 @@ end
     @test failed_err isa JetStreamError
     @test failed_err.code == 400
     @test js_publish_async_pending(js) == 0
+
+    ack_error_payload = """{"stream":"ORDERS","seq":2,"error":{"code":400,"err_code":10071,"description":"wrong last sequence"}}"""
+    ack_error = TestHelpers.thrown_exception() do
+        N._js_read_puback(Msg("\$JS.ACK", nothing, TestHelpers.bytes(ack_error_payload)))
+    end
+    @test ack_error isa JetStreamError
+    @test ack_error.code == 400
+    @test ack_error.err_code == 10071
 
     no_responders = js_publish_async(js, "orders.created", "missing"; timeout=1.0,
                                      retry_attempts=0)
@@ -2078,7 +2123,8 @@ end
     errors = Channel{Any}(1)
     opts = ConnectOptions(error_cb=err -> put!(errors, err))
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
-    sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+    handler = N._JetStreamPushControlHandler(60.0)
+    sub = subscribe(client, "_INBOX.push"; _control_handler=handler)
 
     data = Msg("_INBOX.push", "\$JS.ACK.ORDERS.C1.1.10.1.123456789.2",
                TestHelpers.bytes("one"); sid=sub.sid)
@@ -2173,7 +2219,8 @@ end
     const N = Natter
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+    handler = N._JetStreamPushControlHandler()
+    sub = subscribe(client, "_INBOX.push"; _control_handler=handler)
     data = Msg("_INBOX.push", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("work");
                sid=sub.sid)
     flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
@@ -2181,6 +2228,9 @@ end
                        sid=sub.sid)
 
     N._dispatch_msg(client, data)
+    @test handler.flow_incoming[] == 1
+    @test (@lock handler.lock handler.last_stream_seq == 0)
+
     N._dispatch_msg(client, flow_control)
 
     @test isready(sub.messages)
@@ -2371,6 +2421,32 @@ end
     @test ordered_handler.last_seen[] > ordered_stale
     @test String(N.next(ordered_sub; timeout=0.1)) == "ordered"
     close(ordered_sub)
+end
+
+@testitem "JetStream push heartbeat sequence tracking parses first data reply only" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    handler = N._JetStreamPushControlHandler(60.0)
+    first = Msg("_INBOX.push", "\$JS.ACK.ORDERS.C1.1.10.4.123456789.2",
+                TestHelpers.bytes("one"))
+    second = Msg("_INBOX.push", "\$JS.ACK.not-valid-metadata",
+                 TestHelpers.bytes("two"))
+
+    N._record_subscription_data_received!(handler, first)
+    @test (@lock handler.lock begin
+        handler.sequence_state_anchored &&
+            handler.next_consumer_seq == 5 &&
+            handler.last_stream_seq == 10
+    end)
+
+    N._record_subscription_data_received!(handler, second)
+    @test (@lock handler.lock begin
+        handler.sequence_state_anchored &&
+            handler.next_consumer_seq == 6 &&
+            handler.last_stream_seq == 11
+    end)
 end
 
 @testitem "JetStream push control dispatch does not invoke callbacks" setup=[TestHelpers] begin
@@ -3746,7 +3822,8 @@ end
         @test occursin("\$JS.API.CONSUMER.DELETE.S.C", written)
     end
 
-    pull_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+    opts = N.ConnectOptions(pending_size=0)
+    pull_client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING,
                                           write_io=IOBuffer())
     pull_js = jetstream(pull_client)
     pull = N.PullSubscription(pull_js, "S", "C", ReentrantLock(), ReentrantLock(), true, false)
@@ -3757,7 +3834,7 @@ end
     @test close(pull) === nothing
     @test String(take!(pull_client.write_io)) == ""
 
-    push_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
+    push_client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING,
                                           write_io=IOBuffer())
     push_js = jetstream(push_client)
     handler = N._JetStreamPushControlHandler()

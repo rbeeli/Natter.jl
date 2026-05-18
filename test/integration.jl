@@ -198,6 +198,7 @@ end
             secondary = IntegrationHelpers.start_tcp_proxy(host, port; released=false)
             disconnected = Ref(false)
             reconnected = Ref(false)
+            local service_client = nothing
             client = N.connect([primary.url, secondary.url];
                                connect_timeout=IntegrationHelpers.integration_connect_timeout(),
                                randomize_servers=false,
@@ -216,6 +217,11 @@ end
 
                 subject = "natter.failover.$(randstring(10))"
                 sub = subscribe(client, subject)
+                service_client = connect(url; connect_timeout=IntegrationHelpers.integration_connect_timeout())
+                service = subscribe(service_client, "$subject.req") do req
+                    publish(service_client, req.reply, uppercase(String(req.data)))
+                end
+                flush(service_client; timeout=io_timeout)
                 IntegrationHelpers.publish_and_flush(client, subject, "before failover"; timeout=io_timeout)
                 @test String(N.next(sub; timeout=io_timeout)) == "before failover"
 
@@ -225,6 +231,11 @@ end
                 end
                 @test result != :timed_out
 
+                request_task = @async request(client, "$subject.req", "during failover"; timeout=io_timeout)
+                result = timedwait(1.0; pollint=0.01) do
+                    client.pending_bytes > 0
+                end
+                @test result != :timed_out
                 publish(client, subject, "during failover")
                 secondary.release()
 
@@ -235,10 +246,13 @@ end
                 end
                 @test result != :timed_out
                 flush(client; timeout=io_timeout)
+                @test String(fetch(request_task)) == "DURING FAILOVER"
                 @test String(N.next(sub; timeout=io_timeout)) == "during failover"
                 @test stats(client).reconnects >= 1
+                close(service)
             finally
                 close(client)
+                !isnothing(service_client) && close(service_client)
                 primary.stop()
                 secondary.stop()
             end

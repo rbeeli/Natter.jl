@@ -68,7 +68,7 @@ Conventions:
 | `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |
 | `direct_write_threshold` | `256 KiB` | Direct publishes at or below this size are written as one contiguous frame; larger direct publishes avoid the payload copy. |
 | `write_buffer_latency` | `0.001` | Maximum small-write coalescing delay. |
-| `write_timeout` | `10.0` | Maximum write/flush block time. |
+| `write_timeout` | `10.0` | Maximum transport write/flush block time; `Inf` disables the watchdog. |
 | `record_stats` | `false` | Enable client counters returned by `stats(client)`. |
 | `sub_pending_msgs_limit` | `1024` | Default per-subscription queued message limit. |
 | `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit. |

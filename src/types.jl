@@ -430,6 +430,15 @@ function _connect_option_positive_float(name::String, value)::Float64
     result
 end
 
+function _connect_option_positive_or_infinite_float(name::String, value)::Float64
+    value isa Real && !(value isa Bool) ||
+        throw(ArgumentError("$name must be a positive number or Inf"))
+    result = Float64(value)
+    (result > 0 || result == Inf) && !isnan(result) ||
+        throw(ArgumentError("$name must be a positive number or Inf"))
+    result
+end
+
 function _positive_timeout_seconds(name::AbstractString, value)::Float64
     value isa Real && !(value isa Bool) ||
         throw(ArgumentError("$name must be a positive finite number of seconds"))
@@ -763,7 +772,7 @@ struct ConnectOptions{Servers<:Tuple{Vararg{String}},Auth<:AbstractAuth,ErrorCal
         write_buffer_size = _connect_option_nonnegative_int("write_buffer_size", write_buffer_size)
         direct_write_threshold = _connect_option_nonnegative_int("direct_write_threshold", direct_write_threshold)
         write_buffer_latency = _connect_option_nonnegative_float("write_buffer_latency", write_buffer_latency)
-        write_timeout = _connect_option_positive_float("write_timeout", write_timeout)
+        write_timeout = _connect_option_positive_or_infinite_float("write_timeout", write_timeout)
         record_stats = _connect_option_bool("record_stats", record_stats)
         max_control_line = _connect_option_positive_int("max_control_line", max_control_line)
         max_inbound_payload = _connect_option_positive_int("max_inbound_payload", max_inbound_payload)
@@ -1319,6 +1328,7 @@ mutable struct _JetStreamPushControlHandler
     ordered::Bool
     next_consumer_seq::Int
     last_stream_seq::Int
+    sequence_state_anchored::Bool
     ordered_resetting::Bool
     ordered_reset_callback::Union{Nothing,Function}
     lock::ReentrantLock
@@ -1330,7 +1340,7 @@ _JetStreamPushControlHandler(idle_heartbeat::Real=0.0; flow_control::Bool=true) 
                                  Threads.Atomic{Bool}(false),
                                  Threads.Atomic{UInt64}(UInt64(0)),
                                  UInt64(0), nothing, UInt64(0),
-                                 false, 1, 0, false, nothing,
+                                 false, 1, 0, false, false, nothing,
                                  ReentrantLock())
 struct _RequestMuxControlHandler end
 struct _JetStreamAsyncPublishControlHandler{S}
@@ -1338,6 +1348,10 @@ struct _JetStreamAsyncPublishControlHandler{S}
 end
 
 const _SubscriptionControlHandler = Union{_NoSubscriptionControlHandler,_JetStreamPushControlHandler,_RequestMuxControlHandler,_JetStreamAsyncPublishControlHandler}
+
+_uses_pre_payload_control(::_SubscriptionControlHandler)::Bool = false
+_uses_pre_payload_control(::_RequestMuxControlHandler)::Bool = true
+_uses_pre_payload_control(::_JetStreamAsyncPublishControlHandler)::Bool = true
 
 mutable struct MsgQueue{T}
     buffer::Vector{T}
@@ -1542,6 +1556,74 @@ function _filter_pong_waiter_queue!(f::Function, q::PongWaiterQueue)
     q
 end
 
+struct _DeadlineEntry{V}
+    deadline::Float64
+    token::Int
+    value::V
+end
+
+mutable struct _DeadlineQueue{V}
+    heap::Vector{_DeadlineEntry{V}}
+end
+
+_DeadlineQueue{V}() where {V} = _DeadlineQueue{V}(_DeadlineEntry{V}[])
+
+Base.isempty(q::_DeadlineQueue)::Bool = isempty(q.heap)
+Base.length(q::_DeadlineQueue)::Int = length(q.heap)
+Base.empty!(q::_DeadlineQueue) = (empty!(q.heap); q)
+
+_deadline_queue_compaction_due(q::_DeadlineQueue, live::Int)::Bool =
+    length(q.heap) > max(64, live * 2)
+
+@inline function _deadline_entry_less(a::_DeadlineEntry, b::_DeadlineEntry)::Bool
+    a.deadline < b.deadline || (a.deadline == b.deadline && a.token < b.token)
+end
+
+function _deadline_queue_sift_up!(heap::Vector{_DeadlineEntry{V}}, idx::Int) where {V}
+    while idx > 1
+        parent = idx >>> 1
+        _deadline_entry_less(heap[idx], heap[parent]) || break
+        heap[idx], heap[parent] = heap[parent], heap[idx]
+        idx = parent
+    end
+    nothing
+end
+
+function _deadline_queue_sift_down!(heap::Vector{_DeadlineEntry{V}}, idx::Int) where {V}
+    len = length(heap)
+    while true
+        left = idx << 1
+        left <= len || break
+        right = left + 1
+        child = right <= len && _deadline_entry_less(heap[right], heap[left]) ? right : left
+        _deadline_entry_less(heap[child], heap[idx]) || break
+        heap[idx], heap[child] = heap[child], heap[idx]
+        idx = child
+    end
+    nothing
+end
+
+function _deadline_queue_push!(q::_DeadlineQueue{V}, token::Int, deadline::Float64,
+                               value::V)::Bool where {V}
+    earlier = isempty(q.heap) || deadline < q.heap[1].deadline
+    push!(q.heap, _DeadlineEntry{V}(deadline, token, value))
+    _deadline_queue_sift_up!(q.heap, length(q.heap))
+    earlier
+end
+
+_deadline_queue_peek(q::_DeadlineQueue) = isempty(q.heap) ? nothing : q.heap[1]
+
+function _deadline_queue_pop!(q::_DeadlineQueue)
+    isempty(q.heap) && return nothing
+    top = q.heap[1]
+    tail = pop!(q.heap)
+    if !isempty(q.heap)
+        q.heap[1] = tail
+        _deadline_queue_sift_down!(q.heap, 1)
+    end
+    top
+end
+
 mutable struct RequestWaiter{C<:AbstractNatterClient}
     ready::Bool
     value::Union{Msg,Exception,Nothing}
@@ -1558,7 +1640,9 @@ mutable struct RequestMux{C<:AbstractNatterClient}
     sub::Subscription{C}
     waiters::Dict{Int,RequestWaiter{C}}
     condition::Base.GenericCondition{ReentrantLock}
+    timeout_condition::Base.GenericCondition{ReentrantLock}
     next_token::Int
+    deadline_queue::_DeadlineQueue{RequestWaiter{C}}
     timeout_task::Union{Task,Nothing}
 end
 
@@ -1592,6 +1676,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     subscriptions::Dict{Int,Subscription{Client{Options,ReadIO,WriteIO}}}
     @atomic subscription_snapshot::Vector{Union{Subscription{Client{Options,ReadIO,WriteIO}},Nothing}}
     @atomic borrowed_subscription_snapshot::Vector{Bool}
+    @atomic fast_control_subscription_snapshot::Vector{Bool}
     @atomic request_mux::Union{RequestMux{Client{Options,ReadIO,WriteIO}},Nothing}
     request_mux_lock::ReentrantLock
     pending::PendingBuffer
@@ -1631,12 +1716,15 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
     end
     subscription_snapshot = Vector{Union{Subscription{client_type},Nothing}}(undef, max_sid)
     borrowed_subscription_snapshot = Vector{Bool}(undef, max_sid)
+    fast_control_subscription_snapshot = Vector{Bool}(undef, max_sid)
     fill!(subscription_snapshot, nothing)
     fill!(borrowed_subscription_snapshot, false)
+    fill!(fast_control_subscription_snapshot, false)
     for (sub_sid, sub) in typed_subscriptions
         if sub_sid > 0
             subscription_snapshot[sub_sid] = sub
             borrowed_subscription_snapshot[sub_sid] = sub.borrowed_callback
+            fast_control_subscription_snapshot[sub_sid] = _uses_pre_payload_control(sub.control_handler)
         end
     end
     typed_request_mux = if isnothing(request_mux)
@@ -1644,6 +1732,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
     else
         sub = typed_subscriptions[request_mux.sub.sid]
         waiters = Dict{Int,RequestWaiter{client_type}}()
+        deadline_queue = _DeadlineQueue{RequestWaiter{client_type}}()
         for (token, waiter) in request_mux.waiters
             typed_waiter = RequestWaiter{client_type}(waiter.deadline, waiter.reply)
             typed_waiter.ready = waiter.ready
@@ -1652,10 +1741,14 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                 typed_waiter.value = waiter.value
             end
             waiters[token] = typed_waiter
+            typed_waiter.active &&
+                _deadline_queue_push!(deadline_queue, token, typed_waiter.deadline, typed_waiter)
         end
+        mux_lock = ReentrantLock()
         RequestMux{client_type}(request_mux.prefix, sub, waiters,
-                                Base.Threads.Condition(ReentrantLock()),
-                                request_mux.next_token, nothing)
+                                Base.Threads.Condition(mux_lock),
+                                Base.Threads.Condition(mux_lock),
+                                request_mux.next_token, deadline_queue, nothing)
     end
     reader = isnothing(read_io) ? nothing : ProtocolReader(read_io; read_size=options.read_buffer_size,
                                                            shrink_threshold=options.read_buffer_shrink_threshold)
@@ -1671,7 +1764,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                    Threads.Atomic{Int}(0), Ref{Any}(nothing), Ref(""), nothing,
                                    flush_signal, flusher_task,
                                    sid, typed_subscriptions, subscription_snapshot,
-                                   borrowed_subscription_snapshot,
+                                   borrowed_subscription_snapshot, fast_control_subscription_snapshot,
                                    typed_request_mux, request_mux_lock,
                                    pending, pending_bytes, pongs,
                                    reader_task, ping_task, reconnect_task, pings_out, atomic_stats,
@@ -1683,13 +1776,18 @@ function _set_subscription_snapshot_locked!(client::C, sid::Int,
     sid > 0 || return nothing
     current = @atomic client.subscription_snapshot
     borrowed_current = @atomic client.borrowed_subscription_snapshot
+    fast_control_current = @atomic client.fast_control_subscription_snapshot
     borrowed = !isnothing(sub) && sub.borrowed_callback
-    if isnothing(sub) && sid > length(current) && sid > length(borrowed_current)
+    fast_control = !isnothing(sub) && _uses_pre_payload_control(sub.control_handler)
+    if isnothing(sub) && sid > length(current) && sid > length(borrowed_current) &&
+       sid > length(fast_control_current)
         return nothing
     end
     current_matches = sid <= length(current) && current[sid] === sub
     borrowed_matches = sid <= length(borrowed_current) && borrowed_current[sid] == borrowed
-    if current_matches && borrowed_matches
+    fast_control_matches = sid <= length(fast_control_current) &&
+                           fast_control_current[sid] == fast_control
+    if current_matches && borrowed_matches && fast_control_matches
         return nothing
     end
     snapshot = if sid <= length(current)
@@ -1710,6 +1808,16 @@ function _set_subscription_snapshot_locked!(client::C, sid::Int,
         expanded
     end
     borrowed_snapshot[sid] = borrowed
+    fast_control_snapshot = if sid <= length(fast_control_current)
+        copy(fast_control_current)
+    else
+        expanded = Vector{Bool}(undef, sid)
+        fill!(expanded, false)
+        isempty(fast_control_current) ||
+            copyto!(expanded, 1, fast_control_current, 1, length(fast_control_current))
+        expanded
+    end
+    fast_control_snapshot[sid] = fast_control
     if isnothing(sub)
         last = length(snapshot)
         while last > 0 && isnothing(snapshot[last])
@@ -1721,9 +1829,16 @@ function _set_subscription_snapshot_locked!(client::C, sid::Int,
             last_borrowed -= 1
         end
         last_borrowed < length(borrowed_snapshot) && resize!(borrowed_snapshot, last_borrowed)
+        last_fast_control = length(fast_control_snapshot)
+        while last_fast_control > 0 && !fast_control_snapshot[last_fast_control]
+            last_fast_control -= 1
+        end
+        last_fast_control < length(fast_control_snapshot) &&
+            resize!(fast_control_snapshot, last_fast_control)
     end
     @atomic client.subscription_snapshot = snapshot
     @atomic client.borrowed_subscription_snapshot = borrowed_snapshot
+    @atomic client.fast_control_subscription_snapshot = fast_control_snapshot
     nothing
 end
 
@@ -1737,6 +1852,14 @@ end
 
 @inline function _borrow_payload_for_sid(client::Client, sid::Int)::Bool
     snapshot = @atomic client.borrowed_subscription_snapshot
+    if 0 < sid <= length(snapshot)
+        @inbounds return snapshot[sid]
+    end
+    false
+end
+
+@inline function _fast_control_subscription_for_sid(client::Client, sid::Int)::Bool
+    snapshot = @atomic client.fast_control_subscription_snapshot
     if 0 < sid <= length(snapshot)
         @inbounds return snapshot[sid]
     end
