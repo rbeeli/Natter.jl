@@ -35,20 +35,18 @@ using TestItems
     @test frame.op == :MSG
     msg = N._protocol_msg(frame)
     @test msg.subject == "events"
-    @test msg.headers isa N.LazyHeaders
-    @test isnothing(msg.headers.parsed)
-    @test header(msg, "Trace") == "abc"
-    @test header(msg, "trace") == "abc"
-    @test header(msg, "TRACE") == "abc"
-    @test isnothing(msg.headers.parsed)
+    @test msg.headers isa N.RawHeaders
+    @test N.header(msg, "Trace") == "abc"
+    @test N.header(msg, "trace") == "abc"
+    @test N.header(msg, "TRACE") == "abc"
     @test msg.header_bytes == length(hdr)
     @test N._msg_pending_bytes(msg) == length(payload)
     @test String(msg) == "body"
 
     status_field_hdr = N._headers_bytes(Headers("Status" => ["abc"], "Description" => ["plain"]))
     status_field_msg = N.Msg("events", nothing, UInt8[], N.LazyHeaders(status_field_hdr), 9, length(status_field_hdr))
-    @test header(status_field_msg, "Status") == "abc"
-    @test header(status_field_msg, "Description") == "plain"
+    @test N.header(status_field_msg, "Status") == "abc"
+    @test N.header(status_field_msg, "Description") == "plain"
     @test isnothing(status_field_msg.headers.parsed)
 
     hdr = N._headers_bytes(Headers("Trace" => ["abc", "def"]))
@@ -100,6 +98,8 @@ using TestItems
     @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\n: skipped\r\n\r\n"))
     @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nBad Key: x\r\n\r\n"))
     @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nGood: bad\rvalue\r\n\r\n"))
+    @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0JUNK\r\n\r\n"))
+    @test_throws ProtocolError N._parse_headers(TestHelpers.bytes("NATS/1.0 OK\r\n\r\n"))
     trailing_hdr = TestHelpers.bytes("NATS/1.0\r\nA: b\r\n\r\njunk")
     @test_throws ProtocolError N._parse_headers(trailing_hdr)
     @test_throws ArgumentError N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), trailing_hdr)
@@ -108,6 +108,12 @@ using TestItems
     malformed_payload = vcat(malformed_hdr, TestHelpers.bytes("body"))
     malformed_raw = vcat(TestHelpers.bytes("HMSG events 9 $(length(malformed_hdr)) $(length(malformed_payload))\r\n"), malformed_payload, N.CRLF_BYTES)
     @test_throws ProtocolError N._read_control_or_msg(IOBuffer(malformed_raw))
+
+    invalid_protocol_hdr = TestHelpers.bytes("NATS/1.0JUNK\r\n\r\n")
+    invalid_protocol_payload = vcat(invalid_protocol_hdr, TestHelpers.bytes("body"))
+    invalid_protocol_raw = vcat(TestHelpers.bytes("HMSG events 9 $(length(invalid_protocol_hdr)) $(length(invalid_protocol_payload))\r\n"), invalid_protocol_payload, N.CRLF_BYTES)
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(invalid_protocol_raw))
+    @test_throws ArgumentError N.PublishFrame("foo", nothing, TestHelpers.bytes("hi"), invalid_protocol_hdr)
 
     trailing_payload = vcat(trailing_hdr, TestHelpers.bytes("body"))
     trailing_raw = vcat(TestHelpers.bytes("HMSG events 9 $(length(trailing_hdr)) $(length(trailing_payload))\r\n"), trailing_payload, N.CRLF_BYTES)
@@ -150,10 +156,10 @@ end
     hframe = N._read_control_or_msg(hreader; borrow_payload=_ -> true)
     hmsg = N._protocol_msg(hframe)
     @test hmsg isa BorrowedMsg
-    @test hmsg.headers isa N.LazyHeaders
+    @test hmsg.headers isa N.RawHeaders
     @test hmsg.headers.raw isa SubArray
     @test parent(hmsg.headers.raw) === hreader.buffer
-    @test header(hmsg, "Trace") == "abc"
+    @test N.header(hmsg, "Trace") == "abc"
     @test String(hmsg) == "body"
     @test hmsg.data isa SubArray
     @test parent(hmsg.data) === hreader.buffer
@@ -174,6 +180,7 @@ end
     empty_hframe = N._read_control_or_msg(empty_hreader; borrow_payload=_ -> true)
     empty_hmsg = N._protocol_msg(empty_hframe)
     @test empty_hmsg isa BorrowedMsg
+    @test empty_hmsg.headers isa N.RawHeaders
     @test empty_hmsg.headers.raw isa N._BorrowedDispatchData
     @test empty_hmsg.data isa N._BorrowedDispatchData
     @test parent(empty_hmsg.headers.raw) === empty_hreader.buffer

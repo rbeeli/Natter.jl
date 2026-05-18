@@ -164,8 +164,18 @@ end
 
 LazyHeaders(raw::R) where {R<:AbstractVector{UInt8}} = LazyHeaders{R}(raw, nothing)
 
+struct RawHeaders{R<:AbstractVector{UInt8}} <: AbstractDict{String,Vector{String}}
+    raw::R
+    status::Int
+    description_first::Int
+    description_last::Int
+end
+
+RawHeaders(raw::R) where {R<:AbstractVector{UInt8}} = RawHeaders{R}(raw, 0, 1, 0)
+
 const AnyLazyHeaders = LazyHeaders{<:AbstractVector{UInt8}}
-const HeaderStorage = Union{Headers,AnyLazyHeaders,Nothing}
+const AnyRawHeaders = RawHeaders{<:AbstractVector{UInt8}}
+const HeaderStorage = Union{Headers,AnyLazyHeaders,AnyRawHeaders,Nothing}
 
 abstract type AbstractNatterClient end
 abstract type AbstractMsg end
@@ -289,9 +299,12 @@ function _headers_materialize!(h::LazyHeaders)::Headers
     parsed
 end
 
+_headers_materialize(h::RawHeaders)::Headers = _parse_headers(h.raw)
+
 _headers_copy(::Nothing) = Headers()
 _headers_copy(h::Headers) = _headers_from_pairs(k => copy(v) for (k, v) in h)
 _headers_copy(h::LazyHeaders) = _headers_copy(_headers_materialize!(h))
+_headers_copy(h::RawHeaders) = _headers_copy(_headers_materialize(h))
 _headers_copy(h) = _headers_from_pairs(h)
 
 Base.length(h::LazyHeaders) = length(_headers_materialize!(h))
@@ -301,8 +314,16 @@ Base.haskey(h::LazyHeaders, key) = haskey(_headers_materialize!(h), key)
 Base.get(h::LazyHeaders, key, default) = get(_headers_materialize!(h), key, default)
 Base.keys(h::LazyHeaders) = keys(_headers_materialize!(h))
 
+Base.length(h::RawHeaders) = length(_headers_materialize(h))
+Base.iterate(h::RawHeaders, state...) = iterate(_headers_materialize(h), state...)
+Base.getindex(h::RawHeaders, key::AbstractString) = getindex(_headers_materialize(h), key)
+Base.haskey(h::RawHeaders, key) = haskey(_headers_materialize(h), key)
+Base.get(h::RawHeaders, key, default) = get(_headers_materialize(h), key, default)
+Base.keys(h::RawHeaders) = keys(_headers_materialize(h))
+
 _header_first(::Nothing, _key::AbstractString) = nothing
 _header_first(headers::LazyHeaders, key::AbstractString) = _lazy_header_first(headers, key)
+_header_first(headers::RawHeaders, key::AbstractString) = _raw_header_first(headers, key)
 function _header_first(headers::Headers, key::AbstractString)
     values = get(headers, key, nothing)
     isnothing(values) || isempty(values) ? nothing : first(values)
@@ -324,6 +345,8 @@ function _headers_wire_size(headers::HeaderStorage)::Int
     end
     bytes
 end
+
+_headers_wire_size(headers::RawHeaders)::Int = length(headers.raw)
 
 function _msg_header_bytes(headers::HeaderStorage, header_bytes::Union{Int,Nothing})::Int
     isnothing(header_bytes) && return _headers_wire_size(headers)
@@ -1524,16 +1547,18 @@ mutable struct RequestWaiter{C<:AbstractNatterClient}
     value::Union{Msg,Exception,Nothing}
     active::Bool
     deadline::Float64
+    reply::String
 end
 
-RequestWaiter{C}(deadline::Real=Inf) where {C<:AbstractNatterClient} =
-    RequestWaiter{C}(false, nothing, true, Float64(deadline))
+RequestWaiter{C}(deadline::Real=Inf, reply::String="") where {C<:AbstractNatterClient} =
+    RequestWaiter{C}(false, nothing, true, Float64(deadline), reply)
 
 mutable struct RequestMux{C<:AbstractNatterClient}
     prefix::String
     sub::Subscription{C}
-    waiters::Dict{String,RequestWaiter{C}}
+    waiters::Dict{Int,RequestWaiter{C}}
     condition::Base.GenericCondition{ReentrantLock}
+    next_token::Int
     timeout_task::Union{Task,Nothing}
 end
 
@@ -1617,9 +1642,9 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
         nothing
     else
         sub = typed_subscriptions[request_mux.sub.sid]
-        waiters = Dict{String,RequestWaiter{client_type}}()
+        waiters = Dict{Int,RequestWaiter{client_type}}()
         for (token, waiter) in request_mux.waiters
-            typed_waiter = RequestWaiter{client_type}(waiter.deadline)
+            typed_waiter = RequestWaiter{client_type}(waiter.deadline, waiter.reply)
             typed_waiter.ready = waiter.ready
             typed_waiter.active = waiter.active
             if waiter.value isa Exception || isnothing(waiter.value)
@@ -1627,7 +1652,9 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
             end
             waiters[token] = typed_waiter
         end
-        RequestMux{client_type}(request_mux.prefix, sub, waiters, Base.Threads.Condition(ReentrantLock()), nothing)
+        RequestMux{client_type}(request_mux.prefix, sub, waiters,
+                                Base.Threads.Condition(ReentrantLock()),
+                                request_mux.next_token, nothing)
     end
     reader = isnothing(read_io) ? nothing : ProtocolReader(read_io; read_size=options.read_buffer_size,
                                                            shrink_threshold=options.read_buffer_shrink_threshold)

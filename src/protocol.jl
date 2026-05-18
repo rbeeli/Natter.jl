@@ -502,11 +502,17 @@ function _read_msg_line_handle(reader::ProtocolReader, line_first::Int, line_las
     _has_more_tokens(bytes, pos, line_last) && _malformed_control_line("MSG", bytes, line_first, line_last)
 
     sid = _parse_int_token(bytes, sid_start, sid_end)
-    subject = _cached_subject!(reader, sid, subject_start, subject_end)
-    reply = fourth_start == 0 ? nothing : _bytes_string(bytes, third_start, third_end)
+    has_reply = fourth_start != 0
     size_start, size_end = fourth_start == 0 ? (third_start, third_end) : (fourth_start, fourth_end)
     size = _validate_payload_size(_parse_int_token(bytes, size_start, size_end), max_payload)
-    if borrow_payload(sid)
+    borrowed = borrow_payload(sid)
+    reply_start, reply_end = has_reply ? (third_start, third_end) : (0, -1)
+    _try_handle_msg_control(msg_handler, reader, sid, subject_start, subject_end,
+                            reply_start, reply_end, size, borrowed) && return nothing
+
+    subject = _cached_subject!(reader, sid, subject_start, subject_end)
+    reply = has_reply ? _bytes_string(bytes, third_start, third_end) : nothing
+    if borrowed
         payload = _borrow_exact_payload(reader, size)
         return msg_handler(BorrowedMsg(subject, reply, payload, nothing, sid, 0))
     end
@@ -518,6 +524,20 @@ _read_msg_line(reader::ProtocolReader, line_first::Int, line_last::Int,
                max_payload::Int, borrow_payload) =
     _read_msg_line_handle(reader, line_first, line_last, max_payload, borrow_payload,
                           _ProtocolMsgFrameHandler())
+
+function _try_handle_msg_control(_handler, _reader::ProtocolReader, _sid::Int,
+                                 _subject_start::Int, _subject_end::Int,
+                                 _reply_start::Int, _reply_end::Int,
+                                 _size::Int, _borrowed::Bool)::Bool
+    false
+end
+
+function _try_handle_hmsg_control(_handler, _reader::ProtocolReader, _sid::Int,
+                                  _subject_start::Int, _subject_end::Int,
+                                  _reply_start::Int, _reply_end::Int,
+                                  _hsize::Int, _total::Int, _borrowed::Bool)::Bool
+    false
+end
 
 function _read_hmsg_line_handle(reader::ProtocolReader, line_first::Int, line_last::Int,
                                 max_payload::Int, max_header_bytes::Int, borrow_payload,
@@ -535,18 +555,22 @@ function _read_hmsg_line_handle(reader::ProtocolReader, line_first::Int, line_la
     _has_more_tokens(bytes, pos, line_last) && _malformed_control_line("HMSG", bytes, line_first, line_last)
 
     sid = _parse_int_token(bytes, sid_start, sid_end)
-    subject = _cached_subject!(reader, sid, subject_start, subject_end)
     has_reply = fifth_start != 0
-    reply = has_reply ? _bytes_string(bytes, third_start, third_end) : nothing
     hsize_start, hsize_end = has_reply ? (fourth_start, fourth_end) : (third_start, third_end)
     total_start, total_end = has_reply ? (fifth_start, fifth_end) : (fourth_start, fourth_end)
     hsize = _validate_header_size(_parse_int_token(bytes, hsize_start, hsize_end), max_header_bytes)
     total = _validate_payload_size(_parse_int_token(bytes, total_start, total_end), max_payload)
     borrowed = borrow_payload(sid)
+    reply_start, reply_end = has_reply ? (third_start, third_end) : (0, -1)
+    _try_handle_hmsg_control(msg_handler, reader, sid, subject_start, subject_end,
+                             reply_start, reply_end, hsize, total, borrowed) && return nothing
+
+    subject = _cached_subject!(reader, sid, subject_start, subject_end)
+    reply = has_reply ? _bytes_string(bytes, third_start, third_end) : nothing
     header_bytes, payload = borrowed ? _borrow_exact_header_payload(reader, hsize, total) :
                             _read_exact_header_payload(reader, hsize, total)
-    _validate_headers(header_bytes)
-    hdrs = LazyHeaders(header_bytes)
+    status, description_first, description_last = _validate_headers(header_bytes)
+    hdrs = RawHeaders(header_bytes, status, description_first, description_last)
     msg = borrowed ? BorrowedMsg(subject, reply, payload, hdrs, sid, hsize) :
           Msg(subject, reply, payload, hdrs, sid, hsize)
     msg_handler(msg)
@@ -687,21 +711,44 @@ function _all_digits(bytes::AbstractVector{UInt8}, first::Int, last::Int)::Bool
     true
 end
 
-function _parse_header_protocol_line!(headers::Headers, raw::AbstractVector{UInt8}, line_first::Int, line_last::Int)
-    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || throw(ProtocolError("invalid NATS header block"))
-    pos = _skip_hspace(raw, line_first + ncodeunits("NATS/1.0"), line_last)
-    pos > line_last && return headers
+function _header_protocol_status(raw::AbstractVector{UInt8}, line_first::Int,
+                                 line_last::Int)::Tuple{Int,Int,Int}
+    pos = _header_protocol_status_start(raw, line_first, line_last)
+    isnothing(pos) && return 0, 1, 0
+    pos > line_last && return 0, 1, 0
     status_start, status_end, pos = _next_token(raw, pos, line_last)
-    if _all_digits(raw, status_start, status_end)
-        headers["Status"] = [_bytes_string(raw, status_start, status_end)]
-        description_start = _skip_hspace(raw, pos, line_last)
-        description_start <= line_last && (headers["Description"] = [_bytes_string(raw, description_start, line_last)])
+    _all_digits(raw, status_start, status_end) || return 0, 1, 0
+    status = _parse_int_token(raw, status_start, status_end)
+    description_start = _skip_hspace(raw, pos, line_last)
+    description_start <= line_last ? (status, description_start, line_last) : (status, 1, 0)
+end
+
+function _header_protocol_status_start(raw::AbstractVector{UInt8}, line_first::Int,
+                                       line_last::Int)
+    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || return nothing
+    pos = line_first + ncodeunits("NATS/1.0")
+    pos > line_last && return pos
+    @inbounds _is_hspace(raw[pos]) || return nothing
+    _skip_hspace(raw, pos, line_last)
+end
+
+function _parse_header_protocol_line!(headers::Headers, raw::AbstractVector{UInt8}, line_first::Int, line_last::Int)
+    _validate_header_protocol_line(raw, line_first, line_last)
+    status, description_start, description_end = _header_protocol_status(raw, line_first, line_last)
+    if status != 0
+        headers["Status"] = [string(status)]
+        description_start <= description_end &&
+            (headers["Description"] = [_bytes_string(raw, description_start, description_end)])
     end
     headers
 end
 
 function _validate_header_protocol_line(raw::AbstractVector{UInt8}, line_first::Int, line_last::Int)
-    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || throw(ProtocolError("invalid NATS header block"))
+    pos = _header_protocol_status_start(raw, line_first, line_last)
+    isnothing(pos) && throw(ProtocolError("invalid NATS header block"))
+    pos > line_last && return nothing
+    status_start, status_end, _ = _next_token(raw, pos, line_last)
+    _all_digits(raw, status_start, status_end) || throw(ProtocolError("invalid NATS header block"))
     nothing
 end
 
@@ -714,8 +761,8 @@ function _validate_raw_header_line(raw::AbstractVector{UInt8}, line_first::Int, 
     nothing
 end
 
-function _validate_headers(raw::AbstractVector{UInt8})
-    isempty(raw) && return nothing
+function _validate_headers(raw::AbstractVector{UInt8})::Tuple{Int,Int,Int}
+    isempty(raw) && return 0, 1, 0
     raw_first = firstindex(raw)
     raw_last = lastindex(raw)
 
@@ -724,6 +771,7 @@ function _validate_headers(raw::AbstractVector{UInt8})
     protocol_end = newline - 1
     protocol_end >= raw_first && raw[protocol_end] == UInt8('\r') && (protocol_end -= 1)
     _validate_header_protocol_line(raw, raw_first, protocol_end)
+    status, description_first, description_last = _header_protocol_status(raw, raw_first, protocol_end)
 
     pos = newline + 1
     while pos <= raw_last
@@ -732,7 +780,7 @@ function _validate_headers(raw::AbstractVector{UInt8})
         line_end = newline - 1
         line_end >= pos && raw[line_end] == UInt8('\r') && (line_end -= 1)
         if line_end < pos
-            newline == raw_last && return nothing
+            newline == raw_last && return status, description_first, description_last
             throw(ProtocolError("NATS header block contains trailing bytes"))
         end
 
@@ -797,8 +845,8 @@ function _lazy_status_header(headers::LazyHeaders)
     raw = headers.raw
     line_first, line_last = _lazy_header_protocol_line(raw)
     line_first <= line_last || return nothing
-    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || return nothing
-    pos = _skip_hspace(raw, line_first + ncodeunits("NATS/1.0"), line_last)
+    pos = _header_protocol_status_start(raw, line_first, line_last)
+    isnothing(pos) && return nothing
     pos <= line_last || return nothing
     status_start, status_end, _ = _next_token(raw, pos, line_last)
     _all_digits(raw, status_start, status_end) || return nothing
@@ -815,13 +863,23 @@ function _lazy_status_description_range(headers::LazyHeaders)::Tuple{Int,Int}
     raw = headers.raw
     line_first, line_last = _lazy_header_protocol_line(raw)
     line_first <= line_last || return 1, 0
-    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || return 1, 0
-    pos = _skip_hspace(raw, line_first + ncodeunits("NATS/1.0"), line_last)
+    pos = _header_protocol_status_start(raw, line_first, line_last)
+    isnothing(pos) && return 1, 0
     pos <= line_last || return 1, 0
     status_start, status_end, pos = _next_token(raw, pos, line_last)
     _all_digits(raw, status_start, status_end) || return 1, 0
     description_start = _skip_hspace(raw, pos, line_last)
     description_start <= line_last ? (description_start, line_last) : (1, 0)
+end
+
+_raw_status_header(headers::RawHeaders) = headers.status == 0 ? nothing : headers.status
+_raw_status_description_range(headers::RawHeaders)::Tuple{Int,Int} =
+    (headers.description_first, headers.description_last)
+
+function _raw_status_description(headers::RawHeaders)
+    raw = headers.raw
+    description_start, description_end = _raw_status_description_range(headers)
+    description_start <= description_end ? _bytes_string(raw, description_start, description_end) : ""
 end
 
 function _ascii_equal_foldcase(a::AbstractString, b::AbstractString)::Bool
@@ -840,12 +898,35 @@ function _header_key_matches(raw::AbstractVector{UInt8}, first::Int, last::Int, 
     true
 end
 
+function _scan_raw_header_first(raw::AbstractVector{UInt8}, key::String)
+    raw_first = firstindex(raw)
+    raw_last = lastindex(raw)
+    newline = _find_byte(raw, UInt8('\n'), raw_first, raw_last)
+    isnothing(newline) && return nothing
+    pos = newline + 1
+    while pos <= raw_last
+        newline = _find_byte(raw, UInt8('\n'), pos, raw_last)
+        isnothing(newline) && return nothing
+        line_end = newline - 1
+        line_end >= pos && raw[line_end] == UInt8('\r') && (line_end -= 1)
+        line_end < pos && return nothing
+
+        colon = _find_byte(raw, UInt8(':'), pos, line_end)
+        if !isnothing(colon) && colon > pos && _header_key_matches(raw, pos, colon - 1, key)
+            value_start = _skip_hspace(raw, colon + 1, line_end)
+            return value_start <= line_end ? _bytes_string(raw, value_start, line_end) : ""
+        end
+        pos = newline + 1
+    end
+    nothing
+end
+
 function _lazy_description_header(headers::LazyHeaders)
     raw = headers.raw
     line_first, line_last = _lazy_header_protocol_line(raw)
     line_first <= line_last || return nothing
-    _ascii_startswith(raw, line_first, line_last, "NATS/1.0") || return nothing
-    pos = _skip_hspace(raw, line_first + ncodeunits("NATS/1.0"), line_last)
+    pos = _header_protocol_status_start(raw, line_first, line_last)
+    isnothing(pos) && return nothing
     pos <= line_last || return nothing
     status_start, status_end, pos = _next_token(raw, pos, line_last)
     _all_digits(raw, status_start, status_end) || return nothing
@@ -863,31 +944,30 @@ function _lazy_header_first(headers::LazyHeaders, key::AbstractString)
         !isnothing(description) && return description
     end
 
-    raw = headers.raw
-    raw_first = firstindex(raw)
-    raw_last = lastindex(raw)
-    newline = _find_byte(raw, UInt8('\n'), raw_first, raw_last)
-    isnothing(newline) && return nothing
-    pos = newline + 1
-    while pos <= raw_last
-        newline = _find_byte(raw, UInt8('\n'), pos, raw_last)
-        isnothing(newline) && return nothing
-        line_end = newline - 1
-        line_end >= pos && raw[line_end] == UInt8('\r') && (line_end -= 1)
-        line_end < pos && return nothing
+    _scan_raw_header_first(headers.raw, key_string)
+end
 
-        colon = _find_byte(raw, UInt8(':'), pos, line_end)
-        if !isnothing(colon) && colon > pos && _header_key_matches(raw, pos, colon - 1, key_string)
-            value_start = _skip_hspace(raw, colon + 1, line_end)
-            return value_start <= line_end ? _bytes_string(raw, value_start, line_end) : ""
+function _raw_header_first(headers::RawHeaders, key::AbstractString)
+    key_string = String(key)
+    if _ascii_equal_foldcase(key_string, "Status")
+        status = _raw_status_header(headers)
+        !isnothing(status) && return string(status)
+    elseif _ascii_equal_foldcase(key_string, "Description")
+        description_start, description_end = _raw_status_description_range(headers)
+        if description_start <= description_end
+            return _bytes_string(headers.raw, description_start, description_end)
         end
-        pos = newline + 1
     end
-    nothing
+
+    _scan_raw_header_first(headers.raw, key_string)
 end
 
 function _status_header(msg::AbstractMsg)
     msg.headers isa LazyHeaders && return _lazy_status_header(msg.headers)
+    if msg.headers isa RawHeaders
+        status = _raw_status_header(msg.headers)
+        !isnothing(status) && return status
+    end
     value = header(msg, "Status")
     !isnothing(value) && !isempty(value) && all(isdigit, value) && return parse(Int, value)
     nothing
@@ -895,6 +975,7 @@ end
 
 function _status_description(msg::AbstractMsg)
     msg.headers isa LazyHeaders && return _lazy_status_description(msg.headers)
+    msg.headers isa RawHeaders && return _raw_status_description(msg.headers)
     value = header(msg, "Description")
     isnothing(value) ? "" : value
 end

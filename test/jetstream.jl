@@ -537,6 +537,7 @@ end
     @test occursin("Nats-Schedule-TTL: never\r\n", written)
     @test occursin("Nats-Schedule-Time-Zone: UTC\r\n", written)
 
+    @test isnothing(N._js_publish_headers(nothing))
     hdrs = N._js_publish_headers(nothing; schedule_at=DateTime(2026, 1, 2, 3, 4, 5))
     @test hdrs["Nats-Schedule"] == ["@at 2026-01-02T03:04:05.000Z"]
 
@@ -644,7 +645,7 @@ end
     @test client.pending_bytes == 0
 
     @test timedwait(1.0; pollint=0.001) do
-        status(client) == N.ConnectionStatus.DISCONNECTED
+        N.status(client) == N.ConnectionStatus.DISCONNECTED
     end == :ok
 end
 
@@ -920,8 +921,9 @@ end
     @test TestHelpers.capture_text(capture) == ""
 end
 
-@testitem "JetStream typed configs must be reflected by server response" begin
+@testitem "JetStream configs must be reflected by server response" begin
     using Natter
+    using JSON3
 
     const N = Natter
 
@@ -1058,6 +1060,128 @@ end
         "consumer",
         consumer_clears,
         consumer_still_backoff,
+    )
+
+    raw_stream_requested = Dict{String,Any}(
+        "name" => "ORDERS",
+        "subjects" => ["orders.*"],
+        "future_stream_field" => Dict{String,Any}("enabled" => true),
+    )
+    raw_stream_response = JSON3.read("""
+    {
+      "config": {
+        "name": "ORDERS",
+        "subjects": ["orders.*"],
+        "future_stream_field": {"enabled": true}
+      },
+      "state": {}
+    }
+    """)
+    @test N._assert_stream_config_reflected!(raw_stream_requested, raw_stream_response).name == "ORDERS"
+
+    raw_stream_response_with_server_nested = JSON3.read("""
+    {
+      "config": {
+        "name": "ORDERS",
+        "subjects": ["orders.*"],
+        "future_stream_field": {"enabled": true, "server_default": {"mode": "auto"}}
+      },
+      "state": {}
+    }
+    """)
+    @test N._assert_stream_config_reflected!(
+        raw_stream_requested,
+        raw_stream_response_with_server_nested;
+        allow_unknown_field_extras=true,
+    ).name == "ORDERS"
+    @test_throws UnsupportedFeatureError N._assert_stream_config_reflected!(
+        raw_stream_requested,
+        raw_stream_response_with_server_nested,
+    )
+
+    raw_stream_missing = JSON3.read("""
+    {
+      "config": {
+        "name": "ORDERS",
+        "subjects": ["orders.*"]
+      },
+      "state": {}
+    }
+    """)
+    @test_throws UnsupportedFeatureError N._assert_stream_config_reflected!(
+        raw_stream_requested,
+        raw_stream_missing,
+    )
+
+    raw_known_nested_requested = Dict{String,Any}(
+        "name" => "ORDERS",
+        "subjects" => ["orders.*"],
+        "consumer_limits" => Dict{String,Any}(),
+    )
+    raw_known_nested_observed = JSON3.read("""
+    {
+      "config": {
+        "name": "ORDERS",
+        "subjects": ["orders.*"],
+        "consumer_limits": {"inactive_threshold": 1}
+      },
+      "state": {}
+    }
+    """)
+    @test_throws UnsupportedFeatureError N._assert_stream_config_reflected!(
+        raw_known_nested_requested,
+        raw_known_nested_observed;
+        allow_unknown_field_extras=true,
+    )
+
+    raw_consumer_requested = Dict{String,Any}(
+        "durable_name" => "worker",
+        "ack_policy" => "explicit",
+        "future_consumer_field" => Dict{String,Any}("mode" => "new"),
+    )
+    raw_consumer_response = JSON3.read("""
+    {
+      "stream_name": "ORDERS",
+      "name": "worker",
+      "config": {
+        "durable_name": "worker",
+        "ack_policy": "explicit",
+        "future_consumer_field": {"mode": "new"}
+      }
+    }
+    """)
+    @test N._assert_consumer_config_reflected!(raw_consumer_requested, raw_consumer_response).name == "worker"
+
+    raw_consumer_response_with_server_nested = JSON3.read("""
+    {
+      "stream_name": "ORDERS",
+      "name": "worker",
+      "config": {
+        "durable_name": "worker",
+        "ack_policy": "explicit",
+        "future_consumer_field": {"mode": "new", "server_default": true}
+      }
+    }
+    """)
+    @test N._assert_consumer_config_reflected!(
+        raw_consumer_requested,
+        raw_consumer_response_with_server_nested;
+        allow_unknown_field_extras=true,
+    ).name == "worker"
+
+    raw_consumer_missing = JSON3.read("""
+    {
+      "stream_name": "ORDERS",
+      "name": "worker",
+      "config": {
+        "durable_name": "worker",
+        "ack_policy": "explicit"
+      }
+    }
+    """)
+    @test_throws UnsupportedFeatureError N._assert_consumer_config_reflected!(
+        raw_consumer_requested,
+        raw_consumer_missing,
     )
 end
 
@@ -1829,7 +1953,7 @@ end
                           headers=Headers("Status" => ["100"], "Description" => ["Idle Heartbeat"]),
                           sid=plain_sub.sid)
     N._dispatch_msg(client, plain_heartbeat)
-    @test N._status_header(next(plain_sub; timeout=0.1)) == 100
+    @test N._status_header(N.next(plain_sub; timeout=0.1)) == 100
 
     close(push_sub)
     close(plain_sub)
@@ -1959,7 +2083,7 @@ end
     data = Msg("_INBOX.push", "\$JS.ACK.ORDERS.C1.1.10.1.123456789.2",
                TestHelpers.bytes("one"); sid=sub.sid)
     N._dispatch_msg(client, data)
-    @test String(next(sub; timeout=0.1)) == "one"
+    @test String(N.next(sub; timeout=0.1)) == "one"
     @test !isready(errors)
 
     heartbeat = Msg("_INBOX.push", nothing, UInt8[];
@@ -2061,7 +2185,7 @@ end
 
     @test isready(sub.messages)
     @test client.pending_bytes == 0
-    @test String(next(sub; timeout=0.1)) == "work"
+    @test String(N.next(sub; timeout=0.1)) == "work"
 
     expected = "PUB _INBOX.fc 0\r\n\r\n"
     @test client.pending_bytes == ncodeunits(expected)
@@ -2082,7 +2206,7 @@ end
     try
         N._dispatch_msg(client, Msg("_INBOX.push", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("work");
                                    sid=sub.sid))
-        msg = next(psub; timeout=0.1)
+        msg = N.next(psub; timeout=0.1)
         @test msg isa JetStreamMsg
         @test fieldtype(typeof(msg), :_client) === typeof(client)
         @test String(msg) == "work"
@@ -2103,7 +2227,7 @@ end
     psub = N.PushSubscription(js, sub, "S", "C", ReentrantLock(), false, false)
 
     try
-        err = TestHelpers.thrown_exception(() -> next(psub; timeout=0.1))
+        err = TestHelpers.thrown_exception(() -> N.next(psub; timeout=0.1))
         @test err isa ArgumentError
         @test occursin("callback", err.msg)
         async_err = TestHelpers.thrown_exception(() -> fetch(next_async(psub; timeout=0.1)))
@@ -2231,7 +2355,7 @@ end
     N._dispatch_msg(client, data)
 
     @test handler.last_seen[] > stale
-    @test String(next(sub; timeout=0.1)) == "work"
+    @test String(N.next(sub; timeout=0.1)) == "work"
     close(sub)
 
     ordered_handler = N._JetStreamPushControlHandler(60.0)
@@ -2245,7 +2369,7 @@ end
     N._dispatch_msg(client, ordered_data)
 
     @test ordered_handler.last_seen[] > ordered_stale
-    @test String(next(ordered_sub; timeout=0.1)) == "ordered"
+    @test String(N.next(ordered_sub; timeout=0.1)) == "ordered"
     close(ordered_sub)
 end
 
@@ -2448,8 +2572,8 @@ end
     msg = N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", response)
     @test msg.subject == "orders.created"
     @test String(msg) == "payload"
-    @test header(msg, "X-Test") == "ok"
-    @test isnothing(header(msg, "Nats-Sequence"))
+    @test N.header(msg, "X-Test") == "ok"
+    @test isnothing(N.header(msg, "Nats-Sequence"))
     info_msg = N._direct_message_response_info("\$JS.API.DIRECT.GET.ORDERS", response)
     @test info_msg isa StoredMsg
     @test info_msg.subject == "orders.created"
@@ -2799,6 +2923,43 @@ end
     end
 end
 
+@testitem "JetStream pull fetch publishes concurrent requests independently" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    function request_count(capture)
+        length(collect(eachmatch(r"CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))))
+    end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    core_sub = subscribe(client, "_INBOX.pull.*")
+    TestHelpers.clear_capture!(capture)
+    psub = N.PullSubscription(js, core_sub, "ORDERS", "WORKER", "_INBOX.pull.*",
+                              ReentrantLock(), ReentrantLock(), false, false)
+
+    first = @async fetch(psub, 1; timeout=0.75, heartbeat=0)
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            request_count(capture) >= 1
+        end != :timed_out
+        @test !istaskdone(first)
+
+        second = @async fetch(psub, 1; timeout=0.75, heartbeat=0)
+        @test timedwait(0.25; pollint=0.001) do
+            request_count(capture) >= 2
+        end != :timed_out
+        @test !istaskdone(first)
+
+        @test isempty(fetch(first))
+        @test isempty(fetch(second))
+    finally
+        close(psub)
+    end
+end
+
 @testitem "JetStream continuous pull validates inputs and excludes fetch" setup=[TestHelpers] begin
     using Natter
 
@@ -3020,7 +3181,7 @@ end
     config = N._PullStreamConfig(2, nothing, 1.0, 0.0, 2, nothing,
                                  nothing, nothing, nothing, nothing, nothing, 4)
 
-    first = N._reserve_pull_stream_request!(config, state, "first")
+    first = N._reserve_pull_stream_request!(config, state, 1)
     @test !isnothing(first)
     @test state.requested_messages == 2
     @test state.requested_bytes == 0
@@ -3031,7 +3192,7 @@ end
     @test state.requested_messages == 1
     @test length(state.requests) == 1
 
-    second = N._reserve_pull_stream_request!(config, state, "second")
+    second = N._reserve_pull_stream_request!(config, state, 2)
     @test !isnothing(second)
     @test state.requested_messages == 3
     @test length(state.requests) == 2
@@ -3044,7 +3205,7 @@ end
         @test state.requested_messages == 3
     end
 
-    terminal = Msg("_INBOX.pull.first", nothing, UInt8[];
+    terminal = Msg("_INBOX.pull.1", nothing, UInt8[];
                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"],
                                    "Nats-Pending-Messages" => ["1"]))
     @lock state.lock begin
@@ -3053,7 +3214,7 @@ end
         N._pull_stream_release_terminal_request!(state, request_index, terminal)
         @test state.requested_messages == 2
         @test length(state.requests) == 1
-        @test state.requests[1].token == "second"
+        @test state.requests[1].token == 2
     end
 end
 
@@ -3066,7 +3227,7 @@ end
     config = N._PullStreamConfig(4, 20, 1.0, 0.0, 0, 10,
                                  nothing, nothing, nothing, nothing, nothing, 4)
 
-    first = N._reserve_pull_stream_request!(config, state, "first")
+    first = N._reserve_pull_stream_request!(config, state, 1)
     @test !isnothing(first)
     @test state.requested_messages == 4
     @test state.requested_bytes == 20
@@ -3076,12 +3237,12 @@ end
     @test state.requested_messages == 3
     @test state.requested_bytes == 8
 
-    second = N._reserve_pull_stream_request!(config, state, "second")
+    second = N._reserve_pull_stream_request!(config, state, 2)
     @test !isnothing(second)
     @test state.requested_messages == 4
     @test state.requested_bytes == 20
 
-    terminal = Msg("_INBOX.pull.first", nothing, UInt8[];
+    terminal = Msg("_INBOX.pull.1", nothing, UInt8[];
                    headers=Headers("Status" => ["409"], "Description" => ["Batch Completed"],
                                    "Nats-Pending-Messages" => ["3"],
                                    "Nats-Pending-Bytes" => ["8"]))
@@ -3091,7 +3252,7 @@ end
         N._pull_stream_release_terminal_request!(state, request_index, terminal)
         @test state.requested_messages == 1
         @test state.requested_bytes == 12
-        @test state.requests[1].token == "second"
+        @test state.requests[1].token == 2
     end
 end
 
@@ -3406,6 +3567,9 @@ end
         N._dispatch_msg(client, Msg("_INBOX.pull.old409", nothing, UInt8[];
                                     headers=Headers("Status" => ["409"], "Description" => ["Batch Completed"]),
                                     sid=core_sub.sid))
+        N._dispatch_msg(client, Msg("_INBOX.pull.01", nothing, UInt8[];
+                                    headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
+                                    sid=core_sub.sid))
         N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("payload");
                                     sid=core_sub.sid))
 
@@ -3417,6 +3581,8 @@ end
         @test startswith(reply, "_INBOX.pull.")
         @test reply != psub.deliver
         @test !endswith(reply, ".*")
+        @test N._pull_fetch_status_matches_request("_INBOX.pull.1", 1)
+        @test !N._pull_fetch_status_matches_request("_INBOX.pull.01", 1)
     finally
         close(psub)
     end

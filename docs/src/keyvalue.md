@@ -109,6 +109,8 @@ Remove old delete and purge markers:
 kv_purge_deletes(kv; older_than=30 * 60)
 ```
 
+Use `older_than=-1` to remove all delete and purge markers regardless of age.
+
 ## Watch Changes
 
 Channel watchers yield historical/current entries first, then the sentinel `KV_WATCH_INITIAL_DONE`, then live updates.

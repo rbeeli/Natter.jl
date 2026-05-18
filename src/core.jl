@@ -103,7 +103,8 @@ end
 
 function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flush::Bool=false,
                         replayable::Bool=false, frame_size::Int=_serialized_size(frame),
-                        direct_write::Bool=false)::Bool
+                        direct_write::Bool=false,
+                        payload_size::Int=_pub_payload_size(frame))::Bool
     captured = false
     @lock client.write_lock begin
         st = status(client)
@@ -113,6 +114,7 @@ function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flus
             st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
             throw(ConnectionReconnectingError())
         end
+        _validate_publish_frame_for_client(client, frame, payload_size)
         captured = _write_publish_to_active_io(client, io, frame, force_flush, replayable,
                                                frame_size, direct_write)
     end
@@ -175,6 +177,7 @@ end
 function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
                        force_flush::Bool=false,
                        frame_size::Int=_serialized_size(frame),
+                       payload_size::Int=_pub_payload_size(frame),
                        st::ConnectionStatus.T=status(client),
                        direct_write::Bool=false)
     can_buffer_reconnect = buffer_on_reconnect && _reconnect_buffer_enabled(client)
@@ -183,7 +186,7 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
         try
             replayable_captured = _write_publish(client, frame; force_flush,
                                                  replayable=can_buffer_reconnect, frame_size,
-                                                 direct_write)
+                                                 direct_write, payload_size)
         catch err
             err isa OutboundBufferLimitError && rethrow()
             if st == ConnectionStatus.CONNECTED && _recover_after_write_failure!(client, err)
@@ -350,7 +353,8 @@ function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_
     st = status(client)
     _ensure_usable_status_for_publish(st)
     _validate_publish_frame_for_client(client, frame, payload_size)
-    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size, st, direct_write)
+    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
+                  payload_size, st, direct_write)
     _record_out!(client, payload_size)
     nothing
 end
@@ -368,10 +372,12 @@ function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; 
                                   cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     frame_size = _serialized_size(frame)
+    payload_size = _pub_payload_size(frame)
     st = status(client)
     _ensure_usable_status_for_publish(st)
-    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size, st, direct_write)
-    _record_out!(client, _pub_payload_size(frame))
+    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
+                  payload_size, st, direct_write)
+    _record_out!(client, payload_size)
     nothing
 end
 
@@ -527,18 +533,220 @@ _handle_subscription_control(::_NoSubscriptionControlHandler, _sub::Subscription
 _record_subscription_data_received!(::_SubscriptionControlHandler, ::AbstractMsg) = nothing
 _maybe_reply_to_subscription_flow_control!(::Subscription, ::_SubscriptionControlHandler) = nothing
 
-function _request_mux_token(prefix::String, subject::String)::Union{SubString{String},Nothing}
+function _parse_decimal_token(subject::String, first::Int, last::Int)::Union{Int,Nothing}
+    first <= last || return nothing
+    if first < last
+        leading_zero = @inbounds codeunit(subject, first) == UInt8('0')
+        leading_zero && return nothing
+    end
+    value = 0
+    @inbounds for i in first:last
+        byte = codeunit(subject, i)
+        UInt8('0') <= byte <= UInt8('9') || return nothing
+        digit = Int(byte - UInt8('0'))
+        value <= (typemax(Int) - digit) ÷ 10 || return nothing
+        value = value * 10 + digit
+    end
+    value
+end
+
+function _parse_decimal_token(bytes::AbstractVector{UInt8}, first::Int,
+                              last::Int)::Union{Int,Nothing}
+    first <= last || return nothing
+    if first < last
+        leading_zero = @inbounds bytes[first] == UInt8('0')
+        leading_zero && return nothing
+    end
+    value = 0
+    @inbounds for i in first:last
+        byte = bytes[i]
+        UInt8('0') <= byte <= UInt8('9') || return nothing
+        digit = Int(byte - UInt8('0'))
+        value <= (typemax(Int) - digit) ÷ 10 || return nothing
+        value = value * 10 + digit
+    end
+    value
+end
+
+function _request_mux_token(prefix::String, subject::String)::Union{Int,Nothing}
     prefix_len = ncodeunits(prefix)
     subject_len = ncodeunits(subject)
     subject_len > prefix_len + 1 || return nothing
     startswith(subject, prefix) || return nothing
     codeunit(subject, prefix_len + 1) == UInt8('.') || return nothing
     token_start = prefix_len + 2
-    token_start <= subject_len || return nothing
-    @inbounds for i in token_start:subject_len
-        codeunit(subject, i) == UInt8('.') && return nothing
+    _parse_decimal_token(subject, token_start, subject_len)
+end
+
+function _request_mux_token(prefix::String, bytes::AbstractVector{UInt8},
+                            subject_start::Int, subject_end::Int)::Union{Int,Nothing}
+    prefix_len = ncodeunits(prefix)
+    subject_len = subject_end - subject_start + 1
+    subject_len > prefix_len + 1 || return nothing
+    @inbounds for i in 1:prefix_len
+        bytes[subject_start + i - 1] == codeunit(prefix, i) || return nothing
     end
-    SubString(subject, token_start, subject_len)
+    dot = subject_start + prefix_len
+    @inbounds bytes[dot] == UInt8('.') || return nothing
+    _parse_decimal_token(bytes, dot + 1, subject_end)
+end
+
+function _next_request_mux_token!(mux::RequestMux)::Int
+    start = mux.next_token
+    while true
+        token = mux.next_token == typemax(Int) ? 1 : mux.next_token + 1
+        mux.next_token = token
+        !haskey(mux.waiters, token) && return token
+        token == start && throw(OverflowError("request mux token space exhausted"))
+    end
+end
+
+_try_handle_subscription_msg_control(_handler::_SubscriptionControlHandler, _client::Client,
+                                     _sub::Subscription, _reader::ProtocolReader,
+                                     _subject_start::Int, _subject_end::Int,
+                                     _reply_start::Int, _reply_end::Int,
+                                     _size::Int)::Bool = false
+
+_try_handle_subscription_hmsg_control(_handler::_SubscriptionControlHandler, _client::Client,
+                                      _sub::Subscription, _reader::ProtocolReader,
+                                      _subject_start::Int, _subject_end::Int,
+                                      _reply_start::Int, _reply_end::Int,
+                                      _hsize::Int, _total::Int)::Bool = false
+
+function _try_handle_msg_control(dispatcher::_ReaderMsgDispatcher, reader::ProtocolReader,
+                                 sid::Int, subject_start::Int, subject_end::Int,
+                                 reply_start::Int, reply_end::Int,
+                                 size::Int, borrowed::Bool)::Bool
+    borrowed && return false
+    client = dispatcher.client
+    sub = _lookup_subscription(client, sid)
+    isnothing(sub) && return false
+    closed = false
+    control_handler = _NoSubscriptionControlHandler()
+    @lock sub.lock begin
+        closed = sub.closed
+        control_handler = sub.control_handler
+    end
+    closed && return false
+    _try_handle_subscription_msg_control(control_handler, client, sub, reader, subject_start,
+                                         subject_end, reply_start, reply_end, size)
+end
+
+function _try_handle_hmsg_control(dispatcher::_ReaderMsgDispatcher, reader::ProtocolReader,
+                                  sid::Int, subject_start::Int, subject_end::Int,
+                                  reply_start::Int, reply_end::Int,
+                                  hsize::Int, total::Int, borrowed::Bool)::Bool
+    borrowed && return false
+    client = dispatcher.client
+    sub = _lookup_subscription(client, sid)
+    isnothing(sub) && return false
+    closed = false
+    control_handler = _NoSubscriptionControlHandler()
+    @lock sub.lock begin
+        closed = sub.closed
+        control_handler = sub.control_handler
+    end
+    closed && return false
+    _try_handle_subscription_hmsg_control(control_handler, client, sub, reader, subject_start,
+                                          subject_end, reply_start, reply_end, hsize, total)
+end
+
+function _fast_control_reply(reader::ProtocolReader, reply_start::Int,
+                             reply_end::Int)::Union{String,Nothing}
+    reply_start == 0 && return nothing
+    _bytes_string(reader.buffer, reply_start, reply_end)
+end
+
+function _fast_control_msg_parts(reader::ProtocolReader, reply_start::Int,
+                                 reply_end::Int, size::Int)
+    reply = _fast_control_reply(reader, reply_start, reply_end)
+    payload = _read_exact_payload(reader, size)
+    reply, payload
+end
+
+function _fast_control_hmsg_parts(reader::ProtocolReader, reply_start::Int, reply_end::Int,
+                                  hsize::Int, total::Int)
+    reply = _fast_control_reply(reader, reply_start, reply_end)
+    header_bytes, payload = _read_exact_header_payload(reader, hsize, total)
+    status, description_first, description_last = _validate_headers(header_bytes)
+    RawHeaders(header_bytes, status, description_first, description_last), reply, payload
+end
+
+function _finish_fast_control_msg!(client::Client, msg_bytes::Int, drop::Bool,
+                                   notify_err, subject::Union{String,Nothing})
+    drop && _record_drop!(client)
+    _record_in!(client, msg_bytes)
+    if !isnothing(notify_err)
+        detail = isnothing(subject) ? "deliver control reply" : "deliver request reply $subject"
+        _report_error(client, CleanupError(detail, notify_err))
+    end
+    true
+end
+
+function _resolve_fast_request_mux_reply!(client::Client, sub::Subscription, mux::RequestMux,
+                                          token::Union{Int,Nothing},
+                                          reply::Union{String,Nothing},
+                                          payload::Vector{UInt8}, headers::HeaderStorage,
+                                          header_bytes::Int)
+    waiter = nothing
+    drop = false
+    notify_err = nothing
+    subject = nothing
+    if isnothing(token) || mux.sub !== sub
+        drop = true
+    else
+        lock(mux.condition)
+        try
+            if (@atomic client.request_mux) !== mux
+                drop = true
+            else
+                waiter = pop!(mux.waiters, token, nothing)
+                drop = isnothing(waiter)
+                if !drop
+                    subject = waiter.reply
+                    msg = Msg(waiter.reply, reply, payload, headers, sub.sid, header_bytes)
+                    try
+                        _resolve_request_waiter_locked!(waiter, msg, mux.condition)
+                    catch err
+                        notify_err = err
+                    end
+                end
+            end
+        finally
+            unlock(mux.condition)
+        end
+    end
+    drop, notify_err, subject
+end
+
+function _try_handle_subscription_msg_control(::_RequestMuxControlHandler, client::Client,
+                                              sub::Subscription, reader::ProtocolReader,
+                                              subject_start::Int, subject_end::Int,
+                                              reply_start::Int, reply_end::Int,
+                                              size::Int)::Bool
+    mux = @atomic client.request_mux
+    token = isnothing(mux) ? nothing :
+            _request_mux_token(mux.prefix, reader.buffer, subject_start, subject_end)
+    reply, payload = _fast_control_msg_parts(reader, reply_start, reply_end, size)
+    drop, notify_err, subject = isnothing(mux) ? (true, nothing, nothing) :
+                                _resolve_fast_request_mux_reply!(client, sub, mux, token,
+                                                                 reply, payload, nothing, 0)
+    _finish_fast_control_msg!(client, size, drop, notify_err, subject)
+end
+
+function _try_handle_subscription_hmsg_control(::_RequestMuxControlHandler, client::Client,
+                                               sub::Subscription, reader::ProtocolReader,
+                                               subject_start::Int, subject_end::Int,
+                                               reply_start::Int, reply_end::Int,
+                                               hsize::Int, total::Int)::Bool
+    mux = @atomic client.request_mux
+    token = isnothing(mux) ? nothing :
+            _request_mux_token(mux.prefix, reader.buffer, subject_start, subject_end)
+    hdrs, reply, payload = _fast_control_hmsg_parts(reader, reply_start, reply_end, hsize, total)
+    drop, notify_err, subject = isnothing(mux) ? (true, nothing, nothing) :
+                                _resolve_fast_request_mux_reply!(client, sub, mux, token,
+                                                                 reply, payload, hdrs, hsize)
+    _finish_fast_control_msg!(client, total, drop, notify_err, subject)
 end
 
 function _handle_subscription_control(::_RequestMuxControlHandler, sub::Subscription, msg::Msg)::Bool
@@ -1173,8 +1381,8 @@ function _ensure_request_mux(client::Client)
         end
 
         mux_lock = ReentrantLock()
-        mux = RequestMux(prefix, sub, Dict{String,RequestWaiter{typeof(client)}}(),
-                         Base.Threads.Condition(mux_lock), nothing)
+        mux = RequestMux(prefix, sub, Dict{Int,RequestWaiter{typeof(client)}}(),
+                         Base.Threads.Condition(mux_lock), 0, nothing)
         assigned = @lock client.lock begin
             sub_active = @lock sub.lock !sub.closed && sub.server_active
             if client.status == ConnectionStatus.CONNECTED && sub_active
@@ -1203,12 +1411,12 @@ function _request_timeout_loop(client::C, mux::RequestMux{C}) where {C<:Client}
             expired = nothing
             for (token, waiter) in mux.waiters
                 if !waiter.active
-                    isnothing(expired) && (expired = String[])
+                    isnothing(expired) && (expired = Int[])
                     push!(expired, token)
                     continue
                 end
                 if waiter.deadline <= now
-                    isnothing(expired) && (expired = String[])
+                    isnothing(expired) && (expired = Int[])
                     push!(expired, token)
                 else
                     nearest = min(nearest, waiter.deadline)
@@ -1264,26 +1472,23 @@ function _register_request_waiter!(client::C, mux::RequestMux{C}, timeout::Real)
     sub_active = @lock mux.sub.lock !mux.sub.closed && mux.sub.server_active
     (@atomic client.request_mux) === mux && sub_active || throw(ConnectionReconnectingError())
     deadline = time() + Float64(timeout)
-    while true
-        token = _nuid_suffix(client)
-        lock(mux.condition)
-        try
-            sub_active = @lock mux.sub.lock !mux.sub.closed && mux.sub.server_active
-            (@atomic client.request_mux) === mux && sub_active || throw(ConnectionReconnectingError())
-            if !haskey(mux.waiters, token)
-                waiter = RequestWaiter{C}(deadline)
-                mux.waiters[token] = waiter
-                _ensure_request_timeout_task_locked!(client, mux)
-                notify(mux.condition; all=true)
-                return token, waiter
-            end
-        finally
-            unlock(mux.condition)
-        end
+    lock(mux.condition)
+    try
+        sub_active = @lock mux.sub.lock !mux.sub.closed && mux.sub.server_active
+        (@atomic client.request_mux) === mux && sub_active || throw(ConnectionReconnectingError())
+        token = _next_request_mux_token!(mux)
+        reply = string(mux.prefix, '.', token)
+        waiter = RequestWaiter{C}(deadline, reply)
+        mux.waiters[token] = waiter
+        _ensure_request_timeout_task_locked!(client, mux)
+        notify(mux.condition; all=true)
+        return token, waiter
+    finally
+        unlock(mux.condition)
     end
 end
 
-function _remove_request_waiter!(client::C, mux::RequestMux{C}, token::String,
+function _remove_request_waiter!(client::C, mux::RequestMux{C}, token::Int,
                                  waiter::RequestWaiter{C}) where {C<:Client}
     lock(mux.condition)
     try
@@ -1335,7 +1540,7 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     _validate_publish_frame_for_client(client, request_frame)
     mux = _ensure_request_mux(client)
     token, waiter = _register_request_waiter!(client, mux, timeout)
-    reply = "$(mux.prefix).$token"
+    reply = waiter.reply
     try
         _validate_publish_subject(reply)
         frame = _PublishFrame(request_frame.subject, reply, request_frame.payload, request_frame.headers)

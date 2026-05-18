@@ -398,7 +398,7 @@ end
         TestHelpers.clear_capture!(client_drain_capture)
         @test_throws ArgumentError drain(client_drain_client; timeout=invalid_timeout)
         @test TestHelpers.capture_text(client_drain_capture) == ""
-        @test status(client_drain_client) == N.ConnectionStatus.CONNECTED
+        @test N.status(client_drain_client) == N.ConnectionStatus.CONNECTED
         close(client_drain_client)
     end
 end
@@ -860,7 +860,7 @@ end
     N._dispatch_msg(accepted, accepted_msg)
     @test isready(accepted_sub.messages)
     @test accepted_sub.pending_bytes == length(hdr)
-    @test N._msg_pending_bytes(next(accepted_sub; timeout=0.1)) == length(hdr)
+    @test N._msg_pending_bytes(N.next(accepted_sub; timeout=0.1)) == length(hdr)
     @test accepted_sub.pending_bytes == 0
 
     reported = Any[]
@@ -885,7 +885,7 @@ end
         nothing
     end
     try
-        err = TestHelpers.thrown_exception(() -> next(sub; timeout=0.1))
+        err = TestHelpers.thrown_exception(() -> N.next(sub; timeout=0.1))
         @test err isa ArgumentError
         @test occursin("callback", err.msg)
     finally
@@ -926,7 +926,7 @@ end
     @lock sub.lock put!(sub.messages, Msg("events", nothing, TestHelpers.bytes("stolen"); sid=sub.sid))
 
     lock(sub.lock)
-    task = @async next(sub; timeout=0.05)
+    task = @async N.next(sub; timeout=0.05)
     try
         sleep(0.01)
         stolen = take!(sub.messages)
@@ -1407,12 +1407,12 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     sub = subscribe(client, "updates")
-    already_cancelled = TestHelpers.thrown_exception(() -> next(sub; timeout=1.0, cancel_token=token))
+    already_cancelled = TestHelpers.thrown_exception(() -> N.next(sub; timeout=1.0, cancel_token=token))
     @test already_cancelled isa CancelledError
 
     source = CancellationSource()
     token = cancellation_token(source)
-    next_task = @async TestHelpers.thrown_exception(() -> next(sub; timeout=30.0, cancel_token=token))
+    next_task = @async TestHelpers.thrown_exception(() -> N.next(sub; timeout=30.0, cancel_token=token))
     sleep(0.02)
     @test cancel!(source)
     @test fetch(next_task) isa CancelledError
@@ -1518,7 +1518,7 @@ end
         @test err.actual == 2 * frame_size
     end
 
-    @test status(client) == N.ConnectionStatus.CONNECTED
+    @test N.status(client) == N.ConnectionStatus.CONNECTED
     @test client.pending_bytes == frame_size
     @test isempty(transport.bytes)
     @test stats(client).out_msgs == 1
@@ -1771,7 +1771,7 @@ end
     @test take!(transport.entered)
     close_task = @async close(client)
     @test timedwait(1.0; pollint=0.001) do
-        status(client) == N.ConnectionStatus.CLOSED
+        N.status(client) == N.ConnectionStatus.CLOSED
     end != :timed_out
     put!(transport.release, true)
 
@@ -1793,7 +1793,7 @@ end
     N._enqueue_pending(terminal, data)
     @test terminal.pending_bytes == length(data)
     @test N._terminal_disconnect!(terminal, terminal.generation, N.NoServersError())
-    @test status(terminal) == N.ConnectionStatus.DISCONNECTED
+    @test N.status(terminal) == N.ConnectionStatus.DISCONNECTED
     @test terminal.pending_bytes == 0
     @test isempty(take!(terminal.pending))
 
@@ -1801,7 +1801,7 @@ end
     N._enqueue_pending(closing, data)
     @test closing.pending_bytes == length(data)
     close(closing)
-    @test status(closing) == N.ConnectionStatus.CLOSED
+    @test N.status(closing) == N.ConnectionStatus.CLOSED
     @test closing.pending_bytes == 0
     @test isempty(take!(closing.pending))
 end
@@ -1815,7 +1815,7 @@ end
     N._trigger_reconnect(client, ErrorException("lost"))
 
     @test timedwait(1.0; pollint=0.01) do
-        status(client) == N.ConnectionStatus.DISCONNECTED
+        N.status(client) == N.ConnectionStatus.DISCONNECTED
     end != :timed_out
     @test isnothing(client.reconnect_task) || istaskdone(client.reconnect_task)
 end
@@ -1836,7 +1836,7 @@ end
                                      read_io=transport, write_io=transport)
 
     publish(client, "foo", "bar")
-    @test status(client) == N.ConnectionStatus.RECONNECTING
+    @test N.status(client) == N.ConnectionStatus.RECONNECTING
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
     @test stats(client).out_msgs == 1
     close(client)
@@ -1868,7 +1868,7 @@ end
     error_ref[] = error_client
 
     @test_throws ErrorException publish(error_client, "foo", "bar")
-    @test status(error_client) == N.ConnectionStatus.CLOSED
+    @test N.status(error_client) == N.ConnectionStatus.CLOSED
     @test error_client.pending_bytes == 0
     @test isempty(take!(error_client.pending))
     @test stats(error_client).out_msgs == 0
@@ -1886,7 +1886,7 @@ end
     disconnected_ref[] = disconnected_client
 
     @test_throws ErrorException publish(disconnected_client, "foo", "bar")
-    @test status(disconnected_client) == N.ConnectionStatus.CLOSED
+    @test N.status(disconnected_client) == N.ConnectionStatus.CLOSED
     @test disconnected_client.pending_bytes == 0
     @test isempty(take!(disconnected_client.pending))
     @test stats(disconnected_client).out_msgs == 0
@@ -1899,7 +1899,7 @@ end
     raw_ref[] = raw_client
 
     @test_throws ErrorException N._send_raw(raw_client, TestHelpers.bytes("PING\r\n"); buffer_on_reconnect=true)
-    @test status(raw_client) == N.ConnectionStatus.CLOSED
+    @test N.status(raw_client) == N.ConnectionStatus.CLOSED
     @test raw_client.pending_bytes == 0
     @test isempty(take!(raw_client.pending))
 end
@@ -1964,7 +1964,7 @@ end
                                      read_io=transport, write_io=transport)
 
     @test_throws ConnectionReconnectingError request(client, "foo", "bar"; timeout=0.001)
-    @test status(client) == N.ConnectionStatus.RECONNECTING
+    @test N.status(client) == N.ConnectionStatus.RECONNECTING
     @test length(client.subscriptions) == 1
     @test !isnothing(client.request_mux)
     @test client.request_mux.sub.sid in keys(client.subscriptions)
@@ -2040,7 +2040,7 @@ end
     close(client)
 end
 
-@testitem "request mux reply tokens use client rng" setup=[TestHelpers] begin
+@testitem "request mux reply tokens use numeric suffixes after rng prefix" setup=[TestHelpers] begin
     using Natter
     using Random
 
@@ -2048,7 +2048,6 @@ end
 
     expected_rng = MersenneTwister(1)
     expected_prefix = "_INBOX.$(randstring(expected_rng, N.NUID_ALPHABET, 22))"
-    expected_token = randstring(expected_rng, N.NUID_ALPHABET, 22)
 
     transport = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
@@ -2057,7 +2056,14 @@ end
 
         lines = split(TestHelpers.capture_text(transport), "\r\n"; keepempty=false)
         publish_line = only(line for line in lines if startswith(line, "PUB svc "))
-        @test split(publish_line)[3] == "$expected_prefix.$expected_token"
+        @test split(publish_line)[3] == "$expected_prefix.1"
+        @test N._request_mux_token(expected_prefix, "$expected_prefix.1") == 1
+        @test isnothing(N._request_mux_token(expected_prefix, "$expected_prefix.01"))
+
+        reply_bytes = TestHelpers.bytes("$expected_prefix.1")
+        alias_bytes = TestHelpers.bytes("$expected_prefix.01")
+        @test N._request_mux_token(expected_prefix, reply_bytes, firstindex(reply_bytes), lastindex(reply_bytes)) == 1
+        @test isnothing(N._request_mux_token(expected_prefix, alias_bytes, firstindex(alias_bytes), lastindex(alias_bytes)))
     finally
         close(client)
     end
@@ -2189,7 +2195,7 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
 
     sub = subscribe(client, "foo")
-    @test status(client) == N.ConnectionStatus.RECONNECTING
+    @test N.status(client) == N.ConnectionStatus.RECONNECTING
     @test !sub.server_active
     @test sub.sid in keys(client.subscriptions)
     close(client)
@@ -2210,7 +2216,7 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING, read_io=transport, write_io=transport)
 
     N._trigger_reconnect(client, ErrorException("already reconnecting"))
-    @test status(client) == N.ConnectionStatus.RECONNECTING
+    @test N.status(client) == N.ConnectionStatus.RECONNECTING
     @test closes[] == 0
 end
 
@@ -2223,7 +2229,7 @@ end
     client = TestHelpers.fake_client(; opts=N.ConnectOptions(max_reconnect_attempts=0, error_cb=err -> push!(reported, err)),
                                      status=N.ConnectionStatus.RECONNECTING)
     sub = subscribe(client, "foo")
-    next_task = @async next(sub; timeout=30.0)
+    next_task = @async N.next(sub; timeout=30.0)
     callback_sub = subscribe(client, "bar") do _
         nothing
     end
@@ -2233,7 +2239,7 @@ end
     sleep(0.01)
     N._reconnect_loop(client, client.generation)
 
-    @test status(client) == N.ConnectionStatus.DISCONNECTED
+    @test N.status(client) == N.ConnectionStatus.DISCONNECTED
     @test isempty(client.subscriptions)
     @test sub.closed
     @test callback_sub.closed
@@ -2267,13 +2273,13 @@ end
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io=transport)
     sub = subscribe(client, "foo")
-    next_task = @async next(sub; timeout=30.0)
+    next_task = @async N.next(sub; timeout=30.0)
 
     sleep(0.01)
     reason = ErrorException("lost")
     N._trigger_reconnect(client, reason)
 
-    @test status(client) == N.ConnectionStatus.DISCONNECTED
+    @test N.status(client) == N.ConnectionStatus.DISCONNECTED
     @test isempty(client.subscriptions)
     @test sub.closed
     @test !isopen(sub.messages)
@@ -2304,7 +2310,7 @@ end
     generation = client.generation
 
     @test !N._handle_server_err!(client, generation, "Permissions Violation for Publish to \"secret\"")
-    @test status(client) == N.ConnectionStatus.CONNECTED
+    @test N.status(client) == N.ConnectionStatus.CONNECTED
     @test client.generation == generation
     @test !transport.closed
     @test only(reported) isa PermissionViolationError
@@ -2365,7 +2371,7 @@ end
         N._reconnect_loop(client, client.generation)
 
         @test attempts[] == 2
-        @test status(client) == N.ConnectionStatus.DISCONNECTED
+        @test N.status(client) == N.ConnectionStatus.DISCONNECTED
         @test length(reported) == 2
         @test all(err -> err isa AuthorizationError, reported)
     finally
@@ -2477,7 +2483,7 @@ end
                                  max_reconnect_attempts=5,
                                  error_cb=_ -> (reported[] += 1; nothing))
         client = client_ref[]
-        @test status(client) == N.ConnectionStatus.CONNECTED
+        @test N.status(client) == N.ConnectionStatus.CONNECTED
         @test attempts[] == 2
         @test reported[] >= 1
         connect_line, ping_line = take!(handshake)
@@ -2528,7 +2534,7 @@ end
                                  connect_timeout=0.5,
                                  read_buffer_size=8192)
         client = client_ref[]
-        @test status(client) == N.ConnectionStatus.CONNECTED
+        @test N.status(client) == N.ConnectionStatus.CONNECTED
         @test length(client.reader.scratch) == 8192
     finally
         client = client_ref[]
@@ -2916,7 +2922,7 @@ end
 
     err = TestHelpers.thrown_exception(() -> flush(client; timeout=1.0))
     @test err isa ConnectionClosedError
-    @test status(client) == N.ConnectionStatus.DISCONNECTED
+    @test N.status(client) == N.ConnectionStatus.DISCONNECTED
 end
 
 @testitem "timed out flush consumes its own late pong" setup=[TestHelpers] begin
@@ -3121,7 +3127,7 @@ end
     @test count(startswith("UNSUB "), transport.writes) == 1
     @test count(==("PING\r\n"), transport.writes) == 1
     @test length(reported) == 1
-    @test status(client) == N.ConnectionStatus.CLOSED
+    @test N.status(client) == N.ConnectionStatus.CLOSED
 end
 
 @testitem "client drain close respects remaining timeout budget" setup=[TestHelpers] begin
@@ -3159,7 +3165,7 @@ end
 
     @test N._drain_timed_out(err)
     @test elapsed < 3.0
-    @test status(client) == N.ConnectionStatus.CLOSED
+    @test N.status(client) == N.ConnectionStatus.CLOSED
 
     put!(release, true)
     wait(sub.processor)
@@ -3204,7 +3210,7 @@ end
 
     @test N._drain_timed_out(err)
     @test elapsed < 3.0
-    @test status(client) == N.ConnectionStatus.CLOSED
+    @test N.status(client) == N.ConnectionStatus.CLOSED
     @test timedwait(1.0; pollint=0.01) do
         isready(stopped)
     end != :timed_out
@@ -3251,7 +3257,7 @@ end
         if finished != :timed_out
             err = fetch(drain_task)
             @test err isa TimeoutError
-            @test status(client) == N.ConnectionStatus.CONNECTED
+            @test N.status(client) == N.ConnectionStatus.CONNECTED
         end
     finally
         put!(release, true)
@@ -3302,7 +3308,7 @@ end
         if finished != :timed_out
             err = fetch(drain_task)
             @test N._drain_timed_out(err)
-            @test status(client) == N.ConnectionStatus.CLOSED
+            @test N.status(client) == N.ConnectionStatus.CLOSED
         end
     finally
         put!(release, true)
@@ -3352,7 +3358,7 @@ end
         if finished != :timed_out
             err = fetch(drain_task)
             @test N._drain_timed_out(err)
-            @test status(client) == N.ConnectionStatus.CLOSED
+            @test N.status(client) == N.ConnectionStatus.CLOSED
             detached = @lock client.lock begin
                 isnothing(client.read_io) &&
                     isnothing(client.reader) &&

@@ -204,7 +204,7 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
 | `close(psub; timeout=...)`, `close(push; timeout=...)`, `close(stream)` | `nothing` | Close consumer/message handles. Subscription close timeouts bound server cleanup. |
 
-Typed `StreamConfig` and `ConsumerConfig` create/update calls verify that requested fields are reflected in the server response, including explicit false, zero, and empty values. Raw dictionary configs are pass-through for fields outside Natter's typed API.
+Typed `StreamConfig`, typed `ConsumerConfig`, and raw dictionary create/update calls verify that requested fields are reflected in the server response, including explicit false, zero, and empty values. Raw dictionary configs remain available for fields outside Natter's typed API, but they are not a weaker verification escape hatch. For unknown raw fields, Natter requires requested nested values to be present and tolerates additional nested defaults returned by the server.
 
 JetStream task-backed async helpers mirror management, subscribe, fetch, timeout-aware close, and acknowledgement functions, including acknowledgement kwargs and borrowed messages: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_async_complete_async`. `js_publish_async` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
 
@@ -233,7 +233,7 @@ JetStream task-backed async helpers mirror management, subscribe, fetch, timeout
 | `kv_update(kv, key, value, revision; ttl=nothing, timeout=...)` | `Int` | Put only at the expected revision. |
 | `kv_delete(kv, key; revision=nothing, timeout=...)` | `nothing` | Mark a key deleted. |
 | `kv_purge(kv, key; revision=nothing, ttl=nothing, timeout=...)` | `nothing` | Purge prior values for a key. |
-| `kv_purge_deletes(kv; older_than=1800.0, timeout=...)` | `nothing` | Remove old delete and purge markers. |
+| `kv_purge_deletes(kv; older_than=1800.0, timeout=...)` | `nothing` | Remove old delete and purge markers. Use `older_than < 0` to remove all markers regardless of age. |
 | `kv_history(kv, key; batch=256, timeout=...)` | `Vector{KeyValueEntry}` | Read key history. |
 | `kv_keys(kv; timeout=...)` | `Vector{String}` | List active keys. |
 | `kv_watch(kv; key=">", keys=nothing, history=false, updates_only=false, ignore_deletes=false, meta_only=false, resume_revision=nothing, channel_size=256, notify_initial_done=false, timeout=...)` | `KeyValueWatcher` | Watch with a channel. |

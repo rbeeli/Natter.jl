@@ -73,7 +73,7 @@ abstract type AbstractJetStreamAsyncPublishState{C<:Client} end
 
 mutable struct JetStreamPublishFuture{C<:Client,S<:AbstractJetStreamAsyncPublishState{C}}
     state::S
-    token::String
+    token::Int
     reply::String
     subject::String
     deadline::Float64
@@ -93,7 +93,7 @@ mutable struct JetStreamAsyncPublishState{C<:Client} <: AbstractJetStreamAsyncPu
     condition::Base.GenericCondition{ReentrantLock}
     setup_lock::ReentrantLock
     sub::Union{Subscription{C},Nothing}
-    futures::Dict{String,JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}
+    futures::Dict{Int,JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}
     max_pending::Int
     pending::Int
     next_token::Int
@@ -125,7 +125,7 @@ function JetStreamAsyncPublishState(client::C, max_pending::Int) where {C<:Clien
         Base.Threads.Condition(lock),
         ReentrantLock(),
         nothing,
-        Dict{String,JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}(),
+        Dict{Int,JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}(),
         max_pending,
         0,
         0,
@@ -394,6 +394,8 @@ function _jetstream_status_description_eq(msg::AbstractMsg, expected::AbstractSt
     hdrs = msg.headers
     if hdrs isa LazyHeaders
         return _jetstream_status_description_eq_lazy(hdrs, expected)
+    elseif hdrs isa RawHeaders
+        return _jetstream_status_description_eq_raw(hdrs, expected)
     end
     description = _status_description(msg)
     _js_ascii_eq_ci_stripped(description, 1, ncodeunits(description), expected)
@@ -404,10 +406,17 @@ function _jetstream_status_description_eq_lazy(hdrs::LazyHeaders, expected::Abst
     _js_ascii_eq_ci_stripped(hdrs.raw, first, last, expected)
 end
 
+function _jetstream_status_description_eq_raw(hdrs::RawHeaders, expected::AbstractString)::Bool
+    first, last = _raw_status_description_range(hdrs)
+    _js_ascii_eq_ci_stripped(hdrs.raw, first, last, expected)
+end
+
 function _jetstream_status_description_contains(msg::AbstractMsg, expected::AbstractString)::Bool
     hdrs = msg.headers
     if hdrs isa LazyHeaders
         return _jetstream_status_description_contains_lazy(hdrs, expected)
+    elseif hdrs isa RawHeaders
+        return _jetstream_status_description_contains_raw(hdrs, expected)
     end
     description = _status_description(msg)
     _js_ascii_contains_ci(description, 1, ncodeunits(description), expected)
@@ -415,6 +424,11 @@ end
 
 function _jetstream_status_description_contains_lazy(hdrs::LazyHeaders, expected::AbstractString)::Bool
     first, last = _lazy_status_description_range(hdrs)
+    _js_ascii_contains_ci(hdrs.raw, first, last, expected)
+end
+
+function _jetstream_status_description_contains_raw(hdrs::RawHeaders, expected::AbstractString)::Bool
+    first, last = _raw_status_description_range(hdrs)
     _js_ascii_contains_ci(hdrs.raw, first, last, expected)
 end
 
@@ -592,6 +606,9 @@ function _push_header!(headers::Headers, name::String, value::String)
     headers
 end
 
+_ensure_js_publish_headers(hdrs::Headers) = hdrs
+_ensure_js_publish_headers(::Nothing) = Headers()
+
 function _js_publish_headers(headers; stream::Union{AbstractString,Nothing}=nothing,
                              expected_stream::Union{AbstractString,Nothing}=nothing,
                              msg_id=nothing, expected_last_sequence=nothing,
@@ -600,45 +617,68 @@ function _js_publish_headers(headers; stream::Union{AbstractString,Nothing}=noth
                              expected_last_msg_id=nothing, ttl=nothing,
                              schedule=nothing, schedule_at=nothing, schedule_every=nothing,
                              schedule_target=nothing, schedule_source=nothing,
-                             schedule_ttl=nothing, schedule_timezone=nothing)::Headers
-    hdrs = isnothing(headers) ? Headers() : _headers_copy(headers)
+                             schedule_ttl=nothing, schedule_timezone=nothing)::Union{Headers,Nothing}
+    hdrs = isnothing(headers) ? nothing : _headers_copy(headers)
     if !isnothing(stream) && !isnothing(expected_stream) && String(stream) != String(expected_stream)
         throw(ArgumentError("stream and expected_stream must match when both are provided"))
     end
     expected = isnothing(expected_stream) ? stream : expected_stream
+    publish_schedule = _js_publish_schedule(schedule, schedule_at, schedule_every)
 
-    isnothing(msg_id) || _push_header!(hdrs, _JS_MSG_ID_HEADER, _js_header_nonempty("msg_id", msg_id))
-    isnothing(expected) ||
-        _push_header!(hdrs, _JS_EXPECTED_STREAM_HEADER, _validate_api_name("stream", expected))
-    isnothing(expected_last_sequence) ||
-        _push_header!(hdrs, _JS_EXPECTED_LAST_SEQUENCE_HEADER,
-                      _js_header_sequence("expected_last_sequence", expected_last_sequence))
-    isnothing(expected_last_subject_sequence) ||
-        _push_header!(hdrs, _JS_EXPECTED_LAST_SUBJECT_SEQUENCE_HEADER,
-                      _js_header_sequence("expected_last_subject_sequence", expected_last_subject_sequence))
+    if !isnothing(msg_id)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_MSG_ID_HEADER,
+                             _js_header_nonempty("msg_id", msg_id))
+    end
+    if !isnothing(expected)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_EXPECTED_STREAM_HEADER,
+                             _validate_api_name("stream", expected))
+    end
+    if !isnothing(expected_last_sequence)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_EXPECTED_LAST_SEQUENCE_HEADER,
+                             _js_header_sequence("expected_last_sequence", expected_last_sequence))
+    end
+    if !isnothing(expected_last_subject_sequence)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs),
+                             _JS_EXPECTED_LAST_SUBJECT_SEQUENCE_HEADER,
+                             _js_header_sequence("expected_last_subject_sequence",
+                                                 expected_last_subject_sequence))
+    end
     if !isnothing(expected_last_subject)
         isnothing(expected_last_subject_sequence) &&
             throw(ArgumentError("expected_last_subject requires expected_last_subject_sequence"))
-        _push_header!(hdrs, _JS_EXPECTED_LAST_SUBJECT_SEQUENCE_SUBJECT_HEADER,
-                      _validate_publish_subject(expected_last_subject))
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs),
+                             _JS_EXPECTED_LAST_SUBJECT_SEQUENCE_SUBJECT_HEADER,
+                             _validate_publish_subject(expected_last_subject))
     end
-    isnothing(expected_last_msg_id) ||
-        _push_header!(hdrs, _JS_EXPECTED_LAST_MSG_ID_HEADER,
-                      _js_header_nonempty("expected_last_msg_id", expected_last_msg_id))
-    isnothing(ttl) || _push_header!(hdrs, _JS_MSG_TTL_HEADER, _js_duration_header("ttl", ttl; min_seconds=1.0))
+    if !isnothing(expected_last_msg_id)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_EXPECTED_LAST_MSG_ID_HEADER,
+                             _js_header_nonempty("expected_last_msg_id", expected_last_msg_id))
+    end
+    if !isnothing(ttl)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_MSG_TTL_HEADER,
+                             _js_duration_header("ttl", ttl; min_seconds=1.0))
+    end
 
-    publish_schedule = _js_publish_schedule(schedule, schedule_at, schedule_every)
-    isnothing(publish_schedule) || _push_header!(hdrs, _JS_SCHEDULE_HEADER, publish_schedule)
-    isnothing(schedule_target) ||
-        _push_header!(hdrs, _JS_SCHEDULE_TARGET_HEADER, _validate_publish_subject(schedule_target))
-    isnothing(schedule_source) ||
-        _push_header!(hdrs, _JS_SCHEDULE_SOURCE_HEADER, _validate_publish_subject(schedule_source))
-    isnothing(schedule_ttl) ||
-        _push_header!(hdrs, _JS_SCHEDULE_TTL_HEADER,
-                      _js_duration_header("schedule_ttl", schedule_ttl; allow_never=true))
-    isnothing(schedule_timezone) ||
-        _push_header!(hdrs, _JS_SCHEDULE_TIMEZONE_HEADER,
-                      _js_header_nonempty("schedule_timezone", schedule_timezone))
+    if !isnothing(publish_schedule)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_SCHEDULE_HEADER,
+                             publish_schedule)
+    end
+    if !isnothing(schedule_target)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_SCHEDULE_TARGET_HEADER,
+                             _validate_publish_subject(schedule_target))
+    end
+    if !isnothing(schedule_source)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_SCHEDULE_SOURCE_HEADER,
+                             _validate_publish_subject(schedule_source))
+    end
+    if !isnothing(schedule_ttl)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_SCHEDULE_TTL_HEADER,
+                             _js_duration_header("schedule_ttl", schedule_ttl; allow_never=true))
+    end
+    if !isnothing(schedule_timezone)
+        hdrs = _push_header!(_ensure_js_publish_headers(hdrs), _JS_SCHEDULE_TIMEZONE_HEADER,
+                             _js_header_nonempty("schedule_timezone", schedule_timezone))
+    end
     hdrs
 end
 
@@ -788,8 +828,8 @@ function _clear_js_async_publish_pending!(client::Client, err::Exception)
     nothing
 end
 
-function _handle_js_async_publish_ack(state::JetStreamAsyncPublishState, msg::Msg)
-    token = _request_mux_token(state.prefix, msg.subject)
+function _handle_js_async_publish_ack(state::JetStreamAsyncPublishState,
+                                      token::Union{Int,Nothing}, msg::Msg)
     if isnothing(token)
         _record_drop!(state.client)
         return nothing
@@ -805,6 +845,59 @@ function _handle_js_async_publish_ack(state::JetStreamAsyncPublishState, msg::Ms
     result isa NoRespondersError && _retry_js_async_publish!(future) && return nothing
     _resolve_js_publish_future!(future, result)
     nothing
+end
+
+function _handle_js_async_publish_ack(state::JetStreamAsyncPublishState, msg::Msg)
+    token = _request_mux_token(state.prefix, msg.subject)
+    _handle_js_async_publish_ack(state, token, msg)
+end
+
+function _handle_js_async_publish_ack_parts(state::JetStreamAsyncPublishState,
+                                            token::Union{Int,Nothing}, reply,
+                                            payload::Vector{UInt8}, headers::HeaderStorage,
+                                            sid::Int, header_bytes::Int)
+    if isnothing(token)
+        _record_drop!(state.client)
+        return nothing
+    end
+    future = lock(state.condition) do
+        get(state.futures, token, nothing)
+    end
+    if isnothing(future)
+        _record_drop!(state.client)
+        return nothing
+    end
+    msg = Msg(future.reply, reply, payload, headers, sid, header_bytes)
+    result = _js_async_publish_result(future, msg)
+    result isa NoRespondersError && _retry_js_async_publish!(future) && return nothing
+    _resolve_js_publish_future!(future, result)
+    nothing
+end
+
+function _try_handle_subscription_msg_control(handler::_JetStreamAsyncPublishControlHandler,
+                                              client::Client, sub::Subscription,
+                                              reader::ProtocolReader, subject_start::Int,
+                                              subject_end::Int, reply_start::Int,
+                                              reply_end::Int, size::Int)::Bool
+    state = handler.state
+    token = _request_mux_token(state.prefix, reader.buffer, subject_start, subject_end)
+    reply, payload = _fast_control_msg_parts(reader, reply_start, reply_end, size)
+    _handle_js_async_publish_ack_parts(state, token, reply, payload, nothing, sub.sid, 0)
+    _record_in!(client, size)
+    true
+end
+
+function _try_handle_subscription_hmsg_control(handler::_JetStreamAsyncPublishControlHandler,
+                                               client::Client, sub::Subscription,
+                                               reader::ProtocolReader, subject_start::Int,
+                                               subject_end::Int, reply_start::Int,
+                                               reply_end::Int, hsize::Int, total::Int)::Bool
+    state = handler.state
+    token = _request_mux_token(state.prefix, reader.buffer, subject_start, subject_end)
+    hdrs, reply, payload = _fast_control_hmsg_parts(reader, reply_start, reply_end, hsize, total)
+    _handle_js_async_publish_ack_parts(state, token, reply, payload, hdrs, sub.sid, hsize)
+    _record_in!(client, total)
+    true
 end
 
 function _handle_subscription_control(handler::_JetStreamAsyncPublishControlHandler,
@@ -948,6 +1041,16 @@ function _ensure_js_async_publish_subscription!(state::JetStreamAsyncPublishStat
     end
 end
 
+function _next_js_async_publish_token!(state::JetStreamAsyncPublishState)::Int
+    start = state.next_token
+    while true
+        token = state.next_token == typemax(Int) ? 1 : state.next_token + 1
+        state.next_token = token
+        !haskey(state.futures, token) && return token
+        token == start && throw(OverflowError("JetStream async publish token space exhausted"))
+    end
+end
+
 function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
                                            subject::AbstractString, deadline::Float64,
                                            generation::Int,
@@ -968,9 +1071,8 @@ function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
             ready || throw(TimeoutError("JetStream async publish backpressure timed out"))
         end
 
-        state.next_token += 1
-        token = "pa$(state.next_token)"
-        reply = "$(state.prefix).$token"
+        token = _next_js_async_publish_token!(state)
+        reply = string(state.prefix, '.', token)
         future = JetStreamPublishFuture{C,typeof(state)}(
             state, token, reply, String(subject), deadline, generation, retry_attempts,
             retry_wait, 0, retry_frame, false, true, nothing)
@@ -1117,6 +1219,26 @@ function _stream_config_payload(config::AbstractDict{String,<:Any})::Dict{String
     _validate_stream_config_payload!(payload)
 end
 
+function _js_plain_config_value(value)
+    if isnothing(value)
+        return nothing
+    elseif value isa AbstractString
+        return String(value)
+    elseif value isa Union{AbstractDict,JSON3.Object}
+        return Dict{String,Any}(String(k) => _js_plain_config_value(v) for (k, v) in pairs(value))
+    elseif value isa Union{AbstractVector,JSON3.Array}
+        return Any[_js_plain_config_value(v) for v in value]
+    else
+        return value
+    end
+end
+
+function _js_response_config_payload(obj)::Dict{String,Any}
+    config = _js_plain_config_value(_json_get_required(obj, :config))
+    config isa Dict{String,Any} || throw(ProtocolError("JetStream response config is not an object"))
+    config
+end
+
 struct _JSConfigFieldMissing end
 const _JS_CONFIG_FIELD_MISSING = _JSConfigFieldMissing()
 
@@ -1153,7 +1275,15 @@ function _js_config_value_is_empty_default(value)::Bool
     false
 end
 
-function _js_requested_config_reflected(expected, observed)::Bool
+const _JS_KNOWN_STREAM_CONFIG_FIELDS = Set{String}(string.(fieldnames(StreamConfig)))
+const _JS_KNOWN_CONSUMER_CONFIG_FIELDS = Set{String}(string.(fieldnames(ConsumerConfig)))
+
+_js_unknown_config_field(kind::AbstractString, field::AbstractString)::Bool =
+    kind == "stream" ? !(field in _JS_KNOWN_STREAM_CONFIG_FIELDS) :
+    kind == "consumer" ? !(field in _JS_KNOWN_CONSUMER_CONFIG_FIELDS) :
+    false
+
+function _js_requested_config_reflected(expected, observed; strict_observed_extras::Bool=true)::Bool
     observed isa _JSConfigFieldMissing && return _js_absent_config_field_reflects(expected)
     if expected isa AbstractDict
         observed isa AbstractDict || return false
@@ -1161,19 +1291,23 @@ function _js_requested_config_reflected(expected, observed)::Bool
         for (raw_key, expected_value) in pairs(expected)
             key = String(raw_key)
             push!(expected_keys, key)
-            _js_requested_config_reflected(expected_value, _js_config_field(observed, key)) ||
+            _js_requested_config_reflected(expected_value, _js_config_field(observed, key);
+                                          strict_observed_extras) ||
                 return false
         end
-        for (raw_key, observed_value) in pairs(observed)
-            String(raw_key) in expected_keys && continue
-            _js_config_value_is_empty_default(observed_value) || return false
+        if strict_observed_extras
+            for (raw_key, observed_value) in pairs(observed)
+                String(raw_key) in expected_keys && continue
+                _js_config_value_is_empty_default(observed_value) || return false
+            end
         end
         return true
     elseif expected isa AbstractVector
         observed isa AbstractVector || return false
         length(expected) == length(observed) || return false
         for i in eachindex(expected)
-            _js_requested_config_reflected(expected[i], observed[i]) || return false
+            _js_requested_config_reflected(expected[i], observed[i];
+                                          strict_observed_extras) || return false
         end
         return true
     else
@@ -1181,7 +1315,7 @@ function _js_requested_config_reflected(expected, observed)::Bool
     end
 end
 
-function _js_stream_sources_reflected(expected, observed)::Bool
+function _js_stream_sources_reflected(expected, observed; strict_observed_extras::Bool=true)::Bool
     observed isa _JSConfigFieldMissing && return _js_absent_config_field_reflects(expected)
     expected isa AbstractVector && observed isa AbstractVector || return false
     length(expected) == length(observed) || return false
@@ -1190,7 +1324,8 @@ function _js_stream_sources_reflected(expected, observed)::Bool
         found = false
         for i in eachindex(observed)
             used[i] && continue
-            if _js_requested_config_reflected(expected_source, observed[i])
+            if _js_requested_config_reflected(expected_source, observed[i];
+                                             strict_observed_extras)
                 used[i] = true
                 found = true
                 break
@@ -1222,61 +1357,72 @@ function _js_metadata_reflected(expected, observed)::Bool
 end
 
 function _assert_js_config_reflected!(kind::AbstractString, requested::Dict{String,Any},
-                                      observed::Dict{String,Any})
+                                      observed::Dict{String,Any};
+                                      allow_unknown_field_extras::Bool=false)
     for (field, expected) in requested
+        strict_observed_extras =
+            !(allow_unknown_field_extras && _js_unknown_config_field(kind, field))
         reflected = field == "metadata" ?
                     _js_metadata_reflected(expected, _js_config_field(observed, field)) :
-                    field == "sources" ?
-                    _js_stream_sources_reflected(expected, _js_config_field(observed, field)) :
-                    _js_requested_config_reflected(expected, _js_config_field(observed, field))
+                    kind == "stream" && field == "sources" ?
+                    _js_stream_sources_reflected(expected, _js_config_field(observed, field);
+                                                strict_observed_extras) :
+                    _js_requested_config_reflected(expected, _js_config_field(observed, field);
+                                                  strict_observed_extras)
         reflected ||
             throw(UnsupportedFeatureError("JetStream $kind config field $field was not reflected by server response"))
     end
     nothing
 end
 
-function _assert_stream_config_reflected!(requested::Dict{String,Any}, info::StreamInfo)
-    _assert_js_config_reflected!("stream", requested, _js_config_payload(info.config))
-    info
+function _assert_stream_config_reflected!(requested::Dict{String,Any}, response;
+                                          allow_unknown_field_extras::Bool=false)
+    _assert_js_config_reflected!("stream", requested, _js_response_config_payload(response);
+                                 allow_unknown_field_extras)
+    _stream_info(response)
 end
 
-function _assert_consumer_config_reflected!(requested::Dict{String,Any}, info::ConsumerInfo)
-    _assert_js_config_reflected!("consumer", requested, _js_config_payload(info.config))
-    info
+function _assert_consumer_config_reflected!(requested::Dict{String,Any}, response;
+                                            allow_unknown_field_extras::Bool=false)
+    _assert_js_config_reflected!("consumer", requested, _js_response_config_payload(response);
+                                 allow_unknown_field_extras)
+    _consumer_info(response)
 end
 
 function stream_create(js::JetStreamContext, config::StreamConfig; timeout::Real=js.timeout,
                        cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    info = _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload);
-                                     timeout, cancel_token))
-    _assert_stream_config_reflected!(payload, info)
+    response = _api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload);
+                            timeout, cancel_token)
+    _assert_stream_config_reflected!(payload, response)
 end
 
 function stream_create(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout,
                        cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    _stream_info(_api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload);
-                              timeout, cancel_token))
+    response = _api_request(js, "$(js.prefix).STREAM.CREATE.$name", JSON3.write(payload);
+                            timeout, cancel_token)
+    _assert_stream_config_reflected!(payload, response; allow_unknown_field_extras=true)
 end
 
 function stream_update(js::JetStreamContext, config::StreamConfig; timeout::Real=js.timeout,
                        cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    info = _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload);
-                                     timeout, cancel_token))
-    _assert_stream_config_reflected!(payload, info)
+    response = _api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload);
+                            timeout, cancel_token)
+    _assert_stream_config_reflected!(payload, response)
 end
 
 function stream_update(js::JetStreamContext, config::AbstractDict{String,<:Any}; timeout::Real=js.timeout,
                        cancel_token::MaybeCancellationToken=nothing)
     name = _stream_config_name(config)
     payload = _stream_config_payload(config)
-    _stream_info(_api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload);
-                              timeout, cancel_token))
+    response = _api_request(js, "$(js.prefix).STREAM.UPDATE.$name", JSON3.write(payload);
+                            timeout, cancel_token)
+    _assert_stream_config_reflected!(payload, response; allow_unknown_field_extras=true)
 end
 
 stream_info(js::JetStreamContext, name::AbstractString; timeout::Real=js.timeout,
@@ -1629,25 +1775,30 @@ end
 
 function _consumer_create_request(js::JetStreamContext, stream::AbstractString, config; timeout::Real=js.timeout,
                                   action::Union{String,Nothing}=nothing,
+                                  allow_unknown_field_extras::Bool=false,
                                   cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
-    verify_config = config isa ConsumerConfig
     payload = _js_config_payload(config)
-    _consumer_create_payload_request(js, stream, payload; timeout, action, verify_config,
+    _consumer_create_payload_request(js, stream, payload; timeout, action,
+                                     verify_config=true, allow_unknown_field_extras,
                                      cancel_token)
 end
 
 function _consumer_create_payload_request(js::JetStreamContext, stream::AbstractString, payload::Dict{String,Any};
                                           timeout::Real=js.timeout, action::Union{String,Nothing}=nothing,
                                           verify_config::Bool=false,
+                                          allow_unknown_field_extras::Bool=false,
                                           cancel_token::MaybeCancellationToken=nothing)
     stream = _validate_api_name("stream", stream)
     _validate_consumer_config_payload!(payload)
     subject = _consumer_create_subject(js, stream, payload)
-    info = _consumer_info(_api_request(js, subject, JSON3.write(_consumer_request_payload(js, stream, payload, action));
-                                       timeout, cancel_token))
-    verify_config && _assert_consumer_config_reflected!(payload, info)
-    info
+    response = _api_request(js, subject, JSON3.write(_consumer_request_payload(js, stream, payload, action));
+                            timeout, cancel_token)
+    if verify_config
+        _assert_consumer_config_reflected!(payload, response; allow_unknown_field_extras)
+    else
+        _consumer_info(response)
+    end
 end
 
 consumer_create(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig;
@@ -1656,7 +1807,8 @@ consumer_create(js::JetStreamContext, stream::AbstractString, config::ConsumerCo
 
 consumer_create(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any};
                 timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
-    _consumer_create_request(js, stream, config; timeout, action="create", cancel_token)
+    _consumer_create_request(js, stream, config; timeout, action="create",
+                             allow_unknown_field_extras=true, cancel_token)
 
 consumer_create_or_update(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig;
                           timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
@@ -1664,7 +1816,8 @@ consumer_create_or_update(js::JetStreamContext, stream::AbstractString, config::
 
 consumer_create_or_update(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any};
                           timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
-    _consumer_create_request(js, stream, config; timeout, cancel_token)
+    _consumer_create_request(js, stream, config; timeout, allow_unknown_field_extras=true,
+                             cancel_token)
 
 consumer_update(js::JetStreamContext, stream::AbstractString, config::ConsumerConfig;
                 timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
@@ -1672,7 +1825,8 @@ consumer_update(js::JetStreamContext, stream::AbstractString, config::ConsumerCo
 
 consumer_update(js::JetStreamContext, stream::AbstractString, config::AbstractDict{String,<:Any};
                 timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
-    _consumer_create_request(js, stream, config; timeout, action="update", cancel_token)
+    _consumer_create_request(js, stream, config; timeout, action="update",
+                             allow_unknown_field_extras=true, cancel_token)
 
 consumer_info(js::JetStreamContext, stream::AbstractString, consumer::AbstractString;
               timeout::Real=js.timeout, cancel_token::MaybeCancellationToken=nothing) =
@@ -1825,19 +1979,7 @@ function _delete_consumer_for_close!(mark_deleted::Function, js::JetStreamContex
     nothing
 end
 
-function _consumer_normalized_config_value(value)
-    if isnothing(value)
-        return nothing
-    elseif value isa AbstractString
-        return String(value)
-    elseif value isa Union{AbstractDict,JSON3.Object}
-        return Dict{String,Any}(String(k) => _consumer_normalized_config_value(v) for (k, v) in pairs(value))
-    elseif value isa Union{AbstractVector,JSON3.Array}
-        return Any[_consumer_normalized_config_value(v) for v in value]
-    else
-        return value
-    end
-end
+_consumer_normalized_config_value(value) = _js_plain_config_value(value)
 
 function _consumer_config_field(info::ConsumerInfo, config::Dict{String,Any}, field::String)
     if haskey(config, field)
@@ -2061,7 +2203,7 @@ _pull_fetch_next_subject(js::JetStreamContext, stream::AbstractString, consumer:
     string(js.prefix, ".CONSUMER.MSG.NEXT.", stream, ".", consumer)
 
 mutable struct _PullStreamRequest
-    token::Union{String,Nothing}
+    token::Union{Int,Nothing}
     reserved_messages::Int
     reserved_bytes::Int
 end
@@ -2087,32 +2229,107 @@ struct _PullStreamConfig
     channel_size::Int
 end
 
-function _pull_fetch_request_payload(batch::Int, expires_ns::Int, heartbeat_ns::Int,
-                                     max_bytes::Union{Int,Nothing}, no_wait::Bool,
-                                     pin_id::Union{String,Nothing},
-                                     min_pending::Union{Int,Nothing},
-                                     min_ack_pending::Union{Int,Nothing},
-                                     priority_group::Union{String,Nothing},
-                                     priority::Union{Int,Nothing})::String
-    io = IOBuffer()
-    print(io, "{\"batch\":", batch)
-    isnothing(max_bytes) || print(io, ",\"max_bytes\":", max_bytes)
-    expires_ns > 0 && print(io, ",\"expires\":", expires_ns)
-    heartbeat_ns > 0 && print(io, ",\"idle_heartbeat\":", heartbeat_ns)
-    no_wait && print(io, ",\"no_wait\":true")
-    isnothing(min_pending) || print(io, ",\"min_pending\":", min_pending)
-    isnothing(min_ack_pending) || print(io, ",\"min_ack_pending\":", min_ack_pending)
+function _append_ascii!(buffer::Vector{UInt8}, value::AbstractString)
+    append!(buffer, codeunits(value))
+    buffer
+end
+
+function _append_json_int!(buffer::Vector{UInt8}, value::Int)
+    value >= 0 || throw(ArgumentError("JSON integer must be non-negative"))
+    digits = _decimal_digits(value)
+    old = length(buffer)
+    resize!(buffer, old + digits)
+    pos = old + digits
+    n = value
+    @inbounds while pos > old
+        buffer[pos] = UInt8('0') + UInt8(n % 10)
+        n = div(n, 10)
+        pos -= 1
+    end
+    buffer
+end
+
+function _append_json_hex_byte!(buffer::Vector{UInt8}, byte::UInt8)
+    hi = byte >>> 4
+    lo = byte & 0x0f
+    push!(buffer, hi < 0x0a ? UInt8('0') + hi : UInt8('a') + (hi - 0x0a))
+    push!(buffer, lo < 0x0a ? UInt8('0') + lo : UInt8('a') + (lo - 0x0a))
+    buffer
+end
+
+function _append_json_string!(buffer::Vector{UInt8}, value::String)
+    push!(buffer, UInt8('"'))
+    for byte in codeunits(value)
+        if byte == UInt8('"')
+            _append_ascii!(buffer, "\\\"")
+        elseif byte == UInt8('\\')
+            _append_ascii!(buffer, "\\\\")
+        elseif byte == UInt8('\b')
+            _append_ascii!(buffer, "\\b")
+        elseif byte == UInt8('\t')
+            _append_ascii!(buffer, "\\t")
+        elseif byte == UInt8('\n')
+            _append_ascii!(buffer, "\\n")
+        elseif byte == UInt8('\f')
+            _append_ascii!(buffer, "\\f")
+        elseif byte == UInt8('\r')
+            _append_ascii!(buffer, "\\r")
+        elseif byte < 0x20
+            _append_ascii!(buffer, "\\u00")
+            _append_json_hex_byte!(buffer, byte)
+        else
+            push!(buffer, byte)
+        end
+    end
+    push!(buffer, UInt8('"'))
+    buffer
+end
+
+function _pull_fetch_request_payload!(buffer::Vector{UInt8}, batch::Int, expires_ns::Int,
+                                      heartbeat_ns::Int, max_bytes::Union{Int,Nothing},
+                                      no_wait::Bool, pin_id::Union{String,Nothing},
+                                      min_pending::Union{Int,Nothing},
+                                      min_ack_pending::Union{Int,Nothing},
+                                      priority_group::Union{String,Nothing},
+                                      priority::Union{Int,Nothing})::Vector{UInt8}
+    empty!(buffer)
+    _append_ascii!(buffer, "{\"batch\":")
+    _append_json_int!(buffer, batch)
+    if !isnothing(max_bytes)
+        _append_ascii!(buffer, ",\"max_bytes\":")
+        _append_json_int!(buffer, max_bytes)
+    end
+    if expires_ns > 0
+        _append_ascii!(buffer, ",\"expires\":")
+        _append_json_int!(buffer, expires_ns)
+    end
+    if heartbeat_ns > 0
+        _append_ascii!(buffer, ",\"idle_heartbeat\":")
+        _append_json_int!(buffer, heartbeat_ns)
+    end
+    no_wait && _append_ascii!(buffer, ",\"no_wait\":true")
+    if !isnothing(min_pending)
+        _append_ascii!(buffer, ",\"min_pending\":")
+        _append_json_int!(buffer, min_pending)
+    end
+    if !isnothing(min_ack_pending)
+        _append_ascii!(buffer, ",\"min_ack_pending\":")
+        _append_json_int!(buffer, min_ack_pending)
+    end
     if !isnothing(priority_group)
-        print(io, ",\"group\":")
-        JSON3.write(io, priority_group)
+        _append_ascii!(buffer, ",\"group\":")
+        _append_json_string!(buffer, priority_group)
     end
-    isnothing(priority) || print(io, ",\"priority\":", priority)
+    if !isnothing(priority)
+        _append_ascii!(buffer, ",\"priority\":")
+        _append_json_int!(buffer, priority)
+    end
     if !isnothing(pin_id)
-        print(io, ",\"id\":")
-        JSON3.write(io, pin_id)
+        _append_ascii!(buffer, ",\"id\":")
+        _append_json_string!(buffer, pin_id)
     end
-    write(io, UInt8('}'))
-    String(take!(io))
+    push!(buffer, UInt8('}'))
+    buffer
 end
 
 mutable struct _PullMessageStreamState
@@ -2137,7 +2354,10 @@ mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription
     consumer::String
     next_subject::String
     deliver::String
+    deliver_prefix::String
     fetch_lock::ReentrantLock
+    fetch_payload_buffer::Vector{UInt8}
+    next_fetch_token::Int
     close_lock::ReentrantLock
     delete_on_close::Bool
     closed::Bool
@@ -2167,8 +2387,10 @@ function PullSubscription(js::J, sub::S, stream::AbstractString, consumer::Abstr
                           priority_groups::Vector{String}=String[]) where {C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
     stream = String(stream)
     consumer = String(consumer)
+    deliver = String(deliver)
+    deliver_prefix = endswith(deliver, ".*") ? chop(deliver; tail=1) : deliver
     PullSubscription{C,J,S}(js, sub, stream, consumer, _pull_fetch_next_subject(js, stream, consumer),
-                            String(deliver), fetch_lock, close_lock,
+                            deliver, deliver_prefix, fetch_lock, UInt8[], 0, close_lock,
                             delete_on_close, closed, false, nothing, 0, false,
                             priority_policy, copy(priority_groups))
 end
@@ -2901,8 +3123,9 @@ function _next_pull_fetch_msg(psub::PullSubscription, timeout::Real;
     end
 end
 
-function _publish_pull_fetch_request(psub::PullSubscription, request_subject::String, payload::AbstractString,
-                                     reply::String; cancel_token::MaybeCancellationToken=nothing)
+function _publish_pull_fetch_request(psub::PullSubscription, request_subject::String,
+                                     payload::AbstractVector{UInt8}, reply::String;
+                                     cancel_token::MaybeCancellationToken=nothing)
     try
         _publish(psub.js.client, request_subject, payload; reply,
                  buffer_on_reconnect=false, force_flush=true, cancel_token)
@@ -2916,23 +3139,59 @@ function _publish_pull_fetch_request(psub::PullSubscription, request_subject::St
     nothing
 end
 
-function _pull_fetch_reply(psub::PullSubscription)::Tuple{String,Union{String,Nothing}}
-    endswith(psub.deliver, ".*") || return psub.deliver, nothing
-    token = @lock psub.js.client.lock randstring(psub.js.client.rng, NUID_ALPHABET, 22)
-    string(chop(psub.deliver; tail=1), token), token
+function _next_pull_fetch_token_locked!(psub::PullSubscription)::Int
+    token = psub.next_fetch_token == typemax(Int) ? 1 : psub.next_fetch_token + 1
+    psub.next_fetch_token = token
+    token
 end
 
-function _pull_fetch_status_matches_request(subject::AbstractString, token::Union{String,Nothing})::Bool
+function _next_pull_fetch_token!(psub::PullSubscription)::Int
+    @lock psub.fetch_lock _next_pull_fetch_token_locked!(psub)
+end
+
+function _pull_fetch_reply_locked(psub::PullSubscription)::Tuple{String,Union{Int,Nothing}}
+    endswith(psub.deliver, ".*") || return psub.deliver, nothing
+    token = _next_pull_fetch_token_locked!(psub)
+    string(psub.deliver_prefix, token), token
+end
+
+function _pull_fetch_reply(psub::PullSubscription)::Tuple{String,Union{Int,Nothing}}
+    @lock psub.fetch_lock _pull_fetch_reply_locked(psub)
+end
+
+function _pull_fetch_status_matches_request(subject::AbstractString, token::Union{Int,Nothing})::Bool
     isnothing(token) && return true
     subject = String(subject)
-    subject_len = ncodeunits(subject)
-    token_len = ncodeunits(token)
-    subject_len > token_len || return false
-    codeunit(subject, subject_len - token_len) == UInt8('.') || return false
-    @inbounds for i in 1:token_len
-        codeunit(subject, subject_len - token_len + i) == codeunit(token, i) || return false
+    dot = 0
+    @inbounds for i in ncodeunits(subject):-1:1
+        if codeunit(subject, i) == UInt8('.')
+            dot = i
+            break
+        end
     end
-    true
+    dot == 0 && return false
+    parsed = _parse_decimal_token(subject, dot + 1, ncodeunits(subject))
+    parsed == token
+end
+
+function _prepare_pull_fetch_request!(psub::PullSubscription, request_subject::String,
+                                      batch::Int, expires_ns::Int, heartbeat_ns::Int,
+                                      max_bytes::Union{Int,Nothing}, no_wait::Bool,
+                                      min_pending::Union{Int,Nothing},
+                                      min_ack_pending::Union{Int,Nothing},
+                                      priority_group::Union{String,Nothing},
+                                      priority::Union{Int,Nothing};
+                                      cancel_token::MaybeCancellationToken=nothing)::Union{Int,Nothing}
+    @lock psub.fetch_lock begin
+        _check_pull_subscription_open(psub)
+        payload = _pull_fetch_request_payload!(psub.fetch_payload_buffer, batch, expires_ns,
+                                               heartbeat_ns, max_bytes, no_wait, psub.pin_id,
+                                               min_pending, min_ack_pending, priority_group,
+                                               priority)
+        reply, reply_token = _pull_fetch_reply_locked(psub)
+        _publish_pull_fetch_request(psub, request_subject, payload, reply; cancel_token)
+        reply_token
+    end
 end
 
 function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout,
@@ -2948,55 +3207,51 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
                              min_pending, min_ack_pending, priority_group, priority)
     _begin_pull_fetch!(psub)
     try
-        @lock psub.fetch_lock begin
-            _check_pull_subscription_open(psub)
-            request_subject = psub.next_subject
-            heartbeat_ns = heartbeat_seconds > 0 ? _seconds_to_nanoseconds(heartbeat_seconds) : 0
-            payload = _pull_fetch_request_payload(batch, _seconds_to_nanoseconds(expires_seconds),
-                                                  heartbeat_ns, max_bytes_int, no_wait_bool, psub.pin_id,
-                                                  min_pending, min_ack_pending,
-                                                  priority_group, priority)
-            reply, reply_token = _pull_fetch_reply(psub)
-            _publish_pull_fetch_request(psub, request_subject, payload, reply; cancel_token)
-            msgs = JetStreamMsg{C}[]
-            sizehint!(msgs, batch)
-            deadline = time() + timeout_seconds
-            heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
-            while length(msgs) < batch && time() < deadline
-                wait_deadline = min(deadline, heartbeat_deadline)
-                remaining = max(0.001, wait_deadline - time())
-                try
-                    msg = _next_pull_fetch_msg(psub, remaining; cancel_token)
-                    action, err = _jetstream_status_action(msg, request_subject)
-                    action != :message && !_pull_fetch_status_matches_request(msg.subject, reply_token) && continue
-                    heartbeat_seconds > 0 && (heartbeat_deadline = time() + 2 * heartbeat_seconds)
-                    pin_id = header(msg, "Nats-Pin-Id")
-                    !isnothing(pin_id) && !isempty(pin_id) && (psub.pin_id = pin_id)
-                    if action in (:idle_heartbeat, :flow_control, :control)
-                        continue
-                    elseif action in (:no_messages, :timeout, :batch_completed, :max_bytes_exceeded)
-                        break
-                    elseif action == :message
-                        push!(msgs, JetStreamMsg(msg, psub.js.client))
-                    else
-                        action == :consumer_deleted && (@lock psub.close_lock psub.server_deleted = true)
-                        action == :pin_id_mismatch && (psub.pin_id = nothing)
-                        throw(err)
-                    end
-                catch err
-                    if err isa TimeoutError
-                        if heartbeat_seconds > 0 && time() < deadline && time() >= heartbeat_deadline
-                            throw(_jetstream_heartbeat_error())
-                        end
-                        break
-                    elseif err isa FetchDisconnectedError
-                        isempty(msgs) || break
-                    end
-                    rethrow()
+        request_subject = psub.next_subject
+        heartbeat_ns = heartbeat_seconds > 0 ? _seconds_to_nanoseconds(heartbeat_seconds) : 0
+        reply_token = _prepare_pull_fetch_request!(psub, request_subject, batch,
+                                                   _seconds_to_nanoseconds(expires_seconds),
+                                                   heartbeat_ns, max_bytes_int, no_wait_bool,
+                                                   min_pending, min_ack_pending,
+                                                   priority_group, priority; cancel_token)
+        msgs = JetStreamMsg{C}[]
+        sizehint!(msgs, batch)
+        deadline = time() + timeout_seconds
+        heartbeat_deadline = heartbeat_seconds > 0 ? time() + 2 * heartbeat_seconds : Inf
+        while length(msgs) < batch && time() < deadline
+            wait_deadline = min(deadline, heartbeat_deadline)
+            remaining = max(0.001, wait_deadline - time())
+            try
+                msg = _next_pull_fetch_msg(psub, remaining; cancel_token)
+                action, err = _jetstream_status_action(msg, request_subject)
+                action != :message && !_pull_fetch_status_matches_request(msg.subject, reply_token) && continue
+                heartbeat_seconds > 0 && (heartbeat_deadline = time() + 2 * heartbeat_seconds)
+                pin_id = header(msg, "Nats-Pin-Id")
+                !isnothing(pin_id) && !isempty(pin_id) && (@lock psub.fetch_lock psub.pin_id = pin_id)
+                if action in (:idle_heartbeat, :flow_control, :control)
+                    continue
+                elseif action in (:no_messages, :timeout, :batch_completed, :max_bytes_exceeded)
+                    break
+                elseif action == :message
+                    push!(msgs, JetStreamMsg(msg, psub.js.client))
+                else
+                    action == :consumer_deleted && (@lock psub.close_lock psub.server_deleted = true)
+                    action == :pin_id_mismatch && (@lock psub.fetch_lock psub.pin_id = nothing)
+                    throw(err)
                 end
+            catch err
+                if err isa TimeoutError
+                    if heartbeat_seconds > 0 && time() < deadline && time() >= heartbeat_deadline
+                        throw(_jetstream_heartbeat_error())
+                    end
+                    break
+                elseif err isa FetchDisconnectedError
+                    isempty(msgs) || break
+                end
+                rethrow()
             end
-            msgs
         end
+        msgs
     finally
         _end_pull_fetch!(psub)
     end
@@ -3153,7 +3408,7 @@ function _pull_stream_should_refill(config::_PullStreamConfig,
 end
 
 function _reserve_pull_stream_request!(config::_PullStreamConfig, state::_PullMessageStreamState,
-                                       token::Union{String,Nothing})::Union{_PullStreamReservation,Nothing}
+                                       token::Union{Int,Nothing})::Union{_PullStreamReservation,Nothing}
     @lock state.lock begin
         state.closed && return nothing
         _pull_stream_should_refill(config, state) || return nothing
@@ -3189,19 +3444,22 @@ end
 
 function _publish_pull_stream_request!(psub::PullSubscription, config::_PullStreamConfig,
                                        state::_PullMessageStreamState)::Bool
-    reply, token = _pull_fetch_reply(psub)
-    reservation = _reserve_pull_stream_request!(config, state, token)
-    isnothing(reservation) && return false
-    heartbeat_ns = config.heartbeat > 0 ? _seconds_to_nanoseconds(config.heartbeat) : 0
-    payload = _pull_fetch_request_payload(reservation.batch, _seconds_to_nanoseconds(config.expires),
-                                          heartbeat_ns, reservation.max_bytes, false, psub.pin_id,
-                                          config.min_pending, config.min_ack_pending,
-                                          config.priority_group, config.priority)
-    try
-        _publish_pull_fetch_request(psub, psub.next_subject, payload, reply)
-    catch
-        _unreserve_pull_stream_request!(state, reservation.request)
-        rethrow()
+    @lock psub.fetch_lock begin
+        reply, token = _pull_fetch_reply_locked(psub)
+        reservation = _reserve_pull_stream_request!(config, state, token)
+        isnothing(reservation) && return false
+        heartbeat_ns = config.heartbeat > 0 ? _seconds_to_nanoseconds(config.heartbeat) : 0
+        payload = _pull_fetch_request_payload!(psub.fetch_payload_buffer, reservation.batch,
+                                               _seconds_to_nanoseconds(config.expires),
+                                               heartbeat_ns, reservation.max_bytes, false, psub.pin_id,
+                                               config.min_pending, config.min_ack_pending,
+                                               config.priority_group, config.priority)
+        try
+            _publish_pull_fetch_request(psub, psub.next_subject, payload, reply)
+        catch
+            _unreserve_pull_stream_request!(state, reservation.request)
+            rethrow()
+        end
     end
     true
 end
@@ -4007,7 +4265,7 @@ function _ack_request_raw(client::Client, reply::String, kind::Symbol; delay=not
     payload = _ack_payload(kind; delay)
     mux = _ensure_request_mux(client)
     token, waiter = _register_request_waiter!(client, mux, timeout)
-    response_subject = "$(mux.prefix).$token"
+    response_subject = waiter.reply
     try
         frame = _publish_frame(reply, response_subject, payload, EMPTY_BYTES)
         _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true,

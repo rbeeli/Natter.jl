@@ -24,7 +24,7 @@ stream_create(js, StreamConfig(
 ))
 ```
 
-Raw dictionaries are available for newer server fields that are not typed yet. Dictionary fields are validated when Natter knows their semantics, but otherwise pass through to the server and are not round-trip verified:
+Raw dictionaries are available for newer server fields that are not typed yet. Dictionary fields are validated when Natter knows their semantics, and requested fields are verified against the server response:
 
 ```julia
 stream_update(js, Dict(
