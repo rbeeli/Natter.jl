@@ -1196,12 +1196,8 @@ function Base.wait(future::JetStreamPublishFuture)
                 _resolve_js_publish_future_locked!(future, TimeoutError("JetStream async publish ack timed out"))
                 break
             end
-            ready = _wait_until_condition_locked(state.condition, remaining) do
+            _wait_until_notified_locked(state.condition) do
                 future.ready
-            end
-            if !ready
-                _resolve_js_publish_future_locked!(future, TimeoutError("JetStream async publish ack timed out"))
-                break
             end
         end
         future.value
@@ -2460,6 +2456,8 @@ mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C}}
     active_fetches::Int
     active_stream::Bool
     active_deliveries::Vector{Subscription{C}}
+    fetch_delivery::Union{Subscription{C},Nothing}
+    fetch_delivery_in_use::Bool
     priority_policy::Union{PriorityPolicy.T,Nothing}
     priority_groups::Vector{String}
 end
@@ -2486,7 +2484,8 @@ function PullSubscription(js::J, stream::AbstractString, consumer::AbstractStrin
     consumer = String(consumer)
     PullSubscription{C,J}(js, stream, consumer, _pull_fetch_next_subject(js, stream, consumer),
                           fetch_lock, close_lock, delete_on_close, closed, false, nothing,
-                          0, false, Subscription{C}[], priority_policy, copy(priority_groups))
+                          0, false, Subscription{C}[], nothing, false,
+                          priority_policy, copy(priority_groups))
 end
 
 mutable struct PushSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
@@ -3216,6 +3215,28 @@ function _pull_delivery_pending_bytes_limit(client::Client, pending_msgs_limit::
     max(requested, client.options.sub_pending_bytes_limit)
 end
 
+function _pull_delivery_limits(client::Client, batch::Int,
+                               max_bytes::Union{Int,Nothing})::Tuple{Int,Int}
+    pending_msgs_limit = _pull_delivery_pending_msgs_limit(client, batch)
+    pending_bytes_limit = _pull_delivery_pending_bytes_limit(client, pending_msgs_limit, max_bytes)
+    pending_msgs_limit, pending_bytes_limit
+end
+
+function _pull_delivery_capacity_ok(sub::Subscription, pending_msgs_limit::Int,
+                                    pending_bytes_limit::Int)::Bool
+    sub.pending_msgs_limit >= pending_msgs_limit && sub.pending_bytes_limit >= pending_bytes_limit
+end
+
+function _pull_fetch_delivery_idle(sub::Subscription)::Bool
+    @lock sub.lock !sub.closed && !isready(sub.messages) && sub.pending_bytes == 0
+end
+
+function _remove_active_pull_delivery_locked!(psub::PullSubscription, sub::Subscription)
+    index = findfirst(active -> active === sub, psub.active_deliveries)
+    isnothing(index) || deleteat!(psub.active_deliveries, index)
+    nothing
+end
+
 function _register_pull_delivery!(psub::PullSubscription{C},
                                   sub::Subscription{C}) where {C<:Client}
     close_now = @lock psub.close_lock begin
@@ -3241,8 +3262,7 @@ end
 
 function _unregister_pull_delivery!(psub::PullSubscription, sub::Subscription)
     @lock psub.close_lock begin
-        index = findfirst(active -> active === sub, psub.active_deliveries)
-        isnothing(index) || deleteat!(psub.active_deliveries, index)
+        _remove_active_pull_delivery_locked!(psub, sub)
     end
     nothing
 end
@@ -3251,8 +3271,7 @@ function _subscribe_pull_delivery!(psub::PullSubscription{C}, batch::Int,
                                    max_bytes::Union{Int,Nothing};
                                    cancel_token::MaybeCancellationToken=nothing)::Subscription{C} where {C<:Client}
     client = psub.js.client
-    pending_msgs_limit = _pull_delivery_pending_msgs_limit(client, batch)
-    pending_bytes_limit = _pull_delivery_pending_bytes_limit(client, pending_msgs_limit, max_bytes)
+    pending_msgs_limit, pending_bytes_limit = _pull_delivery_limits(client, batch, max_bytes)
     sub = subscribe(client, new_inbox(client); pending_msgs_limit, pending_bytes_limit,
                     cancel_token)
     _register_pull_delivery!(psub, sub)
@@ -3268,6 +3287,97 @@ function _close_pull_delivery!(psub::PullSubscription, sub::Subscription,
         throw(CleanupError(label, err))
     end
     nothing
+end
+
+function _acquire_pull_fetch_delivery!(psub::PullSubscription{C}, batch::Int,
+                                       max_bytes::Union{Int,Nothing};
+                                       cancel_token::MaybeCancellationToken=nothing)::Tuple{Subscription{C},Bool} where {C<:Client}
+    client = psub.js.client
+    pending_msgs_limit, pending_bytes_limit = _pull_delivery_limits(client, batch, max_bytes)
+    retire::Union{Subscription{C},Nothing} = nothing
+    cached::Union{Subscription{C},Nothing} = @lock psub.close_lock begin
+        psub.closed && throw(ConnectionClosedError("pull subscription is closed"))
+        sub = psub.fetch_delivery
+        if !psub.fetch_delivery_in_use && !isnothing(sub)
+            if _pull_delivery_capacity_ok(sub, pending_msgs_limit, pending_bytes_limit)
+                psub.fetch_delivery_in_use = true
+                sub
+            else
+                psub.fetch_delivery = nothing
+                _remove_active_pull_delivery_locked!(psub, sub)
+                retire = sub
+                nothing
+            end
+        else
+            nothing
+        end
+    end
+    if !isnothing(cached)
+        return cached, true
+    end
+    if !isnothing(retire)
+        try
+            close(retire)
+        catch err
+            throw(CleanupError("close undersized pull fetch delivery subscription", err))
+        end
+    end
+
+    sub = subscribe(client, new_inbox(client); pending_msgs_limit, pending_bytes_limit,
+                    cancel_token)
+    close_now = false
+    use_cached = false
+    @lock psub.close_lock begin
+        if psub.closed
+            close_now = true
+        elseif isnothing(psub.fetch_delivery) && !psub.fetch_delivery_in_use
+            psub.fetch_delivery = sub
+            psub.fetch_delivery_in_use = true
+            push!(psub.active_deliveries, sub)
+            use_cached = true
+        else
+            push!(psub.active_deliveries, sub)
+        end
+    end
+    if close_now
+        closed_err = ConnectionClosedError("pull subscription is closed")
+        try
+            close(sub)
+        catch cleanup_err
+            throw(Base.CompositeException([closed_err,
+                                           CleanupError("close pull delivery subscription", cleanup_err)]))
+        end
+        throw(closed_err)
+    end
+    sub, use_cached
+end
+
+function _release_pull_fetch_delivery!(psub::PullSubscription, sub::Subscription,
+                                       cached::Bool, reusable::Bool,
+                                       label::AbstractString="close pull fetch delivery subscription")
+    if cached
+        keep_cached = reusable && _pull_fetch_delivery_idle(sub)
+        close_now = @lock psub.close_lock begin
+            if psub.fetch_delivery === sub && keep_cached && !psub.closed
+                psub.fetch_delivery_in_use = false
+                false
+            else
+                psub.fetch_delivery === sub && (psub.fetch_delivery = nothing)
+                psub.fetch_delivery_in_use = false
+                _remove_active_pull_delivery_locked!(psub, sub)
+                true
+            end
+        end
+        if close_now
+            try
+                close(sub)
+            catch err
+                throw(CleanupError(label, err))
+            end
+        end
+        return nothing
+    end
+    _close_pull_delivery!(psub, sub, label)
 end
 
 function _next_pull_fetch_msg(sub::Subscription, timeout::Real;
@@ -3342,11 +3452,14 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
         _validate_pull_fetch(psub, batch, timeout, expires, heartbeat, max_bytes, no_wait,
                              min_pending, min_ack_pending, priority_group, priority)
     _begin_pull_fetch!(psub)
-    delivery = nothing
+    delivery::Union{Subscription{C},Nothing} = nothing
+    cached_delivery::Bool = false
+    reusable_delivery::Bool = false
     result = JetStreamMsg{C}[]
     primary_error = nothing
     try
-        delivery = _subscribe_pull_delivery!(psub, batch, max_bytes_int; cancel_token)
+        delivery, cached_delivery = _acquire_pull_fetch_delivery!(psub, batch, max_bytes_int;
+                                                                  cancel_token)
         request_subject = psub.next_subject
         reply = delivery.subject
         heartbeat_ns = heartbeat_seconds > 0 ? _seconds_to_nanoseconds(heartbeat_seconds) : 0
@@ -3372,6 +3485,7 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
                 if action in (:idle_heartbeat, :flow_control, :control)
                     continue
                 elseif action in (:no_messages, :timeout, :batch_completed, :max_bytes_exceeded)
+                    reusable_delivery = true
                     break
                 elseif action == :message
                     push!(result, JetStreamMsg(msg, psub.js.client))
@@ -3392,12 +3506,15 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
                 rethrow()
             end
         end
+        length(result) == batch && (reusable_delivery = true)
     catch err
         primary_error = err
     finally
         if !isnothing(delivery)
             try
-                _close_pull_delivery!(psub, delivery, "close pull fetch delivery subscription")
+                _release_pull_fetch_delivery!(psub, delivery, cached_delivery,
+                                              isnothing(primary_error) && reusable_delivery,
+                                              "close pull fetch delivery subscription")
             catch cleanup_err
                 primary_error = isnothing(primary_error) ? cleanup_err :
                                 Base.CompositeException([primary_error, cleanup_err])
@@ -4117,6 +4234,8 @@ function _close_pull_subscription(psub::PullSubscription; timeout::Real=psub.js.
         psub.closed = true
         deliveries = copy(psub.active_deliveries)
         empty!(psub.active_deliveries)
+        psub.fetch_delivery = nothing
+        psub.fetch_delivery_in_use = false
         was_closed, deliveries
     end
     errors = Any[]

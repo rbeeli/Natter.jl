@@ -182,7 +182,7 @@ end
     end
 end
 
-@testitem "real nats-server reconnect server-pool failover" setup=[IntegrationHelpers] begin
+@testitem "real nats-server reconnect server-pool failover" setup=[TestHelpers, IntegrationHelpers] begin
     using Natter
     using Random
 
@@ -231,12 +231,17 @@ end
                 end
                 @test result != :timed_out
 
-                request_task = @async request(client, "$subject.req", "during failover"; timeout=io_timeout)
+                request_err = TestHelpers.thrown_exception() do
+                    request(client, "$subject.req", "during failover"; timeout=io_timeout)
+                end
+                @test request_err isa ConnectionReconnectingError
+                @test client.pending_bytes == 0
+
+                publish(client, subject, "during failover"; buffer_on_reconnect=true)
                 result = timedwait(1.0; pollint=0.01) do
                     client.pending_bytes > 0
                 end
                 @test result != :timed_out
-                publish(client, subject, "during failover")
                 secondary.release()
 
                 result = timedwait(5.0; pollint=0.02) do
@@ -246,7 +251,6 @@ end
                 end
                 @test result != :timed_out
                 flush(client; timeout=io_timeout)
-                @test String(fetch(request_task)) == "DURING FAILOVER"
                 @test String(N.next(sub; timeout=io_timeout)) == "during failover"
                 @test stats(client).reconnects >= 1
                 close(service)

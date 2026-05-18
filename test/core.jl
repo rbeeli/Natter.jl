@@ -71,13 +71,13 @@ end
 
     stats_opts = N.ConnectOptions(record_stats=true)
     client = TestHelpers.fake_client(; opts=stats_opts, status=N.ConnectionStatus.RECONNECTING)
-    publish(client, "foo", "bar")
+    publish(client, "foo", "bar"; buffer_on_reconnect=true)
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
     @test stats(client).out_msgs == 1
 
     binary_payload = TestHelpers.bytes("bin")
     binary_pending = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    publish(binary_pending, "foo", binary_payload)
+    publish(binary_pending, "foo", binary_payload; buffer_on_reconnect=true)
     binary_payload[1] = UInt8('B')
     @test String(take!(binary_pending.pending)) == "PUB foo 3\r\nbin\r\n"
 
@@ -98,7 +98,8 @@ end
     @test (@allocated publish(hot_client, "foo", hot_payload)) < 1024
 
     ergonomic_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    publish(ergonomic_headers, "foo", "bar"; headers=Dict("Trace" => "abc"))
+    publish(ergonomic_headers, "foo", "bar"; headers=Dict("Trace" => "abc"),
+            buffer_on_reconnect=true)
     publish_frame = String(take!(ergonomic_headers.pending))
     @test startswith(publish_frame, "HPUB foo ")
     @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nbar\r\n", publish_frame)
@@ -355,7 +356,7 @@ end
         write_io = N.BufferedWriteIO(devnull)
         client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io)
         payload = TestHelpers.bytes("bar")
-        publish(client, "foo", payload)
+        publish(client, "foo", payload; buffer_on_reconnect=true)
         payload[1] = UInt8('B')
         entries = N._take_replayable_writes!(write_io)
         only(entries).is_publish || throw(AssertionError("expected publish replay entry"))
@@ -451,7 +452,7 @@ end
 
     reply = SubString("reply.inbox.extra", 1, 11)
     publish_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    publish(publish_client, "foo", "bar"; reply)
+    publish(publish_client, "foo", "bar"; reply, buffer_on_reconnect=true)
     @test String(take!(publish_client.pending)) == "PUB foo reply.inbox 3\r\nbar\r\n"
 
     queue = SubString("workers.extra", 1, 7)
@@ -926,7 +927,7 @@ end
     end
 end
 
-@testitem "subscription snapshot trims closed trailing sids" setup=[TestHelpers] begin
+@testitem "subscription snapshot tracks active sids sparsely" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -937,14 +938,14 @@ end
     sub3 = subscribe(client, "events.3")
 
     @test N._lookup_subscription(client, sub3.sid) === sub3
-    @test length(@atomic client.subscription_snapshot) == sub3.sid
+    @test length(@atomic client.subscription_snapshot) == 3
 
     close(sub3)
     @test isnothing(N._lookup_subscription(client, sub3.sid))
-    @test length(@atomic client.subscription_snapshot) == sub2.sid
+    @test length(@atomic client.subscription_snapshot) == 2
 
     close(sub2)
-    @test length(@atomic client.subscription_snapshot) == sub1.sid
+    @test length(@atomic client.subscription_snapshot) == 1
 
     close(client)
 end
@@ -1062,7 +1063,7 @@ end
     end
     fetch(task)
     @test N._buffered_bytes(write_io) > 0
-    @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
+    @test client.pending_bytes == 0
     @test isready(client.flush_signal)
 
     close(client)
@@ -1159,7 +1160,7 @@ end
     for i in 1:5
         publish(client, "foo", "bar-$i")
     end
-    @test client.pending_bytes > 0
+    @test client.pending_bytes == 0
     @test isempty(transport.bytes)
 
     result = timedwait(1.0; pollint=0.001) do
@@ -1186,7 +1187,7 @@ end
                                      read_io=transport, write_io=write_io)
 
     payload = repeat("x", 64)
-    publish(client, "foo", payload)
+    publish(client, "foo", payload; buffer_on_reconnect=true)
 
     expected = "PUB foo 64\r\n$payload\r\n"
     @test TestHelpers.capture_text(transport) == expected
@@ -1595,11 +1596,11 @@ end
     frame_size = ncodeunits("PUB foo 50\r\n$payload\r\n")
     @test frame_size == opts.pending_size
 
-    publish(client, "foo", payload)
+    publish(client, "foo", payload; buffer_on_reconnect=true)
     @test client.pending_bytes == frame_size
 
     try
-        publish(client, "foo", payload)
+        publish(client, "foo", payload; buffer_on_reconnect=true)
         @test false
     catch err
         @test err isa OutboundBufferLimitError
@@ -1626,7 +1627,7 @@ end
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io)
 
-    publish(client, "foo", "bar")
+    publish(client, "foo", "bar"; buffer_on_reconnect=true)
 
     expected = "PUB foo 3\r\nbar\r\n"
     @test N._buffered_bytes(write_io) == ncodeunits(expected)
@@ -1665,7 +1666,7 @@ end
                                      read_io=transport, write_io=N.BufferedWriteIO(transport))
 
     N._write_raw(client, "SUB foo 1\r\n")
-    publish(client, "foo", "bar")
+    publish(client, "foo", "bar"; buffer_on_reconnect=true)
     expected = "PUB foo 3\r\nbar\r\n"
     @test client.pending_bytes == ncodeunits(expected)
 
@@ -1744,7 +1745,8 @@ end
         info=N.ServerInfo(; headers=true, max_payload=1024),
         write_io=header_transport,
     )
-    publish(header_client, "foo", "bar"; headers=Headers("Trace" => "abc"))
+    publish(header_client, "foo", "bar"; headers=Headers("Trace" => "abc"),
+            buffer_on_reconnect=true)
     header_pending_bytes = header_client.pending_bytes
 
     set_info!(header_client, N.ServerInfo(; headers=false, max_payload=1024))
@@ -1769,7 +1771,7 @@ end
         read_io=original_transport,
         write_io,
     )
-    publish(payload_client, "foo", payload)
+    publish(payload_client, "foo", payload; buffer_on_reconnect=true)
     payload_pending_bytes = payload_client.pending_bytes
     @test N._buffered_bytes(write_io) > 0
 
@@ -1994,25 +1996,19 @@ end
     @test isempty(take!(raw_client.pending))
 end
 
-@testitem "request buffers while reconnecting" setup=[TestHelpers] begin
+@testitem "request does not buffer while reconnecting" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
 
-    @test_throws TimeoutError request(client, "foo", "bar"; timeout=0.001)
-    @test length(client.subscriptions) == 1
-    @test client.sid == 1
-    mux = client.request_mux
-    @test !isnothing(mux)
-    @test mux.sub.sid in keys(client.subscriptions)
-    @test !mux.sub.server_active
-    @test isempty(mux.waiters)
-    pending = String(take!(client.pending))
-    @test startswith(pending, "PUB foo _INBOX.")
-    @test endswith(pending, " 3\r\nbar\r\n")
-    @test client.pending_bytes == ncodeunits(pending)
+    @test_throws ConnectionReconnectingError request(client, "foo", "bar"; timeout=0.001)
+    @test isempty(client.subscriptions)
+    @test client.sid == 0
+    @test isnothing(client.request_mux)
+    @test isempty(take!(client.pending))
+    @test client.pending_bytes == 0
 
     disabled = TestHelpers.fake_client(; opts=N.ConnectOptions(pending_size=0),
                                        status=N.ConnectionStatus.RECONNECTING)
@@ -2229,7 +2225,7 @@ end
     close(client)
 end
 
-@testitem "request mux reconnect behavior keeps waiters and replays queued requests" setup=[TestHelpers] begin
+@testitem "request mux reconnect keeps in-flight waiters and rejects queued requests" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -2275,30 +2271,10 @@ end
     @test isempty(mux.waiters)
     close(client)
 
-    replay_transport = TestHelpers.WriteCapture()
-    replay_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
-                                            read_io=replay_transport,
-                                            write_io=replay_transport)
-    replay_task = @async request(replay_client, "svc", "queued"; timeout=1.0)
-    result = timedwait(1.0; pollint=0.001) do
-        mux = replay_client.request_mux
-        !isnothing(mux) && length(mux.waiters) == 1 && replay_client.pending_bytes > 0
-    end
-    @test result != :timed_out
-    replay_mux = replay_client.request_mux
-    N._replay_subscriptions(replay_client; reconnect_replay=true)
-    N._flush_pending_buffer(replay_client; reconnect_replay=true)
-    replayed = TestHelpers.capture_text(replay_transport)
-    @test startswith(replayed, N._sub_cmd(replay_mux.sub.subject, nothing, replay_mux.sub.sid))
-    replay_publishes = request_publishes(replay_transport)
-    @test length(replay_publishes) == 1
-    replay_reply, payload = only(replay_publishes)
-    @test payload == "queued"
+    replay_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    @test_throws ConnectionReconnectingError request(replay_client, "svc", "queued"; timeout=1.0)
     @test replay_client.pending_bytes == 0
-
-    N._dispatch_msg(replay_client, Msg(replay_reply, nothing, TestHelpers.bytes("replayed"); sid=replay_mux.sub.sid))
-    @test String(fetch(replay_task)) == "replayed"
-    @test isempty(replay_mux.waiters)
+    @test isnothing(replay_client.request_mux)
     close(replay_client)
 end
 
@@ -2351,7 +2327,7 @@ end
                                      read_io=transport, write_io=transport)
     client.write_reconnect_pending[] = true
 
-    publish(client, "foo", "bar")
+    publish(client, "foo", "bar"; buffer_on_reconnect=true)
     expected = "PUB foo 3\r\nbar\r\n"
     @test TestHelpers.capture_text(transport) == ""
     @test client.pending_bytes == ncodeunits(expected)

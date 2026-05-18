@@ -2198,8 +2198,11 @@ end
 
     const N = Natter
 
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     read_io=capture, write_io=capture)
     sub = subscribe(client, "_INBOX.push"; _control_handler=N._JetStreamPushControlHandler())
+    TestHelpers.clear_capture!(capture)
     flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
                        headers=Headers("Status" => ["100"], "Description" => ["FlowControl Request"]),
                        sid=sub.sid)
@@ -2208,8 +2211,8 @@ end
 
     expected = "PUB _INBOX.fc 0\r\n\r\n"
     @test !isready(sub.messages)
-    @test client.pending_bytes == ncodeunits(expected)
-    @test String(take!(client.pending)) == expected
+    @test client.pending_bytes == 0
+    @test TestHelpers.capture_text(capture) == expected
     close(sub)
 end
 
@@ -2218,9 +2221,12 @@ end
 
     const N = Natter
 
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     read_io=capture, write_io=capture)
     handler = N._JetStreamPushControlHandler()
     sub = subscribe(client, "_INBOX.push"; _control_handler=handler)
+    TestHelpers.clear_capture!(capture)
     data = Msg("_INBOX.push", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("work");
                sid=sub.sid)
     flow_control = Msg("_INBOX.push", "_INBOX.fc", UInt8[];
@@ -2235,11 +2241,12 @@ end
 
     @test isready(sub.messages)
     @test client.pending_bytes == 0
+    @test TestHelpers.capture_text(capture) == ""
     @test String(N.next(sub; timeout=0.1)) == "work"
 
     expected = "PUB _INBOX.fc 0\r\n\r\n"
-    @test client.pending_bytes == ncodeunits(expected)
-    @test String(take!(client.pending)) == expected
+    @test client.pending_bytes == 0
+    @test TestHelpers.capture_text(capture) == expected
     close(sub)
 end
 
@@ -2292,7 +2299,9 @@ end
 
     const N = Natter
 
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     read_io=capture, write_io=capture)
     started = Channel{String}(2)
     release = Channel{Bool}(1)
     sub = subscribe(client, "_INBOX.callback";
@@ -2301,6 +2310,7 @@ end
                         String(msg) == "busy" && take!(release)
                     end,
                     _control_handler=N._JetStreamPushControlHandler())
+    TestHelpers.clear_capture!(capture)
 
     try
         busy = Msg("_INBOX.callback", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("busy");
@@ -2320,13 +2330,14 @@ end
         N._dispatch_msg(client, data)
         N._dispatch_msg(client, flow_control)
         @test client.pending_bytes == 0
+        @test TestHelpers.capture_text(capture) == ""
 
         put!(release, true)
         expected = "PUB _INBOX.fc 0\r\n\r\n"
         @test timedwait(1.0; pollint=0.01) do
-            client.pending_bytes == ncodeunits(expected)
+            TestHelpers.capture_text(capture) == expected
         end != :timed_out
-        @test String(take!(client.pending)) == expected
+        @test client.pending_bytes == 0
 
         @test timedwait(1.0; pollint=0.01) do
             isready(started)

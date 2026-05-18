@@ -1207,9 +1207,8 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
 
             subs = collect(values(client.subscriptions))
             empty!(client.subscriptions)
-            @atomic client.subscription_snapshot = Vector{Union{Subscription{typeof(client)},Nothing}}()
-            @atomic client.borrowed_subscription_snapshot = Bool[]
-            @atomic client.fast_control_subscription_snapshot = Bool[]
+            @atomic client.subscription_snapshot =
+                Dict{Int,_SubscriptionSnapshotEntry{typeof(client)}}()
             reader = client.reader
             isnothing(reader) || empty!(reader.subject_cache)
 

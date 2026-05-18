@@ -7,7 +7,7 @@ using TestItems
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
 
-    publish_task = publish_async(client, "foo", "bar")
+    publish_task = publish_async(client, "foo", "bar"; buffer_on_reconnect=true)
     @test publish_task isa NatterTask
     @test isnothing(fetch(publish_task))
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")

@@ -99,7 +99,8 @@ end
 function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flush::Bool=false,
                         replayable::Bool=false, frame_size::Int=_serialized_size(frame),
                         direct_write::Bool=false,
-                        payload_size::Int=_pub_payload_size(frame))::Tuple{Bool,Bool}
+                        payload_size::Int=_pub_payload_size(frame),
+                        validate_frame::Bool=true)::Tuple{Bool,Bool}
     captured, attempted = false, false
     @lock client.write_lock begin
         st = status(client)
@@ -111,7 +112,7 @@ function _write_publish(client::Client, frame::_AbstractPublishFrame; force_flus
             st == ConnectionStatus.DISCONNECTED && throw(ConnectionClosedError("connection is disconnected"))
             throw(ConnectionReconnectingError())
         end
-        _validate_publish_frame_for_client(client, frame, payload_size)
+        validate_frame && _validate_publish_frame_for_client(client, frame, payload_size)
         captured, attempted = _write_publish_to_active_io(client, io, frame, force_flush,
                                                           replayable, frame_size, direct_write)
     end
@@ -205,20 +206,20 @@ function _ensure_connected_for_request(client::Client)
     _throw_not_connected_for_request(st)
 end
 
-function _ensure_reconnect_buffer_for_request(client::Client, st::ConnectionStatus.T)
-    if st in (ConnectionStatus.CONNECTING, ConnectionStatus.RECONNECTING) ||
-       (st == ConnectionStatus.CONNECTED && client.write_reconnect_pending[])
-        _reconnect_buffer_enabled(client) || throw(ConnectionReconnectingError())
-    end
+function _ensure_request_publish_ready(client::Client, st::ConnectionStatus.T)
+    st == ConnectionStatus.CONNECTED || _throw_not_connected_for_request(st)
+    client.write_reconnect_pending[] && throw(ConnectionReconnectingError())
     nothing
 end
 
-function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
+function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=false,
                        force_flush::Bool=false,
                        frame_size::Int=_serialized_size(frame),
                        payload_size::Int=_pub_payload_size(frame),
                        st::ConnectionStatus.T=status(client),
-                       direct_write::Bool=false)
+                       direct_write::Bool=false,
+                       validate_frame::Bool=true)
+    validate_frame && _validate_publish_frame_for_client(client, frame, payload_size)
     can_buffer_reconnect = buffer_on_reconnect && _reconnect_buffer_enabled(client)
     if st == ConnectionStatus.CONNECTED && client.write_reconnect_pending[]
         can_buffer_reconnect || throw(ConnectionReconnectingError())
@@ -228,7 +229,7 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
             _write_publish(client, frame; force_flush, replayable=can_buffer_reconnect,
-                           frame_size, direct_write, payload_size)
+                           frame_size, direct_write, payload_size, validate_frame=false)
         catch err
             failure = err isa _PublishWriteFailure ? err : _PublishWriteFailure(err, false, false)
             cause = failure.cause
@@ -393,7 +394,7 @@ function _validate_pending_replay_for_client(client::Client, entries::AbstractVe
     nothing
 end
 
-function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
+function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=false,
                            force_flush::Bool=false, direct_write::Bool=false,
                            cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
@@ -403,35 +404,37 @@ function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_
     _ensure_usable_status_for_publish(st)
     _validate_publish_frame_for_client(client, frame, payload_size)
     _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
-                  payload_size, st, direct_write)
+                  payload_size, st, direct_write, validate_frame=false)
     _record_out!(client, payload_size)
     nothing
 end
 
 function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
-                  headers=nothing, buffer_on_reconnect::Bool=true, force_flush::Bool=false,
+                  headers=nothing, buffer_on_reconnect::Bool=false, force_flush::Bool=false,
                   direct_write::Bool=false,
                   cancel_token::MaybeCancellationToken=nothing)
     _publish_prepared(client, _publish_frame(subject, reply, data, headers);
                       buffer_on_reconnect, force_flush, direct_write, cancel_token)
 end
 
-function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=true,
+function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=false,
                                   force_flush::Bool=false, direct_write::Bool=false,
-                                  cancel_token::MaybeCancellationToken=nothing)
+                                  cancel_token::MaybeCancellationToken=nothing,
+                                  validate_frame::Bool=true)
     _throw_if_cancelled(cancel_token)
     frame_size = _serialized_size(frame)
     payload_size = _pub_payload_size(frame)
     st = status(client)
     _ensure_usable_status_for_publish(st)
+    validate_frame && _validate_publish_frame_for_client(client, frame, payload_size)
     _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
-                  payload_size, st, direct_write)
+                  payload_size, st, direct_write, validate_frame=false)
     _record_out!(client, payload_size)
     nothing
 end
 
 function _publish_unchecked(client::Client, subject::String, payload::AbstractVector{UInt8};
-                            buffer_on_reconnect::Bool=true, force_flush::Bool=false,
+                            buffer_on_reconnect::Bool=false, force_flush::Bool=false,
                             direct_write::Bool=false,
                             cancel_token::MaybeCancellationToken=nothing)
     _publish_frame_unchecked(client, _publish_frame(subject, nothing, payload, EMPTY_BYTES);
@@ -439,13 +442,13 @@ function _publish_unchecked(client::Client, subject::String, payload::AbstractVe
 end
 
 function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
-                 headers=nothing, buffer_on_reconnect::Bool=true, direct_write::Bool=false,
+                 headers=nothing, buffer_on_reconnect::Bool=false, direct_write::Bool=false,
                  cancel_token::MaybeCancellationToken=nothing)
     _publish(client, subject, data; reply, headers, buffer_on_reconnect, direct_write,
              cancel_token)
 end
 
-function publish(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=true,
+function publish(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=false,
                  direct_write::Bool=false, cancel_token::MaybeCancellationToken=nothing)
     _publish_prepared(client, frame; buffer_on_reconnect, direct_write, cancel_token)
 end
@@ -668,9 +671,9 @@ function _try_handle_msg_control(dispatcher::_ReaderMsgDispatcher, reader::Proto
                                  size::Int, borrowed::Bool)::Bool
     borrowed && return false
     client = dispatcher.client
-    _fast_control_subscription_for_sid(client, sid) || return false
-    sub = _lookup_subscription(client, sid)
-    isnothing(sub) && return false
+    entry = _lookup_subscription_snapshot_entry(client, sid)
+    (isnothing(entry) || !entry.fast_control) && return false
+    sub = entry.sub
     closed = false
     control_handler = _NoSubscriptionControlHandler()
     @lock sub.lock begin
@@ -688,9 +691,9 @@ function _try_handle_hmsg_control(dispatcher::_ReaderMsgDispatcher, reader::Prot
                                   hsize::Int, total::Int, borrowed::Bool)::Bool
     borrowed && return false
     client = dispatcher.client
-    _fast_control_subscription_for_sid(client, sid) || return false
-    sub = _lookup_subscription(client, sid)
-    isnothing(sub) && return false
+    entry = _lookup_subscription_snapshot_entry(client, sid)
+    (isnothing(entry) || !entry.fast_control) && return false
+    sub = entry.sub
     closed = false
     control_handler = _NoSubscriptionControlHandler()
     @lock sub.lock begin
@@ -1321,9 +1324,8 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
             _bump_generation_locked!(client)
             subs = collect(values(client.subscriptions))
             empty!(client.subscriptions)
-            @atomic client.subscription_snapshot = Vector{Union{Subscription{typeof(client)},Nothing}}()
-            @atomic client.borrowed_subscription_snapshot = Bool[]
-            @atomic client.fast_control_subscription_snapshot = Bool[]
+            @atomic client.subscription_snapshot =
+                Dict{Int,_SubscriptionSnapshotEntry{typeof(client)}}()
             reader = client.reader
             isnothing(reader) || empty!(reader.subject_cache)
         else
@@ -1639,12 +1641,8 @@ function _wait_request_reply(mux::RequestMux, waiter::RequestWaiter, timeout::Re
                 waiter.active = false
                 throw(TimeoutError("request timed out"))
             end
-            ready = _wait_until_condition_locked(mux.condition, remaining; cancel_token) do
+            _wait_until_notified_locked(mux.condition; cancel_token) do
                 waiter.ready
-            end
-            if !ready
-                waiter.active = false
-                throw(TimeoutError("request timed out"))
             end
         end
         waiter.value
@@ -1661,8 +1659,7 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     timeout = _positive_timeout_seconds("timeout", timeout)
     request_frame = _publish_frame(subject, nothing, data, headers)
     st = status(client)
-    _ensure_usable_status_for_request(st)
-    _ensure_reconnect_buffer_for_request(client, st)
+    _ensure_request_publish_ready(client, st)
     _validate_publish_frame_for_client(client, request_frame)
     mux = _ensure_request_mux(client)
     token, waiter = _register_request_waiter!(client, mux, timeout)
@@ -1670,8 +1667,8 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     try
         _validate_publish_subject(reply)
         frame = _PublishFrame(request_frame.subject, reply, request_frame.payload, request_frame.headers)
-        _publish_frame_unchecked(client, frame; buffer_on_reconnect=true, force_flush=true,
-                                 cancel_token)
+        _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true,
+                                 cancel_token, validate_frame=false)
         return _wait_request_reply(mux, waiter, timeout; cancel_token)
     finally
         _remove_request_waiter!(client, mux, token, waiter)

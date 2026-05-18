@@ -18,14 +18,14 @@ Statuses:
 | WebSocket transport | Not Planned | `ws://` and `wss://` are not implemented. |
 | Connect handshake | Supported | Client name, no echo, server INFO parsing, TLS requirements, and typed auth. |
 | Authentication | Supported | Token, user/password, NKEY, JWT, `.creds`, callback auth, and URL userinfo for token/user-password. |
-| PUB / HPUB / SUB / UNSUB | Supported | Core publish, headers, queue groups, unsubscribe limits, local subject validation, direct-write publish calls, and opt-out reconnect replay snapshots. |
+| PUB / HPUB / SUB / UNSUB | Supported | Core publish, headers, queue groups, unsubscribe limits, local subject validation, direct-write publish calls, and opt-in reconnect replay snapshots. |
 | MSG / HMSG parsing | Supported | Core data and headers, with an explicit callback-only borrowed payload path for hot subscribers. Borrowed frames use a lock-free SID snapshot and release oversized parser buffers after delivery. |
 | Wildcards | Supported | Subscription wildcards are validated; publish subjects reject wildcards. |
-| Request/reply | Supported | Shared inbox mux, timeouts, reconnect replay buffering, and `NoRespondersError` when supported by the server. |
+| Request/reply | Supported | Shared inbox mux, timeouts, reconnect-aware in-flight waiters, and `NoRespondersError` when supported by the server. |
 | Flush and ping | Supported | `flush`/`ping` use a server round trip. |
 | Drain and close | Supported | Subscription/client drain and deterministic close paths. |
-| Reconnect | Supported | Automatic reconnect, optional initial-connect retry, randomized server-pool attempts with ordered opt-out, discovered servers, subscription and request mux replay, optional bounded publish/request replay, lifecycle events, delay callbacks, and bounded live-server chaos CI are implemented. Broader cluster chaos and auth failover scenarios remain as additional hardening coverage. |
-| Publish replay | Partial | Buffered core publishes are replayed only while they remain in the client buffer and have not been handed to the transport. Ambiguous write failures start reconnect but are not replayed automatically; use `pending_size=0` to disable replay buffering, or JetStream `msg_id` for durable idempotent publish paths. |
+| Reconnect | Supported | Automatic reconnect, optional initial-connect retry, randomized server-pool attempts with ordered opt-out, discovered servers, subscription and request mux replay, optional bounded publish replay, lifecycle events, delay callbacks, and bounded live-server chaos CI are implemented. Broader cluster chaos and auth failover scenarios remain as additional hardening coverage. |
+| Publish replay | Partial | Core publishes opt into reconnect replay with `buffer_on_reconnect=true` and are replayed only while they remain in the client buffer and have not been handed to the transport. Ambiguous write failures start reconnect but are not replayed automatically; use `pending_size=0` to disable replay buffering, or JetStream `msg_id` for durable idempotent publish paths. |
 | Slow consumer handling | Supported | Per-subscription pending limits report `SlowConsumerError`. |
 | Runtime inspection | Supported | `status`, `stats`, and `connected_url`. |
 | Async handles | Supported | Task-backed `_async` helpers return `NatterTask`; blocking calls accept cooperative cancellation tokens and async handles rethrow `CancelledError` from cancelled operations. JetStream publish has a protocol async publisher with `JetStreamPublishFuture`. |

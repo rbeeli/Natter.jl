@@ -62,7 +62,7 @@ Conventions:
 | `reconnect_max_wait` | `5.0` | Maximum reconnect wait. |
 | `reconnect_jitter` | `0.1` | Added reconnect jitter. |
 | `max_reconnect_attempts` | `-1` | `-1` means unlimited reconnect and initial-retry attempts. |
-| `pending_size` | `2 MiB` | Buffered publish bytes retained for reconnect replay; `0` disables replay buffering. |
+| `pending_size` | `2 MiB` | Byte limit for opt-in reconnect publish replay; `0` disables replay buffering. |
 | `read_buffer_size` | `64 KiB` | Inbound socket read buffer used by the protocol parser. |
 | `read_buffer_shrink_threshold` | `256 KiB` | Parser buffer capacity above this size is released after oversized consumed frames. |
 | `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |
@@ -104,9 +104,9 @@ Parser/resource limits:
 | Function | Returns | Use |
 | :--- | :--- | :--- |
 | `connect(url_or_urls=nothing; kwargs...)` | `Client` | Connect to NATS. |
-| `publish(client, subject, data=nothing; reply=nothing, headers=nothing, buffer_on_reconnect=true, direct_write=false)` | `nothing` | Publish a core message. `direct_write=true` bypasses the client write buffer; `buffer_on_reconnect=false` avoids per-call replay snapshots. |
+| `publish(client, subject, data=nothing; reply=nothing, headers=nothing, buffer_on_reconnect=false, direct_write=false)` | `nothing` | Publish a core message. `direct_write=true` bypasses the client write buffer; `buffer_on_reconnect=true` opts into best-effort reconnect replay. |
 | `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | `PublishFrame` | Validate and serialize a reusable publish frame. Payloads are `nothing`, strings, or byte vectors. |
-| `publish(client, frame::PublishFrame; buffer_on_reconnect=true, direct_write=false)` | `nothing` | Publish a prepared frame. |
+| `publish(client, frame::PublishFrame; buffer_on_reconnect=false, direct_write=false)` | `nothing` | Publish a prepared frame. |
 | `subscribe(client, subject; queue=nothing, callback=nothing, borrowed=false, max_msgs=0, pending_msgs_limit=..., pending_bytes_limit=...)` | `Subscription` | Create a subscription. `borrowed=true` requires a callback and delivers `BorrowedMsg` inline from the reader task. |
 | `subscribe(callback, client, subject; kwargs...)` | `Subscription` | Callback-first form. |
 | `next(sub; timeout=1.0)` | `Msg` | Wait for a message on a non-callback subscription. |

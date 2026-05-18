@@ -1470,6 +1470,17 @@ function Subscription(client::C, sid::Int, subject::String, queue::Union{String,
                     max_msgs, closed, processor, server_active, processing)
 end
 
+struct _SubscriptionSnapshotEntry{C<:AbstractNatterClient}
+    sub::Subscription{C}
+    borrow_payload::Bool
+    fast_control::Bool
+end
+
+function _SubscriptionSnapshotEntry(sub::Subscription{C}) where {C<:AbstractNatterClient}
+    _SubscriptionSnapshotEntry{C}(sub, sub.borrowed_callback,
+                                  _uses_pre_payload_control(sub.control_handler))
+end
+
 mutable struct PongWaiter
     condition::Base.GenericCondition{ReentrantLock}
     ready::Bool
@@ -1674,9 +1685,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     flusher_task::Union{Task,Nothing}
     sid::Int
     subscriptions::Dict{Int,Subscription{Client{Options,ReadIO,WriteIO}}}
-    @atomic subscription_snapshot::Vector{Union{Subscription{Client{Options,ReadIO,WriteIO}},Nothing}}
-    @atomic borrowed_subscription_snapshot::Vector{Bool}
-    @atomic fast_control_subscription_snapshot::Vector{Bool}
+    @atomic subscription_snapshot::Dict{Int,_SubscriptionSnapshotEntry{Client{Options,ReadIO,WriteIO}}}
     @atomic request_mux::Union{RequestMux{Client{Options,ReadIO,WriteIO}},Nothing}
     request_mux_lock::ReentrantLock
     pending::PendingBuffer
@@ -1710,21 +1719,11 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
     for (sub_sid, sub) in subscriptions
         typed_subscriptions[Int(sub_sid)] = sub
     end
-    max_sid = 0
-    for sub_sid in keys(typed_subscriptions)
-        max_sid = max(max_sid, sub_sid)
-    end
-    subscription_snapshot = Vector{Union{Subscription{client_type},Nothing}}(undef, max_sid)
-    borrowed_subscription_snapshot = Vector{Bool}(undef, max_sid)
-    fast_control_subscription_snapshot = Vector{Bool}(undef, max_sid)
-    fill!(subscription_snapshot, nothing)
-    fill!(borrowed_subscription_snapshot, false)
-    fill!(fast_control_subscription_snapshot, false)
+    subscription_snapshot = Dict{Int,_SubscriptionSnapshotEntry{client_type}}()
+    sizehint!(subscription_snapshot, length(typed_subscriptions))
     for (sub_sid, sub) in typed_subscriptions
         if sub_sid > 0
-            subscription_snapshot[sub_sid] = sub
-            borrowed_subscription_snapshot[sub_sid] = sub.borrowed_callback
-            fast_control_subscription_snapshot[sub_sid] = _uses_pre_payload_control(sub.control_handler)
+            subscription_snapshot[sub_sid] = _SubscriptionSnapshotEntry(sub)
         end
     end
     typed_request_mux = if isnothing(request_mux)
@@ -1764,7 +1763,6 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                    Threads.Atomic{Int}(0), Ref{Any}(nothing), Ref(""), nothing,
                                    flush_signal, flusher_task,
                                    sid, typed_subscriptions, subscription_snapshot,
-                                   borrowed_subscription_snapshot, fast_control_subscription_snapshot,
                                    typed_request_mux, request_mux_lock,
                                    pending, pending_bytes, pongs,
                                    reader_task, ping_task, reconnect_task, pings_out, atomic_stats,
@@ -1775,95 +1773,47 @@ function _set_subscription_snapshot_locked!(client::C, sid::Int,
                                             sub::Union{Subscription{C},Nothing}) where {C<:Client}
     sid > 0 || return nothing
     current = @atomic client.subscription_snapshot
-    borrowed_current = @atomic client.borrowed_subscription_snapshot
-    fast_control_current = @atomic client.fast_control_subscription_snapshot
-    borrowed = !isnothing(sub) && sub.borrowed_callback
-    fast_control = !isnothing(sub) && _uses_pre_payload_control(sub.control_handler)
-    if isnothing(sub) && sid > length(current) && sid > length(borrowed_current) &&
-       sid > length(fast_control_current)
-        return nothing
-    end
-    current_matches = sid <= length(current) && current[sid] === sub
-    borrowed_matches = sid <= length(borrowed_current) && borrowed_current[sid] == borrowed
-    fast_control_matches = sid <= length(fast_control_current) &&
-                           fast_control_current[sid] == fast_control
-    if current_matches && borrowed_matches && fast_control_matches
-        return nothing
-    end
-    snapshot = if sid <= length(current)
-        copy(current)
-    else
-        expanded = Vector{Union{Subscription{C},Nothing}}(undef, sid)
-        fill!(expanded, nothing)
-        isempty(current) || copyto!(expanded, 1, current, 1, length(current))
-        expanded
-    end
-    snapshot[sid] = sub
-    borrowed_snapshot = if sid <= length(borrowed_current)
-        copy(borrowed_current)
-    else
-        expanded = Vector{Bool}(undef, sid)
-        fill!(expanded, false)
-        isempty(borrowed_current) || copyto!(expanded, 1, borrowed_current, 1, length(borrowed_current))
-        expanded
-    end
-    borrowed_snapshot[sid] = borrowed
-    fast_control_snapshot = if sid <= length(fast_control_current)
-        copy(fast_control_current)
-    else
-        expanded = Vector{Bool}(undef, sid)
-        fill!(expanded, false)
-        isempty(fast_control_current) ||
-            copyto!(expanded, 1, fast_control_current, 1, length(fast_control_current))
-        expanded
-    end
-    fast_control_snapshot[sid] = fast_control
+    existing = get(current, sid, nothing)
     if isnothing(sub)
-        last = length(snapshot)
-        while last > 0 && isnothing(snapshot[last])
-            last -= 1
-        end
-        last < length(snapshot) && resize!(snapshot, last)
-        last_borrowed = length(borrowed_snapshot)
-        while last_borrowed > 0 && !borrowed_snapshot[last_borrowed]
-            last_borrowed -= 1
-        end
-        last_borrowed < length(borrowed_snapshot) && resize!(borrowed_snapshot, last_borrowed)
-        last_fast_control = length(fast_control_snapshot)
-        while last_fast_control > 0 && !fast_control_snapshot[last_fast_control]
-            last_fast_control -= 1
-        end
-        last_fast_control < length(fast_control_snapshot) &&
-            resize!(fast_control_snapshot, last_fast_control)
+        isnothing(existing) && return nothing
+        snapshot = copy(current)
+        delete!(snapshot, sid)
+        @atomic client.subscription_snapshot = snapshot
+        return nothing
     end
+    entry = _SubscriptionSnapshotEntry(sub)
+    if !isnothing(existing) && existing.sub === sub &&
+       existing.borrow_payload == entry.borrow_payload &&
+       existing.fast_control == entry.fast_control
+        return nothing
+    end
+    snapshot = copy(current)
+    snapshot[sid] = entry
     @atomic client.subscription_snapshot = snapshot
-    @atomic client.borrowed_subscription_snapshot = borrowed_snapshot
-    @atomic client.fast_control_subscription_snapshot = fast_control_snapshot
     nothing
 end
 
-@inline function _lookup_subscription(client::Client, sid::Int)
+@inline function _lookup_subscription_snapshot_entry(
+    client::C, sid::Int
+)::Union{_SubscriptionSnapshotEntry{C},Nothing} where {C<:Client}
+    sid > 0 || return nothing
     snapshot = @atomic client.subscription_snapshot
-    if 0 < sid <= length(snapshot)
-        @inbounds return snapshot[sid]
-    end
-    nothing
+    get(snapshot, sid, nothing)
 end
 
-@inline function _borrow_payload_for_sid(client::Client, sid::Int)::Bool
-    snapshot = @atomic client.borrowed_subscription_snapshot
-    if 0 < sid <= length(snapshot)
-        @inbounds return snapshot[sid]
-    end
-    false
+@inline function _lookup_subscription(client::C, sid::Int) where {C<:Client}
+    entry = _lookup_subscription_snapshot_entry(client, sid)
+    isnothing(entry) ? nothing : entry.sub
 end
 
-@inline function _fast_control_subscription_for_sid(client::Client, sid::Int)::Bool
-    snapshot = @atomic client.fast_control_subscription_snapshot
-    if 0 < sid <= length(snapshot)
-        @inbounds return snapshot[sid]
-    end
-    false
+@inline function _borrow_payload_for_sid(client::C, sid::Int)::Bool where {C<:Client}
+    entry = _lookup_subscription_snapshot_entry(client, sid)
+    isnothing(entry) ? false : entry.borrow_payload
+end
+
+@inline function _fast_control_subscription_for_sid(client::C, sid::Int)::Bool where {C<:Client}
+    entry = _lookup_subscription_snapshot_entry(client, sid)
+    isnothing(entry) ? false : entry.fast_control
 end
 
 function _wait_until_condition_locked(predicate::Function, condition::Base.GenericCondition{ReentrantLock},
@@ -1894,6 +1844,24 @@ function _wait_until_condition_locked(predicate::Function, condition::Base.Gener
     finally
         _deregister_cancellation_waiter!(cancel_token, registration)
         isnothing(timer) || close(timer)
+    end
+end
+
+function _wait_until_notified_locked(predicate::Function,
+                                     condition::Base.GenericCondition{ReentrantLock};
+                                     cancel_token::MaybeCancellationToken=nothing)::Bool
+    _throw_if_cancelled(cancel_token)
+    predicate() && return true
+    registration = _register_cancellation_waiter(cancel_token, condition)
+    try
+        while !predicate()
+            _throw_if_cancelled(cancel_token)
+            wait(condition)
+        end
+        _throw_if_cancelled(cancel_token)
+        true
+    finally
+        _deregister_cancellation_waiter!(cancel_token, registration)
     end
 end
 
