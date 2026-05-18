@@ -74,7 +74,7 @@ end
                     proxy.drop_connections()
                     @test ChaosTestHelpers.wait_reconnecting(client; timeout=max(io_timeout, 2.0))
 
-                    publish(client, subject, "during-$i")
+                    publish(client, subject, "during-$i"; buffer_on_reconnect=true)
                     proxy.release()
                     @test ChaosTestHelpers.wait_reconnected(client, expected_reconnects;
                                                             timeout=max(io_timeout, 5.0))

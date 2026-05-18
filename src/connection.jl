@@ -2148,8 +2148,8 @@ function _replay_subscriptions(client::Client; reconnect_replay::Bool=false)
             if !present || sub.closed || sub.server_active
                 nothing
             else
-                remaining = sub.max_msgs > 0 ? sub.max_msgs - sub.delivered : nothing
-                !isnothing(remaining) && remaining <= 0 ? :close : (sub.sid, sub.subject, sub.queue, remaining)
+                remaining = sub.max_msgs > 0 ? sub.max_msgs - sub.delivered : 0
+                sub.max_msgs > 0 && remaining <= 0 ? :close : (sub.sid, sub.subject, sub.queue, remaining)
             end
         end
         isnothing(state) && continue
@@ -2158,8 +2158,7 @@ function _replay_subscriptions(client::Client; reconnect_replay::Bool=false)
             continue
         end
         sid, subject, queue, remaining = state
-        _write_raw(client, _sub_cmd(subject, queue, sid); write_mode)
-        isnothing(remaining) || _write_raw(client, _unsub_cmd(sid, remaining); write_mode)
+        _write_raw(client, _subscription_setup_cmd(subject, queue, sid, remaining); write_mode)
         present = @lock client.lock get(client.subscriptions, sid, nothing) === sub
         active = @lock sub.lock begin
             if present && !sub.closed

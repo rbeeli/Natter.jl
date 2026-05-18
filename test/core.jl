@@ -924,6 +924,63 @@ end
     @test !isopen(exhausted.messages)
 end
 
+@testitem "limited subscribe setup uses one cancellation boundary" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct CancelDuringSubscriptionWrite <: IO
+        bytes::Vector{UInt8}
+        source::CancellationSource
+        writes::Int
+        closed::Bool
+    end
+
+    CancelDuringSubscriptionWrite(source::CancellationSource) =
+        CancelDuringSubscriptionWrite(UInt8[], source, 0, false)
+
+    function Base.write(t::CancelDuringSubscriptionWrite, data::Union{String,SubString{String}})
+        text = String(data)
+        t.writes += 1
+        if t.writes == 1 && startswith(text, "SUB ")
+            line = findfirst("\r\n", text)
+            if isnothing(line)
+                append!(t.bytes, codeunits(text))
+                cancel!(t.source)
+            else
+                append!(t.bytes, codeunits(text[1:last(line)]))
+                cancel!(t.source)
+                last(line) < lastindex(text) && append!(t.bytes, codeunits(text[nextind(text, last(line)):end]))
+            end
+        else
+            append!(t.bytes, codeunits(text))
+        end
+        ncodeunits(text)
+    end
+    Base.write(t::CancelDuringSubscriptionWrite, data::Base.CodeUnits{UInt8}) =
+        write(t, String(data))
+    Base.write(t::CancelDuringSubscriptionWrite, data::Vector{UInt8}) =
+        write(t, String(data))
+    Base.flush(::CancelDuringSubscriptionWrite) = nothing
+    Base.close(t::CancelDuringSubscriptionWrite) = (t.closed = true; nothing)
+
+    source = CancellationSource()
+    token = cancellation_token(source)
+    transport = CancelDuringSubscriptionWrite(source)
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     write_io=transport)
+
+    sub = subscribe(client, "limited.cancel"; max_msgs=2, cancel_token=token)
+    @test iscancelled(token)
+    @test transport.writes == 1
+    @test String(transport.bytes) == "SUB limited.cancel $(sub.sid)\r\nUNSUB $(sub.sid) 2\r\n"
+    @test !sub.closed
+    @test (@lock sub.lock sub.server_active)
+    @test get(client.subscriptions, sub.sid, nothing) === sub
+
+    close(client)
+end
+
 @testitem "subscription delivered stats include slow-consumer drops" setup=[TestHelpers] begin
     using Natter
 
@@ -1780,6 +1837,37 @@ end
     @test TestHelpers.capture_text(sub_transport) == ""
     @test isempty(sub_client.subscriptions)
 
+    unsub_transport = TestHelpers.WriteCapture()
+    unsub_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                           write_io=unsub_transport)
+    unsub = subscribe(unsub_client, "cancel.unsubscribe")
+    @test (@lock unsub.lock unsub.server_active)
+    TestHelpers.clear_capture!(unsub_transport)
+    unsub_err = cancel_during_write_lock(unsub_client) do token
+        unsubscribe(unsub; cancel_token=token)
+    end
+    @test unsub_err isa CancelledError
+    @test N.status(unsub_client) == N.ConnectionStatus.CONNECTED
+    @test TestHelpers.capture_text(unsub_transport) == ""
+    @test !unsub.closed
+    @test (@lock unsub.lock unsub.server_active)
+
+    max_unsub_transport = TestHelpers.WriteCapture()
+    max_unsub_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                               write_io=max_unsub_transport)
+    max_unsub = subscribe(max_unsub_client, "cancel.unsubscribe.max")
+    @test max_unsub.max_msgs == 0
+    TestHelpers.clear_capture!(max_unsub_transport)
+    max_unsub_err = cancel_during_write_lock(max_unsub_client) do token
+        unsubscribe(max_unsub; max_msgs=2, cancel_token=token)
+    end
+    @test max_unsub_err isa CancelledError
+    @test N.status(max_unsub_client) == N.ConnectionStatus.CONNECTED
+    @test TestHelpers.capture_text(max_unsub_transport) == ""
+    @test !max_unsub.closed
+    @test max_unsub.max_msgs == 0
+    @test (@lock max_unsub.lock max_unsub.server_active)
+
     request_transport = TestHelpers.WriteCapture()
     request_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
                                              write_io=request_transport)
@@ -1808,6 +1896,8 @@ end
 
     close(flush_client)
     close(sub_client)
+    close(unsub_client)
+    close(max_unsub_client)
     close(request_client)
     close(drain_client)
 end

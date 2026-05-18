@@ -286,10 +286,8 @@ function _send_subscription_now!(sub::Subscription; cancel_token::MaybeCancellat
         return false
     end
     try
-        _write_raw(sub.client, _sub_cmd(subject, queue, sid); cancel_token)
-        if remaining > 0
-            _write_raw(sub.client, _unsub_cmd(sid, remaining); cancel_token)
-        end
+        _write_raw(sub.client, _subscription_setup_cmd(subject, queue, sid, remaining);
+                   cancel_token)
         @lock sub.lock sub.server_active = true
         return true
     catch err
@@ -1183,6 +1181,17 @@ function _unsubscribe_target(delivered::Int, additional::Int)
     delivered + additional
 end
 
+function _restore_unsubscribe_target!(sub::Subscription, max_msgs::Int, target::Int,
+                                      previous_max::Int)
+    max_msgs > 0 || return nothing
+    @lock sub.lock begin
+        if !sub.closed && sub.max_msgs == target
+            sub.max_msgs = previous_max
+        end
+    end
+    nothing
+end
+
 function unsubscribe(sub::Subscription; max_msgs=0, cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     max_msgs = _validate_core_max_msgs(max_msgs)
@@ -1206,16 +1215,14 @@ function unsubscribe(sub::Subscription; max_msgs=0, cancel_token::MaybeCancellat
     closed && return nothing
     if st == ConnectionStatus.CONNECTED && active
         try
-            _write_raw(sub.client, _unsub_cmd(sid, target))
+            _write_raw(sub.client, _unsub_cmd(sid, target); cancel_token)
         catch err
+            if err isa CancelledError
+                _restore_unsubscribe_target!(sub, max_msgs, target, previous_max)
+                rethrow()
+            end
             if !_recover_after_write_failure!(sub.client, err)
-                if max_msgs > 0
-                    @lock sub.lock begin
-                        if !sub.closed && sub.max_msgs == target
-                            sub.max_msgs = previous_max
-                        end
-                    end
-                end
+                _restore_unsubscribe_target!(sub, max_msgs, target, previous_max)
                 rethrow()
             end
             @lock sub.lock begin

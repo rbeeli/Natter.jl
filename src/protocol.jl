@@ -1304,6 +1304,12 @@ function _sub_cmd(subject::String, queue::Union{String,Nothing}, sid::Int)
     isnothing(queue) || isempty(queue) ? "SUB $subject $sid$CRLF" : "SUB $subject $queue $sid$CRLF"
 end
 
+function _subscription_setup_cmd(subject::String, queue::Union{String,Nothing}, sid::Int,
+                                 remaining::Int)::String
+    sub_cmd = _sub_cmd(subject, queue, sid)
+    remaining > 0 ? string(sub_cmd, _unsub_cmd(sid, remaining)) : sub_cmd
+end
+
 function _validate_core_max_msgs(max_msgs)::Int
     _nonnegative_integer_option("max_msgs", max_msgs)
 end
