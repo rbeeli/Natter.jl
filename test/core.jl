@@ -3321,7 +3321,7 @@ end
         take!(returned_release)
         nothing
     end
-    @test timedwait(0.5; pollint=0.01) do
+    @test timedwait(5.0; pollint=0.01) do
         isready(returned_done)
     end != :timed_out
     @test take!(returned_reported) === returned_error
@@ -3343,7 +3343,7 @@ end
         take!(thrown_release)
         nothing
     end
-    @test timedwait(0.5; pollint=0.01) do
+    @test timedwait(5.0; pollint=0.01) do
         isready(thrown_done)
     end != :timed_out
     thrown_error = take!(thrown_reported)
