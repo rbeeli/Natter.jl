@@ -6,13 +6,13 @@ Natter.jl is a pure Julia NATS client implementation.
 
 - `src/Natter.jl`: module entrypoint, imports, exports, constants, and includes only.
 - `src/errors.jl`: exception types and `showerror` methods.
-- `src/types.jl`: shared public and internal data types.
-- `src/protocol.jl`: NATS wire parsing, command serialization, header handling, subject validation, and byte conversion.
-- `src/connection.jl`: connect handshake, TLS wrapping, reader/ping/reconnect loops, discovered servers, and pending replay.
-- `src/core.jl`: publish, subscribe, request/reply, flush, drain, close, slow-consumer dispatch, and inbox generation.
-- `src/jetstream.jl`: JetStream management, publish ack, consumers, pull/push subscriptions, message metadata, and ack verbs.
+- `src/tasks.jl`: private Julia task spawning helpers used by background client work.
+- `src/types/`: shared public and internal data types, grouped by common utilities, headers, messages, options, protocol/transport support, and client state.
+- `src/protocol/`: NATS wire parsing, header parsing/validation, command serialization, subject validation, and byte conversion.
+- `src/connection/`: connect setup, TLS/socket transport handling, reader/ping/session lifecycle, reconnect, discovered servers, and pending replay.
+- `src/core/`: publish, subscribe, request/reply, flush, drain, close, slow-consumer dispatch, and inbox generation.
+- `src/jetstream/`: JetStream types, context/base helpers, publish futures, management APIs, pull protocol/subscriptions/streams, push runtime/API, message metadata, and ack verbs.
 - `src/keyvalue.jl`: KeyValue bucket and key operations built on JetStream.
-- `src/async.jl`: first-class async API wrappers and the `NatterTask` handle.
 - `docs/`: DocumenterVitepress documentation subproject. Source pages live in `docs/src`; the docs entrypoint is `docs/make.jl`.
 
 Do not put substantial implementation back into `src/Natter.jl`. New features should go into the closest existing file or a new focused file included from `src/Natter.jl`.
@@ -22,11 +22,11 @@ Do not put substantial implementation back into `src/Natter.jl`. New features sh
 - Julia target is `1.10+`.
 - Backward compatibility is not a constraint yet; prefer correctness and maintainability.
 - APIs should be ergonomic and Julia-idiomatic: prefer clear method signatures, keyword arguments for optional behavior, concrete return types where practical, and Base extensions only when they fit established Julia conventions.
-- Public APIs support direct task-friendly calls plus explicit handle-returning helpers for network, blocking, or potentially slow operations. Keep the direct method as the canonical implementation and add an `_async` helper that returns `NatterTask`.
-- Handle-returning async helpers must go through the shared helper in `src/async.jl`; do not add one-off raw `@async` public wrappers. `fetch(handle)` should return the direct-call result or rethrow the original operation error, and `handle.task` remains available for low-level Julia task control.
+- Public APIs should remain directly task-friendly. Prefer direct Natter calls composed with Julia `Task`s for background or fan-out work instead of adding public `_async` wrapper APIs.
+- Internal background work must go through the shared helpers in `src/tasks.jl`; do not add one-off raw `@async` wrappers.
 - When adding or changing a public blocking operation, update exports, docs, and tests for both sync and async forms unless there is a clear reason not to expose an async twin.
 - Internals use Julia tasks for reader, ping, reconnect, callback processing, and public async handles.
-- Documentation should teach idiomatic Julia task concurrency first: direct Natter calls inside handlers and workers, and `@sync`/`@async` for fan-out or background work. Do not show exhaustive join-on-`_async` rewrites as the normal usage pattern; reserve `NatterTask` examples for explicit handle-oriented APIs.
+- Documentation should teach idiomatic Julia task concurrency first: direct Natter calls inside handlers and workers, and `@sync`/`Threads.@spawn` for fan-out or background work. Do not show exhaustive `_async` wrapper rewrites as the normal usage pattern.
 - Automatic recovery from transient disconnects is a core client requirement. Reconnect should happen in the background, preserve user subscriptions, replay subscription commands, flush buffered publishes, and avoid requiring application code to recreate the client.
 - Connection status uses `EnumX.jl`; compare against namespaced values such as `ConnectionStatus.CONNECTED`, not bare enum constants.
 - Extend Base functions deliberately (`close`, `flush`, `fetch`) by importing them in `src/Natter.jl`; avoid accidental shadowing.
