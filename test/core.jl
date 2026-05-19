@@ -41,6 +41,8 @@ end
     @test N.ConnectOptions().allow_reconnect
     @test !N.ConnectOptions().retry_on_initial_connect
     @test N.ConnectOptions().max_reconnect_attempts == -1
+    @test N.ConnectOptions().tcp_nodelay
+    @test !N.ConnectOptions(tcp_nodelay=false).tcp_nodelay
     @test N.ConnectOptions(pending_size=0).pending_size == 0
     @test N.ConnectOptions().read_buffer_size == 64 * 1024
     @test N.ConnectOptions().sub_pending_msgs_limit == 1024
@@ -745,6 +747,7 @@ end
     rejects(read_buffer_size=0)
     rejects(read_buffer_size=true)
     rejects(write_buffer_size=-1)
+    rejects(tcp_nodelay=1)
     rejects(direct_write_threshold=-1)
     rejects(read_buffer_shrink_threshold=1024, read_buffer_size=2048)
     rejects(write_timeout=0)

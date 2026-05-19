@@ -459,7 +459,7 @@ function _resolve_connect_address(host::String, port::Int, timeout::Real,
     value
 end
 
-function _connect_tcp(host::String, port::Int, timeout::Real,
+function _connect_tcp(host::String, port::Int, timeout::Real, tcp_nodelay::Bool,
                       cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     timeout = Float64(timeout)
@@ -494,6 +494,7 @@ function _connect_tcp(host::String, port::Int, timeout::Real,
             throw(TimeoutError("connect to $host:$port timed out"))
         end
         Sockets.wait_connected(sock)
+        Sockets.nagle(sock, !tcp_nodelay)
         connected = true
         return sock
     finally
@@ -1423,7 +1424,8 @@ function _connect_once!(client::Client, server::Server; mark_connected::Bool=tru
     scheme, host, port, url_user, url_pass = _server_parts(server.url)
     tls_host = _tls_server_name(client.options, server, host)
     deadline::Float64 = time() + client.options.connect_timeout
-    sock = _connect_tcp(host, port, _remaining_timeout(deadline), cancel_token)
+    sock = _connect_tcp(host, port, _remaining_timeout(deadline), client.options.tcp_nodelay,
+                        cancel_token)
     read_io = sock
     write_io = sock
     reader = ProtocolReader(read_io; read_size=client.options.read_buffer_size,

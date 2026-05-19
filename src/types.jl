@@ -757,6 +757,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
     tls_ca_path::Union{String,Nothing}
     tls_cert_path::Union{String,Nothing}
     tls_key_path::Union{String,Nothing}
+    tcp_nodelay::Bool
     connect_timeout::Float64
     ping_interval::Float64
     max_outstanding_pings::Int
@@ -789,7 +790,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
 
     function ConnectOptions(
         servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
-        tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
+        tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, tcp_nodelay, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
         reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
         pending_size, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
@@ -814,6 +815,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
         tls_cert_path = _connect_option_optional_string("tls_cert_path", tls_cert_path)
         tls_key_path = _connect_option_optional_string("tls_key_path", tls_key_path)
         _validate_connect_option_tls(tls_cert_path, tls_key_path)
+        tcp_nodelay = _connect_option_bool("tcp_nodelay", tcp_nodelay)
         connect_timeout = _connect_option_positive_float("connect_timeout", connect_timeout)
         ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
         max_outstanding_pings = _connect_option_positive_int("max_outstanding_pings", max_outstanding_pings)
@@ -852,7 +854,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
 
         new{typeof(auth)}(
             servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
-            tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, connect_timeout, ping_interval,
+            tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, tcp_nodelay, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
             reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
             pending_size, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
@@ -920,6 +922,7 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                         tls_first=nothing, tls_verify=true,
                         tls_server_name=nothing, tls_ca_path=nothing,
                         tls_cert_path=nothing, tls_key_path=nothing,
+                        tcp_nodelay=true,
                         connect_timeout=2.0, ping_interval=120.0, max_outstanding_pings=2,
                         allow_reconnect=true, retry_on_initial_connect=false,
                         reconnect_wait=0.5, reconnect_max_wait=5.0, reconnect_jitter=0.1,
@@ -941,7 +944,7 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                         reconnect_delay_cb=_default_reconnect_delay_cb)
     ConnectOptions(servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required,
                    tls_first, tls_verify, tls_server_name, tls_ca_path,
-                   tls_cert_path, tls_key_path, connect_timeout,
+                   tls_cert_path, tls_key_path, tcp_nodelay, connect_timeout,
                    ping_interval, max_outstanding_pings, allow_reconnect,
                    retry_on_initial_connect, reconnect_wait, reconnect_max_wait,
                    reconnect_jitter, max_reconnect_attempts, pending_size,

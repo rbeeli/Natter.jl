@@ -63,4 +63,10 @@ env JULIA_NUM_THREADS=2 julia --project=. benchmarks/run.jl
 docker stop natter-perf
 ```
 
+The report separates direct writes, buffered batch publish, publish-plus-flush,
+callback dispatch, request/reply latency, concurrent publish, reconnect recovery,
+and hot-path allocations. Compare Natter with other clients by matching the
+same publish semantics; buffered batch numbers are not the same operation as
+per-message flush or direct socket writes.
+
 The `Performance` GitHub Actions workflow runs the same report on a schedule and on demand, then uploads Markdown and JSON artifacts for trend review.

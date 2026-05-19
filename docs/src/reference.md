@@ -64,6 +64,7 @@ Conventions:
 | `reconnect_jitter` | `0.1` | Added reconnect jitter. |
 | `max_reconnect_attempts` | `-1` | `-1` means unlimited reconnect and initial-retry attempts. |
 | `pending_size` | `2 MiB` | Byte limit for opt-in reconnect publish replay; `0` disables replay buffering. |
+| `tcp_nodelay` | `true` | Disable Nagle's algorithm for low-latency small writes. |
 | `read_buffer_size` | `64 KiB` | Inbound socket read buffer used by the protocol parser. |
 | `read_buffer_shrink_threshold` | `256 KiB` | Parser buffer capacity above this size is released after oversized consumed frames. |
 | `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |

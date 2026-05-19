@@ -179,7 +179,9 @@ function _write_publish_to_io(client::Client, io::BufferedWriteIO, frame::_Abstr
     captured, attempted = false, false
     try
         if direct_write || _should_write_publish_direct(frame_size, threshold)
-            _flush_write_io(client, io)
+            if _buffered_bytes(io) > 0 || _replayable_bytes(io) > 0
+                _flush_write_io(client, io)
+            end
             transport = _underlying_transport(io)
             attempted = true
             _write_pub_frame_direct_timed(client, transport, frame; force_flush=true)
