@@ -93,6 +93,7 @@ mutable struct JetStreamPublishFuture{C<:Client,S<:AbstractJetStreamAsyncPublish
     retry_attempts::Int
     retry_wait::Float64
     retries::Int
+    retry_deadline::Float64
     retry_frame::Union{_AbstractPublishFrame,Nothing}
     ready::Bool
     active::Bool
@@ -110,7 +111,9 @@ mutable struct JetStreamAsyncPublishState{C<:Client} <: AbstractJetStreamAsyncPu
     max_pending::Int
     pending::Int
     next_token::Int
+    wait_queue::_ConditionTimeoutQueue
     deadline_queue::_DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}
+    retry_queue::_DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}
     timeout_task::Union{Task,Nothing}
 end
 
@@ -144,6 +147,8 @@ function JetStreamAsyncPublishState(client::C, max_pending::Int) where {C<:Clien
         max_pending,
         0,
         0,
+        _ConditionTimeoutQueue(),
+        _DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}(),
         _DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}(),
         nothing,
     )
@@ -807,9 +812,11 @@ function _resolve_js_publish_future_locked!(future::JetStreamPublishFuture{C},
         state.pending = max(0, state.pending - 1)
         if isempty(state.futures)
             empty!(state.deadline_queue)
+            empty!(state.retry_queue)
             _notify_js_async_publish_timeout_task_locked(state)
         else
             _compact_js_async_publish_deadline_queue_locked!(state)
+            _compact_js_async_publish_retry_queue_locked!(state)
         end
     end
     notify(state.condition; all=true)
@@ -834,6 +841,7 @@ function _clear_js_async_publish_pending!(state::JetStreamAsyncPublishState{C},
     try
         if isempty(state.futures)
             empty!(state.deadline_queue)
+            empty!(state.retry_queue)
             _notify_js_async_publish_timeout_task_locked(state)
             return nothing
         end
@@ -847,6 +855,7 @@ function _clear_js_async_publish_pending!(state::JetStreamAsyncPublishState{C},
         end
         empty!(state.futures)
         empty!(state.deadline_queue)
+        empty!(state.retry_queue)
         notify(state.condition; all=true)
         _notify_js_async_publish_timeout_task_locked(state)
     finally
@@ -956,39 +965,25 @@ end
 
 function _retry_js_async_publish!(future::JetStreamPublishFuture{C})::Bool where {C<:Client}
     state = future.state::JetStreamAsyncPublishState{C}
-    frame = nothing
-    retry_wait = 0.0
     lock(state.condition)
     try
         future.active || return false
         future.retries < future.retry_attempts || return false
-        remaining = future.deadline - time()
+        now = time()
+        remaining = future.deadline - now
         remaining > 0 || return false
         retry_frame = future.retry_frame
         isnothing(retry_frame) && return false
         future.retries += 1
-        frame = retry_frame
-        retry_wait = min(future.retry_wait, remaining)
+        future.retry_deadline = now + min(future.retry_wait, remaining)
+        wake_timeout = _deadline_queue_push!(state.retry_queue, future.token,
+                                             future.retry_deadline, future)
+        _ensure_js_async_publish_timeout_task_locked!(state)
+        wake_timeout && _notify_js_async_publish_timeout_task_locked(state)
+        return true
     finally
         unlock(state.condition)
     end
-
-    @async begin
-        sleep(retry_wait)
-        lock(state.condition)
-        try
-            future.active && future.deadline > time() || return
-            isnothing(_js_async_publish_connection_error(state.client, future.generation)) || return
-        finally
-            unlock(state.condition)
-        end
-        try
-            _publish_frame_unchecked(state.client, frame; buffer_on_reconnect=false)
-        catch err
-            _resolve_js_publish_future!(future, err)
-        end
-    end
-    true
 end
 
 function _ensure_js_async_publish_timeout_task_locked!(state::JetStreamAsyncPublishState)
@@ -1029,24 +1024,50 @@ function _compact_js_async_publish_deadline_queue_locked!(state::JetStreamAsyncP
     _rebuild_js_async_publish_deadline_queue_locked!(state)
 end
 
+function _js_async_publish_retry_entry_valid_locked(state::JetStreamAsyncPublishState,
+                                                   entry::_DeadlineEntry)::Bool
+    future = get(state.futures, entry.token, nothing)
+    future === entry.value && future.active && future.retry_deadline == entry.deadline
+end
+
+function _next_js_async_publish_retry_entry_locked!(state::JetStreamAsyncPublishState)
+    while true
+        entry = _deadline_queue_peek(state.retry_queue)
+        isnothing(entry) && return nothing
+        _js_async_publish_retry_entry_valid_locked(state, entry) && return entry
+        _deadline_queue_pop!(state.retry_queue)
+    end
+end
+
+function _rebuild_js_async_publish_retry_queue_locked!(state::JetStreamAsyncPublishState{C}) where {C<:Client}
+    queue = _DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}()
+    for (token, future) in state.futures
+        future.active && isfinite(future.retry_deadline) &&
+            _deadline_queue_push!(queue, token, future.retry_deadline, future)
+    end
+    state.retry_queue = queue
+    nothing
+end
+
+function _compact_js_async_publish_retry_queue_locked!(state::JetStreamAsyncPublishState)
+    _deadline_queue_compaction_due(state.retry_queue, length(state.futures)) ||
+        return nothing
+    _rebuild_js_async_publish_retry_queue_locked!(state)
+end
+
 function _notify_js_async_publish_timeout_task_locked(state::JetStreamAsyncPublishState)
     notify(state.timeout_condition; all=true)
     nothing
 end
 
 function _wait_js_async_publish_timeout_locked!(state::JetStreamAsyncPublishState, delay::Float64)
-    timer = Timer(min(delay, _MAX_TIMER_DELAY_SECONDS)) do _
-        lock(state.timeout_condition)
-        try
-            _notify_js_async_publish_timeout_task_locked(state)
-        finally
-            unlock(state.timeout_condition)
-        end
-    end
+    sleep_for = isfinite(delay) ? min(max(delay, 0.0), _CONDITION_TIMEOUT_POLL_SECONDS) :
+                _CONDITION_TIMEOUT_POLL_SECONDS
+    unlock(state.condition)
     try
-        wait(state.timeout_condition)
+        sleep(sleep_for)
     finally
-        close(timer)
+        lock(state.condition)
     end
     nothing
 end
@@ -1057,44 +1078,74 @@ function _js_async_publish_timeout_loop(state::JetStreamAsyncPublishState{C}) wh
         while true
             if isempty(state.futures)
                 empty!(state.deadline_queue)
+                empty!(state.retry_queue)
                 state.timeout_task = nothing
                 return nothing
             end
 
-            entry = _next_js_async_publish_deadline_entry_locked!(state)
-            if isnothing(entry)
+            deadline_entry = _next_js_async_publish_deadline_entry_locked!(state)
+            if isnothing(deadline_entry)
                 _rebuild_js_async_publish_deadline_queue_locked!(state)
-                entry = _next_js_async_publish_deadline_entry_locked!(state)
-                if isnothing(entry)
+                deadline_entry = _next_js_async_publish_deadline_entry_locked!(state)
+                if isnothing(deadline_entry)
                     empty!(state.futures)
                     empty!(state.deadline_queue)
+                    empty!(state.retry_queue)
                     state.pending = 0
                     state.timeout_task = nothing
                     return nothing
                 end
             end
 
-            err = _js_async_publish_connection_error(state.client, entry.value.generation)
+            retry_entry = _next_js_async_publish_retry_entry_locked!(state)
+            use_retry = !isnothing(retry_entry) && retry_entry.deadline <= deadline_entry.deadline
+            entry = use_retry ? retry_entry : deadline_entry
+            future = entry.value
+
+            err = _js_async_publish_connection_error(state.client, future.generation)
             if !isnothing(err)
-                _deadline_queue_pop!(state.deadline_queue)
+                use_retry ? _deadline_queue_pop!(state.retry_queue) :
+                            _deadline_queue_pop!(state.deadline_queue)
                 future = get(state.futures, entry.token, nothing)
-                if future === entry.value && future.active && future.deadline == entry.deadline
+                if future === entry.value && future.active &&
+                   (use_retry ? future.retry_deadline == entry.deadline :
+                    future.deadline == entry.deadline)
                     _resolve_js_publish_future_locked!(future, err)
                 end
                 continue
             end
 
             delay = entry.deadline - time()
-            if !isfinite(delay)
-                wait(state.timeout_condition)
-            elseif delay <= 0
+            if delay > 0
+                _wait_js_async_publish_timeout_locked!(state, delay)
+            elseif use_retry
+                _deadline_queue_pop!(state.retry_queue)
+                future = get(state.futures, entry.token, nothing)
+                if future === entry.value && future.active &&
+                   future.retry_deadline == entry.deadline
+                    future.retry_deadline = Inf
+                    retry_frame = future.retry_frame
+                    isnothing(retry_frame) && continue
+                    publish_err::Union{Exception,Nothing} = nothing
+                    unlock(state.condition)
+                    try
+                        try
+                            _publish_frame_unchecked(state.client, retry_frame; buffer_on_reconnect=false)
+                        catch err
+                            publish_err = err
+                        end
+                    finally
+                        lock(state.condition)
+                    end
+                    isnothing(publish_err) ||
+                        _resolve_js_publish_future_locked!(future, publish_err)
+                end
+            else
                 _deadline_queue_pop!(state.deadline_queue)
                 future = get(state.futures, entry.token, nothing)
                 if future === entry.value && future.active && future.deadline == entry.deadline
                     _resolve_js_publish_future_locked!(future, TimeoutError("JetStream async publish ack timed out"))
                 end
-            else
-                _wait_js_async_publish_timeout_locked!(state, delay)
             end
         end
     finally
@@ -1167,7 +1218,8 @@ function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
             isnothing(err) || throw(err)
             remaining = deadline - time()
             remaining > 0 || throw(TimeoutError("JetStream async publish backpressure timed out"))
-            ready = _wait_until_condition_locked(state.condition, remaining; cancel_token) do
+            ready = _wait_condition_timeout_queue_locked(state.condition, state.wait_queue,
+                                                         remaining; cancel_token) do
                 state.pending < state.max_pending ||
                     !isnothing(_js_async_publish_connection_error(state.client, generation))
             end
@@ -1178,7 +1230,7 @@ function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
         reply = string(state.prefix, '.', token)
         future = JetStreamPublishFuture{C,typeof(state)}(
             state, token, reply, String(subject), deadline, generation, retry_attempts,
-            retry_wait, 0, retry_frame, false, true, nothing)
+            retry_wait, 0, Inf, retry_frame, false, true, nothing)
         state.futures[token] = future
         state.pending += 1
         wake_timeout = _deadline_queue_push!(state.deadline_queue, token, deadline, future)
@@ -1291,7 +1343,8 @@ function js_publish_future_complete(js::JetStreamContext; timeout::Real=js.timeo
         while state.pending > 0
             remaining = deadline - time()
             remaining > 0 || throw(TimeoutError("JetStream async publish completion timed out"))
-            ready = _wait_until_condition_locked(state.condition, remaining; cancel_token) do
+            ready = _wait_condition_timeout_queue_locked(state.condition, state.wait_queue,
+                                                         remaining; cancel_token) do
                 state.pending == 0
             end
             ready || throw(TimeoutError("JetStream async publish completion timed out"))
@@ -2452,6 +2505,7 @@ mutable struct PullSubscription{C<:Client,J<:JetStreamContext{C}}
     consumer::String
     next_subject::String
     fetch_lock::ReentrantLock
+    fetch_payload_buffer::Vector{UInt8}
     close_lock::ReentrantLock
     delete_on_close::Bool
     closed::Bool
@@ -2487,7 +2541,7 @@ function PullSubscription(js::J, stream::AbstractString, consumer::AbstractStrin
     stream = String(stream)
     consumer = String(consumer)
     PullSubscription{C,J}(js, stream, consumer, _pull_fetch_next_subject(js, stream, consumer),
-                          fetch_lock, close_lock, delete_on_close, closed, false, nothing,
+                          fetch_lock, UInt8[], close_lock, delete_on_close, closed, false, nothing,
                           0, false, Subscription{C}[], nothing, false,
                           priority_policy, copy(priority_groups))
 end
@@ -3399,7 +3453,7 @@ function _next_pull_fetch_msg(sub::Subscription, timeout::Real;
         st = status(client)
         closed && empty && _throw_pull_fetch_wait_interrupted(closed, st)
         ready = @lock sub.lock begin
-            _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline); cancel_token) do
+            _wait_subscription_condition_locked(sub, _remaining_timeout(deadline); cancel_token) do
                 isready(sub.messages) || sub.closed || status(client) != ConnectionStatus.CONNECTED
             end
         end
@@ -3434,15 +3488,16 @@ function _prepare_pull_fetch_request!(psub::PullSubscription, request_subject::S
                                       min_pending::Union{Int,Nothing},
                                       min_ack_pending::Union{Int,Nothing},
                                       priority_group::Union{String,Nothing},
-                                      priority::Union{Int,Nothing}, reply::String,
-                                      buffer::Vector{UInt8};
+                                      priority::Union{Int,Nothing}, reply::String;
                                       cancel_token::MaybeCancellationToken=nothing)
     _check_pull_subscription_open(psub)
-    pin_id = @lock psub.fetch_lock psub.pin_id
-    payload = _pull_fetch_request_payload!(buffer, batch, expires_ns, heartbeat_ns, max_bytes,
-                                           no_wait, pin_id, min_pending, min_ack_pending,
-                                           priority_group, priority)
-    _publish_pull_fetch_request(psub, request_subject, payload, reply; cancel_token)
+    @lock psub.fetch_lock begin
+        payload = _pull_fetch_request_payload!(psub.fetch_payload_buffer, batch, expires_ns,
+                                               heartbeat_ns, max_bytes, no_wait, psub.pin_id,
+                                               min_pending, min_ack_pending, priority_group,
+                                               priority)
+        _publish_pull_fetch_request(psub, request_subject, payload, reply; cancel_token)
+    end
     nothing
 end
 
@@ -3469,12 +3524,11 @@ function fetch(psub::PullSubscription{C}, batch=1; timeout::Real=psub.js.timeout
         request_subject = psub.next_subject
         reply = delivery.subject
         heartbeat_ns = heartbeat_seconds > 0 ? _seconds_to_nanoseconds(heartbeat_seconds) : 0
-        payload_buffer = UInt8[]
         _prepare_pull_fetch_request!(psub, request_subject, batch,
                                      _seconds_to_nanoseconds(expires_seconds),
                                      heartbeat_ns, max_bytes_int, no_wait_bool,
                                      min_pending, min_ack_pending,
-                                     priority_group, priority, reply, payload_buffer;
+                                     priority_group, priority, reply;
                                      cancel_token)
         sizehint!(result, _pull_delivery_pending_msgs_limit(psub.js.client, batch))
         deadline = time() + timeout_seconds
@@ -3614,7 +3668,7 @@ function _next_pull_stream_msg(stream::PullMessageStream, timeout::Real)
         st = status(client)
         closed && empty && _throw_pull_fetch_wait_interrupted(closed, st)
         ready = @lock sub.lock begin
-            _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline)) do
+            _wait_subscription_condition_locked(sub, _remaining_timeout(deadline)) do
                 isready(sub.messages) || sub.closed || status(client) != ConnectionStatus.CONNECTED ||
                     _pull_stream_closed(stream.state)
             end

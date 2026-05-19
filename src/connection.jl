@@ -2234,6 +2234,28 @@ function _pending_replay_batch_size(client::Client)::Int
     threshold > 0 ? threshold : DEFAULT_WRITE_BUFFER_SIZE
 end
 
+function _write_pending_entries(client::Client, entries::Vector{_PendingEntry};
+                                write_mode::_RawWriteMode)
+    _with_write_lock(client, "write pending replay") do
+        st = status(client)
+        io = @atomic client.write_io
+        reconnect_pending = client.write_reconnect_pending[]
+        reconnect_pending && st == ConnectionStatus.CONNECTED &&
+            write_mode != _RAW_WRITE_RECONNECT_REPLAY && throw(ConnectionReconnectingError())
+        _ensure_raw_write_status(st, write_mode)
+        isnothing(io) && throw(ConnectionClosedError("connection transport is closed"))
+
+        data = if length(entries) == 1
+            entries[1].data
+        else
+            _pending_entries_write_bytes!(client.write_scratch, entries)
+        end
+        _write_raw_data_to_io(client, io, data)
+        _flush_or_signal_locked(client, io, true)
+    end
+    nothing
+end
+
 function _flush_pending_buffer(client::Client; generation::Union{Int,Nothing}=nothing,
                                reconnect_replay::Bool=false)
     write_mode = reconnect_replay ? _RAW_WRITE_RECONNECT_REPLAY : _RAW_WRITE_CONNECTED
@@ -2247,8 +2269,7 @@ function _flush_pending_buffer(client::Client; generation::Union{Int,Nothing}=no
         isempty(entries) && return
         try
             _validate_pending_replay_for_client(client, entries)
-            data = _pending_entries_write_bytes(entries)
-            _write_raw(client, data; force_flush=true, write_mode)
+            _write_pending_entries(client, entries; write_mode)
             _release_pending_bytes!(client, _pending_entries_size(entries))
         catch err
             _restore_pending_after_replay_failure!(client, entries, replay_generation)

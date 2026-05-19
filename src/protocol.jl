@@ -746,9 +746,22 @@ function _header_protocol_status_start(raw::AbstractVector{UInt8}, line_first::I
     _skip_hspace(raw, pos, line_last)
 end
 
+function _validate_header_protocol_status(raw::AbstractVector{UInt8}, line_first::Int,
+                                          line_last::Int)::Tuple{Int,Int,Int}
+    pos = _header_protocol_status_start(raw, line_first, line_last)
+    isnothing(pos) && throw(ProtocolError("invalid NATS header block"))
+    pos > line_last && return 0, 1, 0
+    status_start, status_end, pos = _next_token(raw, pos, line_last)
+    _all_digits(raw, status_start, status_end) ||
+        throw(ProtocolError("invalid NATS header block"))
+    status = _parse_int_token(raw, status_start, status_end)
+    description_start = _skip_hspace(raw, pos, line_last)
+    description_start <= line_last ? (status, description_start, line_last) : (status, 1, 0)
+end
+
 function _parse_header_protocol_line!(headers::Headers, raw::AbstractVector{UInt8}, line_first::Int, line_last::Int)
-    _validate_header_protocol_line(raw, line_first, line_last)
-    status, description_start, description_end = _header_protocol_status(raw, line_first, line_last)
+    status, description_start, description_end =
+        _validate_header_protocol_status(raw, line_first, line_last)
     if status != 0
         headers["Status"] = [string(status)]
         description_start <= description_end &&
@@ -758,11 +771,7 @@ function _parse_header_protocol_line!(headers::Headers, raw::AbstractVector{UInt
 end
 
 function _validate_header_protocol_line(raw::AbstractVector{UInt8}, line_first::Int, line_last::Int)
-    pos = _header_protocol_status_start(raw, line_first, line_last)
-    isnothing(pos) && throw(ProtocolError("invalid NATS header block"))
-    pos > line_last && return nothing
-    status_start, status_end, _ = _next_token(raw, pos, line_last)
-    _all_digits(raw, status_start, status_end) || throw(ProtocolError("invalid NATS header block"))
+    _validate_header_protocol_status(raw, line_first, line_last)
     nothing
 end
 
@@ -784,8 +793,8 @@ function _validate_headers(raw::AbstractVector{UInt8})::Tuple{Int,Int,Int}
     isnothing(newline) && throw(ProtocolError("NATS header block missing terminator"))
     protocol_end = newline - 1
     protocol_end >= raw_first && raw[protocol_end] == UInt8('\r') && (protocol_end -= 1)
-    _validate_header_protocol_line(raw, raw_first, protocol_end)
-    status, description_first, description_last = _header_protocol_status(raw, raw_first, protocol_end)
+    status, description_first, description_last =
+        _validate_header_protocol_status(raw, raw_first, protocol_end)
 
     pos = newline + 1
     while pos <= raw_last

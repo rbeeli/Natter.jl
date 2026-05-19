@@ -294,6 +294,17 @@ end
 _pending_entries_write_bytes(entries::Vector{_PendingEntry}) =
     length(entries) == 1 ? entries[1].data : _pending_entries_bytes(entries)
 
+function _pending_entries_write_bytes!(scratch::Vector{UInt8},
+                                       entries::Vector{_PendingEntry})::Vector{UInt8}
+    resize!(scratch, _pending_entries_size(entries))
+    pos = 1
+    for entry in entries
+        pos = _copy_pending_entry_bytes!(scratch, pos, entry)
+    end
+    pos == length(scratch) + 1 || throw(AssertionError("pending replay size mismatch"))
+    scratch
+end
+
 struct _ReplayableEntry
     start::Int
     bytes::Int
@@ -1243,43 +1254,75 @@ end
 mutable struct PendingBuffer
     chunks::Vector{_PendingEntry}
     head::Int
+    len::Int
 end
 
-PendingBuffer() = PendingBuffer(_PendingEntry[], 1)
+PendingBuffer() = PendingBuffer(_PendingEntry[], 1, 0)
 
-Base.isempty(buffer::PendingBuffer) = buffer.head > length(buffer.chunks)
+Base.isempty(buffer::PendingBuffer) = buffer.len == 0
 
 function Base.empty!(buffer::PendingBuffer)
     empty!(buffer.chunks)
     buffer.head = 1
+    buffer.len = 0
     buffer
 end
 
+@inline _pending_buffer_capacity(buffer::PendingBuffer)::Int = length(buffer.chunks)
+
+@inline function _pending_buffer_index(buffer::PendingBuffer, offset::Int)::Int
+    mod1(buffer.head + offset, _pending_buffer_capacity(buffer))
+end
+
+function _resize_pending_buffer!(buffer::PendingBuffer, capacity::Int)
+    capacity = max(capacity, buffer.len)
+    if capacity == 0
+        empty!(buffer)
+        return buffer
+    end
+
+    chunks = Vector{_PendingEntry}(undef, capacity)
+    fill!(chunks, EMPTY_PENDING_ENTRY)
+    for i in 1:buffer.len
+        chunks[i] = buffer.chunks[_pending_buffer_index(buffer, i - 1)]
+    end
+    buffer.chunks = chunks
+    buffer.head = 1
+    buffer
+end
+
+function _ensure_pending_buffer_capacity!(buffer::PendingBuffer, needed::Int)
+    needed <= _pending_buffer_capacity(buffer) && return buffer
+    capacity = max(8, _pending_buffer_capacity(buffer))
+    while capacity < needed
+        capacity *= 2
+    end
+    _resize_pending_buffer!(buffer, capacity)
+end
+
 function _compact_pending_buffer!(buffer::PendingBuffer)
-    if buffer.head > 1
-        deleteat!(buffer.chunks, 1:(buffer.head - 1))
-        buffer.head = 1
+    if buffer.len == 0
+        empty!(buffer)
+    elseif _pending_buffer_capacity(buffer) > max(64, 4 * buffer.len)
+        _resize_pending_buffer!(buffer, max(8, 2 * buffer.len))
     end
     buffer
 end
 
 function _push_pending_chunk!(buffer::PendingBuffer, entry::_PendingEntry)
-    push!(buffer.chunks, entry)
+    _ensure_pending_buffer_capacity!(buffer, buffer.len + 1)
+    buffer.chunks[_pending_buffer_index(buffer, buffer.len)] = entry
+    buffer.len += 1
     buffer
 end
 _push_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8}) =
     _push_pending_chunk!(buffer, _PendingEntry(data))
 
 function _prepend_pending_chunk!(buffer::PendingBuffer, entry::_PendingEntry)
-    if isempty(buffer)
-        empty!(buffer)
-        push!(buffer.chunks, entry)
-    elseif buffer.head > 1
-        buffer.head -= 1
-        buffer.chunks[buffer.head] = entry
-    else
-        pushfirst!(buffer.chunks, entry)
-    end
+    _ensure_pending_buffer_capacity!(buffer, buffer.len + 1)
+    buffer.head = buffer.head == 1 ? _pending_buffer_capacity(buffer) : buffer.head - 1
+    buffer.chunks[buffer.head] = entry
+    buffer.len += 1
     buffer
 end
 _prepend_pending_chunk!(buffer::PendingBuffer, data::Vector{UInt8}) =
@@ -1295,31 +1338,32 @@ end
 function _pop_pending_batch!(buffer::PendingBuffer, max_bytes::Int)::Vector{_PendingEntry}
     isempty(buffer) && return _PendingEntry[]
     max_bytes = max(1, max_bytes)
-    stop = buffer.head - 1
+    count = 0
     total = 0
-    while stop < length(buffer.chunks)
-        chunk = buffer.chunks[stop + 1]
+    while count < buffer.len
+        chunk = buffer.chunks[_pending_buffer_index(buffer, count)]
         chunk_size = _pending_entry_size(chunk)
         if total > 0 && total + chunk_size > max_bytes
             break
         end
-        stop += 1
+        count += 1
         total += chunk_size
         total >= max_bytes && break
     end
 
-    out = Vector{_PendingEntry}(undef, stop - buffer.head + 1)
-    pos = 1
-    for i in buffer.head:stop
-        chunk = buffer.chunks[i]
-        out[pos] = chunk
-        pos += 1
-        buffer.chunks[i] = EMPTY_PENDING_ENTRY
+    out = Vector{_PendingEntry}(undef, count)
+    old_head = buffer.head
+    for i in 1:count
+        idx = mod1(old_head + i - 1, _pending_buffer_capacity(buffer))
+        chunk = buffer.chunks[idx]
+        out[i] = chunk
+        buffer.chunks[idx] = EMPTY_PENDING_ENTRY
     end
-    buffer.head = stop + 1
-    if buffer.head > length(buffer.chunks)
+    buffer.len -= count
+    if buffer.len == 0
         empty!(buffer)
-    elseif buffer.head > 32 && buffer.head > length(buffer.chunks) ÷ 2
+    else
+        buffer.head = mod1(old_head + count, _pending_buffer_capacity(buffer))
         _compact_pending_buffer!(buffer)
     end
     out
@@ -1328,13 +1372,13 @@ end
 function Base.take!(buffer::PendingBuffer)
     isempty(buffer) && return UInt8[]
     total = 0
-    for i in buffer.head:length(buffer.chunks)
-        total += _pending_entry_size(buffer.chunks[i])
+    for i in 1:buffer.len
+        total += _pending_entry_size(buffer.chunks[_pending_buffer_index(buffer, i - 1)])
     end
     out = Vector{UInt8}(undef, total)
     pos = 1
-    for i in buffer.head:length(buffer.chunks)
-        chunk = buffer.chunks[i]
+    for i in 1:buffer.len
+        chunk = buffer.chunks[_pending_buffer_index(buffer, i - 1)]
         pos = _copy_pending_entry_bytes!(out, pos, chunk)
     end
     empty!(buffer)
@@ -1489,6 +1533,196 @@ function _borrowed_callback_handler(client::C, callback) where {C<:AbstractNatte
     _BorrowedCallback{C}(invoke)
 end
 
+struct _DeadlineEntry{V}
+    deadline::Float64
+    token::Int
+    value::V
+end
+
+mutable struct _DeadlineQueue{V}
+    heap::Vector{_DeadlineEntry{V}}
+end
+
+_DeadlineQueue{V}() where {V} = _DeadlineQueue{V}(_DeadlineEntry{V}[])
+
+Base.isempty(q::_DeadlineQueue)::Bool = isempty(q.heap)
+Base.length(q::_DeadlineQueue)::Int = length(q.heap)
+Base.empty!(q::_DeadlineQueue) = (empty!(q.heap); q)
+
+_deadline_queue_compaction_due(q::_DeadlineQueue, live::Int)::Bool =
+    length(q.heap) > max(64, live * 2)
+
+@inline function _deadline_entry_less(a::_DeadlineEntry, b::_DeadlineEntry)::Bool
+    a.deadline < b.deadline || (a.deadline == b.deadline && a.token < b.token)
+end
+
+function _deadline_queue_sift_up!(heap::Vector{_DeadlineEntry{V}}, idx::Int) where {V}
+    while idx > 1
+        parent = idx >>> 1
+        _deadline_entry_less(heap[idx], heap[parent]) || break
+        heap[idx], heap[parent] = heap[parent], heap[idx]
+        idx = parent
+    end
+    nothing
+end
+
+function _deadline_queue_sift_down!(heap::Vector{_DeadlineEntry{V}}, idx::Int) where {V}
+    len = length(heap)
+    while true
+        left = idx << 1
+        left <= len || break
+        right = left + 1
+        child = right <= len && _deadline_entry_less(heap[right], heap[left]) ? right : left
+        _deadline_entry_less(heap[child], heap[idx]) || break
+        heap[idx], heap[child] = heap[child], heap[idx]
+        idx = child
+    end
+    nothing
+end
+
+function _deadline_queue_push!(q::_DeadlineQueue{V}, token::Int, deadline::Float64,
+                               value::V)::Bool where {V}
+    earlier = isempty(q.heap) || deadline < q.heap[1].deadline
+    push!(q.heap, _DeadlineEntry{V}(deadline, token, value))
+    _deadline_queue_sift_up!(q.heap, length(q.heap))
+    earlier
+end
+
+_deadline_queue_peek(q::_DeadlineQueue) = isempty(q.heap) ? nothing : q.heap[1]
+
+function _deadline_queue_pop!(q::_DeadlineQueue)
+    isempty(q.heap) && return nothing
+    top = q.heap[1]
+    tail = pop!(q.heap)
+    if !isempty(q.heap)
+        q.heap[1] = tail
+        _deadline_queue_sift_down!(q.heap, 1)
+    end
+    top
+end
+
+mutable struct _ConditionTimeoutWaiter
+    active::Bool
+    timed_out::Bool
+    deadline::Float64
+end
+
+_ConditionTimeoutWaiter(deadline::Float64) = _ConditionTimeoutWaiter(true, false, deadline)
+
+mutable struct _ConditionTimeoutQueue
+    deadlines::_DeadlineQueue{_ConditionTimeoutWaiter}
+    next_token::Int
+    active::Int
+    task::Union{Task,Nothing}
+end
+
+_ConditionTimeoutQueue() =
+    _ConditionTimeoutQueue(_DeadlineQueue{_ConditionTimeoutWaiter}(), 0, 0, nothing)
+
+const _CONDITION_TIMEOUT_POLL_SECONDS = 0.001
+
+function _next_condition_timeout_token!(queue::_ConditionTimeoutQueue)::Int
+    token = queue.next_token == typemax(Int) ? 1 : queue.next_token + 1
+    queue.next_token = token
+    token
+end
+
+function _condition_timeout_entry_valid(entry::_DeadlineEntry{_ConditionTimeoutWaiter})::Bool
+    waiter = entry.value
+    waiter.active && waiter.deadline == entry.deadline
+end
+
+function _next_condition_timeout_deadline_locked!(queue::_ConditionTimeoutQueue)
+    while true
+        entry = _deadline_queue_peek(queue.deadlines)
+        isnothing(entry) && return nothing
+        _condition_timeout_entry_valid(entry) && return entry
+        _deadline_queue_pop!(queue.deadlines)
+    end
+end
+
+function _rebuild_condition_timeout_queue_locked!(queue::_ConditionTimeoutQueue)
+    deadlines = _DeadlineQueue{_ConditionTimeoutWaiter}()
+    active = 0
+    for entry in queue.deadlines.heap
+        if _condition_timeout_entry_valid(entry)
+            active += 1
+            _deadline_queue_push!(deadlines, entry.token, entry.deadline, entry.value)
+        end
+    end
+    queue.deadlines = deadlines
+    queue.active = active
+    nothing
+end
+
+function _compact_condition_timeout_queue_locked!(queue::_ConditionTimeoutQueue)
+    _deadline_queue_compaction_due(queue.deadlines, queue.active) ||
+        return nothing
+    _rebuild_condition_timeout_queue_locked!(queue)
+end
+
+function _condition_timeout_loop(condition::Base.GenericCondition{ReentrantLock},
+                                 queue::_ConditionTimeoutQueue)
+    while true
+        sleep_for = _CONDITION_TIMEOUT_POLL_SECONDS
+        lock(condition)
+        try
+            entry = _next_condition_timeout_deadline_locked!(queue)
+            if isnothing(entry)
+                queue.task = nothing
+                return nothing
+            end
+
+            delay = entry.deadline - time()
+            if delay <= 0
+                _deadline_queue_pop!(queue.deadlines)
+                waiter = entry.value
+                if waiter.active && waiter.deadline == entry.deadline
+                    waiter.active = false
+                    waiter.timed_out = true
+                    queue.active = max(0, queue.active - 1)
+                    notify(condition; all=true)
+                end
+                continue
+            end
+            sleep_for = min(delay, _CONDITION_TIMEOUT_POLL_SECONDS)
+        finally
+            unlock(condition)
+        end
+        sleep(sleep_for)
+    end
+end
+
+function _ensure_condition_timeout_task_locked!(condition::Base.GenericCondition{ReentrantLock},
+                                                queue::_ConditionTimeoutQueue)
+    task = queue.task
+    if isnothing(task) || istaskdone(task)
+        queue.task = @async _condition_timeout_loop(condition, queue)
+    end
+    nothing
+end
+
+function _register_condition_timeout_locked!(condition::Base.GenericCondition{ReentrantLock},
+                                             queue::_ConditionTimeoutQueue,
+                                             seconds::Float64)::_ConditionTimeoutWaiter
+    waiter = _ConditionTimeoutWaiter(time() + seconds)
+    token = _next_condition_timeout_token!(queue)
+    _deadline_queue_push!(queue.deadlines, token, waiter.deadline, waiter)
+    queue.active += 1
+    _ensure_condition_timeout_task_locked!(condition, queue)
+    waiter
+end
+
+function _deregister_condition_timeout_locked!(queue::_ConditionTimeoutQueue,
+                                               waiter::_ConditionTimeoutWaiter)
+    if waiter.active
+        waiter.active = false
+        queue.active = max(0, queue.active - 1)
+        _compact_condition_timeout_queue_locked!(queue)
+    end
+    nothing
+end
+
 mutable struct Subscription{C<:AbstractNatterClient}
     client::C
     lock::ReentrantLock
@@ -1500,6 +1734,7 @@ mutable struct Subscription{C<:AbstractNatterClient}
     borrowed_callback_handler::_BorrowedCallback{C}
     messages::MsgQueue{Msg}
     condition::Base.GenericCondition{ReentrantLock}
+    timeout_queue::_ConditionTimeoutQueue
     control_handler::_SubscriptionControlHandler
     pending_msgs_limit::Int
     pending_bytes_limit::Int
@@ -1526,7 +1761,7 @@ function Subscription(client::C, sid::Int, subject::String, queue::Union{String,
                       server_delivered_base::Int, processing::Int) where {C<:AbstractNatterClient}
     Subscription{C}(client, lock, sid, subject, queue, !isnothing(callback),
                     borrowed_callback, _borrowed_callback_handler(client, borrowed_callback ? callback : nothing),
-                    messages, condition, control_handler,
+                    messages, condition, _ConditionTimeoutQueue(), control_handler,
                     pending_msgs_limit, pending_bytes_limit, pending_bytes, received,
                     delivered, dropped_msgs, max_msgs, closed, processor, server_active,
                     server_delivered_base, processing)
@@ -1627,74 +1862,6 @@ function _filter_pong_waiter_queue!(f::Function, q::PongWaiterQueue)
         push!(q, waiter)
     end
     q
-end
-
-struct _DeadlineEntry{V}
-    deadline::Float64
-    token::Int
-    value::V
-end
-
-mutable struct _DeadlineQueue{V}
-    heap::Vector{_DeadlineEntry{V}}
-end
-
-_DeadlineQueue{V}() where {V} = _DeadlineQueue{V}(_DeadlineEntry{V}[])
-
-Base.isempty(q::_DeadlineQueue)::Bool = isempty(q.heap)
-Base.length(q::_DeadlineQueue)::Int = length(q.heap)
-Base.empty!(q::_DeadlineQueue) = (empty!(q.heap); q)
-
-_deadline_queue_compaction_due(q::_DeadlineQueue, live::Int)::Bool =
-    length(q.heap) > max(64, live * 2)
-
-@inline function _deadline_entry_less(a::_DeadlineEntry, b::_DeadlineEntry)::Bool
-    a.deadline < b.deadline || (a.deadline == b.deadline && a.token < b.token)
-end
-
-function _deadline_queue_sift_up!(heap::Vector{_DeadlineEntry{V}}, idx::Int) where {V}
-    while idx > 1
-        parent = idx >>> 1
-        _deadline_entry_less(heap[idx], heap[parent]) || break
-        heap[idx], heap[parent] = heap[parent], heap[idx]
-        idx = parent
-    end
-    nothing
-end
-
-function _deadline_queue_sift_down!(heap::Vector{_DeadlineEntry{V}}, idx::Int) where {V}
-    len = length(heap)
-    while true
-        left = idx << 1
-        left <= len || break
-        right = left + 1
-        child = right <= len && _deadline_entry_less(heap[right], heap[left]) ? right : left
-        _deadline_entry_less(heap[child], heap[idx]) || break
-        heap[idx], heap[child] = heap[child], heap[idx]
-        idx = child
-    end
-    nothing
-end
-
-function _deadline_queue_push!(q::_DeadlineQueue{V}, token::Int, deadline::Float64,
-                               value::V)::Bool where {V}
-    earlier = isempty(q.heap) || deadline < q.heap[1].deadline
-    push!(q.heap, _DeadlineEntry{V}(deadline, token, value))
-    _deadline_queue_sift_up!(q.heap, length(q.heap))
-    earlier
-end
-
-_deadline_queue_peek(q::_DeadlineQueue) = isempty(q.heap) ? nothing : q.heap[1]
-
-function _deadline_queue_pop!(q::_DeadlineQueue)
-    isempty(q.heap) && return nothing
-    top = q.heap[1]
-    tail = pop!(q.heap)
-    if !isempty(q.heap)
-        q.heap[1] = tail
-        _deadline_queue_sift_down!(q.heap, 1)
-    end
-    top
 end
 
 mutable struct RequestWaiter{C<:AbstractNatterClient}
@@ -1913,6 +2080,42 @@ function _wait_until_condition_locked(predicate::Function, condition::Base.Gener
         _deregister_cancellation_waiter!(cancel_token, registration)
         isnothing(timer) || close(timer)
     end
+end
+
+function _wait_condition_timeout_queue_locked(predicate::Function,
+                                             condition::Base.GenericCondition{ReentrantLock},
+                                             queue::_ConditionTimeoutQueue,
+                                             timeout::Real;
+                                             cancel_token::MaybeCancellationToken=nothing)::Bool
+    _throw_if_cancelled(cancel_token)
+    predicate() && return true
+    seconds = Float64(timeout)
+    seconds > 0 || return false
+    if !isfinite(seconds)
+        return _wait_until_notified_locked(predicate, condition; cancel_token)
+    end
+
+    registration = _register_cancellation_waiter(cancel_token, condition)
+    waiter = _register_condition_timeout_locked!(condition, queue, seconds)
+    try
+        while !predicate()
+            _throw_if_cancelled(cancel_token)
+            waiter.timed_out && return false
+            wait(condition)
+        end
+        _throw_if_cancelled(cancel_token)
+        true
+    finally
+        _deregister_condition_timeout_locked!(queue, waiter)
+        _deregister_cancellation_waiter!(cancel_token, registration)
+    end
+end
+
+function _wait_subscription_condition_locked(predicate::Function, sub::Subscription,
+                                             timeout::Real;
+                                             cancel_token::MaybeCancellationToken=nothing)::Bool
+    _wait_condition_timeout_queue_locked(predicate, sub.condition, sub.timeout_queue, timeout;
+                                         cancel_token)
 end
 
 function _wait_until_notified_locked(predicate::Function,

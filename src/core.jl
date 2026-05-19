@@ -1182,8 +1182,8 @@ function next(sub::Subscription; timeout::Real=1.0, cancel_token::MaybeCancellat
             if sub.closed && !isready(sub.messages)
                 :closed
             else
-                ready = _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline);
-                                                     cancel_token) do
+                ready = _wait_subscription_condition_locked(sub, _remaining_timeout(deadline);
+                                                           cancel_token) do
                     isready(sub.messages) || sub.closed
                 end
                 ready ? :retry : :timeout
@@ -1315,7 +1315,7 @@ end
 function _drain_wait_subscription!(sub::Subscription, deadline::Float64;
                                    cancel_token::MaybeCancellationToken=nothing)
     ready = @lock sub.lock begin
-        _wait_until_condition_locked(sub.condition, _remaining_timeout(deadline); cancel_token) do
+        _wait_subscription_condition_locked(sub, _remaining_timeout(deadline); cancel_token) do
             !isready(sub.messages) && sub.processing == 0
         end
     end
