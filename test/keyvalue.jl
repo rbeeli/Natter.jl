@@ -2,12 +2,14 @@ using TestItems
 
 @testitem "KeyValue validates buckets and keys" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
     client = TestHelpers.fake_client()
     js = jetstream(client)
-    kv = KeyValue(js, "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(js, "bucket", "KV_bucket", "\$KV.bucket.")
 
     @test kv.direct == false
     @test N._validate_kv_bucket("bucket-1") == "bucket-1"
@@ -24,13 +26,17 @@ end
 
 @testitem "KeyValue tracks direct get capability" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
-    kv = KeyValue(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.", true)
+    kv = KeyValueBucket(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.", true)
     @test kv.direct == true
 end
 
 @testitem "KeyValue bucket config maps to stream config" begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -81,6 +87,8 @@ end
 
 @testitem "KeyValue bucket config validates local limits" begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -98,6 +106,8 @@ end
 
 @testitem "KeyValue numeric validators reject Bool" begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -119,6 +129,8 @@ end
 
 @testitem "KeyValue timeout arguments are positive finite before protocol writes" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -126,7 +138,7 @@ end
         capture = TestHelpers.WriteCapture()
         client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
         js = jetstream(client)
-        kv = KeyValue(js, "bucket", "KV_bucket", "\$KV.bucket.")
+        kv = KeyValueBucket(js, "bucket", "KV_bucket", "\$KV.bucket.")
 
         @test_throws ArgumentError kv_create(js, "newbucket"; timeout=invalid_timeout)
         @test_throws ArgumentError kv_open(js, "bucket"; timeout=invalid_timeout)
@@ -150,7 +162,7 @@ end
 
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
-    kv = KeyValue(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
     @test_throws ArgumentError kv_history(kv, "alpha"; batch=true)
     @test_throws ArgumentError kv_history(kv, "alpha"; batch=big(typemax(Int)) + 1)
     @test TestHelpers.capture_text(capture) == ""
@@ -159,10 +171,12 @@ end
 
 @testitem "KeyValue status summarizes stream state" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
-    kv = KeyValue(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.", true)
+    kv = KeyValueBucket(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.", true)
     info = StreamInfo(
         "KV_bucket",
         StreamConfig(
@@ -192,11 +206,13 @@ end
 
 @testitem "KeyValue errors carry bucket and key context" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Dates
 
     const N = Natter
 
-    kv = KeyValue(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.")
     missing = N._kv_not_found_error(kv, "alpha")
     @test missing isa KeyValueError
     @test missing.bucket == "bucket"
@@ -229,6 +245,8 @@ end
 
 @testitem "KeyValue keys use headers-only metadata snapshots" begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
     prefix = "\$KV.bucket."
@@ -263,10 +281,12 @@ end
 
 @testitem "KeyValue pagination uses pending metadata" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
     prefix = "\$KV.bucket."
-    kv = KeyValue(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", prefix)
+    kv = KeyValueBucket(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", prefix)
 
     history_msg(seq, pending) =
         Msg("$(prefix)alpha", "\$JS.ACK.KV_bucket.C.$seq.$seq.$seq.0.$pending",
@@ -303,6 +323,8 @@ end
 
 @testitem "KeyValue create retry is limited to delete markers" begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -322,6 +344,8 @@ end
 
 @testitem "KeyValue write APIs return revisions without exposing PubAck" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -354,39 +378,41 @@ end
 
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
-    kv = KeyValue(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
 
-    put_task = @async kv_put(kv, "alpha", "one"; timeout=1.0)
+    put_task = Threads.@spawn kv_put(kv, "alpha", "one"; timeout=1.0)
     reply_next_puback!(client, "KV_bucket", 10)
     put_revision = fetch(put_task)
     @test put_revision == 10
     @test put_revision isa Int
 
-    create_task = @async kv_create_key(kv, "beta", "one"; timeout=1.0)
+    create_task = Threads.@spawn kv_create_key(kv, "beta", "one"; timeout=1.0)
     reply_next_puback!(client, "KV_bucket", 11)
     @test fetch(create_task) == 11
 
-    update_task = @async kv_update(kv, "beta", "two", 11; timeout=1.0)
+    update_task = Threads.@spawn kv_update(kv, "beta", "two", 11; timeout=1.0)
     reply_next_puback!(client, "KV_bucket", 12)
     @test fetch(update_task) == 12
 
-    delete_task = @async kv_delete(kv, "beta"; revision=12, timeout=1.0)
+    delete_task = Threads.@spawn kv_delete(kv, "beta"; revision=12, timeout=1.0)
     reply_next_puback!(client, "KV_bucket", 13)
     @test isnothing(fetch(delete_task))
 
-    purge_task = @async kv_purge(kv, "alpha"; timeout=1.0)
+    purge_task = Threads.@spawn kv_purge(kv, "alpha"; timeout=1.0)
     reply_next_puback!(client, "KV_bucket", 14)
     @test isnothing(fetch(purge_task))
 end
 
 @testitem "KeyValue delete and purge include expected revision headers" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
-    kv = KeyValue(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
 
     @test_throws TimeoutError kv_delete(kv, "alpha"; revision=7)
     written = TestHelpers.capture_text(capture)
@@ -408,12 +434,14 @@ end
 
 @testitem "KeyValue writes expose per-key TTL headers" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
-    kv = KeyValue(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
 
     @test_throws TimeoutError kv_put(kv, "alpha", "value"; ttl=2)
     written = TestHelpers.capture_text(capture)
@@ -443,6 +471,8 @@ end
 
 @testitem "KeyValue create conflict path shares one timeout deadline" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -459,11 +489,11 @@ end
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=ConnectionStatus.CONNECTED,
                                      read_io=capture, write_io=capture)
-    kv = KeyValue(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
     subject = "\$KV.bucket.beta"
     operation_timeout = 1.0
 
-    task = @async try
+    task = Threads.@spawn try
         kv_create_key(kv, "beta", "value"; timeout=operation_timeout)
     catch err
         err
@@ -487,10 +517,12 @@ end
 
 @testitem "KeyValue watcher options map to consumer config" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
-    kv = KeyValue(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.")
     filters = N._kv_watch_filters(">", ["alpha", "beta.*"])
     cfg = N._kv_watch_consumer_config(kv, filters; meta_only=true)
     @test cfg["deliver_policy"] == "last_per_subject"
@@ -519,6 +551,8 @@ end
 
 @testitem "KeyValue watchers create ordered push consumers" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -528,7 +562,7 @@ end
         info=N.ServerInfo(; headers=true, version="2.10.0"),
         write_io=capture,
     )
-    kv = KeyValue(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(jetstream(client; timeout=0.001), "bucket", "KV_bucket", "\$KV.bucket.")
 
     @test_throws TimeoutError kv_watch(kv; key="alpha", timeout=0.001)
     written = TestHelpers.capture_text(capture)
@@ -547,6 +581,8 @@ end
 @testitem "KeyValue watchers accept callable objects" setup=[TestHelpers] begin
     using Dates
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -570,6 +606,8 @@ end
 
 @testitem "KeyValue watcher timed take respects timeout" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     const N = Natter
 
@@ -591,11 +629,13 @@ end
 
 @testitem "KeyValue entries expose typed metadata" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Dates
 
     const N = Natter
 
-    kv = KeyValue(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.")
+    kv = KeyValueBucket(TestHelpers.fake_client() |> jetstream, "bucket", "KV_bucket", "\$KV.bucket.")
     created = DateTime(2026, 1, 1, 2, 3, 4, 567)
     msg = Msg("\$KV.bucket.path.to.key", nothing, TestHelpers.bytes("value"))
     entry = N._kv_entry_from_stored_msg(kv, msg, 12, created)

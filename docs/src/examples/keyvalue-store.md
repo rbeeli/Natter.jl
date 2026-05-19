@@ -4,6 +4,8 @@ This recipe uses a KeyValue bucket with direct reads and optimistic writes.
 
 ```julia
 using Natter
+using Natter.JetStream
+using Natter.KeyValue
 
 client = connect("nats://127.0.0.1:4222")
 js = jetstream(client)
@@ -72,7 +74,7 @@ name = Ref{KeyValueEntry}()
 email = Ref{KeyValueEntry}()
 
 @sync begin
-    @async name[] = kv_get(kv, "users.42.name")
-    @async email[] = kv_get(kv, "users.42.email")
+    Threads.@spawn name[] = kv_get(kv, "users.42.name")
+    Threads.@spawn email[] = kv_get(kv, "users.42.email")
 end
 ```

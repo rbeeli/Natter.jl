@@ -436,7 +436,7 @@ function _resolve_connect_address(host::String, port::Int, timeout::Real,
 
     ch = Channel{Tuple{Bool,Any}}(1)
     timed_out = Threads.Atomic{Bool}(false)
-    task = @async begin
+    task = _spawn_sticky(:dns_resolution) do
         try
             value = resolver(host)
             timed_out[] || put!(ch, (true, value))
@@ -522,6 +522,10 @@ _cleanup_errors(result) = Any[result]
 
 function _request_task_stop!(errors::Vector, operation::String, task::Union{Task,Nothing})::Bool
     (isnothing(task) || istaskdone(task) || task === current_task()) && return false
+    # Interrupting migratable tasks can trip Julia runtime edge cases. Only
+    # tasks deliberately created as sticky are force-interrupted; spawned tasks
+    # are expected to stop through cooperative close/generation signals.
+    task.sticky || return false
     try
         # Base.throwto yields to the target and can block the caller; scheduling
         # the exception requests interruption without adding another stuck task.
@@ -581,7 +585,7 @@ end
 function _schedule_timeout_cleanup(operation::String, cleanup::Function,
                                    report_cleanup_errors::Function=errors -> _warn_timeout_cleanup_errors(operation, errors);
                                    task::Union{Task,Nothing}=nothing)
-    @async begin
+    _spawn_work(:timeout_cleanup) do
         errors = Any[]
         try
             append!(errors, _cleanup_errors(cleanup()))
@@ -608,7 +612,7 @@ function _run_with_timeout(f::Function, operation::String, timeout::Real, cleanu
     end
     ch = Channel{Tuple{Bool,Any}}(1)
     timed_out = Threads.Atomic{Bool}(false)
-    task = @async begin
+    task = _spawn_sticky(:timeout_operation) do
         try
             value = f()
             timed_out[] || put!(ch, (true, value))
@@ -799,7 +803,9 @@ end
 function _ensure_write_watchdog_locked!(client::Client)
     task = client.write_timeout_task
     if isnothing(task) || istaskdone(task)
-        client.write_timeout_task = @async _write_watchdog_loop(client)
+        client.write_timeout_task = _spawn_control(:write_watchdog) do
+            _write_watchdog_loop(client)
+        end
     end
     nothing
 end
@@ -1290,7 +1296,7 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
     end
     terminal || return false
 
-    _clear_js_async_publish_pending!(client, ConnectionClosedError("connection is disconnected"))
+    _notify_client_lifecycle_watchers!(client, ConnectionClosedError("connection is disconnected"))
 
     for sub in subs
         @lock sub.lock begin
@@ -1609,7 +1615,9 @@ function _start_flusher_task!(client::Client, generation::Int=(@lock client.lock
         end
     end
     assigned == :start || return nothing
-    flusher_task = @async _flusher_loop(client, generation, flush_signal)
+    flusher_task = _spawn_control(:flusher) do
+        _flusher_loop(client, generation, flush_signal)
+    end
     @lock client.lock begin
         if client.generation == generation &&
            client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING, ConnectionStatus.RECONNECTING)
@@ -1621,8 +1629,12 @@ end
 
 function _start_background_tasks!(client::Client, generation::Int=(@lock client.lock client.generation))
     _start_flusher_task!(client, generation)
-    reader_task = @async _reader_loop(client, generation)
-    ping_task = @async _ping_loop(client, generation)
+    reader_task = _spawn_control(:reader) do
+        _reader_loop(client, generation)
+    end
+    ping_task = _spawn_control(:ping) do
+        _ping_loop(client, generation)
+    end
     assigned = @lock client.lock begin
         if client.generation == generation && client.status in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
             client.reader_task = reader_task
@@ -2008,7 +2020,7 @@ function _trigger_reconnect(client::Client, reason)
         end
     end
     if should_start
-        _clear_js_async_publish_pending!(client, ConnectionReconnectingError())
+        _notify_client_lifecycle_watchers!(client, ConnectionReconnectingError())
         _signal_flusher(client)
         _report_cleanup_errors(client, _notify_pong_waiters!(client, false))
         _close_transport_report_errors!(client, transports...)
@@ -2016,7 +2028,9 @@ function _trigger_reconnect(client::Client, reason)
                                generation)
         should_spawn = @lock client.lock client.generation == generation && client.status == ConnectionStatus.RECONNECTING
         should_spawn || return nothing
-        reconnect_task = @async _reconnect_loop(client, generation)
+        reconnect_task = _spawn_control(:reconnect) do
+            _reconnect_loop(client, generation)
+        end
         assigned = @lock client.lock begin
             if client.generation == generation && client.status == ConnectionStatus.RECONNECTING
                 client.reconnect_task = reconnect_task

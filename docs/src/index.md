@@ -24,8 +24,8 @@ For concurrent work, use Julia tasks around the normal direct calls:
 
 ```julia
 @sync begin
-    @async publish(client, "orders.created", "order-1002")
-    @async publish(client, "orders.created", "order-1003")
+    Threads.@spawn publish(client, "orders.created", "order-1002")
+    Threads.@spawn publish(client, "orders.created", "order-1003")
 end
 
 flush(client)
@@ -46,4 +46,4 @@ flush(client)
 
 Natter.jl supports core NATS messaging, automatic reconnect, token/user-password/NKEY/JWT/`.creds` auth, TLS and mTLS, JetStream stream and consumer management, pull and push consumers, publish acknowledgements, message lookup, KeyValue buckets, optimistic writes, delete/purge operations, and watchers.
 
-See [Feature Coverage](feature-coverage.md) for unsupported areas such as WebSocket transport, Object Store, and Services/Micro.
+See [Feature Coverage](feature-coverage.md) for current support status and hardening notes.

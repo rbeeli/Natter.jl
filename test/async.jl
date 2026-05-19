@@ -1,204 +1,159 @@
 using TestItems
 
-@testitem "core async wrappers return task results and errors" setup=[TestHelpers] begin
+@testitem "public async API uses Base tasks and domain handles" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
+
+    const N = Natter
+
+    removed = (
+        :NatterTask,
+        :connect_async,
+        :publish_async,
+        :respond_async,
+        :subscribe_async,
+        :unsubscribe_async,
+        :next_async,
+        :request_async,
+        :flush_async,
+        :ping_async,
+        :drain_async,
+        :close_async,
+        :fetch_async,
+        :ack_async,
+        :ack_sync_async,
+        :nak_async,
+        :in_progress_async,
+        :term_async,
+        :kv_get_async,
+    )
+    @test all(name -> !isdefined(N, name), removed)
+
+    @test :JetStream in names(N)
+    @test :KeyValue in names(N)
+    @test :js_publish in names(N.JetStream)
+    @test :kv_get in names(N.KeyValue)
+    @test !(:js_publish in names(N))
+    @test !(:kv_get in names(N))
+end
+
+@testitem "internal task helpers use non-sticky Julia tasks" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    control = N._spawn_control(:control_probe) do
+        (task_local_storage(:natter_task_name), Threads.threadpool())
+    end
+    work = N._spawn_work(:work_probe) do
+        (task_local_storage(:natter_task_name), Threads.threadpool())
+    end
+    sticky = N._spawn_sticky(:sticky_probe) do
+        task_local_storage(:natter_task_name)
+    end
+
+    @test control isa Task
+    @test work isa Task
+    @test sticky isa Task
+    @test control.sticky == false
+    @test work.sticky == false
+    @test sticky.sticky == true
+    @test fetch(control) == (:control_probe, :interactive)
+    @test fetch(work) == (:work_probe, :default)
+    @test fetch(sticky) == :sticky_probe
+
+    failed = N._spawn_work(:failure_probe) do
+        error("task failed")
+    end
+    @test failed.sticky == false
+    @test_throws TaskFailedException fetch(failed)
+end
+
+@testitem "source uses private task helpers instead of raw async macro" setup=[TestHelpers] begin
+    using Natter
+
+    srcdir = joinpath(pkgdir(Natter), "src")
+    needle = string('@', "async")
+    matches = String[]
+
+    for (root, _dirs, files) in walkdir(srcdir)
+        for file in files
+            endswith(file, ".jl") || continue
+            path = joinpath(root, file)
+            occursin(needle, read(path, String)) && push!(matches, relpath(path, srcdir))
+        end
+    end
+
+    @test isempty(matches)
+end
+
+@testitem "Base task composition runs direct operations" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
 
-    publish_task = publish_async(client, "foo", "bar"; buffer_on_reconnect=true)
-    @test publish_task isa NatterTask
+    publish_task = Threads.@spawn publish(client, "foo", "bar"; buffer_on_reconnect=true)
+    @test publish_task isa Task
     @test isnothing(fetch(publish_task))
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
 
     response_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    response_task = respond_async(response_client, Msg("svc", "_INBOX.reply", UInt8[]), "ok";
+    respond_task = Threads.@spawn respond(response_client, Msg("svc", "_INBOX.reply", UInt8[]), "ok";
                                   buffer_on_reconnect=true)
-    @test response_task isa NatterTask
-    @test isnothing(fetch(response_task))
+    @test isnothing(fetch(respond_task))
     @test String(take!(response_client.pending)) == "PUB _INBOX.reply 2\r\nok\r\n"
 
-    sub = fetch(subscribe_async(client, "foo"))
-    @test sub isa Subscription
+    sub = fetch(Threads.@spawn subscribe(client, "foo"))
     put!(sub.messages, Msg("foo", nothing, TestHelpers.bytes("hello"); sid=sub.sid))
-    @test String(fetch(next_async(sub; timeout=0.1))) == "hello"
-    @test isnothing(fetch(close_async(sub)))
+    @test String(fetch(Threads.@spawn N.next(sub; timeout=0.1))) == "hello"
+    @test isnothing(fetch(Threads.@spawn close(sub)))
+end
 
-    callback_sub = fetch(subscribe_async(_ -> nothing, client, "foo.callback"))
-    @test callback_sub.has_callback
-    next_err = TestHelpers.thrown_exception(() -> fetch(next_async(callback_sub; timeout=0.1)))
-    @test next_err isa ArgumentError
-    @test isnothing(fetch(close_async(callback_sub)))
+@testitem "Base task composition preserves direct validation and cancellation behavior" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
+
+    const N = Natter
 
     closed = TestHelpers.fake_client(; status=N.ConnectionStatus.DISCONNECTED)
-    publish_err = TestHelpers.thrown_exception(() -> fetch(publish_async(closed, "foo", "bar")))
-    @test publish_err isa ConnectionClosedError
-
-    subscribe_err = TestHelpers.thrown_exception(() -> fetch(subscribe_async(closed, "foo")))
-    @test subscribe_err isa ConnectionClosedError
-end
-
-@testitem "KeyValue watcher async close returns task and closes watcher" setup=[TestHelpers] begin
-    using Natter
-
-    const N = Natter
+    publish_task = Threads.@spawn TestHelpers.thrown_exception(() -> publish(closed, "foo", "bar"))
+    @test fetch(publish_task) isa ConnectionClosedError
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "foo")
+    source = CancellationSource()
+    token = cancellation_token(source)
+    next_task = Threads.@spawn TestHelpers.thrown_exception(() -> N.next(sub; timeout=30.0, cancel_token=token))
+    sleep(0.02)
+    cancel!(source)
+    @test fetch(next_task) isa CancelledError
+
     js = jetstream(client)
-    push_sub = subscribe(client, "_INBOX.kv")
-    push = N.PushSubscription(js, push_sub, "KV_bucket", "watcher", ReentrantLock(), false, false)
-    watcher_state = N._kv_watcher_state(nothing, 1, true)
-    watcher = KeyValueWatcher(push, watcher_state.updates, watcher_state)
-
-    close_task = close_async(watcher; timeout=0.1)
-
-    @test close_task isa NatterTask
-    @test isnothing(fetch(close_task))
-    @test push.closed
-    @test push_sub.closed
-    @test N._kv_watcher_closed(watcher_state)
-    @test !isopen(watcher.updates)
-end
-
-@testitem "JetStream subscription async close accepts timeout" setup=[TestHelpers] begin
-    using Natter
-
-    const N = Natter
-
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    js = jetstream(client)
-
-    pull = N.PullSubscription(js, "S", "C", ReentrantLock(), ReentrantLock(), false, false)
-    pull_task = close_async(pull; timeout=0.1)
-    @test pull_task isa NatterTask
-    @test isnothing(fetch(pull_task))
-    @test pull.closed
-
-    stream_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
-                                            write_io=TestHelpers.WriteCapture())
-    stream_js = jetstream(stream_client)
-    stream_pull = N.PullSubscription(stream_js, "S", "C", ReentrantLock(), ReentrantLock(), false, false)
-    stream = messages(stream_pull; batch=1, expires=1.0, heartbeat=0, stop_after=1)
-    stream_task = close_async(stream; timeout=1.0)
-    @test stream_task isa NatterTask
-    @test isnothing(fetch(stream_task))
-    @test !(@lock stream_pull.close_lock stream_pull.active_stream)
-    close(stream_pull)
-
-    push_core = subscribe(client, "_INBOX.push")
-    push = N.PushSubscription(js, push_core, "S", "C", ReentrantLock(), false, false)
-    push_task = close_async(push; timeout=0.1)
-    @test push_task isa NatterTask
-    @test isnothing(fetch(push_task))
-    @test push.closed
-    @test push_core.closed
-end
-
-@testitem "async wrappers preserve synchronous validation failures" setup=[TestHelpers] begin
-    using Natter
-
-    const N = Natter
-
-    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    js = jetstream(client)
-    kv = KeyValue(js, "bucket", "KV_bucket", "\$KV.bucket.")
-
-    get_err = TestHelpers.thrown_exception(() -> fetch(stream_message_get_async(js, "ORDERS"; seq=0)))
-    @test get_err isa ArgumentError
-
-    delete_err = TestHelpers.thrown_exception(() -> fetch(stream_message_delete_async(js, "ORDERS", 0)))
-    @test delete_err isa ArgumentError
-
-    ordered_err = TestHelpers.thrown_exception(() -> fetch(push_subscribe_async(
-        js,
-        "orders.created";
-        stream="ORDERS",
-        ordered=true,
-        queue="workers",
-    )))
-    @test ordered_err isa ArgumentError
+    kv = KeyValueBucket(js, "bucket", "KV_bucket", "\$KV.bucket.")
+    put_task = Threads.@spawn TestHelpers.thrown_exception(() -> kv_put(kv, "bad.*", "value"))
+    @test fetch(put_task) isa ArgumentError
 
     ack_msg = JetStreamMsg(Msg("s", nothing, UInt8[]), client)
-    ack_err = TestHelpers.thrown_exception(() -> fetch(ack_async(ack_msg)))
-    @test ack_err isa JetStreamError
-
-    put_err = TestHelpers.thrown_exception(() -> fetch(kv_put_async(kv, "bad.*", "value")))
-    @test put_err isa ArgumentError
+    ack_task = Threads.@spawn TestHelpers.thrown_exception(() -> ack(ack_msg))
+    @test fetch(ack_task) isa JetStreamError
 end
 
-@testitem "JetStream ack async helpers mirror ack signatures" setup=[TestHelpers] begin
+@testitem "JetStream publish futures remain protocol-level handles" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
 
-    function borrowed(reply="ACK.REPLY")
-        data = TestHelpers.bytes("work")
-        BorrowedJetStreamMsg(BorrowedMsg("orders.created", reply, @view(data[1:4]), nothing, 1, 0),
-                             client)
-    end
-
-    source = CancellationSource()
-    cancel!(source)
-    cancelled = TestHelpers.thrown_exception() do
-        fetch(ack_async(JetStreamMsg(Msg("orders.created", "ACK.REPLY", TestHelpers.bytes("work")),
-                                     client);
-                        cancel_token=cancellation_token(source)))
-    end
-    @test cancelled isa CancelledError
-    @test TestHelpers.capture_text(capture) == ""
-
-    @test isnothing(fetch(ack_async(borrowed())))
-    @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 0\r\n\r\n"
-
-    TestHelpers.clear_capture!(capture)
-    @test isnothing(fetch(nak_async(borrowed(); delay=0)))
-    @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 16\r\n-NAK {\"delay\":0}\r\n"
-
-    TestHelpers.clear_capture!(capture)
-    @test isnothing(fetch(in_progress_async(borrowed())))
-    @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 4\r\n+WPI\r\n"
-
-    TestHelpers.clear_capture!(capture)
-    @test isnothing(fetch(term_async(borrowed())))
-    @test TestHelpers.capture_text(capture) == "PUB ACK.REPLY 5\r\n+TERM\r\n"
-
-    sync_err = TestHelpers.thrown_exception() do
-        fetch(ack_sync_async(borrowed(nothing); timeout=0.1))
-    end
-    @test sync_err isa JetStreamError
-end
-
-@testitem "NatterTask failures rethrow original operation errors" setup=[TestHelpers] begin
-    using Natter
-
-    const N = Natter
-
-    mutable struct NatterAsyncMarkerError <: Exception
-        msg::String
-    end
-
-    marker = NatterAsyncMarkerError("async marker")
-
-    function natter_async_marker()
-        throw(marker)
-    end
-
-    err = TestHelpers.thrown_exception(() -> fetch(N._natter_async(natter_async_marker)))
-    @test err === marker
-
-    function natter_nested_async_failure()
-        try
-            throw(ArgumentError("inner"))
-        catch
-            throw(ArgumentError("outer"))
-        end
-    end
-
-    nested_err = TestHelpers.thrown_exception(() -> fetch(N._natter_async(natter_nested_async_failure)))
-    @test nested_err isa ArgumentError
-    @test nested_err.msg == "outer"
+    future = js_publish_future(js, "orders.created", "payload"; timeout=1.0)
+    @test future isa JetStreamPublishFuture
+    @test !(future isa Task)
+    @test js_publish_future_pending(js) == 1
 end

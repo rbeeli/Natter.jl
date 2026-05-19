@@ -3,6 +3,9 @@
 JetStream adds persistence, acknowledgements, durable consumers, replay, and stream management. Create a `JetStreamContext` from a connected client:
 
 ```julia
+using Natter
+using Natter.JetStream
+
 client = connect("nats://127.0.0.1:4222")
 js = jetstream(client; timeout=5.0)
 ```
@@ -65,8 +68,8 @@ Publish independent messages concurrently with Julia tasks:
 acks = Vector{PubAck}(undef, 2)
 
 @sync begin
-    @async acks[1] = js_publish(js, "orders.events.created", """{"id":1001}"""; stream="ORDERS")
-    @async acks[2] = js_publish(js, "orders.events.created", """{"id":1002}"""; stream="ORDERS")
+    Threads.@spawn acks[1] = js_publish(js, "orders.events.created", """{"id":1001}"""; stream="ORDERS")
+    Threads.@spawn acks[2] = js_publish(js, "orders.events.created", """{"id":1002}"""; stream="ORDERS")
 end
 ```
 

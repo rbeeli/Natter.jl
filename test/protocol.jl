@@ -288,7 +288,7 @@ end
 
     listener = listen(ip"127.0.0.1", 0)
     _, port = Sockets.getsockname(listener)
-    server_task = @async begin
+    server_task = Threads.@spawn begin
         accepted = accept(listener)
         try
             write(accepted, TestHelpers.bytes("PING\r\nPONG\r\n"))

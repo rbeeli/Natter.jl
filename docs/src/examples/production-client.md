@@ -4,6 +4,7 @@ This recipe puts the common production pieces together: multi-server TLS, lifecy
 
 ```julia
 using Natter
+using Natter.JetStream
 
 function make_client()
     connect([
@@ -96,7 +97,7 @@ For I/O-heavy handlers, process a fetched batch behind one `@sync` boundary:
 msgs = fetch(worker, 50; timeout=2.0)
 
 @sync for msg in msgs
-    @async begin
+    Threads.@spawn begin
         try
             handle_billing_event(String(msg))
             ack(msg)

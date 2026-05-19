@@ -2,6 +2,8 @@ using TestItems
 
 @testmodule ChaosTestHelpers begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
 
     chaos_enabled() =
         get(ENV, "NATTER_RUN_INTEGRATION", "false") == "true" &&
@@ -37,6 +39,8 @@ end
 
 @testitem "real nats-server chaos reconnect publish replay" setup=[IntegrationHelpers, ChaosTestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -105,6 +109,8 @@ end
 
 @testitem "real nats-server chaos slow consumer reports backpressure" setup=[IntegrationHelpers, ChaosTestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     if ChaosTestHelpers.chaos_enabled()
@@ -160,6 +166,8 @@ end
 
 @testitem "real nats-server chaos JetStream fetch disconnect recovers" setup=[IntegrationHelpers, ChaosTestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -191,7 +199,7 @@ end
                 psub[] = pull_subscribe(js, subject; stream, durable)
 
                 before_out = stats(client).out_msgs
-                fetch_task = @async fetch(psub[], 1; timeout=max(io_timeout, 5.0), heartbeat=0)
+                fetch_task = Threads.@spawn fetch(psub[], 1; timeout=max(io_timeout, 5.0), heartbeat=0)
                 @test timedwait(io_timeout; pollint=0.01) do
                     stats(client).out_msgs > before_out
                 end != :timed_out
@@ -234,6 +242,8 @@ end
 
 @testitem "real nats-server chaos KeyValue watcher survives reconnect" setup=[IntegrationHelpers, ChaosTestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -255,7 +265,7 @@ end
                              record_stats=true)
             js = jetstream(client; timeout=io_timeout)
             bucket = "NATTERCHAOSKV_$(randstring(8))"
-            kv = Ref{Union{Nothing,KeyValue}}(nothing)
+            kv = Ref{Union{Nothing,KeyValueBucket}}(nothing)
             watcher = Ref{Any}(nothing)
             try
                 kv[] = kv_create(js, bucket; storage="memory", timeout=io_timeout)
@@ -302,6 +312,8 @@ end
 
 @testitem "real nats-server stress reconnect workload" setup=[IntegrationHelpers, ChaosTestHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -333,7 +345,7 @@ end
                 sub[] = subscribe(client, subject; pending_msgs_limit=4096)
                 deadline = time() + IntegrationHelpers.stress_seconds()
 
-                consumer_task = @async begin
+                consumer_task = Threads.@spawn begin
                     try
                         while !stop[]
                             try
@@ -355,7 +367,7 @@ end
                     end
                 end
 
-                publisher_task = @async begin
+                publisher_task = Threads.@spawn begin
                     try
                         while published[] == 0 || time() < deadline
                             published[] += 1
@@ -367,7 +379,7 @@ end
                     end
                 end
 
-                chaos_task = @async begin
+                chaos_task = Threads.@spawn begin
                     try
                         drop_count = 0
                         while drop_count == 0 || time() < deadline

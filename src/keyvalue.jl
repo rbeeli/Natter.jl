@@ -4,14 +4,14 @@ EnumX.@enumx KeyValueOperation begin
     PURGE
 end
 
-struct KeyValue{J<:JetStreamContext}
+struct KeyValueBucket{J<:JetStreamContext}
     js::J
     bucket::String
     stream::String
     prefix::String
     direct::Bool
 end
-KeyValue(js::JetStreamContext, bucket::String, stream::String, prefix::String) = KeyValue(js, bucket, stream, prefix, false)
+KeyValueBucket(js::JetStreamContext, bucket::String, stream::String, prefix::String) = KeyValueBucket(js, bucket, stream, prefix, false)
 
 struct KeyValueEntry
     bucket::String
@@ -135,7 +135,7 @@ function _kv_add_expected_revision!(hdrs::Headers, revision::Union{Integer,Nothi
     expected
 end
 
-function _kv_key_from_subject(kv::KeyValue, subject::AbstractString)::String
+function _kv_key_from_subject(kv::KeyValueBucket, subject::AbstractString)::String
     startswith(subject, kv.prefix) ||
         throw(ProtocolError("message subject does not belong to key-value bucket $(kv.bucket): $subject"))
     String(chop(String(subject); head=length(kv.prefix), tail=0))
@@ -166,22 +166,22 @@ _kv_is_delete_marker(operation::KeyValueOperation.T)::Bool =
 
 _kv_key_active(msg::AbstractMsg)::Bool = !_kv_is_delete_marker(_kv_operation(msg))
 
-function _kv_entry(kv::KeyValue, msg::AbstractMsg, revision::Int, created::DateTime, delta::Int)::KeyValueEntry
+function _kv_entry(kv::KeyValueBucket, msg::AbstractMsg, revision::Int, created::DateTime, delta::Int)::KeyValueEntry
     KeyValueEntry(kv.bucket, _kv_key_from_subject(kv, msg.subject), msg.data, revision, created, delta, _kv_operation(msg))
 end
 
-function _kv_entry_from_stored_msg(kv::KeyValue, msg::AbstractMsg, revision::Int, created::Union{DateTime,Nothing})::KeyValueEntry
+function _kv_entry_from_stored_msg(kv::KeyValueBucket, msg::AbstractMsg, revision::Int, created::Union{DateTime,Nothing})::KeyValueEntry
     isnothing(created) && throw(ProtocolError("key-value message is missing created timestamp"))
     _kv_entry(kv, msg, revision, created, 0)
 end
 
-_kv_entry_from_stored_msg(kv::KeyValue, msg::StoredMsg)::KeyValueEntry =
+_kv_entry_from_stored_msg(kv::KeyValueBucket, msg::StoredMsg)::KeyValueEntry =
     _kv_entry(kv, msg, msg.seq, msg.created, 0)
 
 _kv_created_from_timestamp_ns(timestamp_ns::Int)::DateTime =
     DateTime(1970, 1, 1) + Millisecond(timestamp_ns ÷ 1_000_000)
 
-function _kv_entry_from_consumer_msg(kv::KeyValue, msg::AbstractMsg)::KeyValueEntry
+function _kv_entry_from_consumer_msg(kv::KeyValueBucket, msg::AbstractMsg)::KeyValueEntry
     meta = _parse_msg_metadata(msg)
     _kv_entry(kv, msg, meta.stream_sequence, _kv_created_from_timestamp_ns(meta.timestamp_ns), meta.pending)
 end
@@ -306,7 +306,7 @@ function _kv_throw_if_deadline_expired(deadline::Float64, operation::String;
     nothing
 end
 
-function _kv_report_cleanup_error(kv::KeyValue, operation::String, err)
+function _kv_report_cleanup_error(kv::KeyValueBucket, operation::String, err)
     _report_cleanup_errors(kv.js.client, Any[CleanupError(operation, err)])
     nothing
 end
@@ -322,7 +322,7 @@ function _kv_record_key_pending!(latest::Dict{String,Tuple{Int,Bool}}, prefix::S
     meta.pending
 end
 
-function _kv_history_chunk_pending!(entries::Vector{KeyValueEntry}, kv::KeyValue,
+function _kv_history_chunk_pending!(entries::Vector{KeyValueEntry}, kv::KeyValueBucket,
                                     chunk::AbstractVector{<:AbstractMsg})::Int
     pending = 0
     for msg in chunk
@@ -345,16 +345,16 @@ end
 _kv_active_keys(latest::Dict{String,Tuple{Int,Bool}})::Vector{String} =
     [key for (key, (_seq, active)) in latest if active]
 
-_kv_not_found_error(kv::KeyValue, key::AbstractString, message::AbstractString="") =
+_kv_not_found_error(kv::KeyValueBucket, key::AbstractString, message::AbstractString="") =
     KeyValueKeyNotFoundError(kv.bucket, String(key), String(message))
-_kv_deleted_error(kv::KeyValue, entry::KeyValueEntry) =
+_kv_deleted_error(kv::KeyValueBucket, entry::KeyValueEntry) =
     KeyValueKeyDeletedError(kv.bucket, entry.key, entry)
-_kv_wrong_revision_error(kv::KeyValue, key::AbstractString, expected_revision::Union{Int,Nothing}, cause::JetStreamError) =
+_kv_wrong_revision_error(kv::KeyValueBucket, key::AbstractString, expected_revision::Union{Int,Nothing}, cause::JetStreamError) =
     KeyValueWrongRevisionError(kv.bucket, String(key), expected_revision, cause)
-_kv_key_exists_error(kv::KeyValue, key::AbstractString, cause::JetStreamError) =
+_kv_key_exists_error(kv::KeyValueBucket, key::AbstractString, cause::JetStreamError) =
     KeyValueKeyExistsError(kv.bucket, String(key), cause)
 
-function _kv_status(kv::KeyValue, info::StreamInfo)::KeyValueStatus
+function _kv_status(kv::KeyValueBucket, info::StreamInfo)::KeyValueStatus
     KeyValueStatus(
         kv.bucket,
         info.name,
@@ -408,26 +408,26 @@ function kv_create(js::JetStreamContext, bucket::AbstractString; history::Intege
     cfg = _kv_stream_config(bucket; history, ttl, max_bytes, max_value_size, storage,
                             replicas, direct, compression, metadata, limit_marker_ttl)
     info = stream_create(js, cfg; timeout, cancel_token)
-    KeyValue(js, bucket, _kv_stream(bucket), _kv_prefix(bucket), something(info.config.allow_direct, false))
+    KeyValueBucket(js, bucket, _kv_stream(bucket), _kv_prefix(bucket), something(info.config.allow_direct, false))
 end
 
 function kv_open(js::JetStreamContext, bucket::AbstractString; timeout::Real=js.timeout,
                  cancel_token::MaybeCancellationToken=nothing)
     bucket = _validate_kv_bucket(bucket)
     info = stream_info(js, _kv_stream(bucket); timeout, cancel_token)
-    KeyValue(js, bucket, info.name, _kv_prefix(bucket), something(info.config.allow_direct, false))
+    KeyValueBucket(js, bucket, info.name, _kv_prefix(bucket), something(info.config.allow_direct, false))
 end
 
-kv_delete_bucket(kv::KeyValue; timeout::Real=kv.js.timeout,
+kv_delete_bucket(kv::KeyValueBucket; timeout::Real=kv.js.timeout,
                  cancel_token::MaybeCancellationToken=nothing) =
     stream_delete(kv.js, kv.stream; timeout, cancel_token)
 
-function kv_status(kv::KeyValue; timeout::Real=kv.js.timeout,
+function kv_status(kv::KeyValueBucket; timeout::Real=kv.js.timeout,
                    cancel_token::MaybeCancellationToken=nothing)
     _kv_status(kv, stream_info(kv.js, kv.stream; timeout, cancel_token))
 end
 
-function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
+function kv_get(kv::KeyValueBucket, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
                 direct::Union{Bool,Nothing}=nothing, timeout::Real=kv.js.timeout,
                 cancel_token::MaybeCancellationToken=nothing)
     key = _validate_kv_key(key)
@@ -450,12 +450,12 @@ function kv_get(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integ
     entry
 end
 
-_kv_publish_revision(kv::KeyValue, subject::AbstractString, value; headers=nothing,
+_kv_publish_revision(kv::KeyValueBucket, subject::AbstractString, value; headers=nothing,
                      ttl=nothing, timeout::Real=kv.js.timeout,
                      cancel_token::MaybeCancellationToken=nothing)::Int =
     js_publish(kv.js, subject, value; headers, ttl, timeout, cancel_token).seq
 
-function kv_put(kv::KeyValue, key::AbstractString, value; revision::Union{Nothing,Integer}=nothing,
+function kv_put(kv::KeyValueBucket, key::AbstractString, value; revision::Union{Nothing,Integer}=nothing,
                 ttl=nothing, timeout::Real=kv.js.timeout,
                 cancel_token::MaybeCancellationToken=nothing)::Int
     key = _validate_kv_key(key)
@@ -474,7 +474,7 @@ _kv_wrong_last_sequence(err) = err isa JetStreamError && err.err_code == 10071
 _kv_delete_marker_revision(msg::AbstractMsg, sequence::Int) =
     _kv_is_delete_marker(_kv_operation(msg)) ? sequence : nothing
 
-function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String; timeout::Real=kv.js.timeout,
+function _kv_latest_delete_marker_revision(kv::KeyValueBucket, subject::String; timeout::Real=kv.js.timeout,
                                            cancel_token::MaybeCancellationToken=nothing)
     req = _stream_message_get_request(nothing, subject, false)
     msg = try
@@ -487,7 +487,7 @@ function _kv_latest_delete_marker_revision(kv::KeyValue, subject::String; timeou
     _kv_delete_marker_revision(msg, msg.seq)
 end
 
-function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,
+function kv_create_key(kv::KeyValueBucket, key::AbstractString, value; ttl=nothing,
                        timeout::Real=kv.js.timeout,
                        cancel_token::MaybeCancellationToken=nothing)::Int
     key = _validate_kv_key(key)
@@ -521,11 +521,11 @@ function kv_create_key(kv::KeyValue, key::AbstractString, value; ttl=nothing,
     end
 end
 
-kv_update(kv::KeyValue, key::AbstractString, value, revision::Integer; ttl=nothing,
+kv_update(kv::KeyValueBucket, key::AbstractString, value, revision::Integer; ttl=nothing,
           timeout::Real=kv.js.timeout, cancel_token::MaybeCancellationToken=nothing)::Int =
     kv_put(kv, key, value; revision, ttl, timeout, cancel_token)
 
-function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
+function kv_delete(kv::KeyValueBucket, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
                    timeout::Real=kv.js.timeout,
                    cancel_token::MaybeCancellationToken=nothing)::Nothing
     key = _validate_kv_key(key)
@@ -540,7 +540,7 @@ function kv_delete(kv::KeyValue, key::AbstractString; revision::Union{Nothing,In
     end
 end
 
-function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
+function kv_purge(kv::KeyValueBucket, key::AbstractString; revision::Union{Nothing,Integer}=nothing,
                   ttl=nothing, timeout::Real=kv.js.timeout,
                   cancel_token::MaybeCancellationToken=nothing)::Nothing
     key = _validate_kv_key(key)
@@ -555,7 +555,7 @@ function kv_purge(kv::KeyValue, key::AbstractString; revision::Union{Nothing,Int
     end
 end
 
-function kv_history(kv::KeyValue, key::AbstractString; batch=256, timeout::Real=kv.js.timeout,
+function kv_history(kv::KeyValueBucket, key::AbstractString; batch=256, timeout::Real=kv.js.timeout,
                     cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     key = _validate_kv_key(key)
@@ -594,7 +594,7 @@ function kv_history(kv::KeyValue, key::AbstractString; batch=256, timeout::Real=
     entries
 end
 
-function kv_keys(kv::KeyValue; timeout::Real=kv.js.timeout,
+function kv_keys(kv::KeyValueBucket; timeout::Real=kv.js.timeout,
                  cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
@@ -660,7 +660,7 @@ function _kv_watch_filters(key::AbstractString, keys)
     filters
 end
 
-function _kv_watch_consumer_config(kv::KeyValue, filters::Vector{String}; history::Bool=false,
+function _kv_watch_consumer_config(kv::KeyValueBucket, filters::Vector{String}; history::Bool=false,
                                    updates_only::Bool=false, meta_only::Bool=false,
                                    resume_revision::Union{Integer,Nothing}=nothing)
     history && updates_only && throw(ArgumentError("history and updates_only cannot both be true"))
@@ -693,7 +693,7 @@ function _consumer_num_pending(info::Union{ConsumerInfo,Nothing})::Int
     max(0, info.num_pending)
 end
 
-function _kv_watch_callback(kv::KeyValue, state::_KeyValueWatcherState, ignore_deletes::Bool)
+function _kv_watch_callback(kv::KeyValueBucket, state::_KeyValueWatcherState, ignore_deletes::Bool)
     msg -> begin
         entry = _kv_entry_from_consumer_msg(kv, msg)
         if !ignore_deletes || !_kv_is_delete_marker(entry.operation)
@@ -706,7 +706,7 @@ function _kv_watch_callback(kv::KeyValue, state::_KeyValueWatcherState, ignore_d
     end
 end
 
-function _kv_watch(callback, kv::KeyValue; key::AbstractString=">",
+function _kv_watch(callback, kv::KeyValueBucket; key::AbstractString=">",
                    keys=nothing, history::Bool=false, updates_only::Bool=false,
                    ignore_deletes::Bool=false, meta_only::Bool=false,
                    resume_revision::Union{Integer,Nothing}=nothing,
@@ -726,9 +726,9 @@ function _kv_watch(callback, kv::KeyValue; key::AbstractString=">",
     watcher
 end
 
-kv_watch(kv::KeyValue; kwargs...) = _kv_watch(nothing, kv; kwargs...)
+kv_watch(kv::KeyValueBucket; kwargs...) = _kv_watch(nothing, kv; kwargs...)
 
-function kv_watch(callback, kv::KeyValue; kwargs...)
+function kv_watch(callback, kv::KeyValueBucket; kwargs...)
     _kv_watch(callback, kv; kwargs...)
 end
 
@@ -741,7 +741,7 @@ function _kv_purge_deletes_threshold(older_than::Real)::Float64
     seconds == 0 ? _KV_DEFAULT_PURGE_DELETES_OLDER_THAN : seconds
 end
 
-function kv_purge_deletes(kv::KeyValue; older_than::Real=_KV_DEFAULT_PURGE_DELETES_OLDER_THAN,
+function kv_purge_deletes(kv::KeyValueBucket; older_than::Real=_KV_DEFAULT_PURGE_DELETES_OLDER_THAN,
                           timeout::Real=kv.js.timeout, cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)

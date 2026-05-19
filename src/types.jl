@@ -1697,7 +1697,9 @@ function _ensure_condition_timeout_task_locked!(condition::Base.GenericCondition
                                                 queue::_ConditionTimeoutQueue)
     task = queue.task
     if isnothing(task) || istaskdone(task)
-        queue.task = @async _condition_timeout_loop(condition, queue)
+        queue.task = _spawn_control(:condition_timeout) do
+            _condition_timeout_loop(condition, queue)
+        end
     end
     nothing
 end
@@ -1931,7 +1933,7 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     rng::MersenneTwister
     generation::Int
     generation_value::Threads.Atomic{Int}
-    jetstream_async_publish_states::Vector{WeakRef}
+    lifecycle_watchers::Vector{WeakRef}
 end
 
 function Client(options::Options, servers::Vector{Server}, current_server::Union{Server,Nothing},
@@ -2025,6 +2027,46 @@ function _set_subscription_snapshot_locked!(client::C, sid::Int,
     snapshot = copy(current)
     snapshot[sid] = entry
     @atomic client.subscription_snapshot = snapshot
+    nothing
+end
+
+function _register_client_lifecycle_watcher!(client::Client, watcher)
+    ref = WeakRef(watcher)
+    @lock client.lock begin
+        refs = client.lifecycle_watchers
+        live = 1
+        for i in eachindex(refs)
+            if !isnothing(refs[i].value)
+                refs[live] = refs[i]
+                live += 1
+            end
+        end
+        resize!(refs, live - 1)
+        push!(refs, ref)
+    end
+    nothing
+end
+
+_client_lifecycle_error!(_watcher, _err::Exception) = nothing
+
+function _notify_client_lifecycle_watchers!(client::Client, err::Exception)
+    watchers = Any[]
+    @lock client.lock begin
+        refs = client.lifecycle_watchers
+        live = 1
+        for i in eachindex(refs)
+            watcher = refs[i].value
+            if !isnothing(watcher)
+                refs[live] = refs[i]
+                live += 1
+                push!(watchers, watcher)
+            end
+        end
+        resize!(refs, live - 1)
+    end
+    for watcher in watchers
+        _client_lifecycle_error!(watcher, err)
+    end
     nothing
 end
 

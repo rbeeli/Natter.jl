@@ -509,7 +509,9 @@ end
 
 function _start_subscription_processor!(sub::Subscription, callback::Callback) where {Callback}
     processor = _SubscriptionProcessor(sub, callback)
-    sub.processor = @async processor()
+    sub.processor = _spawn_work(:subscription_processor) do
+        processor()
+    end
     nothing
 end
 
@@ -1525,7 +1527,7 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
         end
     end
     already && return nothing
-    _clear_js_async_publish_pending!(client, ConnectionClosedError())
+    _notify_client_lifecycle_watchers!(client, ConnectionClosedError())
     for sub in subs
         @lock sub.lock begin
             sub.closed = true
@@ -1776,7 +1778,9 @@ end
 function _ensure_request_timeout_task_locked!(client::C, mux::RequestMux{C}) where {C<:Client}
     task = mux.timeout_task
     if isnothing(task) || istaskdone(task)
-        mux.timeout_task = @async _request_timeout_loop(client, mux)
+        mux.timeout_task = _spawn_control(:request_timeout) do
+            _request_timeout_loop(client, mux)
+        end
     end
     nothing
 end

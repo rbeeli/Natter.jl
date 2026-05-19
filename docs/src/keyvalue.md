@@ -3,6 +3,10 @@
 KeyValue buckets are built on JetStream streams. They are useful for configuration, profiles, feature flags, small state records, and watched state.
 
 ```julia
+using Natter
+using Natter.JetStream
+using Natter.KeyValue
+
 client = connect("nats://127.0.0.1:4222")
 js = jetstream(client)
 ```
@@ -125,7 +129,7 @@ try
         @info "initial setting" key=update.key revision=update.revision
     end
 
-    @async begin
+    Threads.@spawn begin
         for update in watcher.updates
             @info "setting changed" key=update.key operation=update.operation
         end
@@ -164,8 +168,8 @@ profile = Ref{KeyValueEntry}()
 settings = Ref{KeyValueEntry}()
 
 @sync begin
-    @async profile[] = kv_get(kv, "users.42.profile")
-    @async settings[] = kv_get(kv, "users.42.settings")
+    Threads.@spawn profile[] = kv_get(kv, "users.42.profile")
+    Threads.@spawn settings[] = kv_get(kv, "users.42.settings")
 end
 ```
 

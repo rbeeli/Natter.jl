@@ -49,8 +49,8 @@ Run independent work concurrently with Julia tasks:
 
 ```julia
 @sync begin
-    @async publish(client, "events.created", "event-3")
-    @async publish(client, "events.created", "event-4")
+    Threads.@spawn publish(client, "events.created", "event-3")
+    Threads.@spawn publish(client, "events.created", "event-4")
 end
 
 flush(client)

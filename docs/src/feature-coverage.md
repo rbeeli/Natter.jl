@@ -28,13 +28,13 @@ Statuses:
 | Publish replay | Partial | Core publishes opt into reconnect replay with `buffer_on_reconnect=true` and are replayed only while they remain in the client buffer and have not been handed to the transport. Ambiguous write failures start reconnect but are not replayed automatically; use `pending_size=0` to disable replay buffering, or JetStream `msg_id` for durable idempotent publish paths. |
 | Slow consumer handling | Supported | Per-subscription pending limits report `SlowConsumerError`. |
 | Runtime inspection | Supported | `status`, `stats(client)`, `stats(sub)`, and `connected_url`. |
-| Async handles | Supported | Task-backed `_async` helpers return `NatterTask`; blocking calls accept cooperative cancellation tokens and async handles rethrow `CancelledError` from cancelled operations. JetStream publish has a protocol async publisher with `JetStreamPublishFuture`. |
+| Task concurrency | Supported | Direct calls compose with Julia `Threads.@spawn`/`@sync`; blocking calls accept cooperative cancellation tokens. JetStream publish has a protocol async publisher with `JetStreamPublishFuture`. |
 
 ## JetStream
 
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
-| Context | Supported | `jetstream(client)`. |
+| Context | Supported | `JetStream.jetstream(client)` or `jetstream(client)` after `using Natter.JetStream`. |
 | Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options, including two default `NoRespondersError` retries. `js_publish_future` uses protocol-level async publish with pending ack accounting, backpressure, completion waiting, per-message ack/error futures, configurable no-responder retries, and explicit pending-future clearing on reconnect rather than replay. |
 | Stream management | Supported | Create, update, info, list, names, page and iterator listing, purge, delete. |
 | Stream config | Supported | `StreamConfig`, nested helpers, and raw `Dict` payloads. Create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. Unknown raw fields tolerate additional nested defaults returned by the server. |
@@ -61,7 +61,7 @@ Statuses:
 | History and keys | Partial | Common paths implemented; broader large-bucket stress coverage remains. |
 | Watch | Partial | Channel and callback watchers, filters, updates-only, history, ignore deletes, metadata-only, resume revision, bounded close cleanup, ordered-consumer recovery, and bounded reconnect chaos coverage. Broader large-watch stress remains. |
 | Direct get | Supported | `direct=true` buckets use direct reads by default. |
-| Async handles | Supported | Bucket, key, history, keys, watch, and timeout-aware close helpers. |
+| Task concurrency | Supported | KeyValue operations are direct blocking calls that compose with normal Julia tasks and cooperative cancellation where applicable. |
 
 ## Observability And Errors
 

@@ -15,6 +15,13 @@ Then import the package:
 using Natter
 ```
 
+JetStream and KeyValue APIs live in submodules. Import them when using those sections:
+
+```julia
+using Natter.JetStream
+using Natter.KeyValue
+```
+
 For this repository, instantiate the local project instead:
 
 ```bash

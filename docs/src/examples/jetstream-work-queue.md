@@ -4,6 +4,7 @@ This recipe creates a work-queue stream, publishes jobs with message IDs, and pr
 
 ```julia
 using Natter
+using Natter.JetStream
 
 client = connect("nats://127.0.0.1:4222"; name="job-worker")
 js = jetstream(client)
@@ -68,7 +69,7 @@ Process a fetched batch concurrently when handlers are I/O-heavy:
 msgs = fetch(worker, 20; timeout=2.0)
 
 @sync for msg in msgs
-    @async begin
+    Threads.@spawn begin
         try
             job_id = parse(Int, String(msg))
             process_job(job_id)

@@ -967,7 +967,7 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING,
                                      write_io=transport)
     sub = subscribe(client, "race.replay")
-    replay_task = @async N._replay_subscriptions(client; reconnect_replay=true)
+    replay_task = Threads.@spawn N._replay_subscriptions(client; reconnect_replay=true)
     entered = timedwait(1.0; pollint=0.001) do
         isready(transport.entered)
     end
@@ -975,7 +975,7 @@ end
     entered == :ok || fetch(replay_task)
     @test take!(transport.entered)
 
-    unsub_task = @async unsubscribe(sub; max_msgs=2)
+    unsub_task = Threads.@spawn unsubscribe(sub; max_msgs=2)
     @test timedwait(1.0; pollint=0.001) do
         !istaskdone(unsub_task)
     end == :ok
@@ -1026,7 +1026,7 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
                                      write_io=transport)
 
-    subscribe_task = @async subscribe(client, "race.subscribe")
+    subscribe_task = Threads.@spawn subscribe(client, "race.subscribe")
     entered = timedwait(1.0; pollint=0.001) do
         isready(transport.entered)
     end
@@ -1034,7 +1034,7 @@ end
     entered == :ok || fetch(subscribe_task)
     @test take!(transport.entered)
 
-    replay_task = @async N._replay_subscriptions(client)
+    replay_task = Threads.@spawn N._replay_subscriptions(client)
     sleep(0.02)
     put!(transport.release, true)
 
@@ -1335,7 +1335,7 @@ end
     @lock sub.lock put!(sub.messages, Msg("events", nothing, TestHelpers.bytes("stolen"); sid=sub.sid))
 
     lock(sub.lock)
-    task = @async N.next(sub; timeout=0.05)
+    task = Threads.@spawn N.next(sub; timeout=0.05)
     try
         sleep(0.01)
         stolen = take!(sub.messages)
@@ -1366,7 +1366,7 @@ end
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED)
     entered = Channel{Bool}(1)
     release = Channel{Bool}(1)
-    holder = @async begin
+    holder = Threads.@spawn begin
         lock(client.write_lock)
         put!(entered, true)
         try
@@ -1377,7 +1377,7 @@ end
     end
     take!(entered)
 
-    signal_task = @async N._signal_flusher(client)
+    signal_task = Threads.@spawn N._signal_flusher(client)
     try
         @test timedwait(0.2; pollint=0.001) do
             istaskdone(signal_task)
@@ -1401,10 +1401,11 @@ end
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io)
 
+    fetch(Threads.@spawn nothing)
     lock(client.lock)
-    task = @async publish(client, "foo", "bar")
+    task = Threads.@spawn publish(client, "foo", "bar")
     try
-        @test timedwait(0.2; pollint=0.001) do
+        @test timedwait(2.0; pollint=0.001) do
             istaskdone(task)
         end != :timed_out
     finally
@@ -1446,7 +1447,7 @@ end
     old_signal = client.flush_signal
     waiting = Channel{Bool}(1)
     stale_result = Channel{Bool}(1)
-    stale_waiter = @async begin
+    stale_waiter = Threads.@spawn begin
         put!(waiting, true)
         try
             take!(old_signal)
@@ -1557,7 +1558,7 @@ end
         client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
                                          read_io=transport, write_io=transport)
         lock(client.write_lock)
-        task = @async try
+        task = Threads.@spawn try
             N._write_raw(client, TestHelpers.bytes("PING\r\n"))
             nothing
         catch err
@@ -1632,7 +1633,7 @@ end
                                      status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io=transport)
 
-    task = @async try
+    task = Threads.@spawn try
         N._write_raw(client, TestHelpers.bytes("PING\r\n"))
         nothing
     catch err
@@ -1691,7 +1692,7 @@ end
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io=N.BufferedWriteIO(transport))
 
-    task = @async try
+    task = Threads.@spawn try
         publish(client, "foo", repeat("x", 64))
         nothing
     catch err
@@ -1712,7 +1713,7 @@ end
     @test fetch(task) isa N.TimeoutError
     @test transport.closes[] >= 1
 
-    close_task = @async close(client)
+    close_task = Threads.@spawn close(client)
     @test timedwait(1.0; pollint=0.001) do
         istaskdone(close_task)
     end != :timed_out
@@ -1851,18 +1852,17 @@ end
 
     source = CancellationSource()
     token = cancellation_token(source)
-    next_task = @async TestHelpers.thrown_exception(() -> N.next(sub; timeout=30.0, cancel_token=token))
+    next_task = Threads.@spawn TestHelpers.thrown_exception(() -> N.next(sub; timeout=30.0, cancel_token=token))
     sleep(0.02)
     @test cancel!(source)
     @test fetch(next_task) isa CancelledError
 
-    async_source = CancellationSource()
-    async_token = cancellation_token(async_source)
-    handle = next_async(sub; timeout=30.0, cancel_token=async_token)
+    task_source = CancellationSource()
+    task_token = cancellation_token(task_source)
+    handle = Threads.@spawn TestHelpers.thrown_exception(() -> N.next(sub; timeout=30.0, cancel_token=task_token))
     sleep(0.02)
-    cancel!(async_source)
-    async_err = TestHelpers.thrown_exception(() -> fetch(handle))
-    @test async_err isa CancelledError
+    cancel!(task_source)
+    @test fetch(handle) isa CancelledError
 end
 
 @testitem "publish cancellation interrupts write lock waits" setup=[TestHelpers] begin
@@ -1877,7 +1877,7 @@ end
         source = CancellationSource()
         token = cancellation_token(source)
         lock(client.write_lock)
-        task = @async TestHelpers.thrown_exception(() -> call(client, token))
+        task = Threads.@spawn TestHelpers.thrown_exception(() -> call(client, token))
         try
             @test timedwait(1.0; pollint=0.001) do
                 client.write_waiters[] > 0
@@ -1920,7 +1920,7 @@ end
         source = CancellationSource()
         token = cancellation_token(source)
         lock(client.write_lock)
-        task = @async TestHelpers.thrown_exception(() -> call(token))
+        task = Threads.@spawn TestHelpers.thrown_exception(() -> call(token))
         try
             @test timedwait(1.0; pollint=0.001) do
                 client.write_waiters[] > 0
@@ -2040,7 +2040,7 @@ end
                                      write_io=CancellableFlushSink())
     source = CancellationSource()
     token = cancellation_token(source)
-    task = @async TestHelpers.thrown_exception(() -> flush(client; timeout=30.0, cancel_token=token))
+    task = Threads.@spawn TestHelpers.thrown_exception(() -> flush(client; timeout=30.0, cancel_token=token))
 
     @test timedwait(1.0; pollint=0.005) do
         length(client.pongs) == 1
@@ -2075,7 +2075,7 @@ end
                                      read_io=transport, write_io=transport)
     source = CancellationSource()
     token = cancellation_token(source)
-    task = @async TestHelpers.thrown_exception(() -> request(client, "svc", "body";
+    task = Threads.@spawn TestHelpers.thrown_exception(() -> request(client, "svc", "body";
                                                              timeout=30.0, cancel_token=token))
 
     @test timedwait(1.0; pollint=0.005) do
@@ -2361,7 +2361,7 @@ end
     data = TestHelpers.bytes("PUB foo 3\r\nbar\r\n")
     N._enqueue_pending(client, data)
 
-    replay_task = @async try
+    replay_task = Threads.@spawn try
         N._flush_pending_buffer(client; reconnect_replay=true)
         nothing
     catch err
@@ -2369,7 +2369,7 @@ end
     end
 
     @test take!(transport.entered)
-    close_task = @async close(client)
+    close_task = Threads.@spawn close(client)
     @test timedwait(1.0; pollint=0.001) do
         N.status(client) == N.ConnectionStatus.CLOSED
     end != :timed_out
@@ -2630,7 +2630,7 @@ end
     transport = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
 
-    tasks = [@async request(client, "svc", "req$i"; timeout=1.0) for i in 1:5]
+    tasks = [Threads.@spawn request(client, "svc", "req$i"; timeout=1.0) for i in 1:5]
     publishes = wait_for_publishes(transport, 5)
     mux = client.request_mux
     @test !isnothing(mux)
@@ -2720,7 +2720,7 @@ end
     N._dispatch_msg(client, Msg(first_reply, nothing, TestHelpers.bytes("late"); sid=mux.sub.sid))
     @test stats(client).dropped_msgs == before_drops + 1
 
-    task = @async request(client, "svc", "second"; timeout=1.0)
+    task = Threads.@spawn request(client, "svc", "second"; timeout=1.0)
     publishes = wait_for_publishes(transport, 2)
     second_reply = publishes[2][1]
     @test second_reply != first_reply
@@ -2760,7 +2760,7 @@ end
                                      read_io=transport, write_io=transport)
     push!(client.servers, N.Server("nats://127.0.0.1:1"))
 
-    task = @async request(client, "svc", "pending"; timeout=1.0)
+    task = Threads.@spawn request(client, "svc", "pending"; timeout=1.0)
     result = timedwait(1.0; pollint=0.001) do
         length(request_publishes(transport)) == 1
     end
@@ -2857,7 +2857,7 @@ end
     client = TestHelpers.fake_client(; opts=N.ConnectOptions(max_reconnect_attempts=0, error_cb=err -> push!(reported, err)),
                                      status=N.ConnectionStatus.RECONNECTING)
     sub = subscribe(client, "foo")
-    next_task = @async N.next(sub; timeout=30.0)
+    next_task = Threads.@spawn N.next(sub; timeout=30.0)
     callback_sub = subscribe(client, "bar") do _
         nothing
     end
@@ -2901,7 +2901,7 @@ end
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io=transport)
     sub = subscribe(client, "foo")
-    next_task = @async N.next(sub; timeout=30.0)
+    next_task = Threads.@spawn N.next(sub; timeout=30.0)
 
     sleep(0.01)
     reason = ErrorException("lost")
@@ -2966,7 +2966,7 @@ end
     listener = listen(ip"127.0.0.1", 0)
     port = Int(getsockname(listener)[2])
     attempts = Ref(0)
-    server_task = @async begin
+    server_task = Threads.@spawn begin
         try
             while attempts[] < 2
                 sock = accept(listener)
@@ -3020,7 +3020,7 @@ end
     listener = listen(ip"127.0.0.1", 0)
     port = Int(getsockname(listener)[2])
     attempts = Ref(0)
-    server_task = @async begin
+    server_task = Threads.@spawn begin
         try
             while attempts[] < 2
                 sock = accept(listener)
@@ -3073,7 +3073,7 @@ end
     reported = Ref(0)
     release = Channel{Bool}(1)
     handshake = Channel{Tuple{String,String}}(1)
-    server_task = @async begin
+    server_task = Threads.@spawn begin
         try
             while true
                 sock = accept(listener)
@@ -3137,7 +3137,7 @@ end
     listener = listen(ip"127.0.0.1", 0)
     port = Int(getsockname(listener)[2])
     release = Channel{Bool}(1)
-    server_task = @async begin
+    server_task = Threads.@spawn begin
         try
             sock = accept(listener)
             try
@@ -3185,7 +3185,7 @@ end
     port = Int(getsockname(listener)[2])
     accepted = Channel{Sockets.TCPSocket}(1)
     blocker = Channel{Bool}(1)
-    server_task = @async begin
+    server_task = Threads.@spawn begin
         try
             sock = accept(listener)
             put!(accepted, sock)
@@ -3248,7 +3248,7 @@ end
     listener = listen(ip"127.0.0.1", 0)
     port = Int(getsockname(listener)[2])
     accepted = Channel{Sockets.TCPSocket}(1)
-    server_task = @async begin
+    server_task = Threads.@spawn begin
         sock = try
             accept(listener)
         catch err
@@ -3410,7 +3410,7 @@ end
     started = Channel{Bool}(1)
     stopped = Channel{Bool}(1)
     blocker = Channel{Bool}(0)
-    task = @async begin
+    task = N._spawn_sticky(:blocked_test_task) do
         put!(started, true)
         try
             take!(blocker)
@@ -3438,7 +3438,7 @@ end
     started = Channel{Bool}(1)
     stopped = Channel{Bool}(1)
     blocker = Channel{Bool}(1)
-    task = @async begin
+    task = Threads.@spawn begin
         put!(started, true)
         try
             take!(blocker)
@@ -3607,7 +3607,7 @@ end
     @test !keepalive_marker.active
     @test keepalive_marker.ready
 
-    flush_task = @async flush(client; timeout=1.0)
+    flush_task = Threads.@spawn flush(client; timeout=1.0)
     @test timedwait(() -> length(client.pongs) == 2, 1.0; pollint=0.01) != :timed_out
     @test count(==("PING\r\n"), transport.writes) == 2
 
@@ -3667,7 +3667,7 @@ end
     Base.flush(t::CoordinatedPongTransport) = begin
         client = t.client[]
         sub = t.sub[]
-        @async begin
+        Threads.@spawn begin
             sleep(t.pong_delay)
             N._notify_pong(client)
             if !isnothing(sub)
@@ -3821,7 +3821,7 @@ end
     started = Channel{Bool}(1)
     stopped = Channel{Bool}(1)
     blocker = Channel{Bool}(0)
-    reader_task = @async begin
+    reader_task = N._spawn_sticky(:background_close_reader) do
         put!(started, true)
         try
             take!(blocker)
@@ -3865,7 +3865,7 @@ end
 
     entered = Channel{Bool}(1)
     release = Channel{Bool}(1)
-    holder = @async begin
+    holder = Threads.@spawn begin
         lock(client.write_lock)
         put!(entered, true)
         try
@@ -3876,7 +3876,7 @@ end
     end
     take!(entered)
 
-    drain_task = @async TestHelpers.thrown_exception(() -> drain(sub; timeout=0.02))
+    drain_task = Threads.@spawn TestHelpers.thrown_exception(() -> drain(sub; timeout=0.02))
     try
         finished = timedwait(2.0; pollint=0.01) do
             istaskdone(drain_task)
@@ -3916,7 +3916,7 @@ end
 
     entered = Channel{Bool}(1)
     release = Channel{Bool}(1)
-    holder = @async begin
+    holder = Threads.@spawn begin
         lock(client.write_lock)
         put!(entered, true)
         try
@@ -3927,7 +3927,7 @@ end
     end
     take!(entered)
 
-    drain_task = @async TestHelpers.thrown_exception(() -> drain(client; timeout=0.02))
+    drain_task = Threads.@spawn TestHelpers.thrown_exception(() -> drain(client; timeout=0.02))
     try
         finished = timedwait(2.0; pollint=0.01) do
             istaskdone(drain_task)
@@ -3966,7 +3966,7 @@ end
 
     entered = Channel{Bool}(1)
     release = Channel{Bool}(1)
-    holder = @async begin
+    holder = Threads.@spawn begin
         lock(client.write_lock)
         put!(entered, true)
         try
@@ -3977,7 +3977,7 @@ end
     end
     take!(entered)
 
-    drain_task = @async TestHelpers.thrown_exception(() -> drain(client; timeout=0.02))
+    drain_task = Threads.@spawn TestHelpers.thrown_exception(() -> drain(client; timeout=0.02))
     try
         finished = timedwait(2.0; pollint=0.01) do
             istaskdone(drain_task)
@@ -4024,9 +4024,9 @@ end
     transport = BlockingTransport(closes, Channel{Bool}(1), Channel{Bool}(1))
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, read_io=transport, write_io=transport)
 
-    write_task = @async N._write_raw(client, TestHelpers.bytes("PING\r\n"))
+    write_task = Threads.@spawn N._write_raw(client, TestHelpers.bytes("PING\r\n"))
     @test take!(transport.entered) == true
-    close_task = @async N._close_transport!(client)
+    close_task = Threads.@spawn N._close_transport!(client)
     sleep(0.05)
     @test closes[] == 0
     put!(transport.release, true)
@@ -4268,7 +4268,7 @@ end
 
             listener = listen(ip"127.0.0.1", 0)
             _ip, port = getsockname(listener)
-            server_task = @async begin
+            server_task = Threads.@spawn begin
                 sock = accept(listener)
                 ctx = nothing
                 try

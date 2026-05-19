@@ -2,6 +2,8 @@ using TestItems
 
 @testitem "real nats-server core integration" setup=[TestHelpers, IntegrationHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Dates
     using Random
 
@@ -30,14 +32,14 @@ using TestItems
             end
             response = request(client, "$subject.req", "ok"; timeout=2.0)
             @test String(response) == "OK"
-            async_response = fetch(request_async(client, "$subject.req", "async"; timeout=2.0))
+            async_response = fetch(Threads.@spawn request(client, "$subject.req", "async"; timeout=2.0))
             @test String(async_response) == "ASYNC"
             close(service)
 
             @test_throws NoRespondersError request(client, "$subject.none", ""; timeout=2.0)
-            async_no_responders = TestHelpers.thrown_exception() do
-                fetch(request_async(client, "$subject.none", ""; timeout=2.0))
-            end
+            async_no_responders = fetch(Threads.@spawn TestHelpers.thrown_exception() do
+                request(client, "$subject.none", ""; timeout=2.0)
+            end)
             @test async_no_responders isa NoRespondersError
 
             slow_started = Channel{Bool}(1)
@@ -56,11 +58,11 @@ using TestItems
             @test sort(collect(keys(client.subscriptions))) == before_timeout_sids
             close(slow_service)
 
-            async_sub = fetch(subscribe_async(client, "$subject.async"))
-            fetch(publish_async(client, "$subject.async", "from task"))
-            fetch(flush_async(client; timeout=io_timeout))
-            @test String(fetch(next_async(async_sub; timeout=io_timeout))) == "from task"
-            fetch(unsubscribe_async(async_sub))
+            async_sub = fetch(Threads.@spawn subscribe(client, "$subject.async"))
+            fetch(Threads.@spawn publish(client, "$subject.async", "from task"))
+            fetch(Threads.@spawn flush(client; timeout=io_timeout))
+            @test String(fetch(Threads.@spawn N.next(async_sub; timeout=io_timeout))) == "from task"
+            fetch(Threads.@spawn unsubscribe(async_sub))
 
             limited = subscribe(client, "$subject.limited")
             IntegrationHelpers.publish_and_flush(client, "$subject.limited", "first"; timeout=io_timeout)
@@ -99,7 +101,7 @@ using TestItems
             end
             @test started_result != :timed_out
             @test take!(started) == true
-            drain_task = @async begin
+            drain_task = Threads.@spawn begin
                 drain(callback_sub; timeout=io_timeout)
                 drained[] = true
             end
@@ -129,6 +131,8 @@ end
 
 @testitem "real nats-server NKEY auth integration" setup=[IntegrationHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -154,6 +158,8 @@ end
 
 @testitem "real nats-server JWT credentials auth integration" setup=[IntegrationHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -184,6 +190,8 @@ end
 
 @testitem "real nats-server reconnect server-pool failover" setup=[TestHelpers, IntegrationHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -270,6 +278,8 @@ end
 
 @testitem "real nats-server JetStream async publish reconnect clears pending" setup=[TestHelpers, IntegrationHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -356,6 +366,8 @@ end
 
 @testitem "real nats-server JetStream integration" setup=[TestHelpers, IntegrationHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Dates
     using Random
 
@@ -371,7 +383,7 @@ end
         subject = "$subject_root.main"
         other_subject = "$subject_root.other"
         stream_created = Ref(false)
-        kv = Ref{Union{Nothing,KeyValue}}(nothing)
+        kv = Ref{Union{Nothing,KeyValueBucket}}(nothing)
         try
             sinfo = stream_create(js, StreamConfig(name=stream, subjects=["$subject_root.*"], storage=StorageType.MEMORY, allow_direct=true))
             stream_created[] = true
@@ -397,7 +409,7 @@ end
             @test String(direct_next) == "payload2"
             pa_async = fetch(js_publish_future(js, subject, "async-payload"; stream=stream))
             @test pa_async.stream == stream
-            async_direct = fetch(stream_message_get_async(js, stream; seq=pa_async.seq, direct=true))
+            async_direct = fetch(Threads.@spawn stream_message_get(js, stream; seq=pa_async.seq, direct=true))
             @test async_direct.seq == pa_async.seq
             @test String(async_direct) == "async-payload"
 
@@ -439,11 +451,11 @@ end
             end
 
             async_durable = "DURASYNC_$(randstring(6))"
-            async_psub = fetch(pull_subscribe_async(js, subject; stream=stream, durable=async_durable))
-            async_msgs = fetch(fetch_async(async_psub, 1; timeout=2.0))
+            async_psub = fetch(Threads.@spawn pull_subscribe(js, subject; stream=stream, durable=async_durable))
+            async_msgs = fetch(Threads.@spawn fetch(async_psub, 1; timeout=2.0))
             @test length(async_msgs) == 1
-            fetch(ack_async(first(async_msgs)))
-            fetch(close_async(async_psub))
+            fetch(Threads.@spawn ack(first(async_msgs)))
+            fetch(Threads.@spawn close(async_psub))
 
             no_wait_subject = "$subject_root.no-wait"
             no_wait_durable = "NOWAIT_$(randstring(6))"
@@ -694,7 +706,7 @@ end
                 @test empty_status.history == 5
                 @test empty_status.storage == StorageType.MEMORY
                 @test empty_status.direct
-                @test fetch(kv_status_async(kv[])).bucket == bucket
+                @test fetch(Threads.@spawn kv_status(kv[])).bucket == bucket
                 @test_throws KeyValueKeyNotFoundError kv_get(kv[], "missing")
                 alpha_revision = kv_put(kv[], "alpha", "one")
                 @test alpha_revision >= 1
@@ -775,9 +787,9 @@ end
                 finally
                     close(updates_only_watcher)
                 end
-                beta_revision = fetch(kv_put_async(kv[], "beta", "async-one"))
+                beta_revision = fetch(Threads.@spawn kv_put(kv[], "beta", "async-one"))
                 @test beta_revision >= 1
-                @test String(fetch(kv_get_async(kv[], "beta"))) == "async-one"
+                @test String(fetch(Threads.@spawn kv_get(kv[], "beta"))) == "async-one"
                 @test_throws KeyValueWrongRevisionError kv_update(kv[], "beta", "wrong-revision", beta_revision + 100)
                 @test_throws KeyValueWrongRevisionError kv_delete(kv[], "beta"; revision=beta_revision + 100)
                 updates = Channel{KeyValueEntry}(4)
@@ -841,14 +853,14 @@ end
                 finally
                     close(ttl_watcher)
                 end
-                @test isnothing(fetch(kv_delete_async(kv[], "beta"; revision=beta_revision)))
-                async_deleted = TestHelpers.thrown_exception() do
-                    fetch(kv_get_async(kv[], "beta"))
-                end
+                @test isnothing(fetch(Threads.@spawn kv_delete(kv[], "beta"; revision=beta_revision)))
+                async_deleted = fetch(Threads.@spawn TestHelpers.thrown_exception() do
+                    kv_get(kv[], "beta")
+                end)
                 @test async_deleted isa KeyValueKeyDeletedError
                 purge_revision = kv_put(kv[], "purge-me", "value")
                 @test_throws KeyValueWrongRevisionError kv_purge(kv[], "purge-me"; revision=purge_revision + 100)
-                @test isnothing(fetch(kv_purge_async(kv[], "purge-me"; revision=purge_revision)))
+                @test isnothing(fetch(Threads.@spawn kv_purge(kv[], "purge-me"; revision=purge_revision)))
                 @test_throws KeyValueKeyDeletedError kv_get(kv[], "purge-me")
                 kv_delete(kv[], "alpha")
                 @test_throws KeyValueKeyDeletedError kv_get(kv[], "alpha")
@@ -886,6 +898,8 @@ end
 
 @testitem "real nats-server JetStream ordered reset failure recovery" setup=[IntegrationHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -975,6 +989,8 @@ end
 
 @testitem "real nats-server JetStream fetch disconnect integration" setup=[IntegrationHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter
@@ -1001,7 +1017,7 @@ end
             psub[] = pull_subscribe(js, subject; stream, durable)
 
             before_out = stats(client).out_msgs
-            fetch_task = @async fetch(psub[], 1; timeout=5.0, heartbeat=0)
+            fetch_task = Threads.@spawn fetch(psub[], 1; timeout=5.0, heartbeat=0)
             @test timedwait(2.0; pollint=0.01) do
                 stats(client).out_msgs > before_out
             end != :timed_out
@@ -1030,6 +1046,8 @@ end
 
 @testitem "real nats-server TLS first integration" setup=[IntegrationHelpers] begin
     using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
     using Random
 
     const N = Natter

@@ -7,9 +7,10 @@ Conventions:
 - Timeouts and durations are seconds.
 - Status enums are namespaced, for example `ConnectionStatus.CONNECTED` and `AckPolicy.EXPLICIT`.
 - Payload inputs may be strings, byte vectors, or `nothing`; encode structured values explicitly.
-- `String(msg)` works for `Msg`, `BorrowedMsg`, `JetStreamMsg`, `BorrowedJetStreamMsg`, and `KeyValueEntry`.
+- `String(msg)` works for `Msg`, `BorrowedMsg`, `JetStream.JetStreamMsg`, `JetStream.BorrowedJetStreamMsg`, and `KeyValue.KeyValueEntry`.
 - Blocking operations accept `cancel_token=cancellation_token(source)` where cancellation is useful.
-- Most `_async` helpers return `NatterTask`; `js_publish_future` returns `JetStreamPublishFuture`. `fetch(handle)` returns the operation result or rethrows the original error.
+- Use normal Julia `Threads.@spawn`/`@sync` task composition for concurrent direct calls.
+- JetStream and KeyValue APIs are exported from `Natter.JetStream` and `Natter.KeyValue`.
 
 ## Core Types
 
@@ -27,7 +28,6 @@ Conventions:
 | `Headers` | Case-insensitive header dictionary of `String => Vector{String}`. |
 | `PublishFrame` | Prepared core publish frame from `prepare_publish`. |
 | `Subscription` | Core subscription handle. |
-| `NatterTask` | Explicit task handle returned by task-backed `_async` helpers. |
 | `CancellationSource`, `CancellationToken` | Cooperative cancellation source and token for blocking operations. |
 
 ## Authentication Types
@@ -128,11 +128,13 @@ Parser/resource limits:
 | `stats(sub)` | `SubscriptionStats` | Per-subscription pending, processing, received, delivered, dropped, and active-state snapshot. |
 | `connected_url(client)` | `Union{String,Nothing}` | Current server URL. |
 
-Core async helpers: `connect_async`, `publish_async`, `respond_async`, `subscribe_async`, `unsubscribe_async`, `next_async`, `request_async`, `flush_async`, `ping_async`, `drain_async`, and `close_async`.
+For explicit concurrent work, call direct APIs inside Julia tasks, for example `Threads.@spawn request(client, "subject"; timeout=1.0)`.
 
-Cancellation helpers: `CancellationSource()`, `cancellation_token(source)`, `cancel!(source)`, and `iscancelled(token)`. Cancelled operations throw `CancelledError`; `_async` helpers rethrow the same error from `fetch(handle)`.
+Cancellation helpers: `CancellationSource()`, `cancellation_token(source)`, `cancel!(source)`, and `iscancelled(token)`. Cancelled operations throw `CancelledError`.
 
 ## JetStream Types
+
+Import these with `using Natter.JetStream`.
 
 | Type | Purpose |
 | :--- | :--- |
@@ -209,13 +211,13 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 
 Typed `StreamConfig`, typed `ConsumerConfig`, and raw dictionary create/update calls verify that requested fields are reflected in the server response, including explicit false, zero, and empty values. Raw dictionary configs remain available for fields outside Natter's typed API, but they are not a weaker verification escape hatch. For unknown raw fields, Natter requires requested nested values to be present and tolerates additional nested defaults returned by the server.
 
-JetStream task-backed async helpers mirror management, subscribe, fetch, timeout-aware close, and acknowledgement functions, including acknowledgement kwargs and borrowed messages: `stream_*_async`, `consumer_*_async`, `pull_subscribe_async`, `push_subscribe_async`, `fetch_async`, `ack_async`, `ack_sync_async`, `nak_async`, `in_progress_async`, `term_async`, and `js_publish_future_complete_async`. `js_publish_future` is different: it is the protocol async publisher and returns `JetStreamPublishFuture`.
-
 ## KeyValue Types
+
+Import these with `using Natter.KeyValue`. Bucket handles have type `KeyValueBucket`; the `KeyValue` name is the submodule.
 
 | Type | Purpose |
 | :--- | :--- |
-| `KeyValue` | Bucket handle. |
+| `KeyValueBucket` | Bucket handle. |
 | `KeyValueEntry` | Bucket entry with `bucket`, `key`, `value`, `revision`, `created`, `delta`, and `operation`. |
 | `KeyValueOperation` | `PUT`, `DELETE`, `PURGE`. |
 | `KeyValueStatus` | Bucket status and backing stream info. |
@@ -226,8 +228,8 @@ JetStream task-backed async helpers mirror management, subscribe, fetch, timeout
 
 | Function | Returns | Use |
 | :--- | :--- | :--- |
-| `kv_create(js, bucket; history=1, ttl=nothing, max_bytes=-1, max_value_size=-1, storage="file", replicas=1, direct=false, compression=nothing, metadata=nothing, limit_marker_ttl=nothing, timeout=...)` | `KeyValue` | Create a bucket. |
-| `kv_open(js, bucket; timeout=...)` | `KeyValue` | Open an existing bucket. |
+| `kv_create(js, bucket; history=1, ttl=nothing, max_bytes=-1, max_value_size=-1, storage="file", replicas=1, direct=false, compression=nothing, metadata=nothing, limit_marker_ttl=nothing, timeout=...)` | `KeyValueBucket` | Create a bucket. |
+| `kv_open(js, bucket; timeout=...)` | `KeyValueBucket` | Open an existing bucket. |
 | `kv_delete_bucket(kv; timeout=...)` | `Bool` | Delete the bucket. |
 | `kv_status(kv; timeout=...)` | `KeyValueStatus` | Inspect bucket state. |
 | `kv_get(kv, key; revision=nothing, direct=nothing, timeout=...)` | `KeyValueEntry` | Read a key. |
@@ -242,8 +244,6 @@ JetStream task-backed async helpers mirror management, subscribe, fetch, timeout
 | `kv_watch(kv; key=">", keys=nothing, history=false, updates_only=false, ignore_deletes=false, meta_only=false, resume_revision=nothing, channel_size=256, notify_initial_done=false, timeout=...)` | `KeyValueWatcher` | Watch with a channel. |
 | `kv_watch(callback, kv; kwargs...)` | `KeyValueWatcher` | Watch with a callback. |
 | `close(watcher; timeout=...)` | `nothing` | Close a watcher and bound server cleanup. |
-
-KeyValue async helpers: `kv_create_async`, `kv_open_async`, `kv_delete_bucket_async`, `kv_status_async`, `kv_get_async`, `kv_put_async`, `kv_create_key_async`, `kv_update_async`, `kv_delete_async`, `kv_purge_async`, `kv_purge_deletes_async`, `kv_history_async`, `kv_keys_async`, `kv_watch_async`, and `close_async(watcher; timeout=...)`.
 
 ## Errors
 

@@ -3,6 +3,7 @@ using TestItems
 @testitem "JetStream typed stream config serialization" begin
     using Dates
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -68,6 +69,7 @@ end
 @testitem "JetStream typed consumer config serialization" begin
     using Dates
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -119,6 +121,7 @@ end
 
 @testitem "JetStream priority policy values serialize and parse" begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -148,6 +151,7 @@ end
 
 @testitem "JetStream consumer filter config validation" begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -166,6 +170,7 @@ end
 
 @testitem "JetStream typed stream config validates local schema" begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -189,6 +194,7 @@ end
 
 @testitem "JetStream raw stream config validates local schema" begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -222,6 +228,7 @@ end
 
 @testitem "JetStream typed consumer config validates local schema" begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -269,6 +276,7 @@ end
 @testitem "JetStream raw dict config serialization matches typed config units" begin
     using Dates
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -315,6 +323,7 @@ end
 
 @testitem "JetStream normalized consumer payload is not converted twice" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -344,6 +353,7 @@ end
 
 @testitem "JetStream timeout arguments are positive finite before protocol writes" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -397,6 +407,7 @@ end
 @testitem "JetStream list page and iterator APIs page lazily" setup=[TestHelpers] begin
     using JSON3
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -427,7 +438,7 @@ end
         "total" => 3,
         "limit" => 1,
     ))
-    stream_task = @async stream_list_page(js; offset=2)
+    stream_task = Threads.@spawn stream_list_page(js; offset=2)
     respond_next_request!(client, stream_payload)
     stream_page = fetch(stream_task)
     @test stream_page isa JetStreamPage{StreamInfo}
@@ -445,13 +456,13 @@ end
         "total" => 1,
         "limit" => 1,
     ))
-    consumer_task = @async consumer_list_page(js, "ORDERS")
+    consumer_task = Threads.@spawn consumer_list_page(js, "ORDERS")
     respond_next_request!(client, consumer_payload)
     consumer_page = fetch(consumer_task)
     @test consumer_page isa JetStreamPage{ConsumerInfo}
     @test only(consumer_page).name == "worker"
 
-    names_task = @async collect(stream_names_iter(js))
+    names_task = Threads.@spawn collect(stream_names_iter(js))
     respond_next_request!(client, JSON3.write(Dict(
         "streams" => ["A", "B"],
         "offset" => 0,
@@ -467,7 +478,7 @@ end
     @test fetch(names_task) == ["A", "B", "C"]
 
     lazy_iter = stream_names_pages(js)
-    first_task = @async iterate(lazy_iter)
+    first_task = Threads.@spawn iterate(lazy_iter)
     respond_next_request!(client, JSON3.write(Dict(
         "streams" => ["D"],
         "offset" => 0,
@@ -480,7 +491,7 @@ end
     @test first_page.items == ["D"]
     @test (@lock client.lock isempty(client.request_mux.waiters))
 
-    second_task = @async iterate(lazy_iter, state)
+    second_task = Threads.@spawn iterate(lazy_iter, state)
     respond_next_request!(client, JSON3.write(Dict(
         "streams" => ["E"],
         "offset" => 1,
@@ -496,6 +507,7 @@ end
 @testitem "JetStream publish options serialize supported headers" setup=[TestHelpers] begin
     using Dates
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -555,6 +567,7 @@ end
 
 @testitem "JetStream publish ack parser decodes typed ack shape" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -592,6 +605,7 @@ end
 
 @testitem "JetStream async publish uses protocol futures" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -602,7 +616,6 @@ end
     future = js_publish_future(js, "orders.created", "payload"; timeout=1.0)
 
     @test future isa JetStreamPublishFuture
-    @test !(future isa NatterTask)
     @test !isready(future)
     @test future.retry_attempts == N.DEFAULT_JS_PUBLISH_RETRY_ATTEMPTS
     @test js_publish_future_pending(js) == 1
@@ -635,6 +648,7 @@ end
 
 @testitem "JetStream publish futures honor cancellation while waiting for write lock" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -647,7 +661,7 @@ end
     source = CancellationSource()
     token = cancellation_token(source)
     lock(client.write_lock)
-    task = @async TestHelpers.thrown_exception() do
+    task = Threads.@spawn TestHelpers.thrown_exception() do
         js_publish_future(js, "orders.created", "payload"; cancel_token=token)
     end
     try
@@ -674,6 +688,7 @@ end
 
 @testitem "JetStream publish future setup honors cancellation while waiting for write lock" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -684,7 +699,7 @@ end
     source = CancellationSource()
     token = cancellation_token(source)
     lock(client.write_lock)
-    task = @async TestHelpers.thrown_exception() do
+    task = Threads.@spawn TestHelpers.thrown_exception() do
         js_publish_future(js, "orders.created", "payload"; cancel_token=token)
     end
     try
@@ -712,6 +727,7 @@ end
 
 @testitem "JetStream async publish timeout monitor accepts long deadlines" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -736,6 +752,7 @@ end
 
 @testitem "JetStream async publish pending futures are cleared on reconnect" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -745,7 +762,7 @@ end
 
     future = js_publish_future(js, "orders.created", "payload"; timeout=1.0)
     @test js_publish_future_pending(js) == 1
-    @test !isempty(client.jetstream_async_publish_states)
+    @test !isempty(client.lifecycle_watchers)
 
     TestHelpers.clear_capture!(capture)
     N._trigger_reconnect(client, ErrorException("transport failed"))
@@ -765,6 +782,7 @@ end
 
 @testitem "JetStream async publish applies backpressure and waits for completion" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -781,7 +799,7 @@ end
     @test backpressure_err isa TimeoutError
     @test js_publish_future_pending(js) == 1
 
-    complete_task = @async js_publish_future_complete(js; timeout=1.0)
+    complete_task = Threads.@spawn js_publish_future_complete(js; timeout=1.0)
     sleep(0.02)
     @test !istaskdone(complete_task)
 
@@ -796,6 +814,7 @@ end
 
 @testitem "JetStream async publish futures receive server errors and timeouts" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -867,6 +886,7 @@ end
 @testitem "JetStream typed config response parsing" begin
     using Dates
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -963,6 +983,7 @@ end
 
 @testitem "JetStream typed config rejects invalid local metadata" begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -972,6 +993,7 @@ end
 
 @testitem "JetStream consumer filter config validation happens before request" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1012,6 +1034,7 @@ end
 
 @testitem "JetStream stream config validation happens before request" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1045,6 +1068,7 @@ end
 
 @testitem "JetStream configs must be reflected by server response" begin
     using Natter
+    using Natter.JetStream
     using JSON3
 
     const N = Natter
@@ -1309,6 +1333,7 @@ end
 
 @testitem "JetStream stream discovery validates subjects before request" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1330,6 +1355,7 @@ end
 
 @testitem "JetStream consumer config validation happens before request" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1348,6 +1374,7 @@ end
 
 @testitem "JetStream pull consumer priority config validation" begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1379,6 +1406,7 @@ end
 
 @testitem "JetStream stream purge validates filter locally" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1403,6 +1431,7 @@ end
 
 @testitem "JetStream push callback auto ack respects ack none policy" begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1422,6 +1451,7 @@ end
 
 @testitem "JetStream APIs accept abstract strings and callable objects" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1487,6 +1517,7 @@ end
 
 @testitem "JetStream in-progress ack is allowed only before terminal ack" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1522,6 +1553,7 @@ end
 
 @testitem "borrowed JetStream messages share terminal ack guard" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1566,6 +1598,7 @@ end
 
 @testitem "JetStream terminal acks are not marked done while reconnecting" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1595,6 +1628,7 @@ end
 
 @testitem "JetStream terminal acks flush buffered transports before marking done" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1613,6 +1647,7 @@ end
 
 @testitem "JetStream nak validates delay" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1638,6 +1673,7 @@ end
 
 @testitem "JetStream terminal ack guard is synchronized" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1679,9 +1715,9 @@ end
         err
     end
 
-    first = @async ack_result()
+    first = Threads.@spawn ack_result()
     take!(capture.started)
-    second = @async ack_result()
+    second = Threads.@spawn ack_result()
     for _ in 1:100
         yield()
     end
@@ -1697,6 +1733,7 @@ end
 
 @testitem "JetStream push flow control requires positive heartbeat" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1716,6 +1753,7 @@ end
 
 @testitem "JetStream pull rejects push delivery config before create" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1755,6 +1793,7 @@ end
 
 @testitem "JetStream push queue configuration is resolved before create" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1802,6 +1841,7 @@ end
 
 @testitem "JetStream queue push rejects heartbeat and flow control" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1848,6 +1888,7 @@ end
 
 @testitem "JetStream push rejects binding active non-queue consumer" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1886,6 +1927,7 @@ end
 
 @testitem "JetStream push subscribe installs core subscription before creating consumer" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1912,6 +1954,7 @@ end
 
 @testitem "JetStream public ordered push subscribe configures ordered consumer" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1943,6 +1986,7 @@ end
 
 @testitem "JetStream ordered push reset clears stale start time" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -1987,6 +2031,7 @@ end
 
 @testitem "JetStream ordered push reset rolls back subscription mapping after create failure" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2028,6 +2073,7 @@ end
 
 @testitem "JetStream ordered push subscribe rejects unsupported options before write" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2057,6 +2103,7 @@ end
 
 @testitem "JetStream push control dispatch filters heartbeats" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2083,6 +2130,7 @@ end
 
 @testitem "borrowed JetStream push control dispatch handles status frames" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2149,6 +2197,7 @@ end
 
 @testitem "JetStream status controls classify lazy descriptions without allocation" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2172,6 +2221,7 @@ end
 
 @testitem "JetStream push idle heartbeat replies to stalled consumers" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2194,6 +2244,7 @@ end
 
 @testitem "JetStream push idle heartbeat reports consumer sequence mismatch" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2228,6 +2279,7 @@ end
 
 @testitem "JetStream push control dispatch maps lifecycle statuses" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2272,6 +2324,7 @@ end
 
 @testitem "JetStream push flow control replies internally" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2295,6 +2348,7 @@ end
 
 @testitem "JetStream push flow control waits for channel delivery" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2329,6 +2383,7 @@ end
 
 @testitem "JetStream push next returns ackable messages" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2351,6 +2406,7 @@ end
 
 @testitem "JetStream push next rejects callback subscriptions" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2364,8 +2420,8 @@ end
         err = TestHelpers.thrown_exception(() -> N.next(psub; timeout=0.1))
         @test err isa ArgumentError
         @test occursin("callback", err.msg)
-        async_err = TestHelpers.thrown_exception(() -> fetch(next_async(psub; timeout=0.1)))
-        @test async_err isa ArgumentError
+        task = Threads.@spawn TestHelpers.thrown_exception(() -> N.next(psub; timeout=0.1))
+        @test fetch(task) isa ArgumentError
     finally
         close(psub)
     end
@@ -2373,6 +2429,7 @@ end
 
 @testitem "JetStream push flow control waits for callback delivery" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2428,6 +2485,7 @@ end
 
 @testitem "JetStream push flow control reply failures use error callback" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2452,6 +2510,7 @@ end
 
 @testitem "JetStream push heartbeat monitor reports missed heartbeats" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2479,6 +2538,7 @@ end
 
 @testitem "JetStream push data refreshes heartbeat activity" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2513,6 +2573,7 @@ end
 
 @testitem "JetStream push heartbeat sequence tracking parses first data reply only" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2539,6 +2600,7 @@ end
 
 @testitem "JetStream push control dispatch does not invoke callbacks" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2571,6 +2633,7 @@ end
 
 @testitem "JetStream consumer create update and upsert request actions" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2616,6 +2679,7 @@ end
 
 @testitem "JetStream durable bind-or-create binds after create conflict" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
     using JSON3
 
     const N = Natter
@@ -2656,7 +2720,7 @@ end
     )
     pull_js = jetstream(pull_client)
     pull_payload = N._js_config_payload(ConsumerConfig(name="worker", durable_name="worker", filter_subject="orders.created"))
-    pull_task = @async N._bind_or_create_consumer(pull_js, "ORDERS", "worker", pull_payload, Set(["name", "durable_name", "filter_subject"]))
+    pull_task = Threads.@spawn N._bind_or_create_consumer(pull_js, "ORDERS", "worker", pull_payload, Set(["name", "durable_name", "filter_subject"]))
     respond_next_request!(pull_client, missing)
     respond_next_request!(pull_client, conflict)
     respond_next_request!(pull_client, consumer_response())
@@ -2671,7 +2735,7 @@ end
         write_io=IOBuffer(),
     )
     push_js = jetstream(push_client)
-    push_task = @async push_subscribe(push_js, "orders.created"; stream="ORDERS", durable="worker")
+    push_task = Threads.@spawn push_subscribe(push_js, "orders.created"; stream="ORDERS", durable="worker")
     respond_next_request!(push_client, missing)
     respond_next_request!(push_client, conflict)
     respond_next_request!(push_client, consumer_response(deliver_subject="_INBOX.existing"))
@@ -2690,6 +2754,7 @@ end
 
 @testitem "JetStream direct get request validation and response lifting" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
     using Dates
 
     const N = Natter
@@ -2762,6 +2827,7 @@ end
     using JSON3
     using Dates
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2795,7 +2861,7 @@ end
                                      write_io=IOBuffer())
     js = jetstream(client)
 
-    api_task = @async stream_message_get(js, "ORDERS"; seq=7)
+    api_task = Threads.@spawn stream_message_get(js, "ORDERS"; seq=7)
     respond_next_request!(client, JSON3.write(Dict(
         "message" => Dict(
             "subject" => "orders.created",
@@ -2811,7 +2877,7 @@ end
     @test api_msg.created == DateTime(2026, 1, 1, 0, 0, 0, 123)
     @test String(api_msg) == "payload"
 
-    direct_task = @async stream_message_get(js, "ORDERS"; seq=8, direct=true)
+    direct_task = Threads.@spawn stream_message_get(js, "ORDERS"; seq=8, direct=true)
     direct_response = Msg("_INBOX.reply", nothing, TestHelpers.bytes("fast");
                           headers=Headers(
                               "Nats-Stream" => ["ORDERS"],
@@ -2827,7 +2893,7 @@ end
     @test direct_msg.created == DateTime(2026, 1, 1, 0, 0, 1)
     @test String(direct_msg) == "fast"
 
-    async_task = stream_message_get_async(js, "ORDERS"; seq=9)
+    async_task = Threads.@spawn stream_message_get(js, "ORDERS"; seq=9)
     respond_next_request!(client, JSON3.write(Dict(
         "message" => Dict(
             "subject" => "orders.created",
@@ -2845,6 +2911,7 @@ end
 
 @testitem "JetStream metadata" begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2889,6 +2956,7 @@ end
 
 @testitem "JetStream ordered push control detects sequence gaps" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2912,6 +2980,7 @@ end
 
 @testitem "JetStream pull fetch validates inputs before publishing" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -2990,6 +3059,7 @@ end
 
 @testitem "JetStream pull fetch serializes max bytes and no wait" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
     using JSON3
 
     const N = Natter
@@ -3014,7 +3084,7 @@ end
                               PriorityPolicy.OVERFLOW, ["workers"])
 
     try
-        task = @async fetch(psub, big(10); timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true,
+        task = Threads.@spawn fetch(psub, big(10); timeout=10.0, heartbeat=0, max_bytes=256, no_wait=true,
                             min_pending=4, min_ack_pending=5, priority_group="workers")
         delivery = TestHelpers.wait_for_pull_delivery(psub)
         N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
@@ -3036,6 +3106,7 @@ end
 
 @testitem "JetStream pull fetch expires server request before local timeout" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
     using JSON3
 
     const N = Natter
@@ -3059,7 +3130,7 @@ end
     psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     try
-        task = @async fetch(psub, 1; timeout=10.0, heartbeat=0)
+        task = Threads.@spawn fetch(psub, 1; timeout=10.0, heartbeat=0)
         delivery = TestHelpers.wait_for_pull_delivery(psub)
         N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
@@ -3070,7 +3141,7 @@ end
         @test default_payload["expires"] == 9_000_000_000
         @test !haskey(default_payload, "idle_heartbeat")
 
-        task = @async fetch(psub, 1; timeout=10.0, expires=2.5, heartbeat=0)
+        task = Threads.@spawn fetch(psub, 1; timeout=10.0, expires=2.5, heartbeat=0)
         delivery = TestHelpers.wait_for_pull_delivery(psub)
         N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
@@ -3085,6 +3156,7 @@ end
 
 @testitem "JetStream pull fetch publishes concurrent requests independently" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3098,14 +3170,14 @@ end
     TestHelpers.clear_capture!(capture)
     psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
-    first = @async fetch(psub, 1; timeout=0.75, heartbeat=0)
+    first = Threads.@spawn fetch(psub, 1; timeout=0.75, heartbeat=0)
     try
         @test timedwait(1.0; pollint=0.001) do
             request_count(capture) >= 1
         end != :timed_out
         @test !istaskdone(first)
 
-        second = @async fetch(psub, 1; timeout=0.75, heartbeat=0)
+        second = Threads.@spawn fetch(psub, 1; timeout=0.75, heartbeat=0)
         @test timedwait(0.25; pollint=0.001) do
             request_count(capture) >= 2
         end != :timed_out
@@ -3120,6 +3192,7 @@ end
 
 @testitem "JetStream continuous pull validates inputs and excludes fetch" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3171,6 +3244,7 @@ end
 
 @testitem "JetStream continuous pull publishes outside stream state lock" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3226,7 +3300,7 @@ end
             isready(transport.started)
         end != :timed_out
 
-        close_task[] = @async close(stream)
+        close_task[] = Threads.@spawn close(stream)
         @test timedwait(0.2; pollint=0.001) do
             N._pull_stream_closed(stream.state)
         end != :timed_out
@@ -3251,6 +3325,7 @@ end
 
 @testitem "JetStream continuous pull refills at message thresholds" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3293,6 +3368,7 @@ end
 
 @testitem "JetStream continuous pull treats max bytes status as terminal" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3333,6 +3409,7 @@ end
 
 @testitem "JetStream continuous pull accounting uses aggregate request credits" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3368,6 +3445,7 @@ end
 
 @testitem "JetStream continuous pull accounting tracks byte credits from status headers" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3403,6 +3481,7 @@ end
 
 @testitem "JetStream continuous pull keeps requested credits while queue put is blocked" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3418,7 +3497,7 @@ end
     queue_lock = ReentrantLock()
     queue_condition = Base.Threads.Condition(queue_lock)
     queue = N.MsgQueue{Msg}(1)
-    stream_task = @async nothing
+    stream_task = Threads.@spawn nothing
     stream = N.PullMessageStream{typeof(client),typeof(psub)}(
         psub, delivery, queue, queue_lock, queue_condition, config, UInt8[],
         stream_task, nothing, state)
@@ -3439,7 +3518,7 @@ end
     end
 
     done = Channel{Any}(1)
-    task = @async begin
+    task = Threads.@spawn begin
         try
             N._pull_stream_put!(stream, second)
             put!(done, :ok)
@@ -3493,6 +3572,7 @@ end
 
 @testitem "JetStream continuous pull validates status pending headers" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3528,6 +3608,7 @@ end
 
 @testitem "JetStream continuous pull refills from buffered capacity" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
     using JSON3
 
     const N = Natter
@@ -3578,6 +3659,7 @@ end
 
 @testitem "JetStream consume callback drains continuous pull stream" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3615,6 +3697,7 @@ end
 
 @testitem "JetStream pull fetch is reconnect-aware" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3642,7 +3725,7 @@ end
     TestHelpers.clear_capture!(capture)
     psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
-    fetch_task = @async fetch(psub, 1; timeout=5.0, heartbeat=0)
+    fetch_task = Threads.@spawn fetch(psub, 1; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))
     end != :timed_out
@@ -3658,7 +3741,7 @@ end
     TestHelpers.clear_capture!(terminal_capture)
     terminal_psub = N.PullSubscription(terminal_js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
-    terminal_task = @async fetch(terminal_psub, 1; timeout=5.0, heartbeat=0)
+    terminal_task = Threads.@spawn fetch(terminal_psub, 1; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(terminal_capture))
     end != :timed_out
@@ -3679,7 +3762,7 @@ end
     TestHelpers.clear_capture!(partial_capture)
     partial_psub = N.PullSubscription(partial_js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
-    partial_task = @async fetch(partial_psub, 2; timeout=5.0, heartbeat=0)
+    partial_task = Threads.@spawn fetch(partial_psub, 2; timeout=5.0, heartbeat=0)
     @test timedwait(1.0; pollint=0.001) do
         occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(partial_capture))
     end != :timed_out
@@ -3696,6 +3779,7 @@ end
 
 @testitem "JetStream pull fetch isolates concurrent request deliveries" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3718,9 +3802,9 @@ end
     psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     try
-        first_task = @async fetch(psub, 1; timeout=2.0, heartbeat=0)
+        first_task = Threads.@spawn fetch(psub, 1; timeout=2.0, heartbeat=0)
         first_delivery = TestHelpers.wait_for_pull_delivery(psub)
-        second_task = @async fetch(psub, 1; timeout=2.0, heartbeat=0)
+        second_task = Threads.@spawn fetch(psub, 1; timeout=2.0, heartbeat=0)
         @test timedwait(1.0; pollint=0.001) do
             length(TestHelpers.active_pull_deliveries(psub)) == 2
         end != :timed_out
@@ -3749,6 +3833,7 @@ end
 
 @testitem "JetStream pull fetch maps status controls" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3757,7 +3842,7 @@ end
         js = jetstream(client)
         psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
         try
-            task = @async fetch(psub, 1; timeout=1.0, heartbeat=0)
+            task = Threads.@spawn fetch(psub, 1; timeout=1.0, heartbeat=0)
             delivery = TestHelpers.wait_for_pull_delivery(psub)
             subject = isempty(data) ? delivery.subject : "orders.created"
             N._dispatch_msg(client, Msg(subject, nothing, data; headers, sid=delivery.sid))
@@ -3786,13 +3871,14 @@ end
 
 @testitem "JetStream pull fetch uses and monitors idle heartbeats" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=IOBuffer())
     js = jetstream(client)
     psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
-    task = @async fetch(psub, 1; timeout=1.0, heartbeat=0.02)
+    task = Threads.@spawn fetch(psub, 1; timeout=1.0, heartbeat=0.02)
     delivery = TestHelpers.wait_for_pull_delivery(psub)
     N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                 headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
@@ -3813,6 +3899,7 @@ end
 
 @testitem "JetStream pull fetch tracks pinned consumer ids" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3821,7 +3908,7 @@ end
     psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
 
     try
-        task = @async fetch(psub, 1; timeout=1.0, heartbeat=0)
+        task = Threads.@spawn fetch(psub, 1; timeout=1.0, heartbeat=0)
         delivery = TestHelpers.wait_for_pull_delivery(psub)
         N._dispatch_msg(client, Msg("orders.created", nothing, TestHelpers.bytes("payload");
                                     headers=Headers("Nats-Pin-Id" => ["pin-a"]),
@@ -3830,7 +3917,7 @@ end
         @test psub.pin_id == "pin-a"
         take!(client.write_io)
 
-        task = @async fetch(psub, 1; timeout=1.0, heartbeat=0)
+        task = Threads.@spawn fetch(psub, 1; timeout=1.0, heartbeat=0)
         delivery = TestHelpers.wait_for_pull_delivery(psub)
         N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                     headers=Headers("Status" => ["404"], "Description" => ["No Messages"]),
@@ -3840,7 +3927,7 @@ end
         @test occursin("\"id\":\"pin-a\"", request)
         @test !occursin("pin_id", request)
 
-        task = @async fetch(psub, 1; timeout=1.0, heartbeat=0)
+        task = Threads.@spawn fetch(psub, 1; timeout=1.0, heartbeat=0)
         delivery = TestHelpers.wait_for_pull_delivery(psub)
         N._dispatch_msg(client, Msg(delivery.subject, nothing, UInt8[];
                                     headers=Headers("Status" => ["423"], "Description" => ["Pin ID Mismatch"]),
@@ -3854,6 +3941,7 @@ end
 
 @testitem "JetStream subscription close is idempotent" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 
@@ -3875,6 +3963,7 @@ end
 
 @testitem "JetStream ephemeral close retries server delete after transient failure" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
     using JSON3
 
     const N = Natter
@@ -3902,7 +3991,7 @@ end
         @test err.cause isa ConnectionReconnectingError
 
         @lock client.lock N._store_status_locked!(client, N.ConnectionStatus.CONNECTED)
-        task = @async closer()
+        task = Threads.@spawn closer()
         @test respond_next_request!(client, JSON3.write(Dict("success" => true)))
         fetch(task)
 
@@ -3941,6 +4030,7 @@ end
 
 @testitem "JetStream hot handles carry concrete client and subscription types" setup=[TestHelpers] begin
     using Natter
+    using Natter.JetStream
 
     const N = Natter
 

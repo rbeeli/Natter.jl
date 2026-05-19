@@ -113,6 +113,8 @@ end
 
 Callback subscriptions are callback-only. Use `next` only with subscriptions created without a callback.
 
+Normal callbacks run on Natter-managed Julia tasks scheduled on the default thread pool and are serialized per subscription. Synchronize shared mutable state the same way you would for any Julia task.
+
 Use `borrowed=true` only for callback hot paths that process bytes during the callback and do not retain the message:
 
 ```julia
@@ -216,36 +218,37 @@ Header publish and request calls require server header support.
 
 ## Julia Task Concurrency
 
-Natter calls are task-friendly. Use direct calls inside web handlers, workers, and subscription callbacks. Add `@sync`/`@async` only when work should run concurrently:
+Natter calls are task-friendly. Use direct calls inside web handlers, workers, and subscription callbacks. Add `@sync`/`Threads.@spawn` only when work should run concurrently:
 
 ```julia
 user = Ref{Msg}()
 permissions = Ref{Msg}()
 
 @sync begin
-    @async user[] = request(client, "users.lookup", user_id; timeout=0.2)
-    @async permissions[] = request(client, "permissions.lookup", user_id; timeout=0.2)
+    Threads.@spawn user[] = request(client, "users.lookup", user_id; timeout=0.2)
+    Threads.@spawn permissions[] = request(client, "permissions.lookup", user_id; timeout=0.2)
 end
 
 build_response(user[], permissions[])
 ```
 
-The `_async` helpers are for explicit handles:
+Use Julia tasks directly when you want an explicit handle:
 
 ```julia
-handle = request_async(client, "users.lookup", "user-42"; timeout=0.5)
+handle = Threads.@spawn request(client, "users.lookup", "user-42"; timeout=0.5)
 response = fetch(handle)
 ```
 
-`fetch(handle)` returns the synchronous result or throws the same operation error.
+`fetch(handle)` uses normal Julia task semantics. If the task failed, Julia throws
+`TaskFailedException`; wrap the task body when you want to return an error value.
 
 Use a cancellation token when an outer request or shutdown path needs to stop waiting before the normal timeout:
 
 ```julia
 source = CancellationSource()
-handle = request_async(client, "users.lookup", user_id;
-                       timeout=5.0,
-                       cancel_token=cancellation_token(source))
+handle = Threads.@spawn request(client, "users.lookup", user_id;
+                        timeout=5.0,
+                        cancel_token=cancellation_token(source))
 
 cancel!(source)
 ```

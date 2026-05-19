@@ -230,7 +230,7 @@ end
             nothing
         end
 
-        accept_task = @async begin
+        accept_task = Threads.@spawn begin
             while true
                 client_sock = try
                     Sockets.accept(server)
@@ -259,8 +259,8 @@ end
                 end
                 _remember_proxy_resource!(resources, resource_lock, server_sock)
 
-                @async _proxy_pump(client_sock, server_sock)
-                @async _proxy_pump(server_sock, client_sock; before_write=wait_downstream!)
+                Threads.@spawn _proxy_pump(client_sock, server_sock)
+                Threads.@spawn _proxy_pump(server_sock, client_sock; before_write=wait_downstream!)
             end
         end
 

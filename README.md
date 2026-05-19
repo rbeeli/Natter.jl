@@ -4,7 +4,7 @@
 ![Maintenance](https://img.shields.io/maintenance/yes/2026)
 [![Documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://rbeeli.github.io/Natter.jl/)
 
-Natter.jl is a Julia client for [NATS](https://nats.io). It provides ergonomic direct APIs for application code and uses Julia tasks internally for the reader loop, pings, reconnects, subscription callbacks, and explicit async handles. Natter.jl uses task-based cooperative concurrency over Julia's async I/O model. It is not a multithreaded client implementation.
+Natter.jl is a Julia client for [NATS](https://nats.io). It provides ergonomic direct APIs for application code and uses Julia tasks internally for the reader loop, pings, reconnects, subscription callbacks, protocol futures, streams, and watchers. Application concurrency uses normal Julia `Threads.@spawn`/`@sync` task composition over Julia's async I/O model; Natter's internal tasks use Julia thread-pool scheduling where it helps keep control-plane work responsive.
 
 The client is intended for long-running services:
 
@@ -37,8 +37,8 @@ Use Julia tasks when your application needs concurrency:
 
 ```julia
 @sync begin
-    @async publish(client, "events.created", "a")
-    @async publish(client, "events.created", "b")
+    Threads.@spawn publish(client, "events.created", "a")
+    Threads.@spawn publish(client, "events.created", "b")
 end
 
 flush(client)
