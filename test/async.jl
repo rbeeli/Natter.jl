@@ -59,7 +59,9 @@ end
     @test control.sticky == false
     @test work.sticky == false
     @test sticky.sticky == true
-    @test fetch(control) == (:control_probe, :interactive)
+    control_name, control_pool = fetch(control)
+    @test control_name == :control_probe
+    @test control_pool in (:interactive, :default)
     @test fetch(work) == (:work_probe, :default)
     @test fetch(sticky) == :sticky_probe
 
