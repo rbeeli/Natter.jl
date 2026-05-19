@@ -26,8 +26,11 @@ function _parse_options(url_or_urls; kwargs...)
     ConnectOptions(; servers, kwargs...)
 end
 
+_write_buffer_prealloc_size(opts::ConnectOptions)::Int =
+    min(max(0, opts.write_buffer_size), 16 * 1024 * 1024)
+
 _write_transport_for_options(io, opts::ConnectOptions) =
-    max(0, opts.write_buffer_size) == 0 ? io : BufferedWriteIO(io)
+    max(0, opts.write_buffer_size) == 0 ? io : BufferedWriteIO(io, _write_buffer_prealloc_size(opts))
 
 function _connect_with_options(opts::ConnectOptions; cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
@@ -1044,13 +1047,14 @@ function _should_flush_write_io(client::Client, io, force_flush::Bool)::Bool
 end
 
 _flush_or_signal_locked(client::Client, io; force_flush::Bool=false) =
-    _flush_or_signal_locked(client, io, force_flush)
+    _flush_or_signal_locked(client, io, force_flush, false)
 
-function _flush_or_signal_locked(client::Client, io, force_flush::Bool)
+function _flush_or_signal_locked(client::Client, io, force_flush::Bool,
+                                 had_buffered::Bool=false)
     buffered = _buffered_bytes(io)
     if _should_flush_write_io(client, io, force_flush)
         _flush_write_io(client, io)
-    elseif buffered > 0
+    elseif buffered > 0 && !had_buffered
         _signal_flusher(client)
     end
     nothing

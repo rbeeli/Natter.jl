@@ -1098,6 +1098,8 @@ mutable struct BufferedWriteIO{I} <: IO
 end
 
 BufferedWriteIO(io::I) where {I} = BufferedWriteIO{I}(io, IOBuffer(), _ReplayableEntry[], 0, false)
+BufferedWriteIO(io::I, capacity::Integer) where {I} =
+    BufferedWriteIO{I}(io, IOBuffer(sizehint=max(0, Int(capacity))), _ReplayableEntry[], 0, false)
 
 function _ensure_open(io::BufferedWriteIO)
     io.closed && throw(Base.IOError("buffered write transport is closed", 0))
@@ -1112,6 +1114,11 @@ end
 function Base.write(io::BufferedWriteIO, data::Vector{UInt8})
     _ensure_open(io)
     write(io.buffer, data)
+end
+
+function Base.write(io::BufferedWriteIO, data::ImmutableBytes)
+    _ensure_open(io)
+    write(io.buffer, data.data)
 end
 
 function Base.write(io::BufferedWriteIO, data::Base.CodeUnits{UInt8})

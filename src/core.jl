@@ -49,8 +49,24 @@ end
 _should_write_publish_direct(frame_size::Int, threshold::Int)::Bool =
     threshold <= 0 || frame_size >= threshold
 
+function _write_pub_frame_buffered(io::BufferedWriteIO, frame::_AbstractPublishFrame,
+                                   scratch::Vector{UInt8}, contiguous_threshold::Int,
+                                   frame_size::Int)
+    if contiguous_threshold > 0 && frame_size <= contiguous_threshold
+        wire = _cached_pub_wire(frame)
+        isnothing(wire) ? write(io, _pub_cmd!(scratch, frame)) : write(io, wire)
+    else
+        write(io, _pub_prefix!(scratch, frame))
+        isempty(frame.headers) || write(io, frame.headers)
+        write(io, frame.payload)
+        write(io, CRLF)
+    end
+    nothing
+end
+
 function _buffer_publish_frame(client::Client, io::BufferedWriteIO, frame::_AbstractPublishFrame,
-                               replayable::Bool, frame_size::Int)
+                               replayable::Bool, frame_size::Int,
+                               scratch::Vector{UInt8}, contiguous_threshold::Int)
     _ensure_open(io)
     start = position(io.buffer) + 1
     entry_count = length(io.replayable_entries)
@@ -58,7 +74,7 @@ function _buffer_publish_frame(client::Client, io::BufferedWriteIO, frame::_Abst
     if replayable
         _reserve_pending_bytes!(client, frame_size)
         try
-            _write_pub_frame(io, frame)
+            _write_pub_frame_buffered(io, frame, scratch, contiguous_threshold, frame_size)
             written = position(io.buffer) - start + 1
             written == frame_size || throw(AssertionError("buffered publish size mismatch"))
             entry = _ReplayableEntry(start, frame_size, _pub_payload_size(frame), length(frame.headers))
@@ -74,7 +90,7 @@ function _buffer_publish_frame(client::Client, io::BufferedWriteIO, frame::_Abst
         end
     else
         try
-            _write_pub_frame(io, frame)
+            _write_pub_frame_buffered(io, frame, scratch, contiguous_threshold, frame_size)
         catch
             truncate(io.buffer, start - 1)
             seekend(io.buffer)
@@ -188,9 +204,12 @@ function _write_publish_to_io(client::Client, io::BufferedWriteIO, frame::_Abstr
             return false, attempted
         end
 
-        captured = _buffer_publish_frame(client, io, frame, replayable, frame_size)
+        had_buffered = _buffered_bytes(io) > 0
+        captured = _buffer_publish_frame(client, io, frame, replayable, frame_size,
+                                         client.write_scratch,
+                                         client.options.direct_write_threshold)
         attempted = _should_flush_write_io(client, io, force_flush)
-        _flush_or_signal_locked(client, io, force_flush)
+        _flush_or_signal_locked(client, io, force_flush, had_buffered)
         return captured, attempted
     catch err
         err isa OutboundBufferLimitError && rethrow()
@@ -273,6 +292,29 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
         throw(ConnectionClosedError("connection is disconnected"))
     else
         throw(ConnectionClosedError())
+    end
+    nothing
+end
+
+function _send_publish_no_replay(client::Client, frame::_AbstractPublishFrame;
+                                 force_flush::Bool=false,
+                                 frame_size::Int=_serialized_size(frame),
+                                 payload_size::Int=_pub_payload_size(frame),
+                                 direct_write::Bool=false,
+                                 cancel_token::MaybeCancellationToken=nothing)
+    try
+        _write_publish(client, frame; force_flush, replayable=false, frame_size,
+                       direct_write, payload_size, validate_frame=false,
+                       cancel_token)
+    catch err
+        failure = err isa _PublishWriteFailure ? err : _PublishWriteFailure(err, false, false)
+        cause = failure.cause
+        cause isa CancelledError && throw(cause)
+        cause isa OutboundBufferLimitError && throw(cause)
+        if failure.attempted && _recover_after_write_failure!(client, cause)
+            throw(ConnectionReconnectingError())
+        end
+        throw(cause)
     end
     nothing
 end
@@ -435,8 +477,13 @@ function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_
     st = status(client)
     _ensure_usable_status_for_publish(st)
     _validate_publish_frame_for_client(client, frame, payload_size)
-    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
-                  payload_size, st, direct_write, validate_frame=false, cancel_token)
+    if buffer_on_reconnect
+        _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
+                      payload_size, st, direct_write, validate_frame=false, cancel_token)
+    else
+        _send_publish_no_replay(client, frame; force_flush, frame_size, payload_size,
+                                direct_write, cancel_token)
+    end
     _record_out!(client, payload_size)
     nothing
 end
@@ -459,8 +506,13 @@ function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; 
     st = status(client)
     _ensure_usable_status_for_publish(st)
     validate_frame && _validate_publish_frame_for_client(client, frame, payload_size)
-    _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
-                  payload_size, st, direct_write, validate_frame=false, cancel_token)
+    if buffer_on_reconnect
+        _send_publish(client, frame; buffer_on_reconnect, force_flush, frame_size,
+                      payload_size, st, direct_write, validate_frame=false, cancel_token)
+    else
+        _send_publish_no_replay(client, frame; force_flush, frame_size, payload_size,
+                                direct_write, cancel_token)
+    end
     _record_out!(client, payload_size)
     nothing
 end

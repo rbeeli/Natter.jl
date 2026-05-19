@@ -397,6 +397,14 @@ end
     @test plain_frame.payload isa N.ImmutableBytes
     @test plain_frame.headers isa Base.CodeUnits{UInt8,String}
     @test_throws MethodError push!(plain_frame.payload, 0x41)
+    @test N._pub_payload_size(plain_frame) == 2
+    @test N._serialized_size(plain_frame) == length(N._pub_cmd(plain_frame))
+    @test N._cached_pub_wire(plain_frame) isa N.ImmutableBytes
+    @test collect(N._cached_pub_wire(plain_frame)) == N._pub_cmd(plain_frame)
+
+    large_frame = prepare_publish("foo", zeros(UInt8, N.DEFAULT_DIRECT_WRITE_THRESHOLD))
+    @test N._serialized_size(large_frame) > N.DEFAULT_DIRECT_WRITE_THRESHOLD
+    @test isnothing(N._cached_pub_wire(large_frame))
 
     raw_headers = N._headers_bytes(Headers("A" => ["b"]))
     header_snapshot = copy(raw_headers)

@@ -1069,26 +1069,16 @@ function _headers_bytes(headers::Headers)
     out
 end
 
-struct PublishFrame{P<:AbstractVector{UInt8},H<:AbstractVector{UInt8}} <: _AbstractPublishFrame
+struct PublishFrame{P<:AbstractVector{UInt8},H<:AbstractVector{UInt8},
+                    W<:Union{ImmutableBytes,Nothing}} <: _AbstractPublishFrame
     subject::String
     reply::Union{String,Nothing}
     payload::P
     headers::H
-
-    function PublishFrame(subject::AbstractString, reply::Union{AbstractString,Nothing},
-                          data, headers)
-        subject = _validate_publish_subject(subject)
-        reply = isnothing(reply) ? nothing : _validate_publish_subject(reply)
-        payload = _prepared_payload_bytes(data)
-        header_bytes = _prepared_header_bytes(headers)
-        new{typeof(payload),typeof(header_bytes)}(subject, reply, payload, header_bytes)
-    end
+    payload_size::Int
+    serialized_size::Int
+    wire::W
 end
-
-PublishFrame(subject::AbstractString, data=nothing;
-             reply::Union{AbstractString,Nothing}=nothing,
-             headers=nothing) =
-    PublishFrame(subject, reply, data, headers)
 
 struct _PublishFrame{P<:AbstractVector{UInt8},H<:AbstractVector{UInt8}} <: _AbstractPublishFrame
     subject::String
@@ -1096,6 +1086,29 @@ struct _PublishFrame{P<:AbstractVector{UInt8},H<:AbstractVector{UInt8}} <: _Abst
     payload::P
     headers::H
 end
+
+function PublishFrame(subject::AbstractString, reply::Union{AbstractString,Nothing},
+                      data, headers)
+    subject = _validate_publish_subject(subject)
+    reply = isnothing(reply) ? nothing : _validate_publish_subject(reply)
+    payload = _prepared_payload_bytes(data)
+    header_bytes = _prepared_header_bytes(headers)
+    frame = _PublishFrame(subject, reply, payload, header_bytes)
+    payload_size = _pub_payload_size(frame)
+    serialized_size = _serialized_size(frame)
+    # Prepared frames are intended for repeated hot-path publishes. Cache a
+    # contiguous wire image for small frames so those publishes skip formatting.
+    wire = serialized_size <= DEFAULT_DIRECT_WRITE_THRESHOLD ?
+           ImmutableBytes(_pub_cmd(frame); copy=false) : nothing
+    PublishFrame{typeof(payload),typeof(header_bytes),typeof(wire)}(subject, reply, payload,
+                                                                    header_bytes, payload_size,
+                                                                    serialized_size, wire)
+end
+
+PublishFrame(subject::AbstractString, data=nothing;
+             reply::Union{AbstractString,Nothing}=nothing,
+             headers=nothing) =
+    PublishFrame(subject, reply, data, headers)
 
 function _publish_frame(subject::AbstractString, reply::Union{AbstractString,Nothing},
                         data, headers)
@@ -1106,6 +1119,7 @@ end
 
 _pub_payload_size(payload::AbstractVector{UInt8}, hdr::AbstractVector{UInt8}) = length(hdr) + length(payload)
 _pub_payload_size(frame::_AbstractPublishFrame) = _pub_payload_size(frame.payload, frame.headers)
+_pub_payload_size(frame::PublishFrame) = frame.payload_size
 
 function _pending_publish_entry(frame::_AbstractPublishFrame, frame_size::Int=_serialized_size(frame))
     data = _pub_cmd(frame)
@@ -1139,6 +1153,11 @@ function _serialized_size(frame::_AbstractPublishFrame)::Int
     _decimal_digits(headers_len) + 1 + _decimal_digits(total) + 2 +
     headers_len + payload_len + 2
 end
+
+_serialized_size(frame::PublishFrame)::Int = frame.serialized_size
+
+_cached_pub_wire(::_AbstractPublishFrame) = nothing
+_cached_pub_wire(frame::PublishFrame) = frame.wire
 
 function _copy_codeunits!(dest::Vector{UInt8}, pos::Int, value::AbstractString)::Int
     n = ncodeunits(value)
@@ -1268,7 +1287,8 @@ function _write_pub_frame_direct(io, frame::_AbstractPublishFrame, scratch::Vect
                                  contiguous_threshold::Int)
     frame_size = _serialized_size(frame)
     if contiguous_threshold > 0 && frame_size <= contiguous_threshold
-        write(io, _pub_cmd!(scratch, frame))
+        wire = _cached_pub_wire(frame)
+        isnothing(wire) ? write(io, _pub_cmd!(scratch, frame)) : write(io, wire)
     else
         write(io, _pub_prefix!(scratch, frame))
         isempty(frame.headers) || write(io, frame.headers)
