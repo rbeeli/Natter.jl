@@ -52,3 +52,15 @@ flush(client)
 - [KeyValue](https://rbeeli.github.io/Natter.jl/keyvalue) documents buckets, reads, writes, watches, and direct access.
 - [Reliability And TLS](https://rbeeli.github.io/Natter.jl/reliability) describes reconnect behavior, buffering, callbacks, and TLS options.
 - [Examples](https://rbeeli.github.io/Natter.jl/examples/connection-auth-tls) provide complete patterns for common application code.
+
+## Performance Reports
+
+Run the live-server performance report from the repository root:
+
+```bash
+docker run -d --rm --name natter-perf -p 4222:4222 nats:2.11-alpine -js
+env JULIA_NUM_THREADS=2 julia --project=. benchmarks/run.jl
+docker stop natter-perf
+```
+
+The `Performance` GitHub Actions workflow runs the same report on a schedule and on demand, then uploads Markdown and JSON artifacts for trend review.

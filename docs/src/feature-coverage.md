@@ -97,3 +97,11 @@ Longer reconnect stress coverage is intended for scheduled/manual CI:
 ```bash
 env NATTER_RUN_INTEGRATION=true NATTER_RUN_JETSTREAM=true NATTER_RUN_STRESS=true julia --project=. -e 'using Pkg; Pkg.test()'
 ```
+
+Performance snapshots are reported separately from correctness tests:
+
+```bash
+env JULIA_NUM_THREADS=2 julia --project=. benchmarks/run.jl
+```
+
+The `Performance` GitHub Actions workflow runs this report against a live server on a schedule and by manual dispatch. It uploads Markdown and JSON artifacts covering hot-path allocations, publish throughput, callback dispatch, request/reply latency, concurrent publish throughput, and reconnect recovery. The workflow is a reporting job rather than a strict performance gate; compare reports across similar runner, Julia, thread, server, and payload configurations.

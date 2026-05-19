@@ -1,0 +1,55 @@
+name: Performance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '43 3 * * 1'
+
+jobs:
+  live-server-performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.10'
+      - uses: julia-actions/cache@v2
+      - run: docker run -d --name nats -p 4222:4222 nats:2.11-alpine -js
+      - run: |
+          set -euo pipefail
+          ready=false
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 4222; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "${ready}" != "true" ]; then
+            docker logs nats
+            exit 1
+          fi
+      - run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+      - run: |
+          set -euo pipefail
+          mkdir -p perf-artifacts
+          julia --project=. benchmarks/run.jl \
+            --url nats://127.0.0.1:4222 \
+            --messages 10000 \
+            --requests 1000 \
+            --payload-bytes 64 \
+            --concurrency 4 \
+            --output perf-artifacts/performance.md \
+            --json perf-artifacts/performance.json
+        env:
+          JULIA_NUM_THREADS: '2'
+      - run: cat perf-artifacts/performance.md >> "${GITHUB_STEP_SUMMARY}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: natter-performance-report
+          path: perf-artifacts/
+          if-no-files-found: ignore
+      - if: failure()
+        run: docker logs nats
