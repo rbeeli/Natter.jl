@@ -261,6 +261,7 @@ function _send_publish(client::Client, frame::_AbstractPublishFrame; buffer_on_r
     end
     if st in (ConnectionStatus.CONNECTED, ConnectionStatus.DRAINING)
         try
+            _writer_barrier!(client; cancel_token)
             _write_publish(client, frame; force_flush, replayable=can_buffer_reconnect,
                            frame_size, direct_write, payload_size, validate_frame=false,
                            cancel_token)
@@ -303,6 +304,11 @@ function _send_publish_no_replay(client::Client, frame::_AbstractPublishFrame;
                                  direct_write::Bool=false,
                                  cancel_token::MaybeCancellationToken=nothing)
     try
+        if !force_flush && !direct_write &&
+           _enqueue_writer_publish(client, frame, frame_size; cancel_token)
+            return nothing
+        end
+        _writer_queue_pending(client) && _writer_barrier!(client; cancel_token)
         _write_publish(client, frame; force_flush, replayable=false, frame_size,
                        direct_write, payload_size, validate_frame=false,
                        cancel_token)
@@ -468,10 +474,23 @@ function _validate_pending_replay_for_client(client::Client, entries::AbstractVe
     nothing
 end
 
+function _normalize_publish_mode(mode, buffer_on_reconnect::Bool,
+                                 direct_write::Bool)::Tuple{Bool,Bool}
+    mode isa Symbol ||
+        throw(ArgumentError("publish mode must be :queued, :direct, or :replayable"))
+    mode === :queued && return buffer_on_reconnect, direct_write
+    mode === :direct && return buffer_on_reconnect, true
+    mode === :replayable && return true, direct_write
+    throw(ArgumentError("publish mode must be :queued, :direct, or :replayable"))
+end
+
 function _publish_prepared(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=false,
                            force_flush::Bool=false, direct_write::Bool=false,
+                           mode=:queued,
                            cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
+    buffer_on_reconnect, direct_write =
+        _normalize_publish_mode(mode, buffer_on_reconnect, direct_write)
     payload_size = _pub_payload_size(frame)
     frame_size = _serialized_size(frame)
     st = status(client)
@@ -491,16 +510,20 @@ end
 function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
                   headers=nothing, buffer_on_reconnect::Bool=false, force_flush::Bool=false,
                   direct_write::Bool=false,
+                  mode=:queued,
                   cancel_token::MaybeCancellationToken=nothing)
     _publish_prepared(client, _publish_frame(subject, reply, data, headers);
-                      buffer_on_reconnect, force_flush, direct_write, cancel_token)
+                      buffer_on_reconnect, force_flush, direct_write, mode, cancel_token)
 end
 
 function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; buffer_on_reconnect::Bool=false,
                                   force_flush::Bool=false, direct_write::Bool=false,
+                                  mode=:queued,
                                   cancel_token::MaybeCancellationToken=nothing,
                                   validate_frame::Bool=true)
     _throw_if_cancelled(cancel_token)
+    buffer_on_reconnect, direct_write =
+        _normalize_publish_mode(mode, buffer_on_reconnect, direct_write)
     frame_size = _serialized_size(frame)
     payload_size = _pub_payload_size(frame)
     st = status(client)
@@ -520,29 +543,32 @@ end
 function _publish_unchecked(client::Client, subject::String, payload::AbstractVector{UInt8};
                             buffer_on_reconnect::Bool=false, force_flush::Bool=false,
                             direct_write::Bool=false,
+                            mode=:queued,
                             cancel_token::MaybeCancellationToken=nothing)
     _publish_frame_unchecked(client, _publish_frame(subject, nothing, payload, EMPTY_BYTES);
-                             buffer_on_reconnect, force_flush, direct_write, cancel_token)
+                             buffer_on_reconnect, force_flush, direct_write, mode, cancel_token)
 end
 
 function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
                  headers=nothing, buffer_on_reconnect::Bool=false, direct_write::Bool=false,
+                 mode=:queued,
                  cancel_token::MaybeCancellationToken=nothing)
-    _publish(client, subject, data; reply, headers, buffer_on_reconnect, direct_write,
+    _publish(client, subject, data; reply, headers, buffer_on_reconnect, direct_write, mode,
              cancel_token)
 end
 
 function publish(client::Client, frame::PublishFrame; buffer_on_reconnect::Bool=false,
-                 direct_write::Bool=false, cancel_token::MaybeCancellationToken=nothing)
-    _publish_prepared(client, frame; buffer_on_reconnect, direct_write, cancel_token)
+                 direct_write::Bool=false, mode=:queued,
+                 cancel_token::MaybeCancellationToken=nothing)
+    _publish_prepared(client, frame; buffer_on_reconnect, direct_write, mode, cancel_token)
 end
 
 function respond(client::Client, msg::AbstractMsg, data=nothing; headers=nothing,
                  buffer_on_reconnect::Bool=false, direct_write::Bool=false,
+                 mode=:queued,
                  cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     reply = msg.reply
     isnothing(reply) && throw(ArgumentError("message has no reply subject"))
-    publish(client, reply, data; headers, buffer_on_reconnect, direct_write, cancel_token)
+    publish(client, reply, data; headers, buffer_on_reconnect, direct_write, mode, cancel_token)
 end
-

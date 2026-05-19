@@ -31,9 +31,21 @@ publish(client, "events.created", UInt8[0x01, 0x02])
 publish(client, "events.created", """{"id":1001,"status":"created"}""")
 ```
 
-Payloads may be strings, byte vectors, or `nothing`. Encode structured values explicitly before publishing. `publish` validates subjects and the active server payload limit before writing.
+Payloads may be strings, byte vectors, or `nothing`. Encode structured values explicitly before publishing. `publish` validates subjects and the active server payload limit before handing the command to the writer.
 
-For hot publishers, pass byte vectors and use `direct_write=true` to bypass the client write buffer for that call:
+The default `mode=:queued` is the normal hot path on connected clients. It hands publish commands to a bounded background writer, which batches socket writes while preserving command order. Call `flush(client)` when the application needs a server round trip proving earlier commands were processed.
+
+For repeated identical messages, prepare a frame once and publish the frame in queued mode:
+
+```julia
+frame = prepare_publish("metrics.tick", """{"service":"api","value":1}""")
+
+for _ in 1:1_000
+    publish(client, frame)
+end
+```
+
+For mutable scratch buffers that you rewrite immediately, `mode=:direct` writes on the caller task and avoids copying the frame into the writer queue:
 
 ```julia
 payload = Vector{UInt8}(undef, 256)
@@ -41,7 +53,7 @@ payload = Vector{UInt8}(undef, 256)
 for metric in metrics
     n = encode_metric!(payload, metric)
     publish(client, "metrics.raw", @view(payload[1:n]);
-        direct_write=true,
+        mode=:direct,
     )
 end
 ```
@@ -61,26 +73,14 @@ Then normal publish calls on that client write directly and skip replay bufferin
 publish(client, "metrics.raw", @view(payload[1:n]))
 ```
 
-`direct_write=true` avoids copying the payload into Natter's user-space write buffer. Core publishes skip reconnect replay buffering by default and fail during reconnect. Use `buffer_on_reconnect=true` only when best-effort replay is preferable to letting the caller retry, drop, or rebuild the message.
-
-`prepare_publish` is a different optimization: it snapshots a reusable frame once and is best for identical messages, not for mutable payload buffers:
-
-```julia
-frame = prepare_publish("metrics.tick", """{"service":"api","value":1}""")
-
-for _ in 1:1_000
-    publish(client, frame;
-        direct_write=true,
-    )
-end
-```
+Core publishes skip reconnect replay buffering by default and fail during reconnect. Use `mode=:replayable` or `buffer_on_reconnect=true` only when best-effort replay is preferable to letting the caller retry, drop, or rebuild the message.
 
 The publish choices are:
 
-- Plain `publish` validates and writes without reconnect replay bookkeeping.
-- `publish(...; direct_write=true)` skips the write-buffer copy for that call.
-- `publish(...; buffer_on_reconnect=true)` retains buffered frames for best-effort reconnect replay up to `pending_size`.
-- `prepare_publish` copies once into a safe reusable `PublishFrame`.
+- Plain `publish` uses `mode=:queued`, validates, and sends through the background writer when it is active.
+- `publish(...; mode=:direct)` writes on the caller task and bypasses the queued writer for that call.
+- `publish(...; mode=:replayable)` retains buffered frames for best-effort reconnect replay up to `pending_size`.
+- `prepare_publish` copies once into a safe reusable `PublishFrame` for low-allocation queued publishing.
 
 Call `flush(client)` when the application needs a server round trip proving earlier commands were processed.
 
@@ -115,31 +115,31 @@ Callback subscriptions are callback-only. Use `next` only with subscriptions cre
 
 Normal callbacks run on Natter-managed Julia tasks scheduled on the default thread pool and are serialized per subscription. Synchronize shared mutable state the same way you would for any Julia task.
 
-Use `borrowed=true` only for callback hot paths that process bytes during the callback and do not retain the message:
+Use `callback_mode=:inline` for callback hot paths that process bytes during the callback and do not retain the message:
 
 ```julia
-sub = subscribe(client, "ticks.raw"; borrowed=true) do msg
+sub = subscribe(client, "ticks.raw"; callback_mode=:inline) do msg
     value = decode_tick(msg.data)
     record_tick!(value)
 end
 ```
 
-Borrowed callbacks receive `BorrowedMsg`. Its `data` is a view into the reader buffer and is valid only until the callback returns. Copy only at the boundary where the data must outlive the callback:
+Inline callbacks receive `BorrowedMsg`. Its `data` is a view into the reader buffer and is valid only until the callback returns. Copy only at the boundary where the data must outlive the callback:
 
 ```julia
 jobs = Channel{Vector{UInt8}}(1024)
 
-sub = subscribe(client, "ticks.raw"; borrowed=true) do msg
+sub = subscribe(client, "ticks.raw"; callback_mode=:inline) do msg
     put!(jobs, copy(msg.data))
 end
 ```
 
-Borrowed callbacks run inline on the reader task. Keep them short and nonblocking; avoid `request`, `flush`, `next`, slow file or network IO, and unbounded `put!` calls from a borrowed callback. If the work can block, copy the bytes and hand them to another task. Header messages can still allocate header storage; the borrowed fast path is for payload bytes.
+Inline callbacks run on the reader task. Keep them short and nonblocking; avoid `request`, `flush`, `next`, slow file or network IO, and unbounded `put!` calls from an inline callback. If the work can block, copy the bytes and hand them to another task. Header messages can still allocate header storage; the inline fast path is for payload bytes. `borrowed=true` is accepted as a compatibility alias for `callback_mode=:inline`.
 
 The subscribe choices are:
 
 - `next(sub)` and normal callback subscriptions deliver owned `Msg` values that can be retained safely.
-- `subscribe(...; borrowed=true) do msg ... end` delivers callback-only `BorrowedMsg` values and avoids the payload copy.
+- `subscribe(...; callback_mode=:inline) do msg ... end` delivers callback-only `BorrowedMsg` values and avoids the payload copy and callback task handoff.
 - Use a bounded queue plus `copy(msg.data)` when borrowed input needs asynchronous processing.
 
 ## Queue Groups
@@ -173,7 +173,7 @@ user = String(response)
 A simple service handler:
 
 ```julia
-service = subscribe(client, "users.lookup") do msg
+service = subscribe(client, "users.lookup"; callback_mode=:inline) do msg
     isnothing(msg.reply) && return
     respond(client, msg, lookup_user(String(msg)))
 end

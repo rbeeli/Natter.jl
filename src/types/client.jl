@@ -189,6 +189,8 @@ mutable struct Client{Options<:ConnectOptions,ReadIO,WriteIO} <: AbstractNatterC
     write_timeout_task::Union{Task,Nothing}
     @atomic flush_signal::FlushSignal
     flusher_task::Union{Task,Nothing}
+    writer_queue::Union{_WriteQueue,Nothing}
+    writer_task::Union{Task,Nothing}
     sid::Int
     subscriptions::Dict{Int,Subscription{Client{Options,ReadIO,WriteIO}}}
     @atomic subscription_snapshot::Dict{Int,_SubscriptionSnapshotEntry{Client{Options,ReadIO,WriteIO}}}
@@ -262,6 +264,8 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                                            shrink_threshold=options.read_buffer_shrink_threshold)
     pending = _pending_buffer_from(pending)
     atomic_stats = stats isa AtomicStats ? stats : AtomicStats(stats)
+    writer_queue = options.write_driver ?
+                   _WriteQueue(options.write_queue_msgs, options.write_queue_bytes) : nothing
     Client{Options,ReadIO,WriteIO}(options, servers, current_server, connected_url, status,
                                    Threads.Atomic{Int}(Int(status)),
                                    info, Threads.Atomic{Int}(something(info.max_payload, typemax(Int))),
@@ -271,7 +275,7 @@ function Client(options::Options, servers::Vector{Server}, current_server::Union
                                    Threads.Atomic{Bool}(false),
                                    UInt8[], Threads.Atomic{Float64}(Inf), Threads.Atomic{Int}(0),
                                    Threads.Atomic{Int}(0), Ref{Any}(nothing), Ref(""), nothing,
-                                   flush_signal, flusher_task,
+                                   flush_signal, flusher_task, writer_queue, nothing,
                                    sid, typed_subscriptions, subscription_snapshot,
                                    subscription_replay_lock, typed_request_mux, request_mux_lock,
                                    pending, pending_bytes, pongs,

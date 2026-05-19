@@ -85,6 +85,7 @@ makedocs(;
             "Production Client" => "examples/production-client.md",
         ],
         "Reference" => "reference.md",
+        "Benchmarks" => "benchmarks.md",
         "Feature Coverage" => "feature-coverage.md",
     ],
 )

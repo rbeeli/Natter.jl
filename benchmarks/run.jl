@@ -104,18 +104,28 @@ function fmt(value::Real; digits::Int=2)::String
     @sprintf("%.*f", digits, Float64(value))
 end
 
+function jl_option(name::Symbol)::String
+    opts = Base.JLOptions()
+    name in propertynames(opts) ? string(getproperty(opts, name)) : ""
+end
+
+function jl_cpu_target()::String
+    ptr = Base.JLOptions().cpu_target
+    ptr == C_NULL ? "" : unsafe_string(ptr)
+end
+
 function benchmark_allocations(client, subject::String, payload::Vector{UInt8}, iterations::Int)
     frame = prepare_publish(subject, payload)
     prepare_bytes = allocation_bytes_per_call(iterations) do
         prepare_publish(subject, payload)
     end
     publish_bytes = allocation_bytes_per_call(iterations) do
-        publish(client, frame; direct_write=true)
+        publish(client, frame; mode=:direct)
     end
     flush(client; timeout=5.0)
     Dict(
         "prepare_publish_bytes_per_call" => prepare_bytes,
-        "prepared_publish_direct_write_bytes_per_call" => publish_bytes,
+        "prepared_publish_direct_bytes_per_call" => publish_bytes,
         "iterations" => iterations,
     )
 end
@@ -123,13 +133,13 @@ end
 function benchmark_publish_direct(client, subject::String, payload::Vector{UInt8}, messages::Int)
     frame = prepare_publish(subject, payload)
     for _ in 1:min(messages, 100)
-        publish(client, frame; direct_write=true)
+        publish(client, frame; mode=:direct)
     end
     flush(client; timeout=5.0)
 
     seconds = elapsed_seconds() do
         for _ in 1:messages
-            publish(client, frame; direct_write=true)
+            publish(client, frame; mode=:direct)
         end
         flush(client; timeout=10.0)
     end
@@ -194,7 +204,8 @@ function benchmark_publish_flush_each(client, subject::String, payload::Vector{U
 end
 
 function benchmark_callback_dispatch(url::String, subject::String, payload::Vector{UInt8},
-                                     messages::Int, timeout::Float64; mode::Symbol=:direct)
+                                     messages::Int, timeout::Float64; mode::Symbol=:direct,
+                                     callback_mode::Symbol=:task)
     sub_client = connect_perf(url; name="natter-perf-callback-sub")
     pub_client = mode == :buffered_batch ?
                  connect_batch_perf(url, subject, payload, messages; name="natter-perf-callback-pub") :
@@ -204,7 +215,8 @@ function benchmark_callback_dispatch(url::String, subject::String, payload::Vect
         pending_bytes_limit = max(1024 * 1024, messages * max(1, length(payload) + 128))
         sub = subscribe(sub_client, subject;
                         pending_msgs_limit=max(1024, messages),
-                        pending_bytes_limit=pending_bytes_limit) do _msg
+                        pending_bytes_limit=pending_bytes_limit,
+                        callback_mode=callback_mode) do _msg
             Threads.atomic_add!(counter, 1)
             nothing
         end
@@ -213,7 +225,7 @@ function benchmark_callback_dispatch(url::String, subject::String, payload::Vect
 
         warmup = min(messages, 100)
         for _ in 1:warmup
-            publish(pub_client, frame; direct_write=(mode == :direct))
+            publish(pub_client, frame; mode=(mode == :direct ? :direct : :queued))
         end
         flush(pub_client; timeout=5.0)
         result = timedwait(timeout; pollint=0.001) do
@@ -224,7 +236,7 @@ function benchmark_callback_dispatch(url::String, subject::String, payload::Vect
 
         seconds = elapsed_seconds() do
             for _ in 1:messages
-                publish(pub_client, frame; direct_write=(mode == :direct))
+                publish(pub_client, frame; mode=(mode == :direct ? :direct : :queued))
             end
             flush(pub_client; timeout=10.0)
             result = timedwait(timeout; pollint=0.001) do
@@ -252,9 +264,9 @@ function benchmark_request_latency(url::String, subject::String, payload::Vector
     client = connect_perf(url; name="natter-perf-request-client")
     latencies = Vector{Float64}(undef, requests)
     try
-        sub = subscribe(service, subject) do msg
+        sub = subscribe(service, subject; callback_mode=:inline) do msg
             isnothing(msg.reply) && return nothing
-            respond(service, msg, payload; direct_write=true)
+            respond(service, msg, payload; mode=:queued)
             nothing
         end
         flush(service; timeout=5.0)
@@ -297,11 +309,11 @@ function benchmark_concurrent_publish(url::String, subject::String, payload::Vec
     per_task = cld(messages, concurrency)
     total = per_task * concurrency
     try
-        publish(client, frame; direct_write=(mode == :direct))
+        publish(client, frame; mode=(mode == :direct ? :direct : :queued))
         flush(client; timeout=5.0)
         @sync begin
             for _ in 1:concurrency
-                Threads.@spawn publish(client, frame; direct_write=(mode == :direct))
+                Threads.@spawn publish(client, frame; mode=(mode == :direct ? :direct : :queued))
             end
         end
         flush(client; timeout=5.0)
@@ -311,7 +323,7 @@ function benchmark_concurrent_publish(url::String, subject::String, payload::Vec
                 for _ in 1:concurrency
                     Threads.@spawn begin
                         for _ in 1:per_task
-                            publish(client, frame; direct_write=(mode == :direct))
+                            publish(client, frame; mode=(mode == :direct ? :direct : :queued))
                         end
                     end
                 end
@@ -450,7 +462,7 @@ function benchmark_reconnect(url::String, subject::String, payload::Vector{UInt8
         event_cb=event -> push!(events, string(event.kind)),
     )
     try
-        publish(client, subject, payload; direct_write=true)
+        publish(client, subject, payload; mode=:direct)
         flush(client; timeout=5.0)
         drop_proxy_connections!(proxy)
 
@@ -461,7 +473,7 @@ function benchmark_reconnect(url::String, subject::String, payload::Vector{UInt8
         while time() < deadline
             attempts += 1
             try
-                publish(client, subject, payload; direct_write=true)
+                publish(client, subject, payload; mode=:direct)
                 flush(client; timeout=0.25)
                 recovered = true
                 break
@@ -519,7 +531,7 @@ function write_markdown(path::String, report)
 
         allocations = report["benchmarks"]["allocations"]
         println(io, "| Allocations | `prepare_publish` bytes/call | $(fmt(allocations["prepare_publish_bytes_per_call"])) |")
-        println(io, "| Allocations | prepared `publish(...; direct_write=true)` bytes/call | $(fmt(allocations["prepared_publish_direct_write_bytes_per_call"])) |")
+        println(io, "| Allocations | prepared `publish(...; mode=:direct)` bytes/call | $(fmt(allocations["prepared_publish_direct_bytes_per_call"])) |")
 
         publish_direct = report["benchmarks"]["publish_direct"]
         println(io, "| Publish direct write | messages/s | $(fmt(publish_direct["messages_per_second"])) |")
@@ -533,11 +545,17 @@ function write_markdown(path::String, report)
         println(io, "| Publish + flush each | messages/s | $(fmt(publish_flush_each["messages_per_second"])) |")
         println(io, "| Publish + flush each | payload MiB/s | $(fmt(publish_flush_each["payload_mib_per_second"])) |")
 
-        callback_direct = report["benchmarks"]["callback_dispatch_direct"]
-        println(io, "| Callback dispatch direct write | messages/s | $(fmt(callback_direct["messages_per_second"])) |")
+        callback_direct_task = report["benchmarks"]["callback_dispatch_direct_task"]
+        println(io, "| Callback dispatch task direct write | messages/s | $(fmt(callback_direct_task["messages_per_second"])) |")
 
-        callback_batch = report["benchmarks"]["callback_dispatch_buffered_batch"]
-        println(io, "| Callback dispatch buffered batch | messages/s | $(fmt(callback_batch["messages_per_second"])) |")
+        callback_batch_task = report["benchmarks"]["callback_dispatch_buffered_batch_task"]
+        println(io, "| Callback dispatch task buffered batch | messages/s | $(fmt(callback_batch_task["messages_per_second"])) |")
+
+        callback_direct_inline = report["benchmarks"]["callback_dispatch_direct_inline"]
+        println(io, "| Callback dispatch inline direct write | messages/s | $(fmt(callback_direct_inline["messages_per_second"])) |")
+
+        callback_batch_inline = report["benchmarks"]["callback_dispatch_buffered_batch_inline"]
+        println(io, "| Callback dispatch inline buffered batch | messages/s | $(fmt(callback_batch_inline["messages_per_second"])) |")
 
         request = report["benchmarks"]["request_reply"]
         println(io, "| Request/reply | requests/s | $(fmt(request["requests_per_second"])) |")
@@ -580,8 +598,10 @@ function main(args::Vector{String}=ARGS)
     end
 
     benchmarks["publish_buffered_batch"] = benchmark_publish_buffered_batch(opts.url, "$prefix.publish.batch", payload, opts.messages)
-    benchmarks["callback_dispatch_direct"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.direct", payload, opts.messages, opts.timeout; mode=:direct)
-    benchmarks["callback_dispatch_buffered_batch"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.batch", payload, opts.messages, opts.timeout; mode=:buffered_batch)
+    benchmarks["callback_dispatch_direct_task"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.direct.task", payload, opts.messages, opts.timeout; mode=:direct, callback_mode=:task)
+    benchmarks["callback_dispatch_buffered_batch_task"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.batch.task", payload, opts.messages, opts.timeout; mode=:buffered_batch, callback_mode=:task)
+    benchmarks["callback_dispatch_direct_inline"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.direct.inline", payload, opts.messages, opts.timeout; mode=:direct, callback_mode=:inline)
+    benchmarks["callback_dispatch_buffered_batch_inline"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.batch.inline", payload, opts.messages, opts.timeout; mode=:buffered_batch, callback_mode=:inline)
     benchmarks["request_reply"] = benchmark_request_latency(opts.url, "$prefix.request", payload, opts.requests)
     benchmarks["concurrent_publish_direct"] = benchmark_concurrent_publish(opts.url, "$prefix.concurrent.direct", payload, opts.messages, opts.concurrency; mode=:direct)
     benchmarks["concurrent_publish_buffered_batch"] = benchmark_concurrent_publish(opts.url, "$prefix.concurrent.batch", payload, opts.messages, opts.concurrency; mode=:buffered_batch)
@@ -591,6 +611,12 @@ function main(args::Vector{String}=ARGS)
         "julia_version" => string(VERSION),
         "julia_threads" => string(Threads.nthreads()),
         "julia_maxthreadid" => string(Threads.maxthreadid()),
+        "julia_flags" => get(ENV, "NATTER_BENCH_JULIA_FLAGS", ""),
+        "julia_opt_level" => jl_option(:opt_level),
+        "julia_debug_level" => jl_option(:debug_level),
+        "julia_check_bounds" => jl_option(:check_bounds),
+        "julia_cpu_target" => jl_cpu_target(),
+        "nats_image" => get(ENV, "NATTER_BENCH_NATS_IMAGE", ""),
         "natter_version" => string(pkgversion(Natter)),
         "url" => opts.url,
         "messages" => string(opts.messages),

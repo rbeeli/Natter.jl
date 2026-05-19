@@ -1,0 +1,12 @@
+[package]
+name = "natter-rust-nats-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-nats = { path = "../../../../nats.rs/async-nats" }
+bytes = "1"
+futures-util = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

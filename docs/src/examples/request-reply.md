@@ -8,7 +8,7 @@ using Natter
 
 client = connect("nats://127.0.0.1:4222"; name="time-service")
 
-service = subscribe(client, "time.now") do msg
+service = subscribe(client, "time.now"; callback_mode=:inline) do msg
     isnothing(msg.reply) && return
     respond(client, msg, string(now(Dates.UTC)))
 end

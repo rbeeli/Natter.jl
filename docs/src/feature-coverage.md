@@ -18,8 +18,8 @@ Statuses:
 | WebSocket transport | Not Planned | `ws://` and `wss://` are not implemented. |
 | Connect handshake | Supported | Client name, no echo, server INFO parsing, TLS requirements, and typed auth. |
 | Authentication | Supported | Token, user/password, NKEY, JWT, `.creds`, callback auth, and URL userinfo for token/user-password. |
-| PUB / HPUB / SUB / UNSUB | Supported | Core publish, headers, queue groups, unsubscribe limits, local subject validation, direct-write publish calls, and opt-in reconnect replay snapshots. |
-| MSG / HMSG parsing | Supported | Core data and headers, with an explicit callback-only borrowed payload path for hot subscribers. Borrowed frames use a lock-free SID snapshot and release oversized parser buffers after delivery. |
+| PUB / HPUB / SUB / UNSUB | Supported | Core publish, headers, queue groups, unsubscribe limits, local subject validation, queued writer publishes, direct publish mode, and opt-in reconnect replay snapshots. |
+| MSG / HMSG parsing | Supported | Core data and headers, with `callback_mode=:inline` for callback-only hot subscribers. Inline frames use a lock-free SID snapshot and release oversized parser buffers after delivery. |
 | Wildcards | Supported | Subscription wildcards are validated; publish subjects reject wildcards. |
 | Request/reply | Supported | Shared inbox mux, timeouts, reconnect-aware in-flight waiters, and `NoRespondersError` when supported by the server. |
 | Flush and ping | Supported | `flush`/`ping` use a server round trip. |

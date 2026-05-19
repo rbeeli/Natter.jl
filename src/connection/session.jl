@@ -64,6 +64,7 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
             client.current_server = nothing
             client.connected_url = nothing
             client.flusher_task = nothing
+            client.writer_task = nothing
             client.reader_task = nothing
             client.ping_task = nothing
             client.reconnect_task = nothing
@@ -98,6 +99,8 @@ function _terminal_disconnect!(client::Client, generation::Int, err::Exception)
         end
     end
     _signal_flusher(client)
+    _deactivate_writer_queue!(client; close=true, clear=true)
+    _signal_writer(client)
     errors = Any[]
     append!(errors, _notify_pong_waiters!(client, false))
     if !isnothing(request_mux)
@@ -155,12 +158,14 @@ function _take_client_tasks!(client::Client)
             ("stop ping task", client.ping_task),
             ("stop reconnect task", client.reconnect_task),
             ("stop flusher task", client.flusher_task),
+            ("stop writer task", client.writer_task),
             ("stop write watchdog task", client.write_timeout_task),
         )
         client.reader_task = nothing
         client.ping_task = nothing
         client.reconnect_task = nothing
         client.flusher_task = nothing
+        client.writer_task = nothing
         client.write_timeout_task = nothing
         client.write_deadline[] = time()
         tasks
@@ -422,6 +427,7 @@ end
 
 function _start_background_tasks!(client::Client, generation::Int=(@lock client.lock client.generation))
     _start_flusher_task!(client, generation)
+    _start_writer_task!(client, generation)
     reader_task = _spawn_control(:reader) do
         _reader_loop(client, generation)
     end

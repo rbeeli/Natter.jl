@@ -665,6 +665,7 @@ end
 function _write_raw(client::Client, data::Union{AbstractString,Vector{UInt8}}; force_flush::Bool=false,
                     deadline=nothing, write_mode::_RawWriteMode=_RAW_WRITE_CONNECTED,
                     cancel_token::MaybeCancellationToken=nothing)
+    _writer_barrier!(client; deadline, cancel_token)
     _with_write_lock(client, "write protocol command"; deadline, cancel_token) do
         st = status(client)
         io = @atomic client.write_io

@@ -53,22 +53,23 @@ flush(client)
 - [Reliability And TLS](https://rbeeli.github.io/Natter.jl/reliability) describes reconnect behavior, buffering, callbacks, and TLS options.
 - [Examples](https://rbeeli.github.io/Natter.jl/examples/connection-auth-tls) provide complete patterns for common application code.
 
-## Performance Reports
+## Benchmarks
 
-Run the live-server performance report from the repository root:
+<!-- NATTER_BENCHMARK_TABLE_START -->
+Benchmark parameters: `50000` messages, `5000` requests, `64` byte payload, `3` trials per client, URL `nats://127.0.0.1:4222`. Timed regions exclude startup, package loading, compilation/build time, dependency downloads, and benchmark warmup.
 
-```bash
-docker run -d --rm --name natter-perf -p 4222:4222 nats:2.11-alpine -js
-env JULIA_NUM_THREADS=2 julia --project=. benchmarks/run.jl
-docker stop natter-perf
-```
+Benchmarks use each client's common high-level publish, subscribe, request, and flush APIs. Natter.jl callback dispatch uses `callback_mode=:inline` in this comparison; the Natter-only report also includes task-backed callback rows. The table reports best-of-`3` results: rates use the highest throughput, while durations and latencies use the lowest observed value.
 
-The report separates direct writes, buffered batch publish, publish-plus-flush,
-callback dispatch, request/reply latency, concurrent publish, reconnect recovery,
-and hot-path allocations. Compare Natter with other clients by matching the
-same publish semantics; buffered batch numbers are not the same operation as
-per-message flush or direct socket writes. Warmup work runs before each timed
-region, so startup, package loading, JIT compilation, and benchmark warmup are
-not included in the reported timings.
+Optimization modes: Natter.jl runs with `julia --startup-file=no -O3 --check-bounds=no -C native`; Go runs from an explicit `go build -trimpath` binary; Rust runs from `cargo build --release`; the NATS server uses the official `nats:2.11` image.
 
-The `Performance` GitHub Actions workflow runs the same report on a schedule and on demand, then uploads Markdown and JSON artifacts for trend review.
+| Metric | Natter.jl | Go nats.go | Rust nats.rs | Python nats.py |
+| :--- | ---: | ---: | ---: | ---: |
+| Publish batch / queued msg/s | 4,858,044 | 5,424,487 | 4,929,742 | 923,915 |
+| Publish + flush each msg/s | 29,623 | 22,837 | 128,290 | 22,879 |
+| Callback dispatch inline batch msg/s | 2,783,611 | 3,180,066 | 2,682,412 | 265,970 |
+| Request/reply req/s | 18,868 | 11,748 | 17,372 | 9,727 |
+| Request p50 latency ms | 0.046 | 0.054 | 0.049 | 0.090 |
+| Request p95 latency ms | 0.115 | 0.223 | 0.116 | 0.171 |
+
+Generated from benchmark JSON artifacts at `2026-05-19T22:31:28.363`.
+<!-- NATTER_BENCHMARK_TABLE_END -->

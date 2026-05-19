@@ -306,6 +306,7 @@ function _begin_reconnect_transition!(client::Client)
                 should_start = opts.allow_reconnect
                 _store_status_locked!(client, should_start ? ConnectionStatus.RECONNECTING : ConnectionStatus.DISCONNECTED)
                 client.flusher_task = nothing
+                client.writer_task = nothing
                 notify_subs = collect(values(client.subscriptions))
                 read_io, write_io, sock = _take_transport_fields_locked!(client)
                 read_io, write_io, sock, should_start
@@ -323,6 +324,7 @@ function _begin_reconnect_transition!(client::Client)
     end
 
     isempty(replayable) || _prepend_pending!(client, replayable; already_counted=true)
+    _deactivate_writer_queue!(client; clear=true)
     _release_pending_bytes!(client, dropped_replayable)
     generation, should_start, notify_subs, transports
 end
@@ -415,6 +417,7 @@ function _reconnect_loop(client::Client, generation::Int)
                 _connect_once!(client, server; mark_connected=false, generation,
                                attempt=attempts, reconnect=true)
                 _start_flusher_task!(client, generation)
+                _start_writer_task!(client, generation)
                 _record_reconnect!(client)
                 committed = false
                 lock(client.subscription_replay_lock)

@@ -113,6 +113,10 @@ end
     prepared_frame = String(take!(prepared_client.write_io))
     @test startswith(prepared_frame, "HPUB prepared.subject ")
     @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nbody\r\n", prepared_frame)
+    publish(prepared_client, prepared; mode=:direct)
+    @test startswith(String(take!(prepared_client.write_io)), "HPUB prepared.subject ")
+    @test_throws ArgumentError publish(prepared_client, prepared; mode="queued")
+    @test_throws ArgumentError publish(prepared_client, prepared; mode=:bad)
     empty_prepared = prepare_publish("prepared.empty")
     @test isempty(empty_prepared.payload)
     @test_throws MethodError push!(empty_prepared.payload, 0x41)
@@ -547,7 +551,31 @@ end
     @test !isready(borrowed_sub.messages)
     close(borrowed_sub)
 
+    inline_seen = Ref{Any}(nothing)
+    inline_sub = subscribe(borrowed_client, "events.inline"; callback_mode=:inline) do msg
+        inline_seen[] = msg
+        @test msg isa BorrowedMsg
+    end
+    @test inline_sub.has_callback
+    @test inline_sub.borrowed_callback
+    @test isnothing(inline_sub.processor)
+    inline_payload = TestHelpers.bytes("x")
+    inline_msg = BorrowedMsg("events.inline", nothing, @view(inline_payload[:]),
+                             nothing, inline_sub.sid, 0)
+    N._dispatch_msg(borrowed_client, inline_msg)
+    @test inline_seen[] isa BorrowedMsg
+    @test inline_seen[].subject == "events.inline"
+    @test String(inline_seen[]) == "x"
+    close(inline_sub)
+
     @test_throws ArgumentError subscribe(borrowed_client, "events.no-callback"; borrowed=true)
+    @test_throws ArgumentError subscribe(borrowed_client, "events.no-callback"; callback_mode=:inline)
+    @test_throws ArgumentError subscribe(borrowed_client, "events.string-mode"; callback=identity,
+                                         callback_mode="inline")
+    @test_throws ArgumentError subscribe(borrowed_client, "events.bad-mode"; callback=identity,
+                                         callback_mode=:borrowed)
+    @test_throws ArgumentError subscribe(borrowed_client, "events.conflict"; callback=identity,
+                                         borrowed=true, callback_mode=:task)
 
     positional = CoreCallable(String[])
     positional_sub = subscribe(positional, client, "events.positional")
@@ -568,6 +596,8 @@ end
     opts = N.ConnectOptions(connect_timeout=1, ping_interval=2, max_outstanding_pings=1,
                             reconnect_jitter=0, read_buffer_size=8192, write_buffer_size=0,
                             direct_write_threshold=4096, write_timeout=3,
+                            write_driver=false, write_queue_msgs=128,
+                            write_queue_bytes=4096, write_batch_msgs=16,
                             close_callback_timeout=4)
     @test opts.connect_timeout == 1.0
     @test opts.ping_interval == 2.0
@@ -575,6 +605,10 @@ end
     @test opts.write_buffer_size == 0
     @test opts.direct_write_threshold == 4096
     @test opts.write_timeout == 3.0
+    @test !opts.write_driver
+    @test opts.write_queue_msgs == 128
+    @test opts.write_queue_bytes == 4096
+    @test opts.write_batch_msgs == 16
     @test opts.close_callback_timeout == 4.0
     @test opts.randomize_servers
     @test N.CLIENT_VERSION == string(pkgversion(N))
@@ -749,6 +783,10 @@ end
     rejects(write_buffer_size=-1)
     rejects(tcp_nodelay=1)
     rejects(direct_write_threshold=-1)
+    rejects(write_driver=1)
+    rejects(write_queue_msgs=0)
+    rejects(write_queue_bytes=0)
+    rejects(write_batch_msgs=0)
     rejects(read_buffer_shrink_threshold=1024, read_buffer_size=2048)
     rejects(write_timeout=0)
     rejects(close_callback_timeout=-1)
@@ -1523,6 +1561,51 @@ end
     @test client.pending_bytes == 0
     @test transport.flushes == 1
     @test count(line -> startswith(line, "PUB foo "), split(String(copy(transport.bytes)), "\r\n"; keepempty=false)) == 5
+
+    close(client)
+    @test transport.closed
+end
+
+@testitem "queued writer batches prepared publishes and raw barriers preserve order" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct WriterTransport <: IO
+        bytes::Vector{UInt8}
+        flushes::Int
+        closed::Bool
+    end
+    WriterTransport() = WriterTransport(UInt8[], 0, false)
+
+    Base.write(t::WriterTransport, data::Vector{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::WriterTransport, data::Base.CodeUnits{UInt8}) = (append!(t.bytes, data); length(data))
+    Base.write(t::WriterTransport, data::AbstractString) = (append!(t.bytes, codeunits(data)); ncodeunits(data))
+    Base.flush(t::WriterTransport) = (t.flushes += 1; nothing)
+    Base.close(t::WriterTransport) = (t.closed = true; nothing)
+    Base.isopen(t::WriterTransport) = !t.closed
+
+    transport = WriterTransport()
+    write_io = N.BufferedWriteIO(transport)
+    opts = N.ConnectOptions(write_buffer_size=1024 * 1024, write_queue_msgs=16,
+                            write_queue_bytes=1024 * 1024, write_batch_msgs=16)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io)
+    N._start_writer_task!(client, client.generation)
+
+    frame = prepare_publish("foo", "bar")
+    for _ in 1:5
+        publish(client, frame)
+    end
+    N._write_raw(client, TestHelpers.bytes("PING\r\n"); force_flush=true)
+
+    result = timedwait(1.0; pollint=0.001) do
+        count(line -> startswith(line, "PUB foo "), split(String(copy(transport.bytes)), "\r\n"; keepempty=false)) == 5 &&
+            endswith(String(copy(transport.bytes)), "PING\r\n")
+    end
+    @test result != :timed_out
+    @test N._buffered_bytes(write_io) == 0
+    @test transport.flushes >= 1
 
     close(client)
     @test transport.closed

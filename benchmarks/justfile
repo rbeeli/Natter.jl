@@ -1,0 +1,132 @@
+set dotenv-load := true
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+url := env_var_or_default("NATTER_BENCH_URL", "nats://127.0.0.1:4222")
+messages := env_var_or_default("NATTER_BENCH_MESSAGES", "50000")
+requests := env_var_or_default("NATTER_BENCH_REQUESTS", "5000")
+payload_bytes := env_var_or_default("NATTER_BENCH_PAYLOAD_BYTES", "64")
+timeout := env_var_or_default("NATTER_BENCH_TIMEOUT", "30")
+concurrency := env_var_or_default("NATTER_BENCH_CONCURRENCY", "44")
+artifacts := env_var_or_default("NATTER_BENCH_ARTIFACTS", "benchmarks/results")
+pythonpath := env_var_or_default("NATS_PYTHONPATH", "/mnt/data/repos/nats.py/nats/src")
+julia_flags := env_var_or_default("NATTER_BENCH_JULIA_FLAGS", "--startup-file=no -O3 --check-bounds=no -C native")
+trials := env_var_or_default("NATTER_BENCH_TRIALS", "3")
+nats_image := env_var_or_default("NATTER_BENCH_NATS_IMAGE", "nats:2.11")
+
+default:
+    @just --justfile "{{justfile_directory()}}/justfile" --list
+
+server-start:
+    docker run -d --rm --name natter-bench -p 4222:4222 "{{nats_image}}" -js
+
+server-stop:
+    docker stop natter-bench
+
+natter:
+    root="$(cd "{{justfile_directory()}}/.." && pwd)"; \
+    artifacts_dir="{{artifacts}}"; [[ "$artifacts_dir" = /* ]] || artifacts_dir="$root/$artifacts_dir"; \
+    mkdir -p "$artifacts_dir"; \
+    rm -f "$artifacts_dir"/natter-trial-*.json "$artifacts_dir"/natter-trial-*.md "$artifacts_dir/natter.json"; \
+    cd "$root"; \
+    for i in $(seq 1 "{{trials}}"); do \
+      NATTER_BENCH_JULIA_FLAGS="{{julia_flags}}" NATTER_BENCH_NATS_IMAGE="{{nats_image}}" JULIA_NUM_THREADS="${JULIA_NUM_THREADS:-22}" julia {{julia_flags}} --project=. benchmarks/run.jl \
+        --url "{{url}}" \
+        --messages "{{messages}}" \
+        --requests "{{requests}}" \
+        --payload-bytes "{{payload_bytes}}" \
+        --concurrency "{{concurrency}}" \
+        --timeout "{{timeout}}" \
+        --output "$artifacts_dir/natter-trial-$i.md" \
+        --json "$artifacts_dir/natter-trial-$i.json"; \
+    done; \
+    julia --project=. benchmarks/aggregate_min.jl --client natter --output "$artifacts_dir/natter.json" -- "$artifacts_dir"/natter-trial-*.json
+
+python:
+    root="$(cd "{{justfile_directory()}}/.." && pwd)"; \
+    artifacts_dir="{{artifacts}}"; [[ "$artifacts_dir" = /* ]] || artifacts_dir="$root/$artifacts_dir"; \
+    mkdir -p "$artifacts_dir"; \
+    rm -f "$artifacts_dir"/python-nats-trial-*.json "$artifacts_dir/python-nats.json"; \
+    cd "$root"; \
+    for i in $(seq 1 "{{trials}}"); do \
+      PYTHONPATH="{{pythonpath}}" python3 benchmarks/clients/python_nats.py \
+        --url "{{url}}" \
+        --messages "{{messages}}" \
+        --requests "{{requests}}" \
+        --payload-bytes "{{payload_bytes}}" \
+        --timeout "{{timeout}}" \
+        --json "$artifacts_dir/python-nats-trial-$i.json"; \
+    done; \
+    julia --project=. benchmarks/aggregate_min.jl --client python --output "$artifacts_dir/python-nats.json" -- "$artifacts_dir"/python-nats-trial-*.json
+
+rust:
+    root="$(cd "{{justfile_directory()}}/.." && pwd)"; \
+    artifacts_dir="{{artifacts}}"; [[ "$artifacts_dir" = /* ]] || artifacts_dir="$root/$artifacts_dir"; \
+    mkdir -p "$artifacts_dir"; \
+    rm -f "$artifacts_dir"/rust-nats-trial-*.json "$artifacts_dir/rust-nats.json"; \
+    if command -v cargo >/dev/null 2>&1; then \
+      cd "$root/benchmarks/clients/rust_nats"; \
+      CARGO_TARGET_DIR="$artifacts_dir/rust-target" cargo build --release; \
+      for i in $(seq 1 "{{trials}}"); do \
+        "$artifacts_dir/rust-target/release/natter-rust-nats-bench" \
+          --url "{{url}}" \
+          --messages "{{messages}}" \
+          --requests "{{requests}}" \
+          --payload-bytes "{{payload_bytes}}" \
+          --timeout "{{timeout}}" \
+          --json "$artifacts_dir/rust-nats-trial-$i.json"; \
+      done; \
+    else \
+      repos_root="$(cd "$root/.." && pwd)"; \
+      docker run --rm --network host \
+        -v "$repos_root:$repos_root" \
+        -w "$root/benchmarks/clients/rust_nats" \
+        -e CARGO_TARGET_DIR="$artifacts_dir/rust-target" \
+        rust:1.88-bookworm bash -euo pipefail -c 'cargo build --release; for i in $(seq 1 "$1"); do "$CARGO_TARGET_DIR/release/natter-rust-nats-bench" --url "$2" --messages "$3" --requests "$4" --payload-bytes "$5" --timeout "$6" --json "$7/rust-nats-trial-$i.json"; done; chown -R "$8:$9" "$7"/rust-nats-trial-*.json "$CARGO_TARGET_DIR"' \
+        bash "{{trials}}" "{{url}}" "{{messages}}" "{{requests}}" "{{payload_bytes}}" "{{timeout}}" "$artifacts_dir" "$(id -u)" "$(id -g)"; \
+    fi; \
+    cd "$root"; \
+    julia --project=. benchmarks/aggregate_min.jl --client rust --output "$artifacts_dir/rust-nats.json" -- "$artifacts_dir"/rust-nats-trial-*.json
+
+go:
+    root="$(cd "{{justfile_directory()}}/.." && pwd)"; \
+    artifacts_dir="{{artifacts}}"; [[ "$artifacts_dir" = /* ]] || artifacts_dir="$root/$artifacts_dir"; \
+    mkdir -p "$artifacts_dir"; \
+    rm -f "$artifacts_dir"/go-nats-trial-*.json "$artifacts_dir/go-nats.json"; \
+    cd "$root/benchmarks/clients/go_nats"; \
+    go mod tidy; \
+    go build -trimpath -o "$artifacts_dir/go-nats-bench" .; \
+    for i in $(seq 1 "{{trials}}"); do \
+      "$artifacts_dir/go-nats-bench" \
+        -url "{{url}}" \
+        -messages "{{messages}}" \
+        -requests "{{requests}}" \
+        -payload-bytes "{{payload_bytes}}" \
+        -timeout "{{timeout}}" \
+        -json "$artifacts_dir/go-nats-trial-$i.json"; \
+    done; \
+    cd "$root"; \
+    julia --project=. benchmarks/aggregate_min.jl --client go --output "$artifacts_dir/go-nats.json" -- "$artifacts_dir"/go-nats-trial-*.json
+
+run: natter python rust go
+
+table:
+    root="$(cd "{{justfile_directory()}}/.." && pwd)"; \
+    artifacts_dir="{{artifacts}}"; [[ "$artifacts_dir" = /* ]] || artifacts_dir="$root/$artifacts_dir"; \
+    cd "$root"; \
+    julia --project=. benchmarks/format_comparison.jl \
+      --natter "$artifacts_dir/natter.json" \
+      --python "$artifacts_dir/python-nats.json" \
+      --rust "$artifacts_dir/rust-nats.json" \
+      --go "$artifacts_dir/go-nats.json" \
+      --output "$artifacts_dir/comparison.md" \
+      --update-readme README.md \
+      --update-docs docs/src/benchmarks.md
+
+all: run table
+
+with-server:
+    root="$(cd "{{justfile_directory()}}/.." && pwd)"; \
+    docker run -d --rm --name natter-bench -p 4222:4222 "{{nats_image}}" -js; \
+    trap 'docker stop natter-bench >/dev/null' EXIT; \
+    for _ in {1..30}; do nc -z 127.0.0.1 4222 && break; sleep 1; done; \
+    just --justfile "$root/benchmarks/justfile" all

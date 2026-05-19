@@ -255,6 +255,12 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
     catch err
         push!(errors, CleanupError("signal flusher", err))
     end
+    try
+        _deactivate_writer_queue!(client; close=true, clear=true)
+        _signal_writer(client)
+    catch err
+        push!(errors, CleanupError("signal writer", err))
+    end
     append!(errors, _notify_pong_waiters!(client, false))
     append!(errors, _notify_request_waiters!(client, ConnectionClosedError(); clear_mux=true))
     for sub in subs

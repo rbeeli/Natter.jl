@@ -5,6 +5,20 @@ function _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_byt
     max_msgs, pending_msgs_limit, pending_bytes_limit
 end
 
+function _subscription_inline_callback(callback, borrowed::Bool, callback_mode)::Bool
+    callback_mode isa Symbol ||
+        throw(ArgumentError("callback_mode must be :task or :inline"))
+    if callback_mode === :task
+        borrowed && throw(ArgumentError("borrowed=true requires callback_mode=:inline"))
+        return false
+    elseif callback_mode === :inline
+        isnothing(callback) &&
+            throw(ArgumentError("callback_mode=:inline requires a callback"))
+        return true
+    end
+    throw(ArgumentError("callback_mode must be :task or :inline"))
+end
+
 struct _SubscriptionProcessor{S<:Subscription,F}
     sub::S
     callback::F
@@ -23,6 +37,7 @@ end
 
 function _subscribe_unlocked(client::Client, subject::AbstractString; queue::Union{AbstractString,Nothing}=nothing, callback=nothing,
                              borrowed::Bool=false,
+                             callback_mode=(borrowed ? :inline : :task),
                              max_msgs=0, pending_msgs_limit=client.options.sub_pending_msgs_limit,
                              pending_bytes_limit=client.options.sub_pending_bytes_limit,
                              _control_handler::_SubscriptionControlHandler=_NoSubscriptionControlHandler(),
@@ -32,8 +47,7 @@ function _subscribe_unlocked(client::Client, subject::AbstractString; queue::Uni
     subject = _validate_subject(subject)
     queue = _validate_queue(queue)
     borrowed = _connect_option_bool("borrowed", borrowed)
-    borrowed && isnothing(callback) &&
-        throw(ArgumentError("borrowed subscriptions require a callback"))
+    inline_callback = _subscription_inline_callback(callback, borrowed, callback_mode)
     max_msgs, pending_msgs_limit, pending_bytes_limit =
         _validate_subscription_limits(max_msgs, pending_msgs_limit, pending_bytes_limit)
     send_now = false
@@ -48,7 +62,7 @@ function _subscribe_unlocked(client::Client, subject::AbstractString; queue::Uni
         ch = MsgQueue{Msg}(pending_msgs_limit)
         sub_lock = ReentrantLock()
         condition = Base.Threads.Condition(sub_lock)
-        sub = Subscription(client, sid, subject, queue, callback, borrowed, sub_lock, ch,
+        sub = Subscription(client, sid, subject, queue, callback, inline_callback, sub_lock, ch,
                            condition, _control_handler, pending_msgs_limit,
                            pending_bytes_limit, 0, 0, 0, 0, max_msgs, false, nothing,
                            false, 0, 0)
@@ -73,7 +87,7 @@ function _subscribe_unlocked(client::Client, subject::AbstractString; queue::Uni
             isempty(cleanup_errors) ? rethrow() : throw(Base.CompositeException(vcat(Any[err], cleanup_errors)))
         end
     end
-    if !isnothing(callback) && !borrowed
+    if !isnothing(callback) && !inline_callback
         _start_subscription_processor!(sub, callback)
     end
     sub
@@ -121,7 +135,8 @@ function _subscription_processor(sub::Subscription, callback::Callback) where {C
         finally
             @lock sub.lock begin
                 sub.processing = max(0, sub.processing - 1)
-                _notify_subscription_waiters_locked(sub; all=true)
+                (!isready(sub.messages) || sub.processing == 0 || sub.closed) &&
+                    _notify_subscription_waiters_locked(sub; all=true)
             end
         end
     end
@@ -497,10 +512,11 @@ function _dispatch_owned_msg_to_sub(client::Client, sub::Subscription, msg::Msg,
             sub.dropped_msgs += 1
             false
         else
+            was_empty = !isready(sub.messages)
             sub.received += 1
             sub.pending_bytes += msg_bytes
             put!(sub.messages, msg)
-            _notify_subscription_waiters_locked(sub)
+            was_empty && _notify_subscription_waiters_locked(sub)
             true
         end
     end
@@ -549,6 +565,8 @@ function _borrowed_dispatch_msg(msg::BorrowedMsg)::_BorrowedDispatchMsg
     BorrowedMsg(msg.subject, msg.reply, @view(data[1:length(data)]), msg.headers, msg.sid,
                 msg.header_bytes)
 end
+
+_borrowed_dispatch_msg(msg::_BorrowedDispatchMsg) = msg
 
 function _borrowed_dispatch_msg(msg::BorrowedMsg{Vector{UInt8}})::_BorrowedDispatchMsg
     BorrowedMsg(msg.subject, msg.reply, @view(msg.data[1:length(msg.data)]), msg.headers, msg.sid,

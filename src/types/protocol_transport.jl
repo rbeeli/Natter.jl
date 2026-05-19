@@ -234,6 +234,55 @@ function Base.take!(signal::FlushSignal)
     true
 end
 
+mutable struct _WriteQueue
+    condition::Base.GenericCondition{ReentrantLock}
+    items::Vector{Any}
+    sizes::Vector{Int}
+    head::Int
+    tail::Int
+    len::Int
+    bytes::Int
+    in_flight::Int
+    epoch::Int
+    pending_count::Threads.Atomic{Int}
+    max_msgs::Int
+    max_bytes::Int
+    active::Threads.Atomic{Bool}
+    closed::Threads.Atomic{Bool}
+end
+
+function _WriteQueue(max_msgs::Int, max_bytes::Int)
+    max_msgs > 0 || throw(ArgumentError("write_queue_msgs must be positive"))
+    max_bytes > 0 || throw(ArgumentError("write_queue_bytes must be positive"))
+    lock = ReentrantLock()
+    items = Vector{Any}(undef, max_msgs)
+    fill!(items, nothing)
+    _WriteQueue(Base.Threads.Condition(lock), items, fill(0, max_msgs),
+                1, 1, 0, 0, 0, 0, Threads.Atomic{Int}(0), max_msgs, max_bytes,
+                Threads.Atomic{Bool}(false), Threads.Atomic{Bool}(false))
+end
+
+Base.isopen(q::_WriteQueue) = !q.closed[]
+Base.isready(q::_WriteQueue) = q.len > 0
+Base.length(q::_WriteQueue) = q.len
+_write_queue_capacity(q::_WriteQueue)::Int = length(q.items)
+
+@inline function _write_queue_next_index(q::_WriteQueue, index::Int)::Int
+    index == length(q.items) ? 1 : index + 1
+end
+
+function Base.empty!(q::_WriteQueue)
+    fill!(q.items, nothing)
+    fill!(q.sizes, 0)
+    q.head = 1
+    q.tail = 1
+    q.len = 0
+    q.bytes = 0
+    q.in_flight = 0
+    q.pending_count[] = 0
+    q
+end
+
 mutable struct PendingBuffer
     chunks::Vector{_PendingEntry}
     head::Int

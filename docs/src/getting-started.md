@@ -98,7 +98,7 @@ end
 ## Request Reply
 
 ```julia
-service = subscribe(client, "orders.lookup") do msg
+service = subscribe(client, "orders.lookup"; callback_mode=:inline) do msg
     isnothing(msg.reply) && return
     respond(client, msg, lookup_order(String(msg)))
 end

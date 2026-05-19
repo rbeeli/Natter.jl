@@ -304,6 +304,10 @@ struct ConnectOptions{Auth<:AbstractAuth}
     direct_write_threshold::Int
     write_buffer_latency::Float64
     write_timeout::Float64
+    write_driver::Bool
+    write_queue_msgs::Int
+    write_queue_bytes::Int
+    write_batch_msgs::Int
     record_stats::Bool
     max_control_line::Int
     max_inbound_payload::Int
@@ -324,7 +328,8 @@ struct ConnectOptions{Auth<:AbstractAuth}
         max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
         reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
         pending_size, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
-        write_buffer_latency, write_timeout, record_stats,
+        write_buffer_latency, write_timeout, write_driver, write_queue_msgs,
+        write_queue_bytes, write_batch_msgs, record_stats,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
         sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
         inbox_prefix,
@@ -367,6 +372,10 @@ struct ConnectOptions{Auth<:AbstractAuth}
         direct_write_threshold = _connect_option_nonnegative_int("direct_write_threshold", direct_write_threshold)
         write_buffer_latency = _connect_option_nonnegative_float("write_buffer_latency", write_buffer_latency)
         write_timeout = _connect_option_positive_or_infinite_float("write_timeout", write_timeout)
+        write_driver = _connect_option_bool("write_driver", write_driver)
+        write_queue_msgs = _connect_option_positive_int("write_queue_msgs", write_queue_msgs)
+        write_queue_bytes = _connect_option_positive_int("write_queue_bytes", write_queue_bytes)
+        write_batch_msgs = _connect_option_positive_int("write_batch_msgs", write_batch_msgs)
         record_stats = _connect_option_bool("record_stats", record_stats)
         max_control_line = _connect_option_positive_int("max_control_line", max_control_line)
         max_inbound_payload = _connect_option_positive_int("max_inbound_payload", max_inbound_payload)
@@ -388,7 +397,8 @@ struct ConnectOptions{Auth<:AbstractAuth}
             max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
             reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
             pending_size, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
-            write_buffer_latency, write_timeout, record_stats,
+            write_buffer_latency, write_timeout, write_driver, write_queue_msgs,
+            write_queue_bytes, write_batch_msgs, record_stats,
             max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
             sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
             inbox_prefix,
@@ -463,6 +473,8 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                         write_buffer_size=DEFAULT_WRITE_BUFFER_SIZE,
                         direct_write_threshold=DEFAULT_DIRECT_WRITE_THRESHOLD,
                         write_buffer_latency=0.001, write_timeout=DEFAULT_WRITE_TIMEOUT,
+                        write_driver=true, write_queue_msgs=8192,
+                        write_queue_bytes=2 * 1024 * 1024, write_batch_msgs=512,
                         record_stats=false,
                         max_control_line=DEFAULT_MAX_CONTROL_LINE,
                         max_inbound_payload=DEFAULT_MAX_INBOUND_PAYLOAD,
@@ -480,6 +492,7 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                    reconnect_jitter, max_reconnect_attempts, pending_size,
                    read_buffer_size, read_buffer_shrink_threshold, write_buffer_size,
                    direct_write_threshold, write_buffer_latency, write_timeout,
+                   write_driver, write_queue_msgs, write_queue_bytes, write_batch_msgs,
                    record_stats, max_control_line, max_inbound_payload,
                    max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
                    sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
