@@ -67,6 +67,8 @@ The report separates direct writes, buffered batch publish, publish-plus-flush,
 callback dispatch, request/reply latency, concurrent publish, reconnect recovery,
 and hot-path allocations. Compare Natter with other clients by matching the
 same publish semantics; buffered batch numbers are not the same operation as
-per-message flush or direct socket writes.
+per-message flush or direct socket writes. Warmup work runs before each timed
+region, so startup, package loading, JIT compilation, and benchmark warmup are
+not included in the reported timings.
 
 The `Performance` GitHub Actions workflow runs the same report on a schedule and on demand, then uploads Markdown and JSON artifacts for trend review.
