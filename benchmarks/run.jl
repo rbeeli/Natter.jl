@@ -142,6 +142,17 @@ function benchmark_callback_dispatch(url::String, subject::String, payload::Vect
         flush(sub_client; timeout=5.0)
         frame = prepare_publish(subject, payload)
 
+        warmup = min(messages, 100)
+        for _ in 1:warmup
+            publish(pub_client, frame; direct_write=true)
+        end
+        flush(pub_client; timeout=5.0)
+        result = timedwait(timeout; pollint=0.001) do
+            counter[] >= warmup
+        end
+        result == :timed_out && error("timed out waiting for callback warmup: received $(counter[]) of $warmup")
+        counter[] = 0
+
         seconds = elapsed_seconds() do
             for _ in 1:messages
                 publish(pub_client, frame; direct_write=true)
@@ -216,6 +227,12 @@ function benchmark_concurrent_publish(url::String, subject::String, payload::Vec
     total = per_task * concurrency
     try
         publish(client, frame; direct_write=true)
+        flush(client; timeout=5.0)
+        @sync begin
+            for _ in 1:concurrency
+                Threads.@spawn publish(client, frame; direct_write=true)
+            end
+        end
         flush(client; timeout=5.0)
 
         seconds = elapsed_seconds() do
@@ -361,6 +378,7 @@ function benchmark_reconnect(url::String, subject::String, payload::Vector{UInt8
         event_cb=event -> push!(events, string(event.kind)),
     )
     try
+        publish(client, subject, payload; direct_write=true)
         flush(client; timeout=5.0)
         drop_proxy_connections!(proxy)
 
