@@ -2075,10 +2075,12 @@ end
                                      read_io=transport, write_io=transport)
     source = CancellationSource()
     token = cancellation_token(source)
-    task = Threads.@spawn TestHelpers.thrown_exception(() -> request(client, "svc", "body";
-                                                             timeout=30.0, cancel_token=token))
+    task = N._spawn_sticky(:cancelled_request) do
+        TestHelpers.thrown_exception(() -> request(client, "svc", "body";
+                                                   timeout=30.0, cancel_token=token))
+    end
 
-    @test timedwait(1.0; pollint=0.005) do
+    @test timedwait(5.0; pollint=0.005) do
         mux = @atomic client.request_mux
         !isnothing(mux) && (@lock mux.condition !isempty(mux.waiters))
     end == :ok

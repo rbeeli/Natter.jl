@@ -585,7 +585,7 @@ end
 function _schedule_timeout_cleanup(operation::String, cleanup::Function,
                                    report_cleanup_errors::Function=errors -> _warn_timeout_cleanup_errors(operation, errors);
                                    task::Union{Task,Nothing}=nothing)
-    _spawn_work(:timeout_cleanup) do
+    _spawn_sticky(:timeout_cleanup) do
         errors = Any[]
         try
             append!(errors, _cleanup_errors(cleanup()))
