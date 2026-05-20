@@ -245,7 +245,7 @@ end
                 @test request_err isa ConnectionReconnectingError
                 @test client.pending_bytes == 0
 
-                publish(client, subject, "during failover"; mode=:replayable)
+                publish(client, subject, "during failover"; mode=PublishMode.REPLAYABLE)
                 result = timedwait(1.0; pollint=0.01) do
                     client.pending_bytes > 0
                 end

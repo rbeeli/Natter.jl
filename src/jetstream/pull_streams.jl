@@ -272,22 +272,11 @@ function _pull_stream_put!(stream::PullMessageStream, msg::Msg)::Int
         isopen(stream.messages) || throw(_PullStreamClosed())
         @lock stream.state.lock begin
             stream.state.closed && throw(_PullStreamClosed())
-            requested_messages_before = stream.state.requested_messages
-            requested_bytes_before = stream.state.requested_bytes
-            _pull_stream_release_counters!(stream.state, 1, bytes)
+            put!(stream.messages, msg)
+            _pull_stream_decrement_requested!(stream.state, msg)
             stream.state.buffered_messages += 1
             stream.state.buffered_bytes += bytes
             stream.state.delivered += 1
-            try
-                put!(stream.messages, msg)
-            catch
-                stream.state.requested_messages = requested_messages_before
-                stream.state.requested_bytes = requested_bytes_before
-                stream.state.buffered_messages = max(0, stream.state.buffered_messages - 1)
-                stream.state.buffered_bytes = max(0, stream.state.buffered_bytes - bytes)
-                stream.state.delivered = max(0, stream.state.delivered - 1)
-                rethrow()
-            end
         end
         notify(stream.message_condition)
     end

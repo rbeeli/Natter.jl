@@ -1,6 +1,6 @@
 # Reliability And TLS
 
-Natter.jl is designed for long-running clients. Reconnect is enabled by default, active subscriptions are replayed after reconnect, and opt-in publish replay is bounded by `pending_size`. Set `pending_size=0` to disable reconnect publish buffering entirely.
+Natter.jl is designed for long-running clients. Reconnect is enabled by default, active subscriptions are replayed after reconnect, and default core publish replay is bounded by `pending_size`. Set `pending_size=0` to disable reconnect publish buffering entirely.
 
 ## Production Connection
 
@@ -49,7 +49,7 @@ After a transient disconnect the client:
 - marks the connection as `ConnectionStatus.RECONNECTING`;
 - tries configured and server-discovered URLs, randomized unless `randomize_servers=false`;
 - replays active subscriptions;
-- flushes opt-in buffered publishes up to `pending_size`, unless `pending_size=0`;
+- flushes retained replayable publishes up to `pending_size`, unless `pending_size=0`;
 - emits `ConnectionEvent` values through `event_cb`.
 
 Core publish replay is best-effort and should be treated as at-least-once for retained frames. Request calls are not queued while reconnecting because their waiter can expire independently; requests already written before a disconnect keep their waiter until timeout or cancellation. If duplicate effects matter, use JetStream `js_publish(...; msg_id=...)` and idempotent application storage.

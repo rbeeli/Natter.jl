@@ -95,6 +95,12 @@ function _connect_option_bool(name::AbstractString, value)::Bool
     value
 end
 
+function _connect_option_publish_mode(value)::PublishMode.T
+    value isa PublishMode.T ||
+        throw(ArgumentError("publish_mode must be a PublishMode value"))
+    value
+end
+
 function _connect_option_optional_bool(name::AbstractString, value)::Union{Bool,Nothing}
     isnothing(value) && return nothing
     _connect_option_bool(name, value)
@@ -297,6 +303,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
     reconnect_jitter::Float64
     max_reconnect_attempts::Int
     pending_size::Int
+    publish_mode::PublishMode.T
     read_buffer_size::Int
     read_buffer_shrink_threshold::Int
     write_buffer_size::Int
@@ -327,7 +334,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
         tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, tcp_nodelay, connect_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
         reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
-        pending_size, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
+        pending_size, publish_mode, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
         write_buffer_latency, write_timeout, write_driver, write_queue_msgs,
         write_queue_bytes, write_batch_msgs, write_batch_bytes, record_stats,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
@@ -363,6 +370,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
         reconnect_jitter = _connect_option_nonnegative_float("reconnect_jitter", reconnect_jitter)
         max_reconnect_attempts = _connect_option_reconnect_attempts(max_reconnect_attempts)
         pending_size = _connect_option_nonnegative_int("pending_size", pending_size)
+        publish_mode = _connect_option_publish_mode(publish_mode)
         read_buffer_size = _connect_option_positive_int("read_buffer_size", read_buffer_size)
         read_buffer_shrink_threshold = _connect_option_positive_int("read_buffer_shrink_threshold",
                                                                     read_buffer_shrink_threshold)
@@ -397,7 +405,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
             tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, tcp_nodelay, connect_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
             reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
-            pending_size, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
+            pending_size, publish_mode, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
             write_buffer_latency, write_timeout, write_driver, write_queue_msgs,
             write_queue_bytes, write_batch_msgs, write_batch_bytes, record_stats,
             max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
@@ -468,7 +476,8 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                         allow_reconnect=true, retry_on_initial_connect=false,
                         reconnect_wait=0.5, reconnect_max_wait=5.0, reconnect_jitter=0.1,
                         max_reconnect_attempts=-1,
-                        pending_size=2 * 1024 * 1024,
+                        pending_size=8 * 1024 * 1024,
+                        publish_mode=PublishMode.REPLAYABLE,
                         read_buffer_size=DEFAULT_READ_BUFFER_SIZE,
                         read_buffer_shrink_threshold=4 * read_buffer_size,
                         write_buffer_size=DEFAULT_WRITE_BUFFER_SIZE,
@@ -491,7 +500,7 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                    tls_cert_path, tls_key_path, tcp_nodelay, connect_timeout,
                    ping_interval, max_outstanding_pings, allow_reconnect,
                    retry_on_initial_connect, reconnect_wait, reconnect_max_wait,
-                   reconnect_jitter, max_reconnect_attempts, pending_size,
+                   reconnect_jitter, max_reconnect_attempts, pending_size, publish_mode,
                    read_buffer_size, read_buffer_shrink_threshold, write_buffer_size,
                    direct_write_threshold, write_buffer_latency, write_timeout,
                    write_driver, write_queue_msgs, write_queue_bytes, write_batch_msgs,

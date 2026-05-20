@@ -220,7 +220,7 @@ end
 
 function _publish_flow_control_reply(sub::Subscription, reply::String)
     try
-        _publish(sub.client, reply, EMPTY_BYTES; force_flush=true)
+        _publish(sub.client, reply, EMPTY_BYTES; force_flush=true, mode=PublishMode.DIRECT)
     catch err
         _report_error(sub.client, err)
     end

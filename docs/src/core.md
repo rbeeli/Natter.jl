@@ -31,11 +31,11 @@ publish(client, "events.created", UInt8[0x01, 0x02])
 publish(client, "events.created", """{"id":1001,"status":"created"}""")
 ```
 
-Payloads may be strings, byte vectors, or `nothing`. Encode structured values explicitly before publishing. `publish` validates subjects and the active server payload limit before handing the command to the writer.
+Payloads may be strings, byte vectors, or `nothing`. Encode structured values explicitly before publishing. `publish` validates subjects and the active server payload limit before writing or buffering the command.
 
-The default `mode=:queued` is the normal hot path on connected clients. It hands publish commands to a bounded background writer, which batches socket writes while preserving command order. Call `flush(client)` when the application needs a server round trip proving earlier commands were processed.
+The default `PublishMode.REPLAYABLE` keeps publish commands in the bounded reconnect buffer until the buffered bytes are flushed to the transport. This is the safest core publish default for applications that expect reconnect to be transparent. Call `flush(client)` when the application needs a server round trip proving earlier commands were processed.
 
-For repeated identical messages, prepare a frame once and publish the frame in queued mode:
+For repeated identical messages, prepare a frame once and publish the frame:
 
 ```julia
 frame = prepare_publish("metrics.tick", """{"service":"api","value":1}""")
@@ -45,7 +45,7 @@ for _ in 1:1_000
 end
 ```
 
-For mutable scratch buffers that you rewrite immediately, `mode=:direct` writes on the caller task and avoids copying the frame into the writer queue:
+For mutable scratch buffers that you rewrite immediately, `mode=PublishMode.DIRECT` writes on the caller task and disables reconnect replay for that call:
 
 ```julia
 payload = Vector{UInt8}(undef, 256)
@@ -53,34 +53,34 @@ payload = Vector{UInt8}(undef, 256)
 for metric in metrics
     n = encode_metric!(payload, metric)
     publish(client, "metrics.raw", @view(payload[1:n]);
-        mode=:direct,
+        mode=PublishMode.DIRECT,
     )
 end
 ```
 
-For a whole low-latency connection, disable the write buffer:
+For a whole low-latency connection, disable the write buffer and use direct publish as the connection default:
 
 ```julia
 client = connect("nats://127.0.0.1:4222";
     write_buffer_size=0,
+    publish_mode=PublishMode.DIRECT,
     read_buffer_size=256 * 1024,
 )
 ```
 
-Then normal publish calls on that client write directly and skip replay buffering by default:
+Then normal publish calls on that client write directly and fail during reconnect:
 
 ```julia
 publish(client, "metrics.raw", @view(payload[1:n]))
 ```
 
-Core publishes skip reconnect replay buffering by default and fail during reconnect. Use `mode=:replayable` only when best-effort replay is preferable to letting the caller retry, drop, or rebuild the message.
-
 The publish choices are:
 
-- Plain `publish` uses `mode=:queued`, validates, and sends through the background writer when it is active.
-- `publish(...; mode=:direct)` writes on the caller task and bypasses the queued writer for that call.
-- `publish(...; mode=:replayable)` retains buffered frames for best-effort reconnect replay up to `pending_size`.
-- `prepare_publish` copies once into a safe reusable `PublishFrame` for low-allocation queued publishing.
+- Plain `publish` uses `client.options.publish_mode`, which defaults to `PublishMode.REPLAYABLE`.
+- `publish(...; mode=PublishMode.REPLAYABLE)` retains buffered frames for best-effort reconnect replay up to `pending_size`.
+- `publish(...; mode=PublishMode.DIRECT)` writes on the caller task and bypasses replay buffering for that call.
+- `publish(...; mode=PublishMode.QUEUED)` hands commands to the bounded background writer for maximum producer throughput; accepted queued items are not retained for reconnect replay.
+- `prepare_publish` copies once into a safe reusable `PublishFrame` for low-allocation publishing.
 
 Call `flush(client)` when the application needs a server round trip proving earlier commands were processed.
 

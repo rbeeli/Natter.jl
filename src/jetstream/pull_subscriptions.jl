@@ -529,7 +529,7 @@ function _publish_pull_fetch_request(psub::PullSubscription, request_subject::St
                                      cancel_token::MaybeCancellationToken=nothing)
     try
         _publish(psub.js.client, request_subject, payload; reply, force_flush=true,
-                 cancel_token)
+                 mode=PublishMode.DIRECT, cancel_token)
     catch err
         if err isa ConnectionReconnectingError ||
            (err isa ConnectionClosedError && status(psub.js.client) == ConnectionStatus.DISCONNECTED)

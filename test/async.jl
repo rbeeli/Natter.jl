@@ -97,14 +97,14 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
 
-    publish_task = Threads.@spawn publish(client, "foo", "bar"; mode=:replayable)
+    publish_task = Threads.@spawn publish(client, "foo", "bar"; mode=PublishMode.REPLAYABLE)
     @test publish_task isa Task
     @test isnothing(fetch(publish_task))
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
 
     response_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     respond_task = Threads.@spawn respond(response_client, Msg("svc", "_INBOX.reply", UInt8[]), "ok";
-                                  mode=:replayable)
+                                  mode=PublishMode.REPLAYABLE)
     @test isnothing(fetch(respond_task))
     @test String(take!(response_client.pending)) == "PUB _INBOX.reply 2\r\nok\r\n"
 

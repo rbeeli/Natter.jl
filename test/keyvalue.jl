@@ -619,9 +619,40 @@ end
     watcher = KeyValueWatcher(psub, state.updates, state)
 
     try
-        @test_throws TimeoutError N._kv_take!(watcher, 0.01)
+        @test_throws TimeoutError take!(watcher; timeout=0.01)
         put!(state.updates, KV_WATCH_INITIAL_DONE)
-        @test N._kv_take!(watcher, 0.1) === KV_WATCH_INITIAL_DONE
+        @test take!(watcher; timeout=0.1) === KV_WATCH_INITIAL_DONE
+    finally
+        close(watcher; timeout=0.1)
+    end
+end
+
+@testitem "KeyValue watcher take supports cancellation and iteration" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
+    using Dates
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    sub = subscribe(client, "_INBOX.kvwatch")
+    psub = N.PushSubscription(js, sub, "KV_bucket", "watcher", ReentrantLock(), false, false)
+    state = N._kv_watcher_state(nothing, 2, false)
+    watcher = KeyValueWatcher(psub, state.updates, state)
+
+    try
+        source = CancellationSource()
+        cancel!(source)
+        @test_throws CancelledError take!(watcher; cancel_token=cancellation_token(source))
+
+        entry = KeyValueEntry("BUCKET", "key", TestHelpers.bytes("value"), 1,
+                              DateTime(2026), 0, KeyValueOperation.PUT)
+        put!(state.updates, entry)
+        put!(state.updates, KV_WATCH_INITIAL_DONE)
+        @test iterate(watcher)[1] === entry
+        @test take!(watcher; timeout=0.1) === KV_WATCH_INITIAL_DONE
     finally
         close(watcher; timeout=0.1)
     end

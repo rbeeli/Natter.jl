@@ -5,7 +5,7 @@ This page summarizes the exported API. Guide pages show recommended usage; this 
 Conventions:
 
 - Timeouts and durations are seconds.
-- Status enums are namespaced, for example `ConnectionStatus.CONNECTED` and `AckPolicy.EXPLICIT`.
+- Enums are namespaced, for example `ConnectionStatus.CONNECTED`, `PublishMode.REPLAYABLE`, and `AckPolicy.EXPLICIT`.
 - Payload inputs may be strings, byte vectors, or `nothing`; encode structured values explicitly.
 - `String(msg)` works for `Msg`, `BorrowedMsg`, `JetStream.JetStreamMsg`, `JetStream.BorrowedJetStreamMsg`, and `KeyValue.KeyValueEntry`.
 - Blocking operations accept `cancel_token=cancellation_token(source)` where cancellation is useful.
@@ -19,6 +19,7 @@ Conventions:
 | `Client` | Active connection with reader, ping, reconnect, request, and subscription state. |
 | `ConnectOptions` | Connection configuration built by `connect` or directly. |
 | `ConnectionStatus` | `DISCONNECTED`, `CONNECTING`, `CONNECTED`, `RECONNECTING`, `DRAINING`, `CLOSED`. |
+| `PublishMode` | `REPLAYABLE`, `DIRECT`, `QUEUED`. |
 | `ConnectionEventKind` | Lifecycle event kind for `event_cb`. |
 | `ConnectionEvent` | Event passed to `event_cb`; includes kind, status, URL, attempt, delay, error, and generation. |
 | `Stats` | Snapshot of message, byte, reconnect, error, and dropped-message counters. |
@@ -63,7 +64,8 @@ Conventions:
 | `reconnect_max_wait` | `5.0` | Maximum reconnect wait. |
 | `reconnect_jitter` | `0.1` | Added reconnect jitter. |
 | `max_reconnect_attempts` | `-1` | `-1` means unlimited reconnect and initial-retry attempts. |
-| `pending_size` | `2 MiB` | Byte limit for opt-in reconnect publish replay; `0` disables replay buffering. |
+| `pending_size` | `8 MiB` | Byte limit for reconnect publish replay; `0` disables replay buffering. |
+| `publish_mode` | `PublishMode.REPLAYABLE` | Default core publish behavior. Use `PublishMode.DIRECT` to fail during reconnect or `PublishMode.QUEUED` for the background writer path. |
 | `tcp_nodelay` | `true` | Disable Nagle's algorithm for low-latency small writes. |
 | `read_buffer_size` | `64 KiB` | Inbound socket read buffer used by the protocol parser. |
 | `read_buffer_shrink_threshold` | `256 KiB` | Parser buffer capacity above this size is released after oversized consumed frames. |
@@ -111,10 +113,10 @@ Parser/resource limits:
 | Function | Returns | Use |
 | :--- | :--- | :--- |
 | `connect(url_or_urls=nothing; kwargs...)`, `connect(options::ConnectOptions)` | `Client` | Connect to NATS. |
-| `publish(client, subject, data=nothing; reply=nothing, headers=nothing, mode=:queued)` | `nothing` | Publish a core message. `mode=:queued` uses the background writer when active; `mode=:direct` writes on the caller task; `mode=:replayable` opts into best-effort reconnect replay. |
+| `publish(client, subject, data=nothing; reply=nothing, headers=nothing, mode=nothing)` | `nothing` | Publish a core message. The default uses `client.options.publish_mode`, which is `PublishMode.REPLAYABLE` unless changed. |
 | `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | `PublishFrame` | Validate and serialize a reusable publish frame. Payloads are `nothing`, strings, or byte vectors. |
-| `publish(client, frame::PublishFrame; mode=:queued)` | `nothing` | Publish a prepared frame. |
-| `respond(client, msg, data=nothing; headers=nothing, mode=:queued)` | `nothing` | Reply to `msg.reply`, or throw `ArgumentError` when the message has no reply subject. |
+| `publish(client, frame::PublishFrame; mode=nothing)` | `nothing` | Publish a prepared frame. |
+| `respond(client, msg, data=nothing; headers=nothing, mode=nothing)` | `nothing` | Reply to `msg.reply`, or throw `ArgumentError` when the message has no reply subject. |
 | `subscribe(client, subject; queue=nothing, callback=nothing, callback_mode=:task, max_msgs=0, pending_msgs_limit=..., pending_bytes_limit=...)` | `Subscription` | Create a subscription. `callback_mode=:inline` requires a callback and delivers `BorrowedMsg` from the reader task; `borrowed=true` is accepted as an alias. |
 | `subscribe(callback, client, subject; kwargs...)` | `Subscription` | Callback-first form. |
 | `take!(sub; timeout=1.0)` | `Msg` | Wait for a message on a non-callback subscription. |

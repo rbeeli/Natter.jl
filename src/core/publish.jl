@@ -474,20 +474,28 @@ function _validate_pending_replay_for_client(client::Client, entries::AbstractVe
     nothing
 end
 
-function _normalize_publish_mode(mode)::Tuple{Bool,Bool}
-    mode isa Symbol ||
-        throw(ArgumentError("publish mode must be :queued, :direct, or :replayable"))
-    mode === :queued && return false, false
-    mode === :direct && return false, true
-    mode === :replayable && return true, false
-    throw(ArgumentError("publish mode must be :queued, :direct, or :replayable"))
+function _resolve_publish_mode(client::Client, mode::Nothing)::PublishMode.T
+    client.options.publish_mode
+end
+
+_resolve_publish_mode(_client::Client, mode::PublishMode.T)::PublishMode.T = mode
+
+function _resolve_publish_mode(_client::Client, _mode)::PublishMode.T
+    throw(ArgumentError("publish mode must be a PublishMode value"))
+end
+
+function _publish_mode_behavior(mode::PublishMode.T)::Tuple{Bool,Bool}
+    mode == PublishMode.REPLAYABLE && return true, false
+    mode == PublishMode.DIRECT && return false, true
+    mode == PublishMode.QUEUED && return false, false
+    throw(ArgumentError("unknown publish mode"))
 end
 
 function _publish_prepared(client::Client, frame::_AbstractPublishFrame; force_flush::Bool=false,
-                           mode=:queued,
+                           mode=nothing,
                            cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
-    buffer_on_reconnect, direct_write = _normalize_publish_mode(mode)
+    buffer_on_reconnect, direct_write = _publish_mode_behavior(_resolve_publish_mode(client, mode))
     payload_size = _pub_payload_size(frame)
     frame_size = _serialized_size(frame)
     st = status(client)
@@ -506,18 +514,18 @@ end
 
 function _publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
                   headers=nothing, force_flush::Bool=false,
-                  mode=:queued,
+                  mode=nothing,
                   cancel_token::MaybeCancellationToken=nothing)
     _publish_prepared(client, _publish_frame(subject, reply, data, headers);
                       force_flush, mode, cancel_token)
 end
 
 function _publish_frame_unchecked(client::Client, frame::_AbstractPublishFrame; force_flush::Bool=false,
-                                  mode=:queued,
+                                  mode=nothing,
                                   cancel_token::MaybeCancellationToken=nothing,
                                   validate_frame::Bool=true)
     _throw_if_cancelled(cancel_token)
-    buffer_on_reconnect, direct_write = _normalize_publish_mode(mode)
+    buffer_on_reconnect, direct_write = _publish_mode_behavior(_resolve_publish_mode(client, mode))
     frame_size = _serialized_size(frame)
     payload_size = _pub_payload_size(frame)
     st = status(client)
@@ -536,25 +544,25 @@ end
 
 function _publish_unchecked(client::Client, subject::String, payload::AbstractVector{UInt8};
                             force_flush::Bool=false,
-                            mode=:queued,
+                            mode=nothing,
                             cancel_token::MaybeCancellationToken=nothing)
     _publish_frame_unchecked(client, _publish_frame(subject, nothing, payload, EMPTY_BYTES);
                              force_flush, mode, cancel_token)
 end
 
 function publish(client::Client, subject::AbstractString, data=nothing; reply::Union{AbstractString,Nothing}=nothing,
-                 headers=nothing, mode=:queued,
+                 headers=nothing, mode=nothing,
                  cancel_token::MaybeCancellationToken=nothing)
     _publish(client, subject, data; reply, headers, mode, cancel_token)
 end
 
-function publish(client::Client, frame::PublishFrame; mode=:queued,
+function publish(client::Client, frame::PublishFrame; mode=nothing,
                  cancel_token::MaybeCancellationToken=nothing)
     _publish_prepared(client, frame; mode, cancel_token)
 end
 
 function respond(client::Client, msg::AbstractMsg, data=nothing; headers=nothing,
-                 mode=:queued,
+                 mode=nothing,
                  cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     reply = msg.reply

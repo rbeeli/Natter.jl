@@ -274,17 +274,38 @@ Base.close(watcher::KeyValueWatcher; timeout::Real=watcher.subscription.js.timeo
            cancel_token::MaybeCancellationToken=nothing) =
     _close_keyvalue_watcher(watcher; timeout, cancel_token)
 
-function Base.take!(watcher::KeyValueWatcher)
-    isnothing(watcher.updates) &&
+function _kv_watcher_updates(watcher::KeyValueWatcher)::Channel{_KeyValueWatchUpdate}
+    updates = watcher.updates
+    isnothing(updates) &&
         throw(ArgumentError("callback key-value watchers do not buffer updates"))
-    take!(watcher.updates)
+    updates::Channel{_KeyValueWatchUpdate}
+end
+
+function Base.take!(watcher::KeyValueWatcher; timeout=nothing,
+                    cancel_token::MaybeCancellationToken=nothing)
+    _kv_take!(watcher, timeout, cancel_token)
+end
+
+function _kv_take!(watcher::KeyValueWatcher, timeout::Nothing,
+                   cancel_token::MaybeCancellationToken=nothing)
+    updates = _kv_watcher_updates(watcher)
+    if isnothing(cancel_token)
+        return take!(updates)
+    end
+    while true
+        _throw_if_cancelled(cancel_token)
+        if isready(updates) || !isopen(updates)
+            return take!(updates)
+        end
+        timedwait(0.1; pollint=0.01) do
+            isready(updates) || !isopen(updates) || iscancelled(cancel_token)
+        end
+    end
 end
 
 function _kv_take!(watcher::KeyValueWatcher, timeout::Real,
                    cancel_token::MaybeCancellationToken=nothing)
-    updates = watcher.updates
-    isnothing(updates) &&
-        throw(ArgumentError("callback key-value watchers do not buffer updates"))
+    updates = _kv_watcher_updates(watcher)
     timeout = _positive_timeout_seconds("timeout", timeout)
     result = timedwait(timeout; pollint=min(0.01, timeout)) do
         isready(updates) || !isopen(updates) || iscancelled(cancel_token)
@@ -292,6 +313,16 @@ function _kv_take!(watcher::KeyValueWatcher, timeout::Real,
     _throw_if_cancelled(cancel_token)
     result == :timed_out && throw(TimeoutError("key-value watcher timed out"))
     take!(updates)
+end
+
+function _kv_take!(_watcher::KeyValueWatcher, _timeout,
+                   _cancel_token::MaybeCancellationToken=nothing)
+    throw(ArgumentError("timeout must be nothing or a positive finite number of seconds"))
+end
+
+function Base.iterate(watcher::KeyValueWatcher, state=nothing)
+    updates = _kv_watcher_updates(watcher)
+    iterate(updates, state)
 end
 
 const _KV_CLEANUP_TIMEOUT = 0.001

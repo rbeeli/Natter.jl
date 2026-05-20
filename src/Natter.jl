@@ -14,7 +14,7 @@ using libsodium_jll
 import Base: close, fetch, flush, take!
 
 export JetStream, KeyValue
-export Client, ConnectOptions, ConnectionStatus, ConnectionEventKind, ConnectionEvent
+export Client, ConnectOptions, ConnectionStatus, PublishMode, ConnectionEventKind, ConnectionEvent
 export CancellationSource, CancellationToken, cancellation_token, cancel!, iscancelled
 export AbstractAuth, NoAuth, TokenAuth, UserPassAuth, NKeyAuth, JwtAuth, CredentialsAuth, CallbackAuth, AuthRequest
 export Msg, BorrowedMsg, Headers, PublishFrame, Subscription, Stats, SubscriptionStats

@@ -124,13 +124,13 @@ watcher = kv_watch(kv; keys=["checkout.*", "system.*"])
 
 try
     while true
-        update = take!(watcher)
+        update = take!(watcher; timeout=2.0)
         update === KV_WATCH_INITIAL_DONE && break
         @info "initial setting" key=update.key revision=update.revision
     end
 
     Threads.@spawn begin
-        for update in watcher.updates
+        for update in watcher
             @info "setting changed" key=update.key operation=update.operation
         end
     end

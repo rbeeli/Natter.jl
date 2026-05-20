@@ -78,7 +78,7 @@ end
                     proxy.drop_connections()
                     @test ChaosTestHelpers.wait_reconnecting(client; timeout=max(io_timeout, 2.0))
 
-                    publish(client, subject, "during-$i"; mode=:replayable)
+                    publish(client, subject, "during-$i"; mode=PublishMode.REPLAYABLE)
                     proxy.release()
                     @test ChaosTestHelpers.wait_reconnected(client, expected_reconnects;
                                                             timeout=max(io_timeout, 5.0))
@@ -371,7 +371,7 @@ end
                     try
                         while published[] == 0 || time() < deadline
                             published[] += 1
-                            publish(client, subject, "msg-$(published[])"; mode=:replayable)
+                            publish(client, subject, "msg-$(published[])"; mode=PublishMode.REPLAYABLE)
                             sleep(0.005)
                         end
                     catch err

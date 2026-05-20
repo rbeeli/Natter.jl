@@ -44,6 +44,9 @@ end
     @test N.ConnectOptions().tcp_nodelay
     @test !N.ConnectOptions(tcp_nodelay=false).tcp_nodelay
     @test N.ConnectOptions(pending_size=0).pending_size == 0
+    @test N.ConnectOptions().pending_size == 8 * 1024 * 1024
+    @test N.ConnectOptions().publish_mode == PublishMode.REPLAYABLE
+    @test N.ConnectOptions(publish_mode=PublishMode.QUEUED).publish_mode == PublishMode.QUEUED
     @test N.ConnectOptions().read_buffer_size == 64 * 1024
     @test N.ConnectOptions().sub_pending_msgs_limit == 1024
 
@@ -73,18 +76,19 @@ end
 
     stats_opts = N.ConnectOptions(record_stats=true)
     client = TestHelpers.fake_client(; opts=stats_opts, status=N.ConnectionStatus.RECONNECTING)
-    publish(client, "foo", "bar"; mode=:replayable)
+    publish(client, "foo", "bar"; mode=PublishMode.REPLAYABLE)
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
     @test stats(client).out_msgs == 1
 
     binary_payload = TestHelpers.bytes("bin")
     binary_pending = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    publish(binary_pending, "foo", binary_payload; mode=:replayable)
+    publish(binary_pending, "foo", binary_payload; mode=PublishMode.REPLAYABLE)
     binary_payload[1] = UInt8('B')
     @test String(take!(binary_pending.pending)) == "PUB foo 3\r\nbin\r\n"
 
     no_replay = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    @test_throws ConnectionReconnectingError publish(no_replay, "foo", "bar")
+    @test_throws ConnectionReconnectingError publish(no_replay, "foo", "bar";
+                                                     mode=PublishMode.QUEUED)
     @test no_replay.pending_bytes == 0
 
     hot_payload = fill(UInt8('x'), 64 * 1024)
@@ -100,7 +104,7 @@ end
 
     ergonomic_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     publish(ergonomic_headers, "foo", "bar"; headers=Dict("Trace" => "abc"),
-            mode=:replayable)
+            mode=PublishMode.REPLAYABLE)
     publish_frame = String(take!(ergonomic_headers.pending))
     @test startswith(publish_frame, "HPUB foo ")
     @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nbar\r\n", publish_frame)
@@ -112,7 +116,7 @@ end
     prepared_frame = String(take!(prepared_client.write_io))
     @test startswith(prepared_frame, "HPUB prepared.subject ")
     @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nbody\r\n", prepared_frame)
-    publish(prepared_client, prepared; mode=:direct)
+    publish(prepared_client, prepared; mode=PublishMode.DIRECT)
     @test startswith(String(take!(prepared_client.write_io)), "HPUB prepared.subject ")
     @test_throws ArgumentError publish(prepared_client, prepared; mode="queued")
     @test_throws ArgumentError publish(prepared_client, prepared; mode=:bad)
@@ -371,7 +375,7 @@ end
         write_io = N.BufferedWriteIO(devnull)
         client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io)
         payload = TestHelpers.bytes("bar")
-        publish(client, "foo", payload; mode=:replayable)
+        publish(client, "foo", payload; mode=PublishMode.REPLAYABLE)
         payload[1] = UInt8('B')
         entries = N._take_replayable_writes!(write_io)
         only(entries).is_publish || throw(AssertionError("expected publish replay entry"))
@@ -508,7 +512,7 @@ end
 
     reply = SubString("reply.inbox.extra", 1, 11)
     publish_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    publish(publish_client, "foo", "bar"; reply, mode=:replayable)
+    publish(publish_client, "foo", "bar"; reply, mode=PublishMode.REPLAYABLE)
     @test String(take!(publish_client.pending)) == "PUB foo reply.inbox 3\r\nbar\r\n"
 
     queue = SubString("workers.extra", 1, 7)
@@ -823,6 +827,8 @@ end
     rejects(max_reconnect_attempts=-2)
     rejects(pending_size=-1)
     rejects(pending_size=true)
+    rejects(publish_mode=:replayable)
+    rejects(publish_mode="replayable")
     rejects(read_buffer_size=0)
     rejects(read_buffer_size=true)
     rejects(write_buffer_size=-1)
@@ -1511,7 +1517,7 @@ end
     end
     fetch(task)
     @test N._buffered_bytes(write_io) > 0
-    @test client.pending_bytes == 0
+    @test client.pending_bytes == ncodeunits("PUB foo 3\r\nbar\r\n")
     @test isready(client.flush_signal)
 
     close(client)
@@ -1608,7 +1614,7 @@ end
     for i in 1:5
         publish(client, "foo", "bar-$i")
     end
-    @test client.pending_bytes == 0
+    @test client.pending_bytes > 0
     @test isempty(transport.bytes)
 
     result = timedwait(1.0; pollint=0.001) do
@@ -1653,7 +1659,7 @@ end
 
     frame = prepare_publish("foo", "bar")
     for _ in 1:5
-        publish(client, frame)
+        publish(client, frame; mode=PublishMode.QUEUED)
     end
     N._write_raw(client, TestHelpers.bytes("PING\r\n"); force_flush=true)
 
@@ -1731,7 +1737,8 @@ end
                                              read_io=pending_transport, write_io=pending_transport)
     N._activate_writer_queue!(pending_client.writer_queue, pending_client.generation)
     pending_client.write_reconnect_pending[] = true
-    @test_throws ConnectionReconnectingError publish(pending_client, frame)
+    @test_throws ConnectionReconnectingError publish(pending_client, frame;
+                                                    mode=PublishMode.QUEUED)
     @test pending_client.writer_queue.len == 0
     @test TestHelpers.capture_text(pending_transport) == ""
     N._deactivate_writer_queue!(pending_client; close=true, clear=true)
@@ -1768,7 +1775,7 @@ end
                                      read_io=transport, write_io=write_io)
 
     payload = repeat("x", 64)
-    publish(client, "foo", payload; mode=:replayable)
+    publish(client, "foo", payload; mode=PublishMode.REPLAYABLE)
 
     expected = "PUB foo 64\r\n$payload\r\n"
     @test TestHelpers.capture_text(transport) == expected
@@ -2015,7 +2022,7 @@ end
                                              read_io=buffered_transport,
                                              write_io=buffered_write)
 
-    publish(buffered_client, "foo", "bar"; mode=:direct)
+    publish(buffered_client, "foo", "bar"; mode=PublishMode.DIRECT)
 
     @test buffered_transport.chunks == ["PUB foo 3\r\nbar\r\n"]
     @test N._buffered_bytes(buffered_write) == 0
@@ -2338,11 +2345,11 @@ end
     frame_size = ncodeunits("PUB foo 50\r\n$payload\r\n")
     @test frame_size == opts.pending_size
 
-    publish(client, "foo", payload; mode=:replayable)
+    publish(client, "foo", payload; mode=PublishMode.REPLAYABLE)
     @test client.pending_bytes == frame_size
 
     try
-        publish(client, "foo", payload; mode=:replayable)
+        publish(client, "foo", payload; mode=PublishMode.REPLAYABLE)
         @test false
     catch err
         @test err isa OutboundBufferLimitError
@@ -2369,7 +2376,7 @@ end
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io)
 
-    publish(client, "foo", "bar"; mode=:replayable)
+    publish(client, "foo", "bar"; mode=PublishMode.REPLAYABLE)
 
     expected = "PUB foo 3\r\nbar\r\n"
     @test N._buffered_bytes(write_io) == ncodeunits(expected)
@@ -2408,7 +2415,7 @@ end
                                      read_io=transport, write_io=N.BufferedWriteIO(transport))
 
     N._write_raw(client, "SUB foo 1\r\n")
-    publish(client, "foo", "bar"; mode=:replayable)
+    publish(client, "foo", "bar"; mode=PublishMode.REPLAYABLE)
     expected = "PUB foo 3\r\nbar\r\n"
     @test client.pending_bytes == ncodeunits(expected)
 
@@ -2488,7 +2495,7 @@ end
         write_io=header_transport,
     )
     publish(header_client, "foo", "bar"; headers=Headers("Trace" => "abc"),
-            mode=:replayable)
+            mode=PublishMode.REPLAYABLE)
     header_pending_bytes = header_client.pending_bytes
 
     set_info!(header_client, N.ServerInfo(; headers=false, max_payload=1024))
@@ -2513,7 +2520,7 @@ end
         read_io=original_transport,
         write_io,
     )
-    publish(payload_client, "foo", payload; mode=:replayable)
+    publish(payload_client, "foo", payload; mode=PublishMode.REPLAYABLE)
     payload_pending_bytes = payload_client.pending_bytes
     @test N._buffered_bytes(write_io) > 0
 
@@ -3070,14 +3077,15 @@ end
                                      read_io=transport, write_io=transport)
     client.write_reconnect_pending[] = true
 
-    publish(client, "foo", "bar"; mode=:replayable)
+    publish(client, "foo", "bar"; mode=PublishMode.REPLAYABLE)
     expected = "PUB foo 3\r\nbar\r\n"
     @test TestHelpers.capture_text(transport) == ""
     @test client.pending_bytes == ncodeunits(expected)
     @test String(take!(client.pending)) == expected
 
     client.write_reconnect_pending[] = true
-    @test_throws ConnectionReconnectingError publish(client, "foo", "bar")
+    @test_throws ConnectionReconnectingError publish(client, "foo", "bar";
+                                                     mode=PublishMode.QUEUED)
     @test TestHelpers.capture_text(transport) == ""
 end
 

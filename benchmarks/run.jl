@@ -120,7 +120,7 @@ function benchmark_allocations(client, subject::String, payload::Vector{UInt8}, 
         prepare_publish(subject, payload)
     end
     publish_bytes = allocation_bytes_per_call(iterations) do
-        publish(client, frame; mode=:direct)
+        publish(client, frame; mode=PublishMode.DIRECT)
     end
     flush(client; timeout=5.0)
     Dict(
@@ -133,13 +133,13 @@ end
 function benchmark_publish_direct(client, subject::String, payload::Vector{UInt8}, messages::Int)
     frame = prepare_publish(subject, payload)
     for _ in 1:min(messages, 100)
-        publish(client, frame; mode=:direct)
+        publish(client, frame; mode=PublishMode.DIRECT)
     end
     flush(client; timeout=5.0)
 
     seconds = elapsed_seconds() do
         for _ in 1:messages
-            publish(client, frame; mode=:direct)
+            publish(client, frame; mode=PublishMode.DIRECT)
         end
         flush(client; timeout=10.0)
     end
@@ -158,13 +158,13 @@ function benchmark_publish_buffered_batch(url::String, subject::String, payload:
     frame = prepare_publish(subject, payload)
     try
         for _ in 1:min(messages, 1000)
-            publish(client, frame)
+            publish(client, frame; mode=PublishMode.QUEUED)
         end
         flush(client; timeout=5.0)
 
         seconds = elapsed_seconds() do
             for _ in 1:messages
-                publish(client, frame)
+                publish(client, frame; mode=PublishMode.QUEUED)
             end
             flush(client; timeout=10.0)
         end
@@ -184,13 +184,13 @@ function benchmark_publish_flush_each(client, subject::String, payload::Vector{U
     frame = prepare_publish(subject, payload)
     warmup = min(messages, 100)
     for _ in 1:warmup
-        publish(client, frame)
+        publish(client, frame; mode=PublishMode.DIRECT)
         flush(client; timeout=5.0)
     end
 
     seconds = elapsed_seconds() do
         for _ in 1:messages
-            publish(client, frame)
+            publish(client, frame; mode=PublishMode.DIRECT)
             flush(client; timeout=10.0)
         end
     end
@@ -225,7 +225,7 @@ function benchmark_callback_dispatch(url::String, subject::String, payload::Vect
 
         warmup = min(messages, 1000)
         for _ in 1:warmup
-            publish(pub_client, frame; mode=(mode == :direct ? :direct : :queued))
+            publish(pub_client, frame; mode=(mode == :direct ? PublishMode.DIRECT : PublishMode.QUEUED))
         end
         flush(pub_client; timeout=5.0)
         result = timedwait(timeout; pollint=0.001) do
@@ -236,7 +236,7 @@ function benchmark_callback_dispatch(url::String, subject::String, payload::Vect
 
         seconds = elapsed_seconds() do
             for _ in 1:messages
-                publish(pub_client, frame; mode=(mode == :direct ? :direct : :queued))
+                publish(pub_client, frame; mode=(mode == :direct ? PublishMode.DIRECT : PublishMode.QUEUED))
             end
             flush(pub_client; timeout=10.0)
             result = timedwait(timeout; pollint=0.001) do
@@ -266,7 +266,7 @@ function benchmark_request_latency(url::String, subject::String, payload::Vector
     try
         sub = subscribe(service, subject; callback_mode=:inline) do msg
             isnothing(msg.reply) && return nothing
-            respond(service, msg, payload; mode=:queued)
+            respond(service, msg, payload; mode=PublishMode.QUEUED)
             nothing
         end
         flush(service; timeout=5.0)
@@ -309,11 +309,11 @@ function benchmark_concurrent_publish(url::String, subject::String, payload::Vec
     per_task = cld(messages, concurrency)
     total = per_task * concurrency
     try
-        publish(client, frame; mode=(mode == :direct ? :direct : :queued))
+        publish(client, frame; mode=(mode == :direct ? PublishMode.DIRECT : PublishMode.QUEUED))
         flush(client; timeout=5.0)
         @sync begin
             for _ in 1:concurrency
-                Threads.@spawn publish(client, frame; mode=(mode == :direct ? :direct : :queued))
+                Threads.@spawn publish(client, frame; mode=(mode == :direct ? PublishMode.DIRECT : PublishMode.QUEUED))
             end
         end
         flush(client; timeout=5.0)
@@ -323,7 +323,7 @@ function benchmark_concurrent_publish(url::String, subject::String, payload::Vec
                 for _ in 1:concurrency
                     Threads.@spawn begin
                         for _ in 1:per_task
-                            publish(client, frame; mode=(mode == :direct ? :direct : :queued))
+                            publish(client, frame; mode=(mode == :direct ? PublishMode.DIRECT : PublishMode.QUEUED))
                         end
                     end
                 end
@@ -462,7 +462,7 @@ function benchmark_reconnect(url::String, subject::String, payload::Vector{UInt8
         event_cb=event -> push!(events, string(event.kind)),
     )
     try
-        publish(client, subject, payload; mode=:direct)
+        publish(client, subject, payload; mode=PublishMode.DIRECT)
         flush(client; timeout=5.0)
         drop_proxy_connections!(proxy)
 
@@ -473,7 +473,7 @@ function benchmark_reconnect(url::String, subject::String, payload::Vector{UInt8
         while time() < deadline
             attempts += 1
             try
-                publish(client, subject, payload; mode=:direct)
+                publish(client, subject, payload; mode=PublishMode.DIRECT)
                 flush(client; timeout=0.25)
                 recovered = true
                 break
@@ -531,7 +531,7 @@ function write_markdown(path::String, report)
 
         allocations = report["benchmarks"]["allocations"]
         println(io, "| Allocations | `prepare_publish` bytes/call | $(fmt(allocations["prepare_publish_bytes_per_call"])) |")
-        println(io, "| Allocations | prepared `publish(...; mode=:direct)` bytes/call | $(fmt(allocations["prepared_publish_direct_bytes_per_call"])) |")
+        println(io, "| Allocations | prepared `publish(...; mode=PublishMode.DIRECT)` bytes/call | $(fmt(allocations["prepared_publish_direct_bytes_per_call"])) |")
 
         publish_direct = report["benchmarks"]["publish_direct"]
         println(io, "| Publish direct write | messages/s | $(fmt(publish_direct["messages_per_second"])) |")

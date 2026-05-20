@@ -7,6 +7,12 @@ EnumX.@enumx ConnectionStatus begin
     CLOSED
 end
 
+EnumX.@enumx PublishMode begin
+    REPLAYABLE
+    DIRECT
+    QUEUED
+end
+
 Base.@kwdef mutable struct Stats
     in_msgs::Int = 0
     out_msgs::Int = 0

@@ -3479,6 +3479,61 @@ end
     end
 end
 
+@testitem "JetStream continuous pull put consumes request credit before terminal release" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     write_io=TestHelpers.WriteCapture())
+    js = jetstream(client)
+    delivery = subscribe(client, "_INBOX.pull")
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
+
+    state = N._PullMessageStreamState()
+    config = N._PullStreamConfig(2, 64, 1.0, 0.0, 1, 32,
+                                 nothing, nothing, nothing, nothing, nothing, 2)
+    queue_lock = ReentrantLock()
+    queue_condition = Base.Threads.Condition(queue_lock)
+    queue = N.MsgQueue{Msg}(2)
+    stream_task = Threads.@spawn nothing
+    stream = N.PullMessageStream{typeof(client),typeof(psub)}(
+        psub, delivery, queue, queue_lock, queue_condition, config, UInt8[],
+        stream_task, nothing, state)
+
+    try
+        reservation = N._reserve_pull_stream_request!(config, state)
+        @test !isnothing(reservation)
+        @test state.requested_messages == 2
+        @test length(state.requests) == 1
+
+        msg = Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0", TestHelpers.bytes("one"))
+        msg_bytes = N._pull_stream_msg_bytes(msg)
+        N._pull_stream_put!(stream, msg)
+
+        @lock state.lock begin
+            @test state.requested_messages == 1
+            @test state.requested_bytes == 64 - msg_bytes
+            @test length(state.requests) == 1
+            @test first(state.requests).remaining_messages == 1
+            @test first(state.requests).remaining_bytes == 64 - msg_bytes
+        end
+
+        terminal = Msg("_INBOX.pull.1", nothing, UInt8[];
+                       headers=Headers("Status" => ["409"], "Description" => ["Batch Completed"]))
+        @lock state.lock begin
+            @test N._pull_stream_release_terminal_request!(state, terminal)
+            @test state.requested_messages == 0
+            @test state.requested_bytes == 0
+            @test isempty(state.requests)
+        end
+    finally
+        close(stream)
+        close(psub)
+    end
+end
+
 @testitem "JetStream continuous pull keeps requested credits while queue put is blocked" setup=[TestHelpers] begin
     using Natter
     using Natter.JetStream
