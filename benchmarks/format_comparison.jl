@@ -62,7 +62,7 @@ end
 
 function comparison_markdown(reports)
     rows = [
-        (; label="Publish batch / queued msg/s", lower_better=false,
+        (; label="Publish batch buffered msg/s", lower_better=false,
          natter="benchmarks.publish_buffered_batch.messages_per_second",
          other="benchmarks.publish_batch.messages_per_second"),
         (; label="Publish + flush each msg/s", lower_better=false,
@@ -95,7 +95,9 @@ function comparison_markdown(reports)
     lines = String[]
     push!(lines, "Benchmark parameters: `$messages` messages, `$requests` requests, `$payload` byte payload, `$trials` trials per client, URL `$url`. Timed regions exclude startup, package loading, compilation/build time, dependency downloads, and benchmark warmup.")
     push!(lines, "")
-    push!(lines, "Benchmarks use each client's common high-level publish, subscribe, request, and flush APIs. Natter.jl callback dispatch uses `callback_mode=:inline` in this comparison; the Natter-only report also includes task-backed callback rows. The table reports best-of-`$trials` results: rates use the highest throughput, while durations and latencies use the lowest observed value.")
+    push!(lines, "Benchmarks use each client's common high-level publish, subscribe, request, and flush APIs. Batch publish reuses stable subject and payload values in every client: Natter.jl uses `prepare_publish`, Rust uses prebuilt `Subject` and `Bytes`, and Go/Python reuse their subject string and payload buffer. Natter.jl callback dispatch uses `callback_mode=:inline` in this comparison; the Natter-only report also includes task-backed callback rows. The table reports median-of-`$trials` results for each metric.")
+    push!(lines, "")
+    push!(lines, "Flush semantics differ by client: Natter.jl, Go, and Python flush with a server PING/PONG round trip; Rust `async-nats` flush waits for the client writer/socket flush. Treat the Rust publish-plus-flush-each value as client-flush throughput, while request/reply rows are server round trips for all clients.")
     push!(lines, "")
     push!(lines, "Optimization modes: Natter.jl runs with `julia $julia_flags`; Go runs from an explicit `go build -trimpath` binary; Rust runs from `cargo build --release`; the NATS server uses the official `$nats_image` image.")
     push!(lines, "")

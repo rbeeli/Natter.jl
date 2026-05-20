@@ -174,6 +174,7 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout,
     for sub in notify_subs
         _notify_subscription_waiters!(sub; all=true)
     end
+    _signal_writer(client)
     errors = Any[]
     subs = @lock client.lock collect(values(client.subscriptions))
     for sub in subs

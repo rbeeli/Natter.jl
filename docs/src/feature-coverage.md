@@ -25,7 +25,7 @@ Statuses:
 | Flush and ping | Supported | `flush`/`ping` use a server round trip. |
 | Drain and close | Supported | Subscription/client drain and deterministic close paths. |
 | Reconnect | Supported | Automatic reconnect, optional initial-connect retry, randomized server-pool attempts with ordered opt-out, discovered servers, subscription and request mux replay, optional bounded publish replay, lifecycle events, delay callbacks, and bounded live-server chaos CI are implemented. Broader cluster chaos and auth failover scenarios remain as additional hardening coverage. |
-| Publish replay | Partial | Core publishes opt into reconnect replay with `buffer_on_reconnect=true` and are replayed only while they remain in the client buffer and have not been handed to the transport. Ambiguous write failures start reconnect but are not replayed automatically; use `pending_size=0` to disable replay buffering, or JetStream `msg_id` for durable idempotent publish paths. |
+| Publish replay | Partial | Core publishes opt into reconnect replay with `mode=:replayable` and are replayed only while they remain in the client buffer and have not been handed to the transport. Ambiguous write failures start reconnect but are not replayed automatically; use `pending_size=0` to disable replay buffering, or JetStream `msg_id` for durable idempotent publish paths. |
 | Slow consumer handling | Supported | Per-subscription pending limits report `SlowConsumerError`. |
 | Runtime inspection | Supported | `status`, `stats(client)`, `stats(sub)`, and `connected_url`. |
 | Task concurrency | Supported | Direct calls compose with Julia `Threads.@spawn`/`@sync`; blocking calls accept cooperative cancellation tokens. JetStream publish has a protocol async publisher with `JetStreamPublishFuture`. |
@@ -101,7 +101,7 @@ env NATTER_RUN_INTEGRATION=true NATTER_RUN_JETSTREAM=true NATTER_RUN_STRESS=true
 Performance snapshots are reported separately from correctness tests:
 
 ```bash
-env JULIA_NUM_THREADS=2 julia --project=. benchmarks/run.jl
+just --justfile benchmarks/justfile with-server
 ```
 
-The `Performance` GitHub Actions workflow runs this report against a live server on a schedule and by manual dispatch. It uploads Markdown and JSON artifacts covering hot-path allocations, direct-write publish throughput, buffered batch publish throughput, publish-plus-flush throughput, callback dispatch, request/reply latency, concurrent publish throughput, and reconnect recovery. Each benchmark runs warmup work before its timed region, so startup, package loading, JIT compilation, and benchmark warmup are outside the reported timings. The workflow is a reporting job rather than a strict performance gate; compare reports across matching publish semantics and similar runner, Julia, thread, server, and payload configurations.
+The `Performance` GitHub Actions workflow runs the Natter report against a live server on a schedule and by manual dispatch. It uses production Julia flags, the standard server image, five trials, and median aggregation. It uploads Markdown and JSON artifacts covering hot-path allocations, direct publish throughput, buffered batch publish throughput, publish-plus-flush throughput, callback dispatch, request/reply latency, concurrent publish throughput, and reconnect recovery. Each benchmark runs warmup work before its timed region, so startup, package loading, JIT compilation, and benchmark warmup are outside the reported timings. The workflow is a reporting job rather than a strict performance gate; compare reports across matching publish semantics and similar runner, Julia, thread, server, and payload configurations.

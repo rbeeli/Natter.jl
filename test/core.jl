@@ -73,19 +73,18 @@ end
 
     stats_opts = N.ConnectOptions(record_stats=true)
     client = TestHelpers.fake_client(; opts=stats_opts, status=N.ConnectionStatus.RECONNECTING)
-    publish(client, "foo", "bar"; buffer_on_reconnect=true)
+    publish(client, "foo", "bar"; mode=:replayable)
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
     @test stats(client).out_msgs == 1
 
     binary_payload = TestHelpers.bytes("bin")
     binary_pending = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    publish(binary_pending, "foo", binary_payload; buffer_on_reconnect=true)
+    publish(binary_pending, "foo", binary_payload; mode=:replayable)
     binary_payload[1] = UInt8('B')
     @test String(take!(binary_pending.pending)) == "PUB foo 3\r\nbin\r\n"
 
     no_replay = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    @test_throws ConnectionReconnectingError publish(no_replay, "foo", "bar";
-                                                     buffer_on_reconnect=false)
+    @test_throws ConnectionReconnectingError publish(no_replay, "foo", "bar")
     @test no_replay.pending_bytes == 0
 
     hot_payload = fill(UInt8('x'), 64 * 1024)
@@ -101,7 +100,7 @@ end
 
     ergonomic_headers = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     publish(ergonomic_headers, "foo", "bar"; headers=Dict("Trace" => "abc"),
-            buffer_on_reconnect=true)
+            mode=:replayable)
     publish_frame = String(take!(ergonomic_headers.pending))
     @test startswith(publish_frame, "HPUB foo ")
     @test occursin("NATS/1.0\r\nTrace: abc\r\n\r\nbar\r\n", publish_frame)
@@ -179,7 +178,8 @@ end
     @test limited.pending_bytes == 0
 
     small = TestHelpers.fake_client(; opts=N.ConnectOptions(pending_size=3), status=N.ConnectionStatus.RECONNECTING)
-    @test_throws OutboundBufferLimitError N._send_raw(small, TestHelpers.bytes("abcd"); buffer_on_reconnect=true)
+    @test_throws OutboundBufferLimitError N._send_raw(small, TestHelpers.bytes("abcd");
+                                                      buffer_on_reconnect=true)
 
     disabled = TestHelpers.fake_client(; opts=N.ConnectOptions(pending_size=0),
                                        status=N.ConnectionStatus.RECONNECTING)
@@ -371,7 +371,7 @@ end
         write_io = N.BufferedWriteIO(devnull)
         client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED, write_io)
         payload = TestHelpers.bytes("bar")
-        publish(client, "foo", payload; buffer_on_reconnect=true)
+        publish(client, "foo", payload; mode=:replayable)
         payload[1] = UInt8('B')
         entries = N._take_replayable_writes!(write_io)
         only(entries).is_publish || throw(AssertionError("expected publish replay entry"))
@@ -381,6 +381,8 @@ end
     @test queue_put_take_alloc() == 0
     @test !(:callback in fieldnames(N.Subscription))
     @test !(Any in fieldtypes(N.Subscription{N.Client}))
+    @test !(Any in fieldtypes(N._WriteQueue))
+    @test eltype(TestHelpers.fake_client().writer_queue.items) == Union{N._QueuedWriteItem,Nothing}
     @test dispatch_take_alloc() == 0
     @test borrowed_dispatch_alloc() == 0
     nonempty_reader_alloc, nonempty_count, nonempty_bytes, nonempty_views = borrowed_reader_dispatch_alloc("x")
@@ -429,8 +431,8 @@ end
     @test isnothing(N._read_control_or_msg_dispatch(reader, client.options, resolver, handler))
     @test isnothing(N._read_control_or_msg_dispatch(reader, client.options, resolver, handler))
     @test resolver.count == 2
-    @test String(N.next(sub; timeout=0.1)) == "one"
-    hmsg = N.next(sub; timeout=0.1)
+    @test String(N.take!(sub; timeout=0.1)) == "one"
+    hmsg = N.take!(sub; timeout=0.1)
     @test String(hmsg) == "two"
     @test header(hmsg, "Trace") == "abc"
     close(sub)
@@ -506,7 +508,7 @@ end
 
     reply = SubString("reply.inbox.extra", 1, 11)
     publish_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
-    publish(publish_client, "foo", "bar"; reply, buffer_on_reconnect=true)
+    publish(publish_client, "foo", "bar"; reply, mode=:replayable)
     @test String(take!(publish_client.pending)) == "PUB foo reply.inbox 3\r\nbar\r\n"
 
     queue = SubString("workers.extra", 1, 7)
@@ -583,6 +585,47 @@ end
     close(positional_sub)
     wait(positional_sub.processor)
 
+    mutable struct InlineDrainPongTransport <: IO
+        client::Base.RefValue{Any}
+    end
+    Base.write(::InlineDrainPongTransport, data::Vector{UInt8}) = length(data)
+    Base.write(::InlineDrainPongTransport, data::String) = ncodeunits(data)
+    Base.flush(t::InlineDrainPongTransport) = (N._notify_pong(t.client[]); nothing)
+    Base.close(::InlineDrainPongTransport) = nothing
+
+    inline_client_ref = Ref{Any}(nothing)
+    inline_transport = InlineDrainPongTransport(inline_client_ref)
+    inline_drain_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                                  write_io=inline_transport)
+    inline_client_ref[] = inline_drain_client
+    entered = Channel{Bool}(1)
+    release = Channel{Bool}(1)
+    inline_drain_sub = subscribe(inline_drain_client, "events.inline.drain";
+                                 borrowed=true) do _
+        put!(entered, true)
+        take!(release)
+    end
+    drain_payload = TestHelpers.bytes("x")
+    drain_msg = BorrowedMsg("events.inline.drain", nothing, @view(drain_payload[1:1]),
+                            nothing, inline_drain_sub.sid, 0)
+    dispatch_task = @async N._dispatch_msg(inline_drain_client, drain_msg)
+    take!(entered)
+    drain_task = @async drain(inline_drain_sub; timeout=1.0)
+    @test timedwait(1.0; pollint=0.001) do
+        @lock inline_drain_sub.lock begin
+            inline_drain_sub.processing == 1 && inline_drain_sub.timeout_queue.active > 0
+        end
+    end != :timed_out
+    @test !istaskdone(drain_task)
+    put!(release, true)
+    @test timedwait(1.0; pollint=0.001) do
+        istaskdone(drain_task) && istaskdone(dispatch_task)
+    end != :timed_out
+    fetch(drain_task)
+    fetch(dispatch_task)
+    @test (@lock inline_drain_sub.lock inline_drain_sub.closed)
+    close(inline_drain_client)
+
     inbox = new_inbox(client; prefix=SubString("_INBOX.extra", 1, 6))
     @test startswith(inbox, "_INBOX.")
     @test_throws ArgumentError new_inbox(client; prefix="bad.*")
@@ -598,6 +641,7 @@ end
                             direct_write_threshold=4096, write_timeout=3,
                             write_driver=false, write_queue_msgs=128,
                             write_queue_bytes=4096, write_batch_msgs=16,
+                            write_batch_bytes=8192,
                             close_callback_timeout=4)
     @test opts.connect_timeout == 1.0
     @test opts.ping_interval == 2.0
@@ -609,6 +653,7 @@ end
     @test opts.write_queue_msgs == 128
     @test opts.write_queue_bytes == 4096
     @test opts.write_batch_msgs == 16
+    @test opts.write_batch_bytes == 8192
     @test opts.close_callback_timeout == 4.0
     @test opts.randomize_servers
     @test N.CLIENT_VERSION == string(pkgversion(N))
@@ -787,6 +832,7 @@ end
     rejects(write_queue_msgs=0)
     rejects(write_queue_bytes=0)
     rejects(write_batch_msgs=0)
+    rejects(write_batch_bytes=0)
     rejects(read_buffer_shrink_threshold=1024, read_buffer_size=2048)
     rejects(write_timeout=0)
     rejects(close_callback_timeout=-1)
@@ -1194,7 +1240,7 @@ end
     N._dispatch_msg(accepted, accepted_msg)
     @test isready(accepted_sub.messages)
     @test accepted_sub.pending_bytes == length(hdr)
-    @test N._msg_pending_bytes(N.next(accepted_sub; timeout=0.1)) == length(hdr)
+    @test N._msg_pending_bytes(N.take!(accepted_sub; timeout=0.1)) == length(hdr)
     @test accepted_sub.pending_bytes == 0
 
     reported = Any[]
@@ -1209,7 +1255,7 @@ end
     @test only(reported) isa SlowConsumerError
 end
 
-@testitem "next rejects callback subscriptions" setup=[TestHelpers] begin
+@testitem "take! rejects callback subscriptions" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -1219,12 +1265,23 @@ end
         nothing
     end
     try
-        err = TestHelpers.thrown_exception(() -> N.next(sub; timeout=0.1))
+        err = TestHelpers.thrown_exception(() -> N.take!(sub; timeout=0.1))
         @test err isa ArgumentError
         @test occursin("callback", err.msg)
     finally
         close(sub)
     end
+end
+
+@testitem "take! receives from sync subscriptions" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    sub = subscribe(client, "events")
+    put!(sub.messages, Msg("events", nothing, TestHelpers.bytes("payload"); sid=sub.sid))
+    @test String(take!(sub; timeout=0.1)) == "payload"
 end
 
 @testitem "subscription snapshot tracks active sids sparsely" setup=[TestHelpers] begin
@@ -1366,7 +1423,7 @@ end
     close(client)
 end
 
-@testitem "next timeout survives concurrent direct channel consumption" setup=[TestHelpers] begin
+@testitem "take! timeout survives concurrent direct channel consumption" setup=[TestHelpers] begin
     using Natter
 
     const N = Natter
@@ -1376,7 +1433,7 @@ end
     @lock sub.lock put!(sub.messages, Msg("events", nothing, TestHelpers.bytes("stolen"); sid=sub.sid))
 
     lock(sub.lock)
-    task = Threads.@spawn N.next(sub; timeout=0.05)
+    task = Threads.@spawn N.take!(sub; timeout=0.05)
     try
         sleep(0.01)
         stolen = take!(sub.messages)
@@ -1588,7 +1645,8 @@ end
     transport = WriterTransport()
     write_io = N.BufferedWriteIO(transport)
     opts = N.ConnectOptions(write_buffer_size=1024 * 1024, write_queue_msgs=16,
-                            write_queue_bytes=1024 * 1024, write_batch_msgs=16)
+                            write_queue_bytes=1024 * 1024, write_batch_msgs=16,
+                            write_batch_bytes=1024 * 1024)
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io)
     N._start_writer_task!(client, client.generation)
@@ -1611,6 +1669,93 @@ end
     @test transport.closed
 end
 
+@testitem "queued writer buffered batch flushes once for small prepared publishes" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    mutable struct CountingBatchTransport <: IO
+        bytes::Vector{UInt8}
+        writes::Int
+        flushes::Int
+        closed::Bool
+    end
+    CountingBatchTransport() = CountingBatchTransport(UInt8[], 0, 0, false)
+
+    function Base.write(t::CountingBatchTransport, data::Vector{UInt8})
+        t.writes += 1
+        append!(t.bytes, data)
+        length(data)
+    end
+    function Base.write(t::CountingBatchTransport, data::AbstractString)
+        t.writes += 1
+        append!(t.bytes, codeunits(data))
+        ncodeunits(data)
+    end
+    Base.flush(t::CountingBatchTransport) = (t.flushes += 1; nothing)
+    Base.close(t::CountingBatchTransport) = (t.closed = true; nothing)
+    Base.isopen(t::CountingBatchTransport) = !t.closed
+
+    transport = CountingBatchTransport()
+    write_io = N.BufferedWriteIO(transport)
+    opts = N.ConnectOptions(write_buffer_size=1024 * 1024,
+                            direct_write_threshold=1024 * 1024)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     read_io=transport, write_io)
+    frame = prepare_publish("foo", "bar")
+    items = N._QueuedWriteItem[frame, frame, frame, frame]
+    sizes = fill(N._serialized_size(frame), length(items))
+
+    N._write_writer_batch(client, items, sizes, length(items))
+
+    @test String(copy(transport.bytes)) == repeat("PUB foo 3\r\nbar\r\n", length(items))
+    @test N._buffered_bytes(write_io) == 0
+    @test transport.writes == 1
+    @test transport.flushes == 1
+
+    close(client)
+    @test transport.closed
+end
+
+@testitem "queued writer admission follows connection lifecycle" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    opts = N.ConnectOptions(write_queue_msgs=8, write_queue_bytes=1024)
+    frame = prepare_publish("foo", "bar")
+    frame_size = N._serialized_size(frame)
+
+    pending_transport = TestHelpers.WriteCapture()
+    pending_client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                             read_io=pending_transport, write_io=pending_transport)
+    N._activate_writer_queue!(pending_client.writer_queue, pending_client.generation)
+    pending_client.write_reconnect_pending[] = true
+    @test_throws ConnectionReconnectingError publish(pending_client, frame)
+    @test pending_client.writer_queue.len == 0
+    @test TestHelpers.capture_text(pending_transport) == ""
+    N._deactivate_writer_queue!(pending_client; close=true, clear=true)
+
+    drain_transport = TestHelpers.WriteCapture()
+    drain_client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                           read_io=drain_transport, write_io=drain_transport)
+    N._activate_writer_queue!(drain_client.writer_queue, drain_client.generation)
+    @lock drain_client.lock N._store_status_locked!(drain_client, N.ConnectionStatus.DRAINING)
+    @test_throws ConnectionDrainingError N._enqueue_writer_publish(drain_client, frame, frame_size)
+    @test drain_client.writer_queue.len == 0
+    @test TestHelpers.capture_text(drain_transport) == ""
+    N._deactivate_writer_queue!(drain_client; close=true, clear=true)
+
+    stale_transport = TestHelpers.WriteCapture()
+    stale_client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                           read_io=stale_transport, write_io=stale_transport)
+    N._activate_writer_queue!(stale_client.writer_queue, stale_client.generation)
+    @lock stale_client.lock N._bump_generation_locked!(stale_client)
+    @test !N._enqueue_writer_publish(stale_client, frame, frame_size)
+    @test stale_client.writer_queue.len == 0
+    N._deactivate_writer_queue!(stale_client; close=true, clear=true)
+end
+
 @testitem "large publishes bypass buffered replay capture" setup=[TestHelpers] begin
     using Natter
 
@@ -1623,7 +1768,7 @@ end
                                      read_io=transport, write_io=write_io)
 
     payload = repeat("x", 64)
-    publish(client, "foo", payload; buffer_on_reconnect=true)
+    publish(client, "foo", payload; mode=:replayable)
 
     expected = "PUB foo 64\r\n$payload\r\n"
     @test TestHelpers.capture_text(transport) == expected
@@ -1870,7 +2015,7 @@ end
                                              read_io=buffered_transport,
                                              write_io=buffered_write)
 
-    publish(buffered_client, "foo", "bar"; direct_write=true, buffer_on_reconnect=false)
+    publish(buffered_client, "foo", "bar"; mode=:direct)
 
     @test buffered_transport.chunks == ["PUB foo 3\r\nbar\r\n"]
     @test N._buffered_bytes(buffered_write) == 0
@@ -1933,19 +2078,19 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     sub = subscribe(client, "updates")
-    already_cancelled = TestHelpers.thrown_exception(() -> N.next(sub; timeout=1.0, cancel_token=token))
+    already_cancelled = TestHelpers.thrown_exception(() -> N.take!(sub; timeout=1.0, cancel_token=token))
     @test already_cancelled isa CancelledError
 
     source = CancellationSource()
     token = cancellation_token(source)
-    next_task = Threads.@spawn TestHelpers.thrown_exception(() -> N.next(sub; timeout=30.0, cancel_token=token))
+    take_task = Threads.@spawn TestHelpers.thrown_exception(() -> N.take!(sub; timeout=30.0, cancel_token=token))
     sleep(0.02)
     @test cancel!(source)
-    @test fetch(next_task) isa CancelledError
+    @test fetch(take_task) isa CancelledError
 
     task_source = CancellationSource()
     task_token = cancellation_token(task_source)
-    handle = Threads.@spawn TestHelpers.thrown_exception(() -> N.next(sub; timeout=30.0, cancel_token=task_token))
+    handle = Threads.@spawn TestHelpers.thrown_exception(() -> N.take!(sub; timeout=30.0, cancel_token=task_token))
     sleep(0.02)
     cancel!(task_source)
     @test fetch(handle) isa CancelledError
@@ -2193,11 +2338,11 @@ end
     frame_size = ncodeunits("PUB foo 50\r\n$payload\r\n")
     @test frame_size == opts.pending_size
 
-    publish(client, "foo", payload; buffer_on_reconnect=true)
+    publish(client, "foo", payload; mode=:replayable)
     @test client.pending_bytes == frame_size
 
     try
-        publish(client, "foo", payload; buffer_on_reconnect=true)
+        publish(client, "foo", payload; mode=:replayable)
         @test false
     catch err
         @test err isa OutboundBufferLimitError
@@ -2224,7 +2369,7 @@ end
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io)
 
-    publish(client, "foo", "bar"; buffer_on_reconnect=true)
+    publish(client, "foo", "bar"; mode=:replayable)
 
     expected = "PUB foo 3\r\nbar\r\n"
     @test N._buffered_bytes(write_io) == ncodeunits(expected)
@@ -2263,7 +2408,7 @@ end
                                      read_io=transport, write_io=N.BufferedWriteIO(transport))
 
     N._write_raw(client, "SUB foo 1\r\n")
-    publish(client, "foo", "bar"; buffer_on_reconnect=true)
+    publish(client, "foo", "bar"; mode=:replayable)
     expected = "PUB foo 3\r\nbar\r\n"
     @test client.pending_bytes == ncodeunits(expected)
 
@@ -2343,7 +2488,7 @@ end
         write_io=header_transport,
     )
     publish(header_client, "foo", "bar"; headers=Headers("Trace" => "abc"),
-            buffer_on_reconnect=true)
+            mode=:replayable)
     header_pending_bytes = header_client.pending_bytes
 
     set_info!(header_client, N.ServerInfo(; headers=false, max_payload=1024))
@@ -2368,7 +2513,7 @@ end
         read_io=original_transport,
         write_io,
     )
-    publish(payload_client, "foo", payload; buffer_on_reconnect=true)
+    publish(payload_client, "foo", payload; mode=:replayable)
     payload_pending_bytes = payload_client.pending_bytes
     @test N._buffered_bytes(write_io) > 0
 
@@ -2587,7 +2732,8 @@ end
                                          read_io=raw_transport, write_io=raw_transport)
     raw_ref[] = raw_client
 
-    @test_throws ErrorException N._send_raw(raw_client, TestHelpers.bytes("PING\r\n"); buffer_on_reconnect=true)
+    @test_throws ErrorException N._send_raw(raw_client, TestHelpers.bytes("PING\r\n");
+                                           buffer_on_reconnect=true)
     @test N.status(raw_client) == N.ConnectionStatus.CLOSED
     @test raw_client.pending_bytes == 0
     @test isempty(take!(raw_client.pending))
@@ -2924,15 +3070,14 @@ end
                                      read_io=transport, write_io=transport)
     client.write_reconnect_pending[] = true
 
-    publish(client, "foo", "bar"; buffer_on_reconnect=true)
+    publish(client, "foo", "bar"; mode=:replayable)
     expected = "PUB foo 3\r\nbar\r\n"
     @test TestHelpers.capture_text(transport) == ""
     @test client.pending_bytes == ncodeunits(expected)
     @test String(take!(client.pending)) == expected
 
     client.write_reconnect_pending[] = true
-    @test_throws ConnectionReconnectingError publish(client, "foo", "bar";
-                                                     buffer_on_reconnect=false)
+    @test_throws ConnectionReconnectingError publish(client, "foo", "bar")
     @test TestHelpers.capture_text(transport) == ""
 end
 
@@ -2945,7 +3090,7 @@ end
     client = TestHelpers.fake_client(; opts=N.ConnectOptions(max_reconnect_attempts=0, error_cb=err -> push!(reported, err)),
                                      status=N.ConnectionStatus.RECONNECTING)
     sub = subscribe(client, "foo")
-    next_task = Threads.@spawn N.next(sub; timeout=30.0)
+    take_task = Threads.@spawn N.take!(sub; timeout=30.0)
     callback_sub = subscribe(client, "bar") do _
         nothing
     end
@@ -2963,13 +3108,13 @@ end
     @test !isopen(callback_sub.messages)
 
     @test timedwait(1.0; pollint=0.001) do
-        istaskdone(next_task)
+        istaskdone(take_task)
     end != :timed_out
     err = try
-        fetch(next_task)
+        fetch(take_task)
         nothing
     catch caught
-        caught isa TaskFailedException ? first(Base.current_exceptions(next_task)).exception : caught
+        caught isa TaskFailedException ? first(Base.current_exceptions(take_task)).exception : caught
     end
     @test err isa ConnectionClosedError
     @test timedwait(1.0; pollint=0.001) do
@@ -2989,7 +3134,7 @@ end
     client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
                                      read_io=transport, write_io=transport)
     sub = subscribe(client, "foo")
-    next_task = Threads.@spawn N.next(sub; timeout=30.0)
+    take_task = Threads.@spawn N.take!(sub; timeout=30.0)
 
     sleep(0.01)
     reason = ErrorException("lost")
@@ -3001,13 +3146,13 @@ end
     @test !isopen(sub.messages)
     @test transport.closed
     @test timedwait(1.0; pollint=0.001) do
-        istaskdone(next_task)
+        istaskdone(take_task)
     end != :timed_out
     err = try
-        fetch(next_task)
+        fetch(take_task)
         nothing
     catch caught
-        caught isa TaskFailedException ? first(Base.current_exceptions(next_task)).exception : caught
+        caught isa TaskFailedException ? first(Base.current_exceptions(take_task)).exception : caught
     end
     @test err isa ConnectionClosedError
     @test only(reported) === reason

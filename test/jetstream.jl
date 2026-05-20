@@ -2122,7 +2122,7 @@ end
                           headers=Headers("Status" => ["100"], "Description" => ["Idle Heartbeat"]),
                           sid=plain_sub.sid)
     N._dispatch_msg(client, plain_heartbeat)
-    @test N._status_header(N.next(plain_sub; timeout=0.1)) == 100
+    @test N._status_header(N.take!(plain_sub; timeout=0.1)) == 100
 
     close(push_sub)
     close(plain_sub)
@@ -2257,7 +2257,7 @@ end
     data = Msg("_INBOX.push", "\$JS.ACK.ORDERS.C1.1.10.1.123456789.2",
                TestHelpers.bytes("one"); sid=sub.sid)
     N._dispatch_msg(client, data)
-    @test String(N.next(sub; timeout=0.1)) == "one"
+    @test String(N.take!(sub; timeout=0.1)) == "one"
     @test !isready(errors)
 
     heartbeat = Msg("_INBOX.push", nothing, UInt8[];
@@ -2373,7 +2373,7 @@ end
     @test isready(sub.messages)
     @test client.pending_bytes == 0
     @test TestHelpers.capture_text(capture) == ""
-    @test String(N.next(sub; timeout=0.1)) == "work"
+    @test String(N.take!(sub; timeout=0.1)) == "work"
 
     expected = "PUB _INBOX.fc 0\r\n\r\n"
     @test client.pending_bytes == 0
@@ -2381,7 +2381,7 @@ end
     close(sub)
 end
 
-@testitem "JetStream push next returns ackable messages" setup=[TestHelpers] begin
+@testitem "JetStream push take! returns ackable messages" setup=[TestHelpers] begin
     using Natter
     using Natter.JetStream
 
@@ -2395,7 +2395,7 @@ end
     try
         N._dispatch_msg(client, Msg("_INBOX.push", "\$JS.ACK.S.C.1.1.1.0.0", TestHelpers.bytes("work");
                                    sid=sub.sid))
-        msg = N.next(psub; timeout=0.1)
+        msg = N.take!(psub; timeout=0.1)
         @test msg isa JetStreamMsg
         @test fieldtype(typeof(msg), :_client) === typeof(client)
         @test String(msg) == "work"
@@ -2404,7 +2404,7 @@ end
     end
 end
 
-@testitem "JetStream push next rejects callback subscriptions" setup=[TestHelpers] begin
+@testitem "JetStream push take! rejects callback subscriptions" setup=[TestHelpers] begin
     using Natter
     using Natter.JetStream
 
@@ -2417,10 +2417,10 @@ end
     psub = N.PushSubscription(js, sub, "S", "C", ReentrantLock(), false, false)
 
     try
-        err = TestHelpers.thrown_exception(() -> N.next(psub; timeout=0.1))
+        err = TestHelpers.thrown_exception(() -> N.take!(psub; timeout=0.1))
         @test err isa ArgumentError
         @test occursin("callback", err.msg)
-        task = Threads.@spawn TestHelpers.thrown_exception(() -> N.next(psub; timeout=0.1))
+        task = Threads.@spawn TestHelpers.thrown_exception(() -> N.take!(psub; timeout=0.1))
         @test fetch(task) isa ArgumentError
     finally
         close(psub)
@@ -2553,7 +2553,7 @@ end
     N._dispatch_msg(client, data)
 
     @test handler.last_seen[] > stale
-    @test String(N.next(sub; timeout=0.1)) == "work"
+    @test String(N.take!(sub; timeout=0.1)) == "work"
     close(sub)
 
     ordered_handler = N._JetStreamPushControlHandler(60.0)
@@ -2567,7 +2567,7 @@ end
     N._dispatch_msg(client, ordered_data)
 
     @test ordered_handler.last_seen[] > ordered_stale
-    @test String(N.next(ordered_sub; timeout=0.1)) == "ordered"
+    @test String(N.take!(ordered_sub; timeout=0.1)) == "ordered"
     close(ordered_sub)
 end
 

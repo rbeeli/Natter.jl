@@ -549,7 +549,9 @@ end
 @noinline function _finish_borrowed_callback!(sub::Subscription)
     @lock sub.lock begin
         sub.processing = max(0, sub.processing - 1)
-        _notify_subscription_waiters_locked(sub; all=true)
+        if sub.closed || sub.timeout_queue.active > 0
+            _notify_subscription_waiters_locked(sub; all=true)
+        end
     end
     nothing
 end
@@ -606,8 +608,10 @@ end
 function _dispatch_borrowed_msg_to_sub(client::C, sub::Subscription{C}, msg::BorrowedMsg,
                                        msg_bytes::Int) where {C<:Client}
     control_handler = _NoSubscriptionControlHandler()
+    handler = sub.borrowed_callback_handler
     dispatch_owned = false
     should_close = false
+    accepted_fast = false
     inactive = @lock sub.lock begin
         if sub.closed || sub.sid != msg.sid
             true
@@ -618,6 +622,13 @@ function _dispatch_borrowed_msg_to_sub(client::C, sub::Subscription{C}, msg::Bor
             sub.delivered += 1
             should_close = sub.max_msgs > 0 && sub.delivered >= sub.max_msgs
             control_handler = sub.control_handler
+            if control_handler isa _NoSubscriptionControlHandler && sub.borrowed_callback &&
+               sub.has_callback
+                handler = sub.borrowed_callback_handler
+                sub.received += 1
+                sub.processing += 1
+                accepted_fast = true
+            end
             false
         end
     end
@@ -628,6 +639,13 @@ function _dispatch_borrowed_msg_to_sub(client::C, sub::Subscription{C}, msg::Bor
     end
     if dispatch_owned
         _dispatch_msg(client, sub, _owned_msg(msg))
+        return
+    end
+
+    if accepted_fast
+        _record_in!(client, msg_bytes)
+        _run_borrowed_callback(client, sub, handler, msg)
+        should_close && _close_subscription_locally!(sub; throw_errors=false)
         return
     end
 
@@ -643,7 +661,6 @@ function _dispatch_borrowed_msg_to_sub(client::C, sub::Subscription{C}, msg::Bor
         return
     end
 
-    handler = sub.borrowed_callback_handler
     accepted = @lock sub.lock begin
         if sub.closed || !sub.borrowed_callback || !sub.has_callback
             sub.dropped_msgs += 1
@@ -691,11 +708,12 @@ function _take_subscription_msg_ready!(sub::Subscription)::Tuple{Bool,Msg}
 end
 
 function _ensure_sync_subscription(sub::Subscription)
-    sub.has_callback && throw(ArgumentError("next requires a subscription without a callback"))
+    sub.has_callback && throw(ArgumentError("take! requires a subscription without a callback"))
     nothing
 end
 
-function next(sub::Subscription; timeout::Real=1.0, cancel_token::MaybeCancellationToken=nothing)
+function Base.take!(sub::Subscription; timeout::Real=1.0,
+                    cancel_token::MaybeCancellationToken=nothing)
     _ensure_sync_subscription(sub)
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
@@ -716,7 +734,7 @@ function next(sub::Subscription; timeout::Real=1.0, cancel_token::MaybeCancellat
             end
         end
         wait_result === :closed && throw(ConnectionClosedError("subscription is closed"))
-        wait_result === :timeout && throw(TimeoutError("next message timed out"))
+        wait_result === :timeout && throw(TimeoutError("take! timed out"))
     end
 end
 

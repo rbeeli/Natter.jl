@@ -70,7 +70,7 @@ Channel-style subscriptions are useful in scripts and tests:
 sub = subscribe(client, "orders.created")
 
 publish(client, "orders.created", "order-1001")
-msg = next(sub; timeout=1.0)
+msg = take!(sub; timeout=1.0)
 
 @assert String(msg) == "order-1001"
 close(sub)

@@ -97,20 +97,20 @@ end
 
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
 
-    publish_task = Threads.@spawn publish(client, "foo", "bar"; buffer_on_reconnect=true)
+    publish_task = Threads.@spawn publish(client, "foo", "bar"; mode=:replayable)
     @test publish_task isa Task
     @test isnothing(fetch(publish_task))
     @test client.pending_bytes == length("PUB foo 3\r\nbar\r\n")
 
     response_client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
     respond_task = Threads.@spawn respond(response_client, Msg("svc", "_INBOX.reply", UInt8[]), "ok";
-                                  buffer_on_reconnect=true)
+                                  mode=:replayable)
     @test isnothing(fetch(respond_task))
     @test String(take!(response_client.pending)) == "PUB _INBOX.reply 2\r\nok\r\n"
 
     sub = fetch(Threads.@spawn subscribe(client, "foo"))
     put!(sub.messages, Msg("foo", nothing, TestHelpers.bytes("hello"); sid=sub.sid))
-    @test String(fetch(Threads.@spawn N.next(sub; timeout=0.1))) == "hello"
+    @test String(fetch(Threads.@spawn N.take!(sub; timeout=0.1))) == "hello"
     @test isnothing(fetch(Threads.@spawn close(sub)))
 end
 
@@ -129,10 +129,10 @@ end
     sub = subscribe(client, "foo")
     source = CancellationSource()
     token = cancellation_token(source)
-    next_task = Threads.@spawn TestHelpers.thrown_exception(() -> N.next(sub; timeout=30.0, cancel_token=token))
+    take_task = Threads.@spawn TestHelpers.thrown_exception(() -> N.take!(sub; timeout=30.0, cancel_token=token))
     sleep(0.02)
     cancel!(source)
-    @test fetch(next_task) isa CancelledError
+    @test fetch(take_task) isa CancelledError
 
     js = jetstream(client)
     kv = KeyValueBucket(js, "bucket", "KV_bucket", "\$KV.bucket.")

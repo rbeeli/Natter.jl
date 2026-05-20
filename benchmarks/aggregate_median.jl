@@ -2,6 +2,7 @@
 
 using Dates
 using JSON3
+using Statistics
 
 function arg_value(args::Vector{String}, name::String, default::Union{String,Nothing}=nothing)
     index = findfirst(==(name), args)
@@ -33,18 +34,21 @@ function read_report(path::AbstractString)
     to_julia(JSON3.read(read(path, String)))
 end
 
-is_rate_key(key::AbstractString) = endswith(key, "_per_second")
-
 function equivalent_values(values::Vector)
     first_value = first(values)
     all(==(first_value), values)
+end
+
+function median_value(values::Vector)
+    sorted = sort!(Float64.(values))
+    median(sorted)
 end
 
 function aggregate_values(key::AbstractString, values::Vector)
     equivalent_values(values) && return first(values)
 
     if all(v -> v isa Real, values)
-        return is_rate_key(key) ? maximum(values) : minimum(values)
+        return median_value(values)
     elseif all(v -> v isa AbstractDict, values)
         keys_union = sort!(collect(reduce(union, (Set(keys(v)) for v in values))))
         return Dict(k => aggregate_values(k, Any[v[k] for v in values if haskey(v, k)])
@@ -62,7 +66,7 @@ function aggregate_reports(client::String, paths::Vector{String})
     environment = Dict{String,Any}(get(first(reports), "environment", Dict{String,Any}()))
     environment["client"] = get(environment, "client", client)
     environment["trials"] = string(length(reports))
-    environment["aggregate"] = "best_of_$(length(reports))_minimum_time_per_metric"
+    environment["aggregate"] = "median_of_$(length(reports))_trials_per_metric"
     environment["trial_reports"] = [basename(path) for path in paths]
 
     Dict(

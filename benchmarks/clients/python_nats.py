@@ -154,10 +154,10 @@ async def bench_request_reply(url, subject, payload, requests, timeout):
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
-    parser.add_argument("--messages", type=int, default=50000)
-    parser.add_argument("--requests", type=int, default=5000)
+    parser.add_argument("--messages", type=int, default=200000)
+    parser.add_argument("--requests", type=int, default=20000)
     parser.add_argument("--payload-bytes", type=int, default=64)
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--json", required=True)
     args = parser.parse_args()
 

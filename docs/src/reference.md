@@ -74,7 +74,8 @@ Conventions:
 | `write_driver` | `true` | Enable the background writer task used by queued publishes. |
 | `write_queue_msgs` | `8192` | Maximum queued publish commands before producers apply backpressure. |
 | `write_queue_bytes` | `2 MiB` | Maximum queued publish bytes before producers apply backpressure. |
-| `write_batch_msgs` | `512` | Maximum publish commands the writer drains per batch. |
+| `write_batch_msgs` | `4096` | Maximum publish commands the writer drains per batch. |
+| `write_batch_bytes` | `512 KiB` | Maximum queued publish bytes the writer drains per batch. |
 | `record_stats` | `false` | Enable client counters returned by `stats(client)`. |
 | `sub_pending_msgs_limit` | `1024` | Default per-subscription queued message limit. |
 | `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit. |
@@ -110,13 +111,13 @@ Parser/resource limits:
 | Function | Returns | Use |
 | :--- | :--- | :--- |
 | `connect(url_or_urls=nothing; kwargs...)`, `connect(options::ConnectOptions)` | `Client` | Connect to NATS. |
-| `publish(client, subject, data=nothing; reply=nothing, headers=nothing, mode=:queued, buffer_on_reconnect=false)` | `nothing` | Publish a core message. `mode=:queued` uses the background writer when active; `mode=:direct` writes on the caller task; `mode=:replayable` opts into best-effort reconnect replay. |
+| `publish(client, subject, data=nothing; reply=nothing, headers=nothing, mode=:queued)` | `nothing` | Publish a core message. `mode=:queued` uses the background writer when active; `mode=:direct` writes on the caller task; `mode=:replayable` opts into best-effort reconnect replay. |
 | `prepare_publish(subject, data=nothing; reply=nothing, headers=nothing)` | `PublishFrame` | Validate and serialize a reusable publish frame. Payloads are `nothing`, strings, or byte vectors. |
-| `publish(client, frame::PublishFrame; mode=:queued, buffer_on_reconnect=false)` | `nothing` | Publish a prepared frame. |
-| `respond(client, msg, data=nothing; headers=nothing, mode=:queued, buffer_on_reconnect=false)` | `nothing` | Reply to `msg.reply`, or throw `ArgumentError` when the message has no reply subject. |
+| `publish(client, frame::PublishFrame; mode=:queued)` | `nothing` | Publish a prepared frame. |
+| `respond(client, msg, data=nothing; headers=nothing, mode=:queued)` | `nothing` | Reply to `msg.reply`, or throw `ArgumentError` when the message has no reply subject. |
 | `subscribe(client, subject; queue=nothing, callback=nothing, callback_mode=:task, max_msgs=0, pending_msgs_limit=..., pending_bytes_limit=...)` | `Subscription` | Create a subscription. `callback_mode=:inline` requires a callback and delivers `BorrowedMsg` from the reader task; `borrowed=true` is accepted as an alias. |
 | `subscribe(callback, client, subject; kwargs...)` | `Subscription` | Callback-first form. |
-| `next(sub; timeout=1.0)` | `Msg` | Wait for a message on a non-callback subscription. |
+| `take!(sub; timeout=1.0)` | `Msg` | Wait for a message on a non-callback subscription. |
 | `unsubscribe(sub; max_msgs=0)` | `nothing` | Unsubscribe now or after more messages. |
 | `close(sub)` | `nothing` | Alias for immediate unsubscribe. |
 | `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | `Msg` | Send a request and wait for one reply. Payloads are `nothing`, strings, or byte vectors. |
@@ -209,7 +210,7 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | `PullMessageStream` | Start a bounded refill stream. |
 | `consume(callback, psub; kwargs...)` | `PullMessageStream` | Run a callback over `messages`. |
 | `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=..., ordered=false, borrowed=false)` | `PushSubscription` | Create or bind a push consumer, or create an ordered ephemeral push consumer with `ordered=true`. `borrowed=true` is callback-only and delivers `BorrowedJetStreamMsg`. |
-| `next(psub::PushSubscription; timeout=1.0)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
+| `take!(psub::PushSubscription; timeout=1.0)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
 | `ack(msg; cancel_token=nothing)`, `ack_sync(msg; timeout=1.0, cancel_token=nothing)`, `nak(msg; delay=nothing, cancel_token=nothing)`, `in_progress(msg; cancel_token=nothing)`, `term(msg; cancel_token=nothing)` | `nothing` or `Msg` | Acknowledge or control redelivery for `AbstractJetStreamMsg` values. |
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
 | `close(psub; timeout=...)`, `close(push; timeout=...)`, `close(stream)` | `nothing` | Close consumer/message handles. Subscription close timeouts bound server cleanup. |

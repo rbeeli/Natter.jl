@@ -234,9 +234,12 @@ function Base.take!(signal::FlushSignal)
     true
 end
 
+const _QueuedWriteItem = Union{PublishFrame,_PendingEntry}
+const _MaybeQueuedWriteItem = Union{_QueuedWriteItem,Nothing}
+
 mutable struct _WriteQueue
     condition::Base.GenericCondition{ReentrantLock}
-    items::Vector{Any}
+    items::Vector{_MaybeQueuedWriteItem}
     sizes::Vector{Int}
     head::Int
     tail::Int
@@ -244,7 +247,8 @@ mutable struct _WriteQueue
     bytes::Int
     in_flight::Int
     epoch::Int
-    pending_count::Threads.Atomic{Int}
+    generation::Int
+    pending_count::Int
     max_msgs::Int
     max_bytes::Int
     active::Threads.Atomic{Bool}
@@ -255,10 +259,10 @@ function _WriteQueue(max_msgs::Int, max_bytes::Int)
     max_msgs > 0 || throw(ArgumentError("write_queue_msgs must be positive"))
     max_bytes > 0 || throw(ArgumentError("write_queue_bytes must be positive"))
     lock = ReentrantLock()
-    items = Vector{Any}(undef, max_msgs)
+    items = Vector{_MaybeQueuedWriteItem}(undef, max_msgs)
     fill!(items, nothing)
     _WriteQueue(Base.Threads.Condition(lock), items, fill(0, max_msgs),
-                1, 1, 0, 0, 0, 0, Threads.Atomic{Int}(0), max_msgs, max_bytes,
+                1, 1, 0, 0, 0, 0, 0, 0, max_msgs, max_bytes,
                 Threads.Atomic{Bool}(false), Threads.Atomic{Bool}(false))
 end
 
@@ -279,7 +283,7 @@ function Base.empty!(q::_WriteQueue)
     q.len = 0
     q.bytes = 0
     q.in_flight = 0
-    q.pending_count[] = 0
+    q.pending_count = 0
     q
 end
 

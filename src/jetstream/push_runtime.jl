@@ -173,9 +173,9 @@ function _start_push_heartbeat_monitor(psub::PushSubscription, handler::_JetStre
     end
 end
 
-function next(psub::PushSubscription{C}; timeout::Real=1.0,
-              cancel_token::MaybeCancellationToken=nothing)::JetStreamMsg{C} where {C<:Client}
-    JetStreamMsg(next(psub.sub; timeout, cancel_token), psub.js.client)
+function Base.take!(psub::PushSubscription{C}; timeout::Real=1.0,
+                    cancel_token::MaybeCancellationToken=nothing)::JetStreamMsg{C} where {C<:Client}
+    JetStreamMsg(take!(psub.sub; timeout, cancel_token), psub.js.client)
 end
 
 function _push_idle_heartbeat_seconds(info::ConsumerInfo)::Float64

@@ -73,7 +73,7 @@ Then normal publish calls on that client write directly and skip replay bufferin
 publish(client, "metrics.raw", @view(payload[1:n]))
 ```
 
-Core publishes skip reconnect replay buffering by default and fail during reconnect. Use `mode=:replayable` or `buffer_on_reconnect=true` only when best-effort replay is preferable to letting the caller retry, drop, or rebuild the message.
+Core publishes skip reconnect replay buffering by default and fail during reconnect. Use `mode=:replayable` only when best-effort replay is preferable to letting the caller retry, drop, or rebuild the message.
 
 The publish choices are:
 
@@ -91,7 +91,7 @@ flush(client; timeout=2.0)
 
 ## Subscribe
 
-Use `next` for explicit pull-style reads:
+Use `take!` for explicit pull-style reads:
 
 ```julia
 sub = subscribe(client, "events.*";
@@ -99,7 +99,7 @@ sub = subscribe(client, "events.*";
     pending_bytes_limit=64 * 1024 * 1024,
 )
 
-msg = next(sub; timeout=1.0)
+msg = take!(sub; timeout=1.0)
 @info "event" subject=msg.subject data=String(msg)
 ```
 
@@ -111,7 +111,7 @@ sub = subscribe(client, "events.created") do msg
 end
 ```
 
-Callback subscriptions are callback-only. Use `next` only with subscriptions created without a callback.
+Callback subscriptions are callback-only. Use `take!` only with subscriptions created without a callback.
 
 Normal callbacks run on Natter-managed Julia tasks scheduled on the default thread pool and are serialized per subscription. Synchronize shared mutable state the same way you would for any Julia task.
 
@@ -134,11 +134,11 @@ sub = subscribe(client, "ticks.raw"; callback_mode=:inline) do msg
 end
 ```
 
-Inline callbacks run on the reader task. Keep them short and nonblocking; avoid `request`, `flush`, `next`, slow file or network IO, and unbounded `put!` calls from an inline callback. If the work can block, copy the bytes and hand them to another task. Header messages can still allocate header storage; the inline fast path is for payload bytes. `borrowed=true` is accepted as a compatibility alias for `callback_mode=:inline`.
+Inline callbacks run on the reader task. Keep them short and nonblocking; avoid `request`, `flush`, `take!`, slow file or network IO, and unbounded `put!` calls from an inline callback. If the work can block, copy the bytes and hand them to another task. Header messages can still allocate header storage; the inline fast path is for payload bytes. `borrowed=true` is accepted as a compatibility alias for `callback_mode=:inline`.
 
 The subscribe choices are:
 
-- `next(sub)` and normal callback subscriptions deliver owned `Msg` values that can be retained safely.
+- `take!(sub)` and normal callback subscriptions deliver owned `Msg` values that can be retained safely.
 - `subscribe(...; callback_mode=:inline) do msg ... end` delivers callback-only `BorrowedMsg` values and avoids the payload copy and callback task handoff.
 - Use a bounded queue plus `copy(msg.data)` when borrowed input needs asynchronous processing.
 
@@ -156,7 +156,7 @@ Limit a subscription to a fixed number of messages:
 
 ```julia
 one = subscribe(client, "startup.ready"; max_msgs=1)
-msg = next(one; timeout=5.0)
+msg = take!(one; timeout=5.0)
 ```
 
 `unsubscribe(sub; max_msgs=n)` keeps an existing subscription open for `n` more protocol deliveries. `stats(sub)` reports both `delivered` and user-visible `received` counts, which can differ when slow-consumer limits drop messages.

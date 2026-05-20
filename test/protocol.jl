@@ -64,6 +64,17 @@ using TestItems
     @test String(msg) == "work"
     @test N._read_control_or_msg(reader).op == :PING
 
+    for sid in ("0", "-1", "+1")
+        @test_throws ProtocolError N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG bad $sid 0\r\n\r\n")))
+        bad_hmsg = vcat(TestHelpers.bytes("HMSG bad $sid $(length(hdr)) $(length(hdr))\r\n"),
+                        hdr, N.CRLF_BYTES)
+        @test_throws ProtocolError N._read_control_or_msg(IOBuffer(bad_hmsg))
+    end
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG bad.size 1 +1\r\nx\r\n")))
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(TestHelpers.bytes("MSG bad.size 1 -1\r\n\r\n")))
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(TestHelpers.bytes("HMSG bad.size 1 +0 0\r\n\r\n")))
+    @test_throws ProtocolError N._read_control_or_msg(IOBuffer(TestHelpers.bytes("HMSG bad.size 1 0 +0\r\n\r\n")))
+
     status_headers = N._parse_headers(TestHelpers.bytes("NATS/1.0 503 No Responders\r\n\r\n"))
     status_msg = Msg("reply", nothing, UInt8[]; headers=status_headers)
     @test N._status_header(status_msg) == 503

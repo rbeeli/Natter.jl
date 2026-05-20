@@ -496,6 +496,33 @@ function _parse_int_token(bytes::AbstractVector{UInt8}, first::Int, last::Int)::
     negative ? -value : value
 end
 
+function _parse_unsigned_int_token(bytes::AbstractVector{UInt8}, first::Int, last::Int,
+                                   field::AbstractString)::Int
+    first <= last || throw(ProtocolError("malformed $field field in protocol line"))
+    value = 0
+    @inbounds begin
+        pos = first
+        while pos <= last
+            byte = bytes[pos]
+            UInt8('0') <= byte <= UInt8('9') ||
+                throw(ProtocolError("$field field must be an unsigned integer"))
+            digit = Int(byte - UInt8('0'))
+            value <= (typemax(Int) - digit) ÷ 10 ||
+                throw(ProtocolError("$field field exceeds Int range"))
+            value = value * 10 + digit
+            pos += 1
+        end
+    end
+    value
+end
+
+function _parse_positive_int_token(bytes::AbstractVector{UInt8}, first::Int, last::Int,
+                                   field::AbstractString)::Int
+    value = _parse_unsigned_int_token(bytes, first, last, field)
+    value > 0 || throw(ProtocolError("$field field must be a positive integer"))
+    value
+end
+
 function _malformed_control_line(kind::AbstractString, bytes::AbstractVector{UInt8}, first::Int, last::Int)
     throw(ProtocolError("malformed $kind control line: $(_bytes_string(bytes, first, last))"))
 end
@@ -512,10 +539,10 @@ function _read_msg_line_handle(reader::ProtocolReader, line_first::Int, line_las
     fourth_start, fourth_end, pos = _next_token(bytes, pos, line_last)
     _has_more_tokens(bytes, pos, line_last) && _malformed_control_line("MSG", bytes, line_first, line_last)
 
-    sid = _parse_int_token(bytes, sid_start, sid_end)
+    sid = _parse_positive_int_token(bytes, sid_start, sid_end, "sid")
     has_reply = fourth_start != 0
     size_start, size_end = fourth_start == 0 ? (third_start, third_end) : (fourth_start, fourth_end)
-    size = _validate_payload_size(_parse_int_token(bytes, size_start, size_end), max_payload)
+    size = _validate_payload_size(_parse_unsigned_int_token(bytes, size_start, size_end, "payload size"), max_payload)
     route = _resolve_message_route(route_resolver, sid)
     borrowed = _route_borrow_payload(route)
     reply_start, reply_end = has_reply ? (third_start, third_end) : (0, -1)
@@ -567,12 +594,12 @@ function _read_hmsg_line_handle(reader::ProtocolReader, line_first::Int, line_la
     fifth_start, fifth_end, pos = _next_token(bytes, pos, line_last)
     _has_more_tokens(bytes, pos, line_last) && _malformed_control_line("HMSG", bytes, line_first, line_last)
 
-    sid = _parse_int_token(bytes, sid_start, sid_end)
+    sid = _parse_positive_int_token(bytes, sid_start, sid_end, "sid")
     has_reply = fifth_start != 0
     hsize_start, hsize_end = has_reply ? (fourth_start, fourth_end) : (third_start, third_end)
     total_start, total_end = has_reply ? (fifth_start, fifth_end) : (fourth_start, fourth_end)
-    hsize = _validate_header_size(_parse_int_token(bytes, hsize_start, hsize_end), max_header_bytes)
-    total = _validate_payload_size(_parse_int_token(bytes, total_start, total_end), max_payload)
+    hsize = _validate_header_size(_parse_unsigned_int_token(bytes, hsize_start, hsize_end, "header size"), max_header_bytes)
+    total = _validate_payload_size(_parse_unsigned_int_token(bytes, total_start, total_end, "payload size"), max_payload)
     route = _resolve_message_route(route_resolver, sid)
     borrowed = _route_borrow_payload(route)
     reply_start, reply_end = has_reply ? (third_start, third_end) : (0, -1)

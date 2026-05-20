@@ -1,12 +1,13 @@
-struct PublishFrame{P<:AbstractVector{UInt8},H<:AbstractVector{UInt8},
-                    W<:Union{ImmutableBytes,Nothing}} <: _AbstractPublishFrame
+const _PreparedFrameBytes = Union{Base.CodeUnits{UInt8,String},ImmutableBytes}
+
+struct PublishFrame <: _AbstractPublishFrame
     subject::String
     reply::Union{String,Nothing}
-    payload::P
-    headers::H
+    payload::_PreparedFrameBytes
+    headers::_PreparedFrameBytes
     payload_size::Int
     serialized_size::Int
-    wire::W
+    wire::Union{ImmutableBytes,Nothing}
 end
 
 struct _PublishFrame{P<:AbstractVector{UInt8},H<:AbstractVector{UInt8}} <: _AbstractPublishFrame
@@ -29,9 +30,7 @@ function PublishFrame(subject::AbstractString, reply::Union{AbstractString,Nothi
     # contiguous wire image for small frames so those publishes skip formatting.
     wire = serialized_size <= DEFAULT_DIRECT_WRITE_THRESHOLD ?
            ImmutableBytes(_pub_cmd(frame); copy=false) : nothing
-    PublishFrame{typeof(payload),typeof(header_bytes),typeof(wire)}(subject, reply, payload,
-                                                                    header_bytes, payload_size,
-                                                                    serialized_size, wire)
+    PublishFrame(subject, reply, payload, header_bytes, payload_size, serialized_size, wire)
 end
 
 PublishFrame(subject::AbstractString, data=nothing;

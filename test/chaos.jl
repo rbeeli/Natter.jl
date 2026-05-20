@@ -70,7 +70,7 @@ end
                 end
 
                 IntegrationHelpers.publish_and_flush(client, subject, "before"; timeout=io_timeout)
-                @test String(next(sub[]; timeout=io_timeout)) == "before"
+                @test String(take!(sub[]; timeout=io_timeout)) == "before"
 
                 for i in 1:IntegrationHelpers.chaos_iterations()
                     expected_reconnects = stats(client).reconnects + 1
@@ -78,13 +78,13 @@ end
                     proxy.drop_connections()
                     @test ChaosTestHelpers.wait_reconnecting(client; timeout=max(io_timeout, 2.0))
 
-                    publish(client, subject, "during-$i"; buffer_on_reconnect=true)
+                    publish(client, subject, "during-$i"; mode=:replayable)
                     proxy.release()
                     @test ChaosTestHelpers.wait_reconnected(client, expected_reconnects;
                                                             timeout=max(io_timeout, 5.0))
 
                     flush(client; timeout=io_timeout)
-                    @test String(next(sub[]; timeout=io_timeout)) == "during-$i"
+                    @test String(take!(sub[]; timeout=io_timeout)) == "during-$i"
                     @test String(request(client, "$subject.req", "$i"; timeout=io_timeout)) == "reply-$i"
                 end
             finally
@@ -143,13 +143,13 @@ end
                 @test saw_slow
                 @test stats(client).dropped_msgs > 0
 
-                @test startswith(String(next(sub; timeout=io_timeout)), "msg-")
+                @test startswith(String(take!(sub; timeout=io_timeout)), "msg-")
 
                 healthy_subject = "$subject.healthy"
                 healthy = subscribe(client, healthy_subject)
                 try
                     IntegrationHelpers.publish_and_flush(client, healthy_subject, "ok"; timeout=io_timeout)
-                    @test String(next(healthy; timeout=io_timeout)) == "ok"
+                    @test String(take!(healthy; timeout=io_timeout)) == "ok"
                 finally
                     close(healthy)
                 end
@@ -349,7 +349,7 @@ end
                     try
                         while !stop[]
                             try
-                                next(sub[]; timeout=0.1)
+                                take!(sub[]; timeout=0.1)
                                 received[] += 1
                             catch err
                                 if err isa TimeoutError
@@ -371,7 +371,7 @@ end
                     try
                         while published[] == 0 || time() < deadline
                             published[] += 1
-                            publish(client, subject, "msg-$(published[])")
+                            publish(client, subject, "msg-$(published[])"; mode=:replayable)
                             sleep(0.005)
                         end
                     catch err

@@ -24,7 +24,7 @@ using TestItems
             subject = "natter.test.$(randstring(10))"
             sub = subscribe(client, subject)
             IntegrationHelpers.publish_and_flush(client, subject, "hello"; timeout=io_timeout)
-            msg = N.next(sub; timeout=io_timeout)
+            msg = N.take!(sub; timeout=io_timeout)
             @test String(msg) == "hello"
 
             service = subscribe(client, "$subject.req") do req
@@ -61,20 +61,20 @@ using TestItems
             async_sub = fetch(Threads.@spawn subscribe(client, "$subject.async"))
             fetch(Threads.@spawn publish(client, "$subject.async", "from task"))
             fetch(Threads.@spawn flush(client; timeout=io_timeout))
-            @test String(fetch(Threads.@spawn N.next(async_sub; timeout=io_timeout))) == "from task"
+            @test String(fetch(Threads.@spawn N.take!(async_sub; timeout=io_timeout))) == "from task"
             fetch(Threads.@spawn unsubscribe(async_sub))
 
             limited = subscribe(client, "$subject.limited")
             IntegrationHelpers.publish_and_flush(client, "$subject.limited", "first"; timeout=io_timeout)
-            @test String(N.next(limited; timeout=io_timeout)) == "first"
+            @test String(N.take!(limited; timeout=io_timeout)) == "first"
             unsubscribe(limited; max_msgs=2)
             flush(client; timeout=io_timeout)
             publish(client, "$subject.limited", "second")
             publish(client, "$subject.limited", "third")
             IntegrationHelpers.publish_and_flush(client, "$subject.limited", "fourth"; timeout=io_timeout)
-            @test String(N.next(limited; timeout=io_timeout)) == "second"
-            @test String(N.next(limited; timeout=io_timeout)) == "third"
-            @test_throws ConnectionClosedError N.next(limited; timeout=0.5)
+            @test String(N.take!(limited; timeout=io_timeout)) == "second"
+            @test String(N.take!(limited; timeout=io_timeout)) == "third"
+            @test_throws ConnectionClosedError N.take!(limited; timeout=0.5)
             @test limited.closed
 
             close(client.socket)
@@ -83,7 +83,7 @@ using TestItems
             end
             @test result != :timed_out
             IntegrationHelpers.publish_and_flush(client, subject, "after reconnect"; timeout=io_timeout)
-            @test String(N.next(sub; timeout=io_timeout)) == "after reconnect"
+            @test String(N.take!(sub; timeout=io_timeout)) == "after reconnect"
 
             drain(sub; timeout=io_timeout)
             @test sub.closed
@@ -115,7 +115,7 @@ using TestItems
             try
                 drain_sub = subscribe(drain_client, "$subject.drain")
                 IntegrationHelpers.publish_and_flush(drain_client, "$subject.drain", "drain"; timeout=io_timeout)
-                @test String(N.next(drain_sub; timeout=io_timeout)) == "drain"
+                @test String(N.take!(drain_sub; timeout=io_timeout)) == "drain"
                 drain(drain_client; timeout=io_timeout)
                 @test N.status(drain_client) == N.ConnectionStatus.CLOSED
             finally
@@ -147,7 +147,7 @@ end
             subject = "natter.auth.$(randstring(10))"
             sub = subscribe(client, subject)
             IntegrationHelpers.publish_and_flush(client, subject, "nkey"; timeout=io_timeout)
-            @test String(N.next(sub; timeout=io_timeout)) == "nkey"
+            @test String(N.take!(sub; timeout=io_timeout)) == "nkey"
         finally
             close(client)
         end
@@ -179,7 +179,7 @@ end
             subject = "natter.auth.jwt.$(randstring(10))"
             sub = subscribe(client, subject)
             IntegrationHelpers.publish_and_flush(client, subject, "jwt"; timeout=io_timeout)
-            @test String(N.next(sub; timeout=io_timeout)) == "jwt"
+            @test String(N.take!(sub; timeout=io_timeout)) == "jwt"
         finally
             close(client)
         end
@@ -231,7 +231,7 @@ end
                 end
                 flush(service_client; timeout=io_timeout)
                 IntegrationHelpers.publish_and_flush(client, subject, "before failover"; timeout=io_timeout)
-                @test String(N.next(sub; timeout=io_timeout)) == "before failover"
+                @test String(N.take!(sub; timeout=io_timeout)) == "before failover"
 
                 primary.stop()
                 result = timedwait(2.0; pollint=0.01) do
@@ -245,7 +245,7 @@ end
                 @test request_err isa ConnectionReconnectingError
                 @test client.pending_bytes == 0
 
-                publish(client, subject, "during failover"; buffer_on_reconnect=true)
+                publish(client, subject, "during failover"; mode=:replayable)
                 result = timedwait(1.0; pollint=0.01) do
                     client.pending_bytes > 0
                 end
@@ -259,7 +259,7 @@ end
                 end
                 @test result != :timed_out
                 flush(client; timeout=io_timeout)
-                @test String(N.next(sub; timeout=io_timeout)) == "during failover"
+                @test String(N.take!(sub; timeout=io_timeout)) == "during failover"
                 @test stats(client).reconnects >= 1
                 close(service)
             finally
@@ -569,7 +569,7 @@ end
                                                                  ack_policy=AckPolicy.EXPLICIT,
                                                                  idle_heartbeat=0.1))
             try
-                @test_throws TimeoutError N.next(heartbeat_sub; timeout=0.35)
+                @test_throws TimeoutError N.take!(heartbeat_sub; timeout=0.35)
             finally
                 close(heartbeat_sub)
             end
@@ -582,7 +582,7 @@ end
                                                             idle_heartbeat=0.1))
             try
                 js_publish(js, flow_subject, "flow-control"; stream=stream)
-                msg = N.next(flow_sub; timeout=2.0)
+                msg = N.take!(flow_sub; timeout=2.0)
                 @test msg.subject == flow_subject
                 @test String(msg) == "flow-control"
                 @test msg isa JetStreamMsg
@@ -603,8 +603,8 @@ end
 
                 js_publish(js, ordered_subject, "ordered-one"; stream=stream)
                 js_publish(js, ordered_subject, "ordered-two"; stream=stream)
-                first_ordered = N.next(ordered_sub; timeout=2.0)
-                second_ordered = N.next(ordered_sub; timeout=2.0)
+                first_ordered = N.take!(ordered_sub; timeout=2.0)
+                second_ordered = N.take!(ordered_sub; timeout=2.0)
                 @test first_ordered.subject == ordered_subject
                 @test second_ordered.subject == ordered_subject
                 @test String(first_ordered) == "ordered-one"
@@ -639,7 +639,7 @@ end
             try
                 flush(client; timeout=2.0)
                 js_publish(js, queue_subject, "queue-config"; stream=stream)
-                msg = N.next(queue_sub; timeout=2.0)
+                msg = N.take!(queue_sub; timeout=2.0)
                 @test msg.subject == queue_subject
                 @test String(msg) == "queue-config"
                 @test msg isa JetStreamMsg
@@ -678,7 +678,7 @@ end
                 while length(received) < length(payloads) && time() < deadline
                     for sub in (queue_only_sub1, queue_only_sub2)
                         try
-                            msg = N.next(sub; timeout=0.05)
+                            msg = N.take!(sub; timeout=0.05)
                             push!(received, String(msg))
                             ack(msg)
                         catch err
@@ -687,8 +687,8 @@ end
                     end
                 end
                 @test sort(received) == payloads
-                @test_throws TimeoutError N.next(queue_only_sub1; timeout=0.1)
-                @test_throws TimeoutError N.next(queue_only_sub2; timeout=0.1)
+                @test_throws TimeoutError N.take!(queue_only_sub1; timeout=0.1)
+                @test_throws TimeoutError N.take!(queue_only_sub2; timeout=0.1)
             finally
                 close(queue_only_sub1)
                 close(queue_only_sub2)
@@ -930,7 +930,7 @@ end
             handler = psub.control_handler::N._JetStreamPushControlHandler
 
             js_publish(js, subject, "ordered-before-reset"; stream, timeout=io_timeout)
-            first = N.next(psub; timeout=io_timeout)
+            first = N.take!(psub; timeout=io_timeout)
             @test String(first) == "ordered-before-reset"
             reset_seq = metadata(first).stream_sequence + 1
 
@@ -962,12 +962,12 @@ end
             resetting = @lock handler.lock handler.ordered_resetting
             @test !resetting
 
-            recovered = N.next(psub; timeout=io_timeout)
+            recovered = N.take!(psub; timeout=io_timeout)
             @test String(recovered) == "ordered-after-failed-reset"
             @test metadata(recovered).stream_sequence == reset_seq
 
             js_publish(js, subject, "ordered-after-recovery"; stream, timeout=io_timeout)
-            @test String(N.next(psub; timeout=io_timeout)) == "ordered-after-recovery"
+            @test String(N.take!(psub; timeout=io_timeout)) == "ordered-after-recovery"
         finally
             try
                 if !isnothing(ordered_sub[]) && N.status(client) == N.ConnectionStatus.CONNECTED
@@ -1066,7 +1066,7 @@ end
             subject = "natter.tls.$(randstring(10))"
             sub = subscribe(client, subject)
             IntegrationHelpers.publish_and_flush(client, subject, "secure"; timeout=io_timeout)
-            @test String(N.next(sub; timeout=io_timeout)) == "secure"
+            @test String(N.take!(sub; timeout=io_timeout)) == "secure"
         finally
             close(client)
         end

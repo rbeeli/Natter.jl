@@ -58,6 +58,15 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
         isnothing(info) ? _push_idle_heartbeat_seconds(cfg) : _push_idle_heartbeat_seconds(info);
         flow_control=isnothing(info) ? _push_flow_control_enabled(cfg) : _push_flow_control_enabled(info),
     )
+    if ordered
+        @lock control_handler.lock begin
+            control_handler.ordered = true
+            control_handler.next_consumer_seq = 1
+            control_handler.last_stream_seq = 0
+            control_handler.sequence_state_anchored = false
+            control_handler.ordered_resetting = false
+        end
+    end
     deliver_subject = String(cfg["deliver_subject"])
     auto_ack = isnothing(info) ? _push_callback_auto_ack(manual_ack, callback, cfg) :
                _push_callback_auto_ack(manual_ack, callback, info)
@@ -101,11 +110,6 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
         if ordered
             base_config = ordered_base_config::Dict{String,Any}
             @lock control_handler.lock begin
-                control_handler.ordered = true
-                control_handler.next_consumer_seq = 1
-                control_handler.last_stream_seq = 0
-                control_handler.sequence_state_anchored = false
-                control_handler.ordered_resetting = false
                 control_handler.ordered_reset_callback =
                     start_seq -> _schedule_ordered_push_reset!(psub, base_config, start_seq)
             end

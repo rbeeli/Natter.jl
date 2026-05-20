@@ -276,8 +276,8 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     try
         _validate_publish_subject(reply)
         frame = _PublishFrame(request_frame.subject, reply, request_frame.payload, request_frame.headers)
-        _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true,
-                                 cancel_token, validate_frame=false)
+        _publish_frame_unchecked(client, frame; force_flush=true, cancel_token,
+                                 validate_frame=false)
         return _wait_request_reply(mux, waiter, timeout; cancel_token)
     finally
         _remove_request_waiter!(client, mux, token, waiter)

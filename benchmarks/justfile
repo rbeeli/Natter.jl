@@ -2,15 +2,16 @@ set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 url := env_var_or_default("NATTER_BENCH_URL", "nats://127.0.0.1:4222")
-messages := env_var_or_default("NATTER_BENCH_MESSAGES", "50000")
-requests := env_var_or_default("NATTER_BENCH_REQUESTS", "5000")
+messages := env_var_or_default("NATTER_BENCH_MESSAGES", "200000")
+requests := env_var_or_default("NATTER_BENCH_REQUESTS", "20000")
 payload_bytes := env_var_or_default("NATTER_BENCH_PAYLOAD_BYTES", "64")
-timeout := env_var_or_default("NATTER_BENCH_TIMEOUT", "30")
+timeout := env_var_or_default("NATTER_BENCH_TIMEOUT", "90")
 concurrency := env_var_or_default("NATTER_BENCH_CONCURRENCY", "44")
 artifacts := env_var_or_default("NATTER_BENCH_ARTIFACTS", "benchmarks/results")
 pythonpath := env_var_or_default("NATS_PYTHONPATH", "/mnt/data/repos/nats.py/nats/src")
 julia_flags := env_var_or_default("NATTER_BENCH_JULIA_FLAGS", "--startup-file=no -O3 --check-bounds=no -C native")
-trials := env_var_or_default("NATTER_BENCH_TRIALS", "3")
+trials := env_var_or_default("NATTER_BENCH_TRIALS", "7")
+alloc_iterations := env_var_or_default("NATTER_BENCH_ALLOC_ITERATIONS", "10000")
 nats_image := env_var_or_default("NATTER_BENCH_NATS_IMAGE", "nats:2.11")
 
 default:
@@ -36,10 +37,11 @@ natter:
         --payload-bytes "{{payload_bytes}}" \
         --concurrency "{{concurrency}}" \
         --timeout "{{timeout}}" \
+        --alloc-iterations "{{alloc_iterations}}" \
         --output "$artifacts_dir/natter-trial-$i.md" \
         --json "$artifacts_dir/natter-trial-$i.json"; \
     done; \
-    julia --project=. benchmarks/aggregate_min.jl --client natter --output "$artifacts_dir/natter.json" -- "$artifacts_dir"/natter-trial-*.json
+    julia --project=. benchmarks/aggregate_median.jl --client natter --output "$artifacts_dir/natter.json" -- "$artifacts_dir"/natter-trial-*.json
 
 python:
     root="$(cd "{{justfile_directory()}}/.." && pwd)"; \
@@ -56,7 +58,7 @@ python:
         --timeout "{{timeout}}" \
         --json "$artifacts_dir/python-nats-trial-$i.json"; \
     done; \
-    julia --project=. benchmarks/aggregate_min.jl --client python --output "$artifacts_dir/python-nats.json" -- "$artifacts_dir"/python-nats-trial-*.json
+    julia --project=. benchmarks/aggregate_median.jl --client python --output "$artifacts_dir/python-nats.json" -- "$artifacts_dir"/python-nats-trial-*.json
 
 rust:
     root="$(cd "{{justfile_directory()}}/.." && pwd)"; \
@@ -85,7 +87,7 @@ rust:
         bash "{{trials}}" "{{url}}" "{{messages}}" "{{requests}}" "{{payload_bytes}}" "{{timeout}}" "$artifacts_dir" "$(id -u)" "$(id -g)"; \
     fi; \
     cd "$root"; \
-    julia --project=. benchmarks/aggregate_min.jl --client rust --output "$artifacts_dir/rust-nats.json" -- "$artifacts_dir"/rust-nats-trial-*.json
+    julia --project=. benchmarks/aggregate_median.jl --client rust --output "$artifacts_dir/rust-nats.json" -- "$artifacts_dir"/rust-nats-trial-*.json
 
 go:
     root="$(cd "{{justfile_directory()}}/.." && pwd)"; \
@@ -105,7 +107,7 @@ go:
         -json "$artifacts_dir/go-nats-trial-$i.json"; \
     done; \
     cd "$root"; \
-    julia --project=. benchmarks/aggregate_min.jl --client go --output "$artifacts_dir/go-nats.json" -- "$artifacts_dir"/go-nats-trial-*.json
+    julia --project=. benchmarks/aggregate_median.jl --client go --output "$artifacts_dir/go-nats.json" -- "$artifacts_dir"/go-nats-trial-*.json
 
 run: natter python rust go
 

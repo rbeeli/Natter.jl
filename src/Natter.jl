@@ -11,14 +11,14 @@ using Sockets
 using URIs
 using libsodium_jll
 
-import Base: close, fetch, flush
+import Base: close, fetch, flush, take!
 
 export JetStream, KeyValue
 export Client, ConnectOptions, ConnectionStatus, ConnectionEventKind, ConnectionEvent
 export CancellationSource, CancellationToken, cancellation_token, cancel!, iscancelled
 export AbstractAuth, NoAuth, TokenAuth, UserPassAuth, NKeyAuth, JwtAuth, CredentialsAuth, CallbackAuth, AuthRequest
 export Msg, BorrowedMsg, Headers, PublishFrame, Subscription, Stats, SubscriptionStats
-export connect, close, drain, flush, ping, publish, respond, prepare_publish, subscribe, unsubscribe, request, next, new_inbox
+export connect, close, drain, flush, ping, publish, respond, prepare_publish, subscribe, unsubscribe, request, new_inbox
 export header, headers, status, stats, connected_url
 export NatterError, TimeoutError, CancelledError, NoRespondersError, ConnectionClosedError, ConnectionReconnectingError
 export ConnectionDrainingError, ProtocolError, AuthenticationError, AuthorizationError
@@ -41,6 +41,7 @@ const DEFAULT_MAX_CONTROL_LINE = 16 * 1024
 const DEFAULT_MAX_INBOUND_PAYLOAD = 64 * 1024 * 1024
 const DEFAULT_MAX_HEADER_BYTES = 64 * 1024
 const DEFAULT_DIRECT_WRITE_THRESHOLD = 256 * 1024
+const DEFAULT_WRITE_BATCH_BYTES = 512 * 1024
 const _MAX_TIMER_DELAY_SECONDS = prevfloat(Float64(typemax(UInt64)) / 1000)
 
 include("errors.jl")
@@ -51,12 +52,12 @@ include("types/common.jl")
 include("types/headers.jl")
 include("types/messages.jl")
 include("types/options.jl")
+include("protocol/headers.jl")
+include("protocol/serialization.jl")
 include("types/protocol_transport.jl")
 include("types/client.jl")
 include("auth.jl")
 include("protocol/parser.jl")
-include("protocol/headers.jl")
-include("protocol/serialization.jl")
 include("connection/setup.jl")
 include("connection/transport.jl")
 include("connection/session.jl")

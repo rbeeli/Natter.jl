@@ -11,14 +11,14 @@ using Statistics
 using URIs
 
 const DEFAULT_URL = get(ENV, "NATTER_PERF_URL", "nats://127.0.0.1:4222")
-const DEFAULT_MESSAGES = parse(Int, get(ENV, "NATTER_PERF_MESSAGES", "10000"))
-const DEFAULT_REQUESTS = parse(Int, get(ENV, "NATTER_PERF_REQUESTS", "1000"))
+const DEFAULT_MESSAGES = parse(Int, get(ENV, "NATTER_PERF_MESSAGES", "200000"))
+const DEFAULT_REQUESTS = parse(Int, get(ENV, "NATTER_PERF_REQUESTS", "20000"))
 const DEFAULT_PAYLOAD_BYTES = parse(Int, get(ENV, "NATTER_PERF_PAYLOAD_BYTES", "64"))
 const DEFAULT_CONCURRENCY = parse(Int, get(ENV, "NATTER_PERF_CONCURRENCY", string(max(1, 2 * Threads.nthreads()))))
 const DEFAULT_OUTPUT = get(ENV, "NATTER_PERF_OUTPUT", "performance-report.md")
 const DEFAULT_JSON = get(ENV, "NATTER_PERF_JSON", "performance-report.json")
-const DEFAULT_TIMEOUT = parse(Float64, get(ENV, "NATTER_PERF_TIMEOUT", "15.0"))
-const DEFAULT_ALLOC_ITERATIONS = parse(Int, get(ENV, "NATTER_PERF_ALLOC_ITERATIONS", "1000"))
+const DEFAULT_TIMEOUT = parse(Float64, get(ENV, "NATTER_PERF_TIMEOUT", "90.0"))
+const DEFAULT_ALLOC_ITERATIONS = parse(Int, get(ENV, "NATTER_PERF_ALLOC_ITERATIONS", "10000"))
 
 function arg_value(args::Vector{String}, name::String, default::String)::String
     index = findfirst(==(name), args)
@@ -157,7 +157,7 @@ function benchmark_publish_buffered_batch(url::String, subject::String, payload:
     client = connect_batch_perf(url, subject, payload, messages; name="natter-perf-publish-batch")
     frame = prepare_publish(subject, payload)
     try
-        for _ in 1:min(messages, 100)
+        for _ in 1:min(messages, 1000)
             publish(client, frame)
         end
         flush(client; timeout=5.0)
@@ -182,7 +182,7 @@ end
 
 function benchmark_publish_flush_each(client, subject::String, payload::Vector{UInt8}, messages::Int)
     frame = prepare_publish(subject, payload)
-    warmup = min(messages, 20)
+    warmup = min(messages, 100)
     for _ in 1:warmup
         publish(client, frame)
         flush(client; timeout=5.0)
@@ -223,7 +223,7 @@ function benchmark_callback_dispatch(url::String, subject::String, payload::Vect
         flush(sub_client; timeout=5.0)
         frame = prepare_publish(subject, payload)
 
-        warmup = min(messages, 100)
+        warmup = min(messages, 1000)
         for _ in 1:warmup
             publish(pub_client, frame; mode=(mode == :direct ? :direct : :queued))
         end
@@ -271,7 +271,7 @@ function benchmark_request_latency(url::String, subject::String, payload::Vector
         end
         flush(service; timeout=5.0)
 
-        for _ in 1:min(requests, 50)
+        for _ in 1:min(requests, 200)
             request(client, subject, payload; timeout=5.0)
         end
 

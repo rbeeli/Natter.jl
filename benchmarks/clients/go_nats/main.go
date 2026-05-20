@@ -229,10 +229,10 @@ func benchRequestReply(url, subject string, payload []byte, requests int, timeou
 
 func main() {
 	url := flag.String("url", "nats://127.0.0.1:4222", "")
-	messages := flag.Int("messages", 50000, "")
-	requests := flag.Int("requests", 5000, "")
+	messages := flag.Int("messages", 200000, "")
+	requests := flag.Int("requests", 20000, "")
 	payloadBytes := flag.Int("payload-bytes", 64, "")
-	timeoutSeconds := flag.Float64("timeout", 30, "")
+	timeoutSeconds := flag.Float64("timeout", 90, "")
 	jsonPath := flag.String("json", "/tmp/go-nats.json", "")
 	flag.Parse()
 

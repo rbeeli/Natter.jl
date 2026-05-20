@@ -259,7 +259,7 @@ function _ack_publish_raw(client::Client, reply::String, kind::Symbol; delay=not
     payload = _ack_payload(kind; delay)
     terminal = _ack_terminal(kind)
     _publish_unchecked(client, reply, payload;
-                       buffer_on_reconnect=!terminal,
+                       mode=terminal ? :queued : :replayable,
                        force_flush=terminal,
                        cancel_token)
     nothing
@@ -276,8 +276,7 @@ function _ack_request_raw(client::Client, reply::String, kind::Symbol; delay=not
     response_subject = waiter.reply
     try
         frame = _publish_frame(reply, response_subject, payload, EMPTY_BYTES)
-        _publish_frame_unchecked(client, frame; buffer_on_reconnect=false, force_flush=true,
-                                 cancel_token)
+        _publish_frame_unchecked(client, frame; force_flush=true, cancel_token)
         response = _wait_request_reply(mux, waiter, timeout; cancel_token)
         code = _status_header(response)
         if code == 503

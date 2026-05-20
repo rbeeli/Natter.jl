@@ -1,3 +1,4 @@
+use async_nats::Subject;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::json;
@@ -40,15 +41,16 @@ async fn bench_publish_batch(
     messages: usize,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let client = async_nats::connect(url).await?;
+    let subject = Subject::from(subject.to_owned());
     let warmup = messages.min(1000);
     for _ in 0..warmup {
-        client.publish(subject.to_string(), payload.clone()).await?;
+        client.publish(subject.clone(), payload.clone()).await?;
     }
     client.flush().await?;
 
     let started = Instant::now();
     for _ in 0..messages {
-        client.publish(subject.to_string(), payload.clone()).await?;
+        client.publish(subject.clone(), payload.clone()).await?;
     }
     client.flush().await?;
     let seconds = started.elapsed().as_secs_f64();
@@ -67,15 +69,16 @@ async fn bench_publish_flush_each(
     messages: usize,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let client = async_nats::connect(url).await?;
+    let subject = Subject::from(subject.to_owned());
     let warmup = messages.min(100);
     for _ in 0..warmup {
-        client.publish(subject.to_string(), payload.clone()).await?;
+        client.publish(subject.clone(), payload.clone()).await?;
         client.flush().await?;
     }
 
     let started = Instant::now();
     for _ in 0..messages {
-        client.publish(subject.to_string(), payload.clone()).await?;
+        client.publish(subject.clone(), payload.clone()).await?;
         client.flush().await?;
     }
     let seconds = started.elapsed().as_secs_f64();
@@ -96,7 +99,8 @@ async fn bench_callback_dispatch(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let sub_client = async_nats::connect(url).await?;
     let pub_client = async_nats::connect(url).await?;
-    let mut sub = sub_client.subscribe(subject.to_string()).await?;
+    let subject = Subject::from(subject.to_owned());
+    let mut sub = sub_client.subscribe(subject.clone()).await?;
     sub_client.flush().await?;
 
     let received = Arc::new(AtomicUsize::new(0));
@@ -109,7 +113,7 @@ async fn bench_callback_dispatch(
 
     let warmup = messages.min(1000);
     for _ in 0..warmup {
-        pub_client.publish(subject.to_string(), payload.clone()).await?;
+        pub_client.publish(subject.clone(), payload.clone()).await?;
     }
     pub_client.flush().await?;
     wait_for(|| received.load(Ordering::Relaxed) >= warmup, timeout).await?;
@@ -117,7 +121,7 @@ async fn bench_callback_dispatch(
 
     let started = Instant::now();
     for _ in 0..messages {
-        pub_client.publish(subject.to_string(), payload.clone()).await?;
+        pub_client.publish(subject.clone(), payload.clone()).await?;
     }
     pub_client.flush().await?;
     wait_for(|| received.load(Ordering::Relaxed) >= messages, timeout).await?;
@@ -138,7 +142,8 @@ async fn bench_request_reply(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let service = async_nats::connect(url).await?;
     let client = async_nats::connect(url).await?;
-    let mut sub = service.subscribe(subject.to_string()).await?;
+    let subject = Subject::from(subject.to_owned());
+    let mut sub = service.subscribe(subject.clone()).await?;
     service.flush().await?;
 
     let service_payload = payload.clone();
@@ -152,14 +157,14 @@ async fn bench_request_reply(
 
     let warmup = requests.min(200);
     for _ in 0..warmup {
-        client.request(subject.to_string(), payload.clone()).await?;
+        client.request(subject.clone(), payload.clone()).await?;
     }
 
     let mut latencies = Vec::with_capacity(requests);
     let started = Instant::now();
     for _ in 0..requests {
         let request_started = Instant::now();
-        client.request(subject.to_string(), payload.clone()).await?;
+        client.request(subject.clone(), payload.clone()).await?;
         latencies.push(request_started.elapsed().as_secs_f64() * 1000.0);
     }
     let seconds = started.elapsed().as_secs_f64();
@@ -184,10 +189,10 @@ async fn bench_request_reply(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let url = arg_value(&args, "--url", "nats://127.0.0.1:4222");
-    let messages = arg_value(&args, "--messages", "50000").parse::<usize>()?;
-    let requests = arg_value(&args, "--requests", "5000").parse::<usize>()?;
+    let messages = arg_value(&args, "--messages", "200000").parse::<usize>()?;
+    let requests = arg_value(&args, "--requests", "20000").parse::<usize>()?;
     let payload_bytes = arg_value(&args, "--payload-bytes", "64").parse::<usize>()?;
-    let timeout = Duration::from_secs_f64(arg_value(&args, "--timeout", "30").parse::<f64>()?);
+    let timeout = Duration::from_secs_f64(arg_value(&args, "--timeout", "90").parse::<f64>()?);
     let json_path = arg_value(&args, "--json", "/tmp/rust-nats.json");
     let payload = Bytes::from(vec![b'x'; payload_bytes]);
     let prefix = format!(

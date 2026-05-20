@@ -1,6 +1,6 @@
 # Basic Publish And Subscribe
 
-This example shows the two core subscription styles: explicit `next` calls for scripts/tests and callbacks for services.
+This example shows the two core subscription styles: explicit `take!` calls for scripts/tests and callbacks for services.
 
 ```julia
 using Natter
@@ -10,7 +10,7 @@ client = connect("nats://127.0.0.1:4222"; name="basic-example")
 events = subscribe(client, "events.created")
 
 publish(client, "events.created", "event-1")
-msg = next(events; timeout=1.0)
+msg = take!(events; timeout=1.0)
 @info "received" subject=msg.subject data=String(msg)
 
 close(events)

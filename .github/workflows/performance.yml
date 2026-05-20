@@ -8,14 +8,14 @@ on:
 jobs:
   live-server-performance:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
           version: '1.10'
       - uses: julia-actions/cache@v2
-      - run: docker run -d --name nats -p 4222:4222 nats:2.11-alpine -js
+      - run: docker run -d --name nats -p 4222:4222 nats:2.11 -js
       - run: |
           set -euo pipefail
           ready=false
@@ -34,17 +34,37 @@ jobs:
       - run: |
           set -euo pipefail
           mkdir -p perf-artifacts
-          julia --project=. benchmarks/run.jl \
-            --url nats://127.0.0.1:4222 \
-            --messages 10000 \
-            --requests 1000 \
-            --payload-bytes 64 \
-            --concurrency 4 \
-            --output perf-artifacts/performance.md \
-            --json perf-artifacts/performance.json
+          trials="${NATTER_BENCH_TRIALS:-7}"
+          julia_flags="${NATTER_BENCH_JULIA_FLAGS:-}"
+          if [ -z "${julia_flags}" ]; then
+            julia_flags="--startup-file=no -O3 --check-bounds=no -C native"
+          fi
+          for i in $(seq 1 "${trials}"); do
+            NATTER_BENCH_JULIA_FLAGS="${julia_flags}" NATTER_BENCH_NATS_IMAGE="nats:2.11" \
+              julia ${julia_flags} --project=. benchmarks/run.jl \
+                --url nats://127.0.0.1:4222 \
+                --messages "${NATTER_BENCH_MESSAGES:-200000}" \
+                --requests "${NATTER_BENCH_REQUESTS:-20000}" \
+                --payload-bytes 64 \
+                --concurrency 4 \
+                --timeout "${NATTER_BENCH_TIMEOUT:-90}" \
+                --alloc-iterations "${NATTER_BENCH_ALLOC_ITERATIONS:-10000}" \
+                --output "perf-artifacts/performance-trial-${i}.md" \
+                --json "perf-artifacts/performance-trial-${i}.json"
+          done
+          julia --project=. benchmarks/aggregate_median.jl \
+            --client natter \
+            --output perf-artifacts/performance.json \
+            -- perf-artifacts/performance-trial-*.json
         env:
           JULIA_NUM_THREADS: '2'
-      - run: cat perf-artifacts/performance.md >> "${GITHUB_STEP_SUMMARY}"
+          NATTER_BENCH_TRIALS: '7'
+          NATTER_BENCH_MESSAGES: '200000'
+          NATTER_BENCH_REQUESTS: '20000'
+          NATTER_BENCH_TIMEOUT: '90'
+          NATTER_BENCH_ALLOC_ITERATIONS: '10000'
+          NATTER_BENCH_JULIA_FLAGS: '--startup-file=no -O3 --check-bounds=no -C native'
+      - run: cat perf-artifacts/performance.json >> "${GITHUB_STEP_SUMMARY}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

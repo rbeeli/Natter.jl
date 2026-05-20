@@ -341,7 +341,7 @@ function _js_async_publish_timeout_loop(state::JetStreamAsyncPublishState{C}) wh
                     unlock(state.condition)
                     try
                         try
-                            _publish_frame_unchecked(state.client, retry_frame; buffer_on_reconnect=false)
+                            _publish_frame_unchecked(state.client, retry_frame)
                         catch err
                             publish_err = err
                         end
@@ -526,7 +526,7 @@ function js_publish_future(js::JetStreamContext, subject::AbstractString, data=n
         future.retry_frame = publish_frame
     end
     try
-        _publish_frame_unchecked(js.client, publish_frame; buffer_on_reconnect=false, cancel_token)
+        _publish_frame_unchecked(js.client, publish_frame; cancel_token)
     catch err
         _resolve_js_publish_future!(future, err)
         rethrow()
