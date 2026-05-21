@@ -2578,6 +2578,53 @@ end
     end
 end
 
+@testitem "JetStream push close timeout bounds background task cleanup" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    sub = subscribe(client, "_INBOX.push")
+    psub = N.PushSubscription(js, sub, "S", "C", ReentrantLock(), false, false)
+    started = Channel{Bool}(1)
+    stopped = Channel{Bool}(1)
+    blocker = Channel{Bool}(1)
+    release = Threads.Atomic{Bool}(false)
+
+    psub.heartbeat_task = N._spawn_sticky(:push_close_timeout_blocker) do
+        put!(started, true)
+        try
+            while !release[]
+                try
+                    take!(blocker)
+                catch err
+                    err isa InterruptException || rethrow()
+                end
+            end
+        finally
+            put!(stopped, true)
+        end
+    end
+    take!(started)
+
+    start = time()
+    err = TestHelpers.thrown_exception(() -> close(psub; timeout=0.02))
+    elapsed = time() - start
+
+    @test N._drain_timed_out(err)
+    @test elapsed < 1.0
+    @test psub.closed
+    @test sub.closed
+
+    release[] = true
+    put!(blocker, true)
+    @test timedwait(1.0; pollint=0.01) do
+        isready(stopped)
+    end != :timed_out
+end
+
 @testitem "JetStream push data refreshes heartbeat activity" setup=[TestHelpers] begin
     using Natter
     using Natter.JetStream

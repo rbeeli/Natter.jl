@@ -515,6 +515,73 @@ end
     close(client)
 end
 
+@testitem "KeyValue history timeout closes temporary consumer" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
+
+    const N = Natter
+
+    function reply_next_request!(client, payload::AbstractString)
+        result = timedwait(1.0; pollint=0.001) do
+            mux = @atomic client.request_mux
+            if isnothing(mux)
+                false
+            else
+                lock(mux.condition)
+                try
+                    !isempty(mux.waiters)
+                finally
+                    unlock(mux.condition)
+                end
+            end
+        end
+        result == :timed_out && error("request waiter not registered")
+        mux = @atomic client.request_mux
+        subject, sid = begin
+            lock(mux.condition)
+            try
+                token = first(keys(mux.waiters))
+                "$(mux.prefix).$token", mux.sub.sid
+            finally
+                unlock(mux.condition)
+            end
+        end
+        N._dispatch_msg(client, Msg(subject, nothing, TestHelpers.bytes(payload); sid))
+        nothing
+    end
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
+                                     info=N.ServerInfo(; headers=true, version="2.10.0"),
+                                     read_io=capture, write_io=capture)
+    kv = KeyValueBucket(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
+
+    task = Threads.@spawn TestHelpers.thrown_exception() do
+        kv_history(kv, "alpha"; timeout=0.2)
+    end
+
+    marker = "\"config\":{\"name\":\""
+    @test timedwait(1.0; pollint=0.001) do
+        occursin(marker, TestHelpers.capture_text(capture))
+    end != :timed_out
+    written = TestHelpers.capture_text(capture)
+    marker_range = findfirst(marker, written)
+    @test !isnothing(marker_range)
+    name_start = nextind(written, last(marker_range))
+    name_stop = prevind(written, findnext(==('"'), written, name_start))
+    consumer = written[name_start:name_stop]
+    response = """
+    {"stream_name":"KV_bucket","name":"$consumer","config":{"name":"$consumer","filter_subject":"\$KV.bucket.alpha","deliver_policy":"all"}}
+    """
+    reply_next_request!(client, response)
+    err = fetch(task)
+
+    @test err isa TimeoutError
+    @test occursin("\$JS.API.CONSUMER.DELETE.KV_bucket.$consumer", TestHelpers.capture_text(capture))
+    close(client)
+end
+
 @testitem "KeyValue watcher options map to consumer config" setup=[TestHelpers] begin
     using Natter
     using Natter.JetStream
@@ -604,6 +671,38 @@ end
     @test callback.updates == Any[entry, KV_WATCH_INITIAL_DONE]
 end
 
+@testitem "KeyValue watcher callback errors are reported" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
+
+    const N = Natter
+
+    errors = Channel{Any}(1)
+    opts = N.ConnectOptions(error_cb=err -> put!(errors, err))
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.RECONNECTING)
+    kv = KeyValueBucket(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
+    state = N._kv_watcher_state(nothing, 1, false)
+    callback = N._kv_watch_callback(kv, state, false)
+    sub = subscribe(client, "\$KV.bucket.>"; callback)
+
+    bad = Msg("other.subject", "\$JS.ACK.KV_bucket.C1.1.17.2.123456789.4",
+              TestHelpers.bytes("bad"); sid=sub.sid)
+    N._dispatch_msg(client, bad)
+
+    try
+        @test timedwait(1.0; pollint=0.01) do
+            isready(errors)
+        end != :timed_out
+        err = take!(errors)
+        @test err isa ProtocolError
+        @test occursin("key-value bucket bucket", sprint(showerror, err))
+        @test !isready(state.updates)
+    finally
+        close(sub)
+    end
+end
+
 @testitem "KeyValue watcher timed take respects timeout" setup=[TestHelpers] begin
     using Natter
     using Natter.JetStream
@@ -625,6 +724,35 @@ end
     finally
         close(watcher; timeout=0.1)
     end
+end
+
+@testitem "KeyValue watcher close wakes blocked readers" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+    using Natter.KeyValue
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.RECONNECTING)
+    js = jetstream(client)
+    sub = subscribe(client, "_INBOX.kvwatch")
+    psub = N.PushSubscription(js, sub, "KV_bucket", "watcher", ReentrantLock(), false, false)
+    state = N._kv_watcher_state(nothing, 1, false)
+    watcher = KeyValueWatcher(psub, state.updates, state)
+    started = Channel{Bool}(1)
+
+    task = Threads.@spawn begin
+        put!(started, true)
+        TestHelpers.thrown_exception(() -> take!(watcher))
+    end
+    take!(started)
+
+    close(watcher; timeout=0.1)
+    @test timedwait(1.0; pollint=0.01) do
+        istaskdone(task)
+    end != :timed_out
+    @test fetch(task) isa InvalidStateException
+    @test !isopen(state.updates)
 end
 
 @testitem "KeyValue watcher take supports cancellation and iteration" setup=[TestHelpers] begin
