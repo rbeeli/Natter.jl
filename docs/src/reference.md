@@ -4,7 +4,9 @@ This page summarizes the exported API. Guide pages show recommended usage; this 
 
 Conventions:
 
-- Timeouts and durations are seconds.
+- Numeric timeout, delay, interval, wait, jitter, heartbeat, TTL, and window
+  values are seconds unless a name explicitly says bytes, messages, or another
+  unit.
 - Enums are namespaced, for example `ConnectionStatus.CONNECTED`, `PublishMode.REPLAYABLE`, and `AckPolicy.EXPLICIT`.
 - Payload inputs may be strings, byte vectors, or `nothing`; encode structured values explicitly.
 - `String(msg)` works for `Msg`, `BorrowedMsg`, `JetStream.JetStreamMsg`, `JetStream.BorrowedJetStreamMsg`, and `KeyValue.KeyValueEntry`.
@@ -55,14 +57,15 @@ Conventions:
 | `name` | `nothing` | Human-readable connection name. |
 | `auth` | `NoAuth()` | One typed authentication value. |
 | `no_echo` | `false` | Do not receive this connection's own publishes. |
-| `connect_timeout` | `2.0` | Socket and handshake timeout. |
-| `ping_interval` | `120.0` | Keepalive interval. |
+| `connect_timeout` | `2.0` | Socket and handshake timeout, in seconds. |
+| `request_timeout` | `1.0` | Default timeout for core `request` calls, in seconds, when no per-call timeout is provided. |
+| `ping_interval` | `120.0` | Keepalive interval, in seconds. |
 | `max_outstanding_pings` | `2` | Missed keepalives before reconnect. |
 | `allow_reconnect` | `true` | Enable automatic reconnect. |
 | `retry_on_initial_connect` | `false` | Retry startup connection failures using the reconnect wait and attempt settings. |
-| `reconnect_wait` | `0.5` | Initial reconnect wait. |
-| `reconnect_max_wait` | `5.0` | Maximum reconnect wait. |
-| `reconnect_jitter` | `0.1` | Added reconnect jitter. |
+| `reconnect_wait` | `0.5` | Initial reconnect wait, in seconds. |
+| `reconnect_max_wait` | `5.0` | Maximum reconnect wait, in seconds. |
+| `reconnect_jitter` | `0.1` | Added reconnect jitter, in seconds. |
 | `max_reconnect_attempts` | `-1` | `-1` means unlimited reconnect and initial-retry attempts. |
 | `pending_size` | `8 MiB` | Byte limit for reconnect publish replay; `0` disables replay buffering. |
 | `publish_mode` | `PublishMode.REPLAYABLE` | Default core publish behavior. Use `PublishMode.DIRECT` to fail during reconnect or `PublishMode.QUEUED` for the background writer path. |
@@ -71,8 +74,8 @@ Conventions:
 | `read_buffer_shrink_threshold` | `256 KiB` | Parser buffer capacity above this size is released after oversized consumed frames. |
 | `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |
 | `direct_write_threshold` | `256 KiB` | Direct publishes at or below this size are written as one contiguous frame; larger direct publishes avoid the payload copy. |
-| `write_buffer_latency` | `0.001` | Maximum small-write coalescing delay. |
-| `write_timeout` | `10.0` | Maximum transport write/flush block time; `Inf` disables the watchdog. |
+| `write_buffer_latency` | `0.001` | Maximum small-write coalescing delay, in seconds. |
+| `write_timeout` | `10.0` | Maximum transport write/flush block time, in seconds; `Inf` disables the watchdog. |
 | `write_driver` | `true` | Enable the background writer task used by queued publishes. |
 | `write_queue_msgs` | `8192` | Maximum queued publish commands before producers apply backpressure. |
 | `write_queue_bytes` | `2 MiB` | Maximum queued publish bytes before producers apply backpressure. |
@@ -81,12 +84,13 @@ Conventions:
 | `record_stats` | `false` | Enable client counters returned by `stats(client)`. |
 | `sub_pending_msgs_limit` | `1024` | Default per-subscription queued message limit. |
 | `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit. |
-| `drain_timeout` | `30.0` | Default `drain` timeout. |
-| `close_callback_timeout` | `5.0` | Wait for active callbacks during close. |
+| `drain_timeout` | `30.0` | Default `drain` timeout, in seconds. |
+| `close_timeout` | `5.0` | Default `close` cleanup timeout, in seconds. |
+| `close_callback_timeout` | `5.0` | Wait for active callbacks during close, in seconds. |
 | `inbox_prefix` | `"_INBOX"` | Prefix for generated inbox subjects. |
 | `error_cb` | warning callback | Receives background, callback, and cleanup errors. |
 | `event_cb` | no-op | Receives `ConnectionEvent` lifecycle events. |
-| `reconnect_delay_cb` | no-op | Optional reconnect delay override. |
+| `reconnect_delay_cb` | no-op | Optional reconnect delay override; return a delay in seconds. |
 
 TLS options:
 
@@ -110,6 +114,8 @@ Parser/resource limits:
 
 ## Core Functions
 
+Every `timeout` and `callback_timeout` value in this table is seconds.
+
 | Function | Returns | Use |
 | :--- | :--- | :--- |
 | `connect(url_or_urls=nothing; kwargs...)`, `connect(options::ConnectOptions)` | `Client` | Connect to NATS. |
@@ -119,15 +125,15 @@ Parser/resource limits:
 | `respond(client, msg, data=nothing; headers=nothing, mode=nothing)` | `nothing` | Reply to `msg.reply`, or throw `ArgumentError` when the message has no reply subject. |
 | `subscribe(client, subject; queue=nothing, callback=nothing, callback_mode=:task, max_msgs=0, pending_msgs_limit=..., pending_bytes_limit=...)` | `Subscription` | Create a subscription. `callback_mode=:inline` requires a callback and delivers `BorrowedMsg` from the reader task; `borrowed=true` is accepted as an alias. |
 | `subscribe(callback, client, subject; kwargs...)` | `Subscription` | Callback-first form. |
-| `take!(sub; timeout=1.0)` | `Msg` | Wait for a message on a non-callback subscription. |
+| `take!(sub; timeout=1.0)` | `Msg` | Wait up to `timeout` seconds for a message on a non-callback subscription. |
 | `unsubscribe(sub; max_msgs=0)` | `nothing` | Unsubscribe now or after more messages. |
 | `close(sub)` | `nothing` | Alias for immediate unsubscribe. |
-| `request(client, subject, data=nothing; timeout=1.0, headers=nothing)` | `Msg` | Send a request and wait for one reply. Payloads are `nothing`, strings, or byte vectors. |
-| `flush(client; timeout=10.0)` | `nothing` | Wait for a server round trip. |
-| `ping(client; timeout=10.0)` | `nothing` | Alias for `flush`. |
-| `drain(sub; timeout=...)` | `nothing` | Unsubscribe and wait for queued callback work. |
-| `drain(client; timeout=...)` | `nothing` | Drain subscriptions, flush, and close. |
-| `close(client; throw_errors=false, callback_timeout=nothing)` | `nothing` | Close the client. |
+| `request(client, subject, data=nothing; timeout=client.options.request_timeout, headers=nothing)` | `Msg` | Send a request and wait up to `timeout` seconds for one reply. Payloads are `nothing`, strings, or byte vectors. |
+| `flush(client; timeout=10.0)` | `nothing` | Wait up to `timeout` seconds for a server round trip. |
+| `ping(client; timeout=10.0)` | `nothing` | Alias for `flush`; timeout is seconds. |
+| `drain(sub; timeout=...)` | `nothing` | Unsubscribe and wait up to `timeout` seconds for queued callback work. |
+| `drain(client; timeout=...)` | `nothing` | Drain subscriptions, flush, and close within `timeout` seconds. |
+| `close(client; timeout=client.options.close_timeout, throw_errors=false, callback_timeout=nothing)` | `nothing` | Close the client; `timeout` and `callback_timeout` are seconds. |
 | `new_inbox(client; prefix=...)` | `String` | Generate an inbox subject. |
 | `header(msg, key)` | `Union{String,Nothing}` | First header value by case-insensitive key. |
 | `headers(msg)` | `Headers` | Copy all message headers. |
@@ -178,17 +184,20 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 
 ## JetStream Functions
 
+Every `timeout`, `expires`, `heartbeat`, `retry_wait`, `delay`, `ack_wait`,
+TTL, and window duration in this table is seconds.
+
 | Function | Returns | Use |
 | :--- | :--- | :--- |
-| `jetstream(client; prefix="$JS.API", timeout=5.0, publish_future_max_pending=256)` | `JetStreamContext` | Create a context. |
+| `jetstream(client; prefix="$JS.API", timeout=5.0, publish_future_max_pending=256)` | `JetStreamContext` | Create a context; `timeout` is seconds. |
 | `js_publish(js, subject, data=nothing; kwargs...)` | `PubAck` | Publish and wait for an ack. |
 | `js_publish_future(js, subject, data=nothing; kwargs...)` | `JetStreamPublishFuture` | Publish with the context async publisher and return an ack future. Pending futures are failed, not replayed, on reconnect. |
-| `fetch(future::JetStreamPublishFuture; timeout=Inf, cancel_token=nothing)` | `PubAck` | Wait for the async publish ack or rethrow its error. A finite `timeout` bounds only this wait; the future can still complete later. |
+| `fetch(future::JetStreamPublishFuture; timeout=Inf, cancel_token=nothing)` | `PubAck` | Wait for the async publish ack or rethrow its error. A finite `timeout` is seconds and bounds only this wait; the future can still complete later. |
 | `js_publish_future_pending(js)` | `Int` | Count async publishes still waiting for acks. |
-| `js_publish_future_complete(js; timeout=..., cancel_token=nothing)` | `nothing` | Wait until all pending async publishes on the context complete. |
-| `stream_create(js, config; timeout=...)` | `StreamInfo` | Create a stream. |
-| `stream_update(js, config; timeout=...)` | `StreamInfo` | Update a stream. |
-| `stream_info(js, name; timeout=...)` | `StreamInfo` | Fetch stream info. |
+| `js_publish_future_complete(js; timeout=..., cancel_token=nothing)` | `nothing` | Wait up to `timeout` seconds until all pending async publishes on the context complete. |
+| `stream_create(js, config; timeout=...)` | `StreamInfo` | Create a stream; timeout is seconds. |
+| `stream_update(js, config; timeout=...)` | `StreamInfo` | Update a stream; timeout is seconds. |
+| `stream_info(js, name; timeout=...)` | `StreamInfo` | Fetch stream info; timeout is seconds. |
 | `stream_list(js; offset=0, timeout=...)` | `Vector{StreamInfo}` | List streams. |
 | `stream_list_page(js; offset=0, timeout=...)` | `JetStreamPage{StreamInfo}` | Fetch one stream list page. |
 | `stream_list_pages(js; offset=0, timeout=...)`, `stream_list_iter(js; offset=0, timeout=...)` | iterator | Iterate stream pages or stream infos lazily. |
@@ -207,16 +216,16 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `consumer_list_page(js, stream; offset=0, timeout=...)` | `JetStreamPage{ConsumerInfo}` | Fetch one consumer list page. |
 | `consumer_list_pages(js, stream; offset=0, timeout=...)`, `consumer_list_iter(js, stream; offset=0, timeout=...)` | iterator | Iterate consumer pages or consumer infos lazily. |
 | `consumer_delete(js, stream, consumer; timeout=...)` | `Bool` | Delete a consumer. |
-| `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig(), timeout=...)` | `PullSubscription` | Create or bind a pull consumer. |
-| `fetch(psub, batch=1; timeout=..., expires=..., heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `Vector{JetStreamMsg}` | Fetch a bounded batch. |
-| `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `PullMessageStream` | Start a bounded refill stream. |
+| `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig(), timeout=...)` | `PullSubscription` | Create or bind a pull consumer; timeout is seconds. |
+| `fetch(psub, batch=1; timeout=..., expires=..., heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `Vector{JetStreamMsg}` | Fetch a bounded batch. `timeout`, `expires`, and `heartbeat` are seconds. |
+| `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `PullMessageStream` | Start a bounded refill stream. `expires` and `heartbeat` are seconds. |
 | `consume(callback, psub; kwargs...)` | `PullMessageStream` | Run a callback over `messages`. |
 | `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=..., ordered=false, borrowed=false)` | `PushSubscription` | Create or bind a push consumer, or create an ordered ephemeral push consumer with `ordered=true`. `borrowed=true` is callback-only and delivers `BorrowedJetStreamMsg`. |
-| `take!(stream::PullMessageStream; timeout=Inf, cancel_token=nothing)` | `JetStreamMsg` | Read from a continuous pull stream. Timeout and cancellation stop only the read wait; the stream remains open. |
-| `take!(psub::PushSubscription; timeout=1.0, cancel_token=nothing)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
-| `ack(msg; cancel_token=nothing)`, `ack_sync(msg; timeout=1.0, cancel_token=nothing)`, `nak(msg; delay=nothing, cancel_token=nothing)`, `in_progress(msg; cancel_token=nothing)`, `term(msg; cancel_token=nothing)` | `nothing` or `Msg` | Acknowledge or control redelivery for `AbstractJetStreamMsg` values. |
+| `take!(stream::PullMessageStream; timeout=Inf, cancel_token=nothing)` | `JetStreamMsg` | Read from a continuous pull stream. Timeout is seconds; timeout and cancellation stop only the read wait, and the stream remains open. |
+| `take!(psub::PushSubscription; timeout=1.0, cancel_token=nothing)` | `JetStreamMsg` | Read from a channel-backed push subscription; timeout is seconds. |
+| `ack(msg; cancel_token=nothing)`, `ack_sync(msg; timeout=1.0, cancel_token=nothing)`, `nak(msg; delay=nothing, cancel_token=nothing)`, `in_progress(msg; cancel_token=nothing)`, `term(msg; cancel_token=nothing)` | `nothing` or `Msg` | Acknowledge or control redelivery for `AbstractJetStreamMsg` values. `ack_sync` timeout and `nak` delay are seconds. |
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
-| `close(psub; timeout=...)`, `close(push; timeout=...)`, `close(stream)` | `nothing` | Close consumer/message handles. Subscription close timeouts bound server cleanup. |
+| `close(psub; timeout=...)`, `close(push; timeout=...)`, `close(stream)` | `nothing` | Close consumer/message handles. Subscription close timeouts are seconds and bound server cleanup. |
 
 Typed `StreamConfig`, typed `ConsumerConfig`, and raw dictionary create/update calls verify that requested fields are reflected in the server response, including explicit false, zero, and empty values. Raw dictionary configs remain available for fields outside Natter's typed API, but they are not a weaker verification escape hatch. For unknown raw fields, Natter requires requested nested values to be present and tolerates additional nested defaults returned by the server.
 
@@ -235,24 +244,27 @@ Import these with `using Natter.KeyValue`. Bucket handles have type `KeyValueBuc
 
 ## KeyValue Functions
 
+Every `ttl`, `limit_marker_ttl`, `older_than`, and `timeout` value in this
+table is seconds.
+
 | Function | Returns | Use |
 | :--- | :--- | :--- |
-| `kv_create(js, bucket; history=1, ttl=nothing, max_bytes=-1, max_value_size=-1, storage="file", replicas=1, direct=false, compression=nothing, metadata=nothing, limit_marker_ttl=nothing, timeout=...)` | `KeyValueBucket` | Create a bucket. |
+| `kv_create(js, bucket; history=1, ttl=nothing, max_bytes=-1, max_value_size=-1, storage="file", replicas=1, direct=false, compression=nothing, metadata=nothing, limit_marker_ttl=nothing, timeout=...)` | `KeyValueBucket` | Create a bucket. `ttl`, `limit_marker_ttl`, and `timeout` are seconds. |
 | `kv_open(js, bucket; timeout=...)` | `KeyValueBucket` | Open an existing bucket. |
 | `kv_delete_bucket(kv; timeout=...)` | `Bool` | Delete the bucket. |
 | `kv_status(kv; timeout=...)` | `KeyValueStatus` | Inspect bucket state. |
 | `kv_get(kv, key; revision=nothing, direct=nothing, timeout=...)` | `KeyValueEntry` | Read a key. |
-| `kv_put(kv, key, value; revision=nothing, ttl=nothing, timeout=...)` | `Int` | Put a value and return the new revision. |
-| `kv_create_key(kv, key, value; ttl=nothing, timeout=...)` | `Int` | Put only if absent or deleted. |
-| `kv_update(kv, key, value, revision; ttl=nothing, timeout=...)` | `Int` | Put only at the expected revision. |
+| `kv_put(kv, key, value; revision=nothing, ttl=nothing, timeout=...)` | `Int` | Put a value and return the new revision. `ttl` and `timeout` are seconds. |
+| `kv_create_key(kv, key, value; ttl=nothing, timeout=...)` | `Int` | Put only if absent or deleted. `ttl` and `timeout` are seconds. |
+| `kv_update(kv, key, value, revision; ttl=nothing, timeout=...)` | `Int` | Put only at the expected revision. `ttl` and `timeout` are seconds. |
 | `kv_delete(kv, key; revision=nothing, timeout=...)` | `nothing` | Mark a key deleted. |
-| `kv_purge(kv, key; revision=nothing, ttl=nothing, timeout=...)` | `nothing` | Purge prior values for a key. |
-| `kv_purge_deletes(kv; older_than=1800.0, timeout=...)` | `nothing` | Remove old delete and purge markers. Use `older_than < 0` to remove all markers regardless of age. |
+| `kv_purge(kv, key; revision=nothing, ttl=nothing, timeout=...)` | `nothing` | Purge prior values for a key. `ttl` and `timeout` are seconds. |
+| `kv_purge_deletes(kv; older_than=1800.0, timeout=...)` | `nothing` | Remove old delete and purge markers. `older_than` and `timeout` are seconds; use `older_than < 0` to remove all markers regardless of age. |
 | `kv_history(kv, key; batch=256, timeout=...)` | `Vector{KeyValueEntry}` | Read key history. |
 | `kv_keys(kv; timeout=...)` | `Vector{String}` | List active keys. |
 | `kv_watch(kv; key=">", keys=nothing, history=false, updates_only=false, ignore_deletes=false, meta_only=false, resume_revision=nothing, channel_size=256, notify_initial_done=false, timeout=...)` | `KeyValueWatcher` | Watch with a channel. |
 | `kv_watch(callback, kv; kwargs...)` | `KeyValueWatcher` | Watch with a callback. |
-| `close(watcher; timeout=...)` | `nothing` | Close a watcher and bound server cleanup. |
+| `close(watcher; timeout=...)` | `nothing` | Close a watcher and bound server cleanup; timeout is seconds. |
 
 ## Errors
 

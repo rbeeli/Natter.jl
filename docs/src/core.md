@@ -2,6 +2,8 @@
 
 Core messaging is the lightweight NATS API: publish/subscribe, queue groups, request/reply, headers, flush, drain, and close.
 
+Numeric `timeout` values in this guide are seconds.
+
 ## Connect For A Service
 
 ```julia
@@ -163,7 +165,9 @@ msg = take!(one; timeout=5.0)
 
 ## Request Reply
 
-`request` publishes a message with a reply inbox and waits for one response.
+`request` publishes a message with a reply inbox and waits for one response. If
+`timeout` is omitted, `client.options.request_timeout` is used; both values are
+seconds.
 
 ```julia
 response = request(client, "users.lookup", "user-42"; timeout=0.5)
@@ -242,7 +246,7 @@ response = fetch(handle)
 `fetch(handle)` uses normal Julia task semantics. If the task failed, Julia throws
 `TaskFailedException`; wrap the task body when you want to return an error value.
 
-Use a cancellation token when an outer request or shutdown path needs to stop waiting before the normal timeout:
+Use a cancellation token when an outer request or shutdown path needs to stop waiting before the normal timeout in seconds:
 
 ```julia
 source = CancellationSource()
@@ -257,13 +261,13 @@ Cancelled operations throw `CancelledError`.
 
 ## Drain And Close
 
-`drain(sub)` unsubscribes and waits for queued callback work. `drain(client)` drains subscriptions, flushes, and closes the client within one timeout.
+`drain(sub)` unsubscribes and waits for queued callback work. `drain(client)` drains subscriptions, flushes, and closes the client within one timeout in seconds.
 
 ```julia
 drain(client; timeout=10.0)
 ```
 
-`close(client)` is immediate teardown. In strict shutdown code or tests, pass `throw_errors=true` to surface cleanup failures.
+`close(client)` is immediate teardown. It waits up to `client.options.close_timeout` seconds for local cleanup; pass `timeout` to override that wait. In strict shutdown code or tests, pass `throw_errors=true` to surface cleanup failures.
 
 ```julia
 close(client; throw_errors=true)

@@ -10,6 +10,9 @@ client = connect("nats://127.0.0.1:4222")
 js = jetstream(client; timeout=5.0)
 ```
 
+Numeric `timeout`, `expires`, `heartbeat`, `retry_wait`, `delay`, `ack_wait`,
+TTL, and duplicate-window values in this guide are seconds.
+
 ## Create A Stream
 
 Use typed Julia config structs for normal code. Only fields you set are sent to the server, common names, subjects, queues, and numeric bounds are validated locally, and typed fields must be reflected by the server response.
@@ -90,9 +93,9 @@ js_publish_future_complete(js; timeout=5.0)
 acks = fetch.(futures)
 ```
 
-`fetch(future)` returns `PubAck` or throws the publish error for that message. Pass `timeout` or `cancel_token` to bound an individual wait without cancelling the future itself. Use `js_publish_future_pending(js)` to inspect the current pending count.
+`fetch(future)` returns `PubAck` or throws the publish error for that message. Pass `timeout` in seconds or `cancel_token` to bound an individual wait without cancelling the future itself. Use `js_publish_future_pending(js)` to inspect the current pending count.
 
-Pending `js_publish_future` futures are not replayed after a reconnect. If the connection enters reconnect, the context clears outstanding async publish futures with `ConnectionReconnectingError`; publish again after reconnect and use `msg_id` when duplicate effects matter. JetStream publish retries server `NoRespondersError` responses twice by default with a 250 ms wait; `retry_attempts` and `retry_wait` tune that behavior and only apply while the same connection generation is still active.
+Pending `js_publish_future` futures are not replayed after a reconnect. If the connection enters reconnect, the context clears outstanding async publish futures with `ConnectionReconnectingError`; publish again after reconnect and use `msg_id` when duplicate effects matter. JetStream publish retries server `NoRespondersError` responses twice by default with a 0.25-second wait; `retry_attempts` and `retry_wait` in seconds tune that behavior and only apply while the same connection generation is still active.
 
 ## Durable Pull Worker
 
@@ -121,7 +124,8 @@ for msg in fetch(worker, 25; timeout=2.0)
 end
 ```
 
-Fetch options cover common pull request shapes:
+Fetch options cover common pull request shapes. `timeout`, `expires`, and
+`heartbeat` are seconds:
 
 ```julia
 msgs = fetch(worker, 100; timeout=2.0, max_bytes=512 * 1024)
@@ -148,7 +152,7 @@ finally
 end
 ```
 
-When a worker needs bounded shutdown checks, call `take!(stream; timeout=1.0, cancel_token=token)` directly. A timeout or cancellation exits only that receive call; keep using the stream or close it explicitly.
+When a worker needs bounded shutdown checks, call `take!(stream; timeout=1.0, cancel_token=token)` directly. The timeout is seconds. A timeout or cancellation exits only that receive call; keep using the stream or close it explicitly.
 
 Use `consume` for a callback worker:
 
@@ -224,7 +228,9 @@ in_progress(msg)
 term(msg)
 ```
 
-`ack_sync` waits for a server reply. Use `in_progress` for work that may exceed `ack_wait`, and `term` when a message should not be redelivered.
+`ack_sync` waits for a server reply. `ack_sync` timeout, `nak` delay, and
+consumer `ack_wait` values are seconds. Use `in_progress` for work that may
+exceed `ack_wait`, and `term` when a message should not be redelivered.
 
 Delivery metadata is available on JetStream messages:
 

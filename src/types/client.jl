@@ -36,7 +36,7 @@ function Subscription(client::C, sid::Int, subject::String, queue::Union{String,
                       server_delivered_base::Int, processing::Int) where {C<:AbstractNatterClient}
     Subscription{C}(client, lock, sid, subject, queue, !isnothing(callback),
                     borrowed_callback, _borrowed_callback_handler(client, borrowed_callback ? callback : nothing),
-                    messages, condition, _ConditionTimeoutQueue(), control_handler,
+                    messages, condition, _ConditionTimeoutQueue(lock), control_handler,
                     pending_msgs_limit, pending_bytes_limit, pending_bytes, received,
                     delivered, dropped_msgs, max_msgs, closed, processor, server_active,
                     server_delivered_base, processing)

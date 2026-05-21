@@ -33,6 +33,59 @@ using TestItems
     @test !N._deadline_queue_compaction_due(queue, 65)
 end
 
+@testitem "condition timeout queue wakes on notifications and earlier deadlines" begin
+    using Natter
+
+    const N = Natter
+
+    lock_obj = ReentrantLock()
+    condition = Base.Threads.Condition(lock_obj)
+    queue = N._ConditionTimeoutQueue(lock_obj)
+    done = Ref(false)
+
+    wait_with_timeout(timeout) = begin
+        lock(condition)
+        try
+            N._wait_condition_timeout_queue_locked(condition, queue, timeout) do
+                done[]
+            end
+        finally
+            unlock(condition)
+        end
+    end
+
+    wait_task = Threads.@spawn wait_with_timeout(30.0)
+    @test timedwait(1.0; pollint=0.001) do
+        @lock condition queue.active == 1
+    end == :ok
+    @lock condition begin
+        done[] = true
+        notify(condition; all=true)
+    end
+    @test fetch(wait_task)
+    @test timedwait(1.0; pollint=0.001) do
+        @lock condition queue.active == 0 && (isnothing(queue.task) || istaskdone(queue.task))
+    end == :ok
+
+    done[] = false
+    long_task = Threads.@spawn wait_with_timeout(30.0)
+    @test timedwait(1.0; pollint=0.001) do
+        @lock condition queue.active == 1
+    end == :ok
+    short_task = Threads.@spawn wait_with_timeout(0.02)
+    @test timedwait(1.0; pollint=0.001) do
+        istaskdone(short_task)
+    end == :ok
+    @test fetch(short_task) == false
+    @test !istaskdone(long_task)
+
+    @lock condition begin
+        done[] = true
+        notify(condition; all=true)
+    end
+    @test fetch(long_task)
+end
+
 @testitem "validation and buffering" setup=[TestHelpers] begin
     using Natter
 
@@ -43,12 +96,15 @@ end
     @test N.ConnectOptions().max_reconnect_attempts == -1
     @test N.ConnectOptions().tcp_nodelay
     @test !N.ConnectOptions(tcp_nodelay=false).tcp_nodelay
+    @test N.ConnectOptions().request_timeout == 1.0
+    @test N.ConnectOptions(request_timeout=2).request_timeout == 2.0
     @test N.ConnectOptions(pending_size=0).pending_size == 0
     @test N.ConnectOptions().pending_size == 8 * 1024 * 1024
     @test N.ConnectOptions().publish_mode == PublishMode.REPLAYABLE
     @test N.ConnectOptions(publish_mode=PublishMode.QUEUED).publish_mode == PublishMode.QUEUED
     @test N.ConnectOptions().read_buffer_size == 64 * 1024
     @test N.ConnectOptions().sub_pending_msgs_limit == 1024
+    @test N.ConnectOptions().close_timeout == 5.0
 
     @test N._validate_subject("foo.*.bar") == "foo.*.bar"
     @test N._validate_subject("foo.>") == "foo.>"
@@ -468,6 +524,7 @@ end
         @test TestHelpers.capture_text(request_capture) == ""
         @test isempty(request_client.subscriptions)
         @test request_client.pending_bytes == 0
+        @test_throws ArgumentError N.ConnectOptions(; request_timeout=invalid_timeout)
 
         flush_capture = TestHelpers.WriteCapture()
         flush_client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED,
@@ -495,6 +552,17 @@ end
         @test N.status(client_drain_client) == N.ConnectionStatus.CONNECTED
         close(client_drain_client)
     end
+end
+
+@testitem "core request default timeout comes from ConnectOptions" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    opts = N.ConnectOptions(request_timeout=0.001)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED,
+                                     write_io=IOBuffer())
+    @test_throws TimeoutError request(client, "svc.default.timeout", "body")
 end
 
 @testitem "core APIs accept abstract strings and callable objects" setup=[TestHelpers] begin
@@ -646,7 +714,7 @@ end
                             write_driver=false, write_queue_msgs=128,
                             write_queue_bytes=4096, write_batch_msgs=16,
                             write_batch_bytes=8192,
-                            close_callback_timeout=4)
+                            close_timeout=6, close_callback_timeout=4)
     @test opts.connect_timeout == 1.0
     @test opts.ping_interval == 2.0
     @test opts.read_buffer_size == 8192
@@ -658,6 +726,7 @@ end
     @test opts.write_queue_bytes == 4096
     @test opts.write_batch_msgs == 16
     @test opts.write_batch_bytes == 8192
+    @test opts.close_timeout == 6.0
     @test opts.close_callback_timeout == 4.0
     @test opts.randomize_servers
     @test N.CLIENT_VERSION == string(pkgversion(N))
@@ -841,6 +910,11 @@ end
     rejects(write_batch_bytes=0)
     rejects(read_buffer_shrink_threshold=1024, read_buffer_size=2048)
     rejects(write_timeout=0)
+    rejects(close_timeout=nothing)
+    rejects(close_timeout=0)
+    rejects(close_timeout=-1)
+    rejects(close_timeout=Inf)
+    rejects(close_timeout=true)
     rejects(close_callback_timeout=-1)
     rejects(close_callback_timeout=Inf)
     rejects(max_control_line=0)
@@ -3747,6 +3821,50 @@ end
     @test isready(stopped)
 end
 
+@testitem "client close timeout bounds background task cleanup" setup=[TestHelpers] begin
+    using Natter
+
+    const N = Natter
+
+    opts = N.ConnectOptions(; close_timeout=0.02)
+    client = TestHelpers.fake_client(; opts, status=N.ConnectionStatus.CONNECTED)
+    started = Channel{Bool}(1)
+    stopped = Channel{Bool}(1)
+    blocker = Channel{Bool}(1)
+    release = Threads.Atomic{Bool}(false)
+
+    task = N._spawn_sticky(:close_timeout_blocker) do
+        put!(started, true)
+        try
+            while !release[]
+                try
+                    take!(blocker)
+                catch err
+                    err isa InterruptException || rethrow()
+                end
+            end
+        finally
+            put!(stopped, true)
+        end
+    end
+    take!(started)
+    @lock client.lock client.reader_task = task
+
+    start = time()
+    err = TestHelpers.thrown_exception(() -> close(client; throw_errors=true))
+    elapsed = time() - start
+
+    @test N._drain_timed_out(err)
+    @test elapsed < 1.0
+    @test N.status(client) == N.ConnectionStatus.CLOSED
+
+    release[] = true
+    put!(blocker, true)
+    @test timedwait(1.0; pollint=0.01) do
+        isready(stopped)
+    end != :timed_out
+end
+
 @testitem "close notifies pending flush waiters" setup=[TestHelpers] begin
     using Natter
 
@@ -4434,6 +4552,27 @@ end
     bad_client = TestHelpers.fake_client(; opts=bad_opts, status=N.ConnectionStatus.RECONNECTING)
     @test N._resolve_reconnect_delay(bad_client, delay_event, 1.0) == 1.0
     @test last(errors) isa ArgumentError
+end
+
+@testitem "URL credentials are redacted when displayed" begin
+    using Natter
+
+    const N = Natter
+
+    server = N.Server("tls://user:secret@example.test:4222"; discovered=true,
+                      tls_name="example.test")
+    event = N.ConnectionEvent(N.ConnectionEventKind.CONNECTED,
+                              N.ConnectionStatus.CONNECTED,
+                              server, server.url, 1, nothing, nothing, 2)
+    request = N.AuthRequest(server, server.url, "nonce", N.ServerInfo(), 1, false)
+
+    for rendered in (sprint(show, server), sprint(show, event), sprint(show, request),
+                     sprint(show, MIME"text/plain"(), server),
+                     sprint(show, MIME"text/plain"(), event),
+                     sprint(show, MIME"text/plain"(), request))
+        @test occursin("tls://<redacted>@example.test:4222", rendered)
+        @test !occursin("user:secret", rendered)
+    end
 end
 
 @testitem "TLS first handshake mode is explicit and overridable" begin

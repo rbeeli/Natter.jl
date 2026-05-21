@@ -134,7 +134,7 @@ function JetStreamAsyncPublishState(client::C, max_pending::Int) where {C<:Clien
         max_pending,
         0,
         0,
-        _ConditionTimeoutQueue(),
+        _ConditionTimeoutQueue(lock),
         _DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}(),
         _DeadlineQueue{JetStreamPublishFuture{C,JetStreamAsyncPublishState{C}}}(),
         nothing,

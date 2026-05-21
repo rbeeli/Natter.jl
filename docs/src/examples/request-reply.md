@@ -2,6 +2,8 @@
 
 Request/reply is useful for lightweight service calls over NATS.
 
+Numeric timeout values in this recipe are seconds.
+
 ```julia
 using Dates
 using Natter

@@ -2,6 +2,8 @@
 
 This recipe uses a KeyValue bucket with direct reads and optimistic writes.
 
+Numeric TTL and timeout values in this recipe are seconds.
+
 ```julia
 using Natter
 using Natter.JetStream

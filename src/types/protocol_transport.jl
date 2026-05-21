@@ -650,12 +650,13 @@ mutable struct _ConditionTimeoutQueue
     next_token::Int
     active::Int
     task::Union{Task,Nothing}
+    lock::ReentrantLock
+    condition::Union{Base.GenericCondition{ReentrantLock},Nothing}
 end
 
-_ConditionTimeoutQueue() =
-    _ConditionTimeoutQueue(_DeadlineQueue{_ConditionTimeoutWaiter}(), 0, 0, nothing)
-
-const _CONDITION_TIMEOUT_POLL_SECONDS = 0.001
+_ConditionTimeoutQueue(lock::ReentrantLock) =
+    _ConditionTimeoutQueue(_DeadlineQueue{_ConditionTimeoutWaiter}(), 0, 0, nothing,
+                           lock, nothing)
 
 function _next_condition_timeout_token!(queue::_ConditionTimeoutQueue)::Int
     token = queue.next_token == typemax(Int) ? 1 : queue.next_token + 1
@@ -697,15 +698,53 @@ function _compact_condition_timeout_queue_locked!(queue::_ConditionTimeoutQueue)
     _rebuild_condition_timeout_queue_locked!(queue)
 end
 
-function _condition_timeout_loop(condition::Base.GenericCondition{ReentrantLock},
-                                 queue::_ConditionTimeoutQueue)
-    while true
-        sleep_for = _CONDITION_TIMEOUT_POLL_SECONDS
+function _notify_condition_timeout_task_locked(queue::_ConditionTimeoutQueue)
+    condition = queue.condition
+    isnothing(condition) || notify(condition; all=true)
+    nothing
+end
+
+function _condition_timeout_condition_locked(queue::_ConditionTimeoutQueue)
+    timeout_condition = queue.condition
+    if isnothing(timeout_condition)
+        timeout_condition = Base.Threads.Condition(queue.lock)
+        queue.condition = timeout_condition
+    end
+    timeout_condition
+end
+
+function _wait_condition_timeout_task_locked!(condition::Base.GenericCondition{ReentrantLock},
+                                              delay::Float64)
+    if !isfinite(delay)
+        wait(condition)
+        return nothing
+    end
+    timer = Timer(min(max(delay, 0.0), _MAX_TIMER_DELAY_SECONDS)) do _
         lock(condition)
         try
+            notify(condition; all=true)
+        finally
+            unlock(condition)
+        end
+    end
+    try
+        wait(condition)
+    finally
+        close(timer)
+    end
+    nothing
+end
+
+function _condition_timeout_loop(condition::Base.GenericCondition{ReentrantLock},
+                                 queue::_ConditionTimeoutQueue,
+                                 timeout_condition::Base.GenericCondition{ReentrantLock})
+    lock(condition)
+    try
+        while true
             entry = _next_condition_timeout_deadline_locked!(queue)
             if isnothing(entry)
                 queue.task = nothing
+                queue.condition = nothing
                 return nothing
             end
 
@@ -721,11 +760,10 @@ function _condition_timeout_loop(condition::Base.GenericCondition{ReentrantLock}
                 end
                 continue
             end
-            sleep_for = min(delay, _CONDITION_TIMEOUT_POLL_SECONDS)
-        finally
-            unlock(condition)
+            _wait_condition_timeout_task_locked!(timeout_condition, delay)
         end
-        sleep(sleep_for)
+    finally
+        unlock(condition)
     end
 end
 
@@ -733,8 +771,9 @@ function _ensure_condition_timeout_task_locked!(condition::Base.GenericCondition
                                                 queue::_ConditionTimeoutQueue)
     task = queue.task
     if isnothing(task) || istaskdone(task)
+        timeout_condition = _condition_timeout_condition_locked(queue)
         queue.task = _spawn_control(:condition_timeout) do
-            _condition_timeout_loop(condition, queue)
+            _condition_timeout_loop(condition, queue, timeout_condition)
         end
     end
     nothing
@@ -745,9 +784,11 @@ function _register_condition_timeout_locked!(condition::Base.GenericCondition{Re
                                              seconds::Float64)::_ConditionTimeoutWaiter
     waiter = _ConditionTimeoutWaiter(time() + seconds)
     token = _next_condition_timeout_token!(queue)
-    _deadline_queue_push!(queue.deadlines, token, waiter.deadline, waiter)
+    wake_timeout = _deadline_queue_push!(queue.deadlines, token, waiter.deadline, waiter)
     queue.active += 1
+    task_active = !isnothing(queue.task) && !istaskdone(queue.task)
     _ensure_condition_timeout_task_locked!(condition, queue)
+    task_active && wake_timeout && _notify_condition_timeout_task_locked(queue)
     waiter
 end
 
@@ -757,6 +798,7 @@ function _deregister_condition_timeout_locked!(queue::_ConditionTimeoutQueue,
         waiter.active = false
         queue.active = max(0, queue.active - 1)
         _compact_condition_timeout_queue_locked!(queue)
+        queue.active == 0 && _notify_condition_timeout_task_locked(queue)
     end
     nothing
 end

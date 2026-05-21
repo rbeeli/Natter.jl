@@ -215,13 +215,17 @@ function drain(client::Client; timeout::Real=client.options.drain_timeout,
     nothing
 end
 
-function _client_task_close_timeout(client::Client)::Float64
-    min(5.0, max(0.5, client.options.connect_timeout + 0.2))
+function _close_timeout_and_deadline(timeout::Real, deadline)::Tuple{Float64,Float64}
+    close_timeout = _positive_timeout_seconds("timeout", timeout)
+    close_deadline = time() + close_timeout
+    close_timeout, isnothing(deadline) ? close_deadline : min(close_deadline, deadline)
 end
 
-function _close_client!(client::Client; throw_errors::Bool=false, callback_timeout=nothing,
+function _close_client!(client::Client; throw_errors::Bool=false,
+                        timeout::Real=client.options.close_timeout, callback_timeout=nothing,
                         deadline=nothing, cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
+    close_timeout, close_deadline = _close_timeout_and_deadline(timeout, deadline)
     callback_wait = isnothing(callback_timeout) ? client.options.close_callback_timeout :
                     _connect_option_nonnegative_float("callback_timeout", callback_timeout)
     already = false
@@ -268,18 +272,19 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
         _close_subscription_channel!(errors, sub)
     end
     try
-        append!(errors, _close_transport(_take_transport!(client; deadline)...))
+        append!(errors, _close_transport(_take_transport!(client; deadline=close_deadline)...;
+                                         deadline=close_deadline))
     catch err
         push!(errors, err)
         if _drain_timed_out(err)
-            _abort_transport_for_blocked_write_lock!(client)
+            _abort_transport_for_blocked_write_lock!(client; deadline=close_deadline)
         end
     end
     _clear_pending_buffer!(client)
-    append!(errors, _stop_client_tasks!(client; timeout=_client_task_close_timeout(client), deadline=deadline))
+    append!(errors, _stop_client_tasks!(client; timeout=close_timeout, deadline=close_deadline))
     for sub in subs
         _wait_task!(errors, "stop subscription processor $(sub.sid)", sub.processor;
-                    timeout=callback_wait, deadline=deadline)
+                    timeout=callback_wait, deadline=close_deadline)
     end
     event = _connection_event(client, ConnectionEventKind.CLOSED)
     try
@@ -296,9 +301,11 @@ function _close_client!(client::Client; throw_errors::Bool=false, callback_timeo
     nothing
 end
 
-close(client::Client; throw_errors::Bool=false, callback_timeout=nothing,
+close(client::Client; timeout::Real=client.options.close_timeout,
+      throw_errors::Bool=false, callback_timeout=nothing,
       cancel_token::MaybeCancellationToken=nothing) =
-    _close_client!(client; throw_errors=throw_errors, callback_timeout=callback_timeout,
+    _close_client!(client; throw_errors=throw_errors, timeout=timeout,
+                   callback_timeout=callback_timeout,
                    cancel_token=cancel_token)
 
 _nuid_suffix(client::Client)::String =

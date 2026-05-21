@@ -698,17 +698,27 @@ function _write_raw_data_to_io(client::Client, io::IO, data::Union{AbstractStrin
     nothing
 end
 
-function _close_resource!(errors::Vector, operation::String, resource)
+function _close_resource!(errors::Vector, operation::String, resource; deadline=nothing)
     isnothing(resource) && return errors
+    close_resource() = (close(resource); nothing)
     try
-        close(resource)
+        if isnothing(deadline)
+            close_resource()
+        else
+            remaining = _remaining_timeout(deadline)
+            if remaining <= 0
+                _schedule_timeout_cleanup(operation, close_resource)
+                throw(TimeoutError("$operation timed out"))
+            end
+            _run_with_timeout(close_resource, operation, remaining, () -> nothing)
+        end
     catch err
         push!(errors, CleanupError(operation, err))
     end
     errors
 end
 
-function _close_transport(read_io, write_io, sock)
+function _close_transport(read_io, write_io, sock; deadline=nothing)
     errors = Any[]
     seen = Any[]
     for (operation, io) in (("close read transport", read_io), ("close write transport", write_io), ("close socket", sock))
@@ -716,7 +726,7 @@ function _close_transport(read_io, write_io, sock)
         transport = _underlying_transport(io)
         any(x -> x === transport, seen) && continue
         push!(seen, transport)
-        _close_resource!(errors, operation, transport)
+        _close_resource!(errors, operation, transport; deadline)
     end
     errors
 end
@@ -753,9 +763,9 @@ function _take_transport!(client::Client; preserve_replayable::Bool=false, deadl
     transports
 end
 
-function _abort_transport_for_blocked_write_lock!(client::Client)
+function _abort_transport_for_blocked_write_lock!(client::Client; deadline=nothing)
     read_io, write_io, sock = @lock client.lock _take_transport_fields_locked!(client)
-    errors = _close_transport(read_io, write_io, sock)
+    errors = _close_transport(read_io, write_io, sock; deadline)
     _report_cleanup_errors(client, errors)
     nothing
 end
@@ -773,13 +783,13 @@ function _report_cleanup_errors(client::Client, errors::Vector)
 end
 
 function _close_transport!(client::Client; deadline=nothing)
-    errors = _close_transport(_take_transport!(client; deadline)...)
+    errors = _close_transport(_take_transport!(client; deadline)...; deadline)
     _throw_errors(errors)
     nothing
 end
 
 function _close_transport_report_errors!(client::Client; preserve_replayable::Bool=false, deadline=nothing)
-    errors = _close_transport(_take_transport!(client; preserve_replayable, deadline)...)
+    errors = _close_transport(_take_transport!(client; preserve_replayable, deadline)...; deadline)
     _report_cleanup_errors(client, errors)
     nothing
 end

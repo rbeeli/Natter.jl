@@ -2,6 +2,9 @@
 
 This recipe puts the common production pieces together: multi-server TLS, lifecycle callbacks, JetStream deduplication, a durable pull worker, and graceful shutdown.
 
+Numeric timeout, interval, wait, jitter, delay, ack-wait, and duplicate-window
+values in this recipe are seconds.
+
 ```julia
 using Natter
 using Natter.JetStream
@@ -24,6 +27,7 @@ function make_client()
         max_reconnect_attempts=-1,
         pending_size=16 * 1024 * 1024,
         write_timeout=5.0,
+        close_timeout=5.0,
         record_stats=true,
         sub_pending_msgs_limit=8192,
         sub_pending_bytes_limit=128 * 1024 * 1024,

@@ -272,13 +272,22 @@ function _notify_js_async_publish_timeout_task_locked(state::JetStreamAsyncPubli
 end
 
 function _wait_js_async_publish_timeout_locked!(state::JetStreamAsyncPublishState, delay::Float64)
-    sleep_for = isfinite(delay) ? min(max(delay, 0.0), _CONDITION_TIMEOUT_POLL_SECONDS) :
-                _CONDITION_TIMEOUT_POLL_SECONDS
-    unlock(state.condition)
+    if !isfinite(delay)
+        wait(state.timeout_condition)
+        return nothing
+    end
+    timer = Timer(min(max(delay, 0.0), _MAX_TIMER_DELAY_SECONDS)) do _
+        lock(state.timeout_condition)
+        try
+            notify(state.timeout_condition; all=true)
+        finally
+            unlock(state.timeout_condition)
+        end
+    end
     try
-        sleep(sleep_for)
+        wait(state.timeout_condition)
     finally
-        lock(state.condition)
+        close(timer)
     end
     nothing
 end

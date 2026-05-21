@@ -11,6 +11,8 @@ client = connect("nats://127.0.0.1:4222")
 js = jetstream(client)
 ```
 
+Numeric `ttl`, `timeout`, and `older_than` values in this guide are seconds.
+
 ## Create Or Open A Bucket
 
 ```julia
@@ -66,7 +68,7 @@ current = kv_get(kv, "checkout.currency")
 new_revision = kv_update(kv, "checkout.currency", "EUR", current.revision)
 ```
 
-`kv_put(kv, key, value; revision=rev)` is the same guarded write pattern. Per-key TTL is available with `ttl=...` when the bucket is configured for message TTL markers.
+`kv_put(kv, key, value; revision=rev)` is the same guarded write pattern. Per-key TTL is available with `ttl=...` in seconds when the bucket is configured for message TTL markers.
 
 ## Delete And Purge
 
@@ -113,7 +115,7 @@ Remove old delete and purge markers:
 kv_purge_deletes(kv; older_than=30 * 60)
 ```
 
-Use `older_than=-1` to remove all delete and purge markers regardless of age.
+`older_than` is seconds. Use `older_than=-1` to remove all delete and purge markers regardless of age.
 
 ## Watch Changes
 

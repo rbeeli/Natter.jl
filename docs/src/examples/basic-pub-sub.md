@@ -2,6 +2,8 @@
 
 This example shows the two core subscription styles: explicit `take!` calls for scripts/tests and callbacks for services.
 
+Numeric timeout values in this example are seconds.
+
 ```julia
 using Natter
 

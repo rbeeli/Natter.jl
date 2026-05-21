@@ -294,6 +294,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
     tls_key_path::Union{String,Nothing}
     tcp_nodelay::Bool
     connect_timeout::Float64
+    request_timeout::Float64
     ping_interval::Float64
     max_outstanding_pings::Int
     allow_reconnect::Bool
@@ -323,6 +324,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
     sub_pending_msgs_limit::Int
     sub_pending_bytes_limit::Int
     drain_timeout::Float64
+    close_timeout::Float64
     close_callback_timeout::Float64
     inbox_prefix::String
     error_cb::_ErrorCallback
@@ -331,14 +333,16 @@ struct ConnectOptions{Auth<:AbstractAuth}
 
     function ConnectOptions(
         servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
-        tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, tcp_nodelay, connect_timeout, ping_interval,
+        tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, tcp_nodelay,
+        connect_timeout, request_timeout, ping_interval,
         max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
         reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
         pending_size, publish_mode, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
         write_buffer_latency, write_timeout, write_driver, write_queue_msgs,
         write_queue_bytes, write_batch_msgs, write_batch_bytes, record_stats,
         max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
-        sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
+        sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_timeout,
+        close_callback_timeout,
         inbox_prefix,
         error_cb, event_cb, reconnect_delay_cb,
     )
@@ -359,6 +363,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
         _validate_connect_option_tls(tls_cert_path, tls_key_path)
         tcp_nodelay = _connect_option_bool("tcp_nodelay", tcp_nodelay)
         connect_timeout = _connect_option_positive_float("connect_timeout", connect_timeout)
+        request_timeout = _connect_option_positive_float("request_timeout", request_timeout)
         ping_interval = _connect_option_positive_float("ping_interval", ping_interval)
         max_outstanding_pings = _connect_option_positive_int("max_outstanding_pings", max_outstanding_pings)
         allow_reconnect = _connect_option_bool("allow_reconnect", allow_reconnect)
@@ -393,6 +398,7 @@ struct ConnectOptions{Auth<:AbstractAuth}
         sub_pending_msgs_limit = _connect_option_positive_int("sub_pending_msgs_limit", sub_pending_msgs_limit)
         sub_pending_bytes_limit = _connect_option_positive_int("sub_pending_bytes_limit", sub_pending_bytes_limit)
         drain_timeout = _connect_option_positive_float("drain_timeout", drain_timeout)
+        close_timeout = _positive_timeout_seconds("close_timeout", close_timeout)
         close_callback_timeout = _connect_option_nonnegative_float("close_callback_timeout", close_callback_timeout)
         inbox_prefix = _validate_inbox_prefix(inbox_prefix)
 
@@ -402,14 +408,16 @@ struct ConnectOptions{Auth<:AbstractAuth}
 
         new{typeof(auth)}(
             servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required, tls_first,
-            tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, tcp_nodelay, connect_timeout, ping_interval,
+            tls_verify, tls_server_name, tls_ca_path, tls_cert_path, tls_key_path, tcp_nodelay,
+            connect_timeout, request_timeout, ping_interval,
             max_outstanding_pings, allow_reconnect, retry_on_initial_connect,
             reconnect_wait, reconnect_max_wait, reconnect_jitter, max_reconnect_attempts,
             pending_size, publish_mode, read_buffer_size, read_buffer_shrink_threshold, write_buffer_size, direct_write_threshold,
             write_buffer_latency, write_timeout, write_driver, write_queue_msgs,
             write_queue_bytes, write_batch_msgs, write_batch_bytes, record_stats,
             max_control_line, max_inbound_payload, max_header_bytes, max_stale_pong_waiters,
-            sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
+            sub_pending_msgs_limit, sub_pending_bytes_limit, drain_timeout, close_timeout,
+            close_callback_timeout,
             inbox_prefix,
             error_cb, event_cb, reconnect_delay_cb)
     end
@@ -472,7 +480,8 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                         tls_server_name=nothing, tls_ca_path=nothing,
                         tls_cert_path=nothing, tls_key_path=nothing,
                         tcp_nodelay=true,
-                        connect_timeout=2.0, ping_interval=120.0, max_outstanding_pings=2,
+                        connect_timeout=2.0, request_timeout=1.0,
+                        ping_interval=120.0, max_outstanding_pings=2,
                         allow_reconnect=true, retry_on_initial_connect=false,
                         reconnect_wait=0.5, reconnect_max_wait=5.0, reconnect_jitter=0.1,
                         max_reconnect_attempts=-1,
@@ -492,13 +501,14 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                         max_header_bytes=DEFAULT_MAX_HEADER_BYTES,
                         max_stale_pong_waiters=1024, sub_pending_msgs_limit=1024,
                         sub_pending_bytes_limit=128 * 1024 * 1024, drain_timeout=30.0,
-                        close_callback_timeout=5.0, inbox_prefix=DEFAULT_INBOX_PREFIX,
+                        close_timeout=5.0, close_callback_timeout=5.0,
+                        inbox_prefix=DEFAULT_INBOX_PREFIX,
                         error_cb=_default_error_cb, event_cb=_default_noop_event_cb,
                         reconnect_delay_cb=_default_reconnect_delay_cb)
     ConnectOptions(servers, randomize_servers, name, verbose, pedantic, auth, no_echo, tls_required,
                    tls_first, tls_verify, tls_server_name, tls_ca_path,
                    tls_cert_path, tls_key_path, tcp_nodelay, connect_timeout,
-                   ping_interval, max_outstanding_pings, allow_reconnect,
+                   request_timeout, ping_interval, max_outstanding_pings, allow_reconnect,
                    retry_on_initial_connect, reconnect_wait, reconnect_max_wait,
                    reconnect_jitter, max_reconnect_attempts, pending_size, publish_mode,
                    read_buffer_size, read_buffer_shrink_threshold, write_buffer_size,
@@ -507,7 +517,8 @@ function ConnectOptions(; servers=(DEFAULT_URL,), randomize_servers=true, name=n
                    write_batch_bytes,
                    record_stats, max_control_line, max_inbound_payload,
                    max_header_bytes, max_stale_pong_waiters, sub_pending_msgs_limit,
-                   sub_pending_bytes_limit, drain_timeout, close_callback_timeout,
+                   sub_pending_bytes_limit, drain_timeout, close_timeout,
+                   close_callback_timeout,
                    inbox_prefix, error_cb, event_cb, reconnect_delay_cb)
 end
 
@@ -523,6 +534,20 @@ function Server(url::String; discovered=false, tls_name=nothing)
     normalized_tls_name = isnothing(tls_name) ? nothing : String(tls_name)
     Server(url, 0, 0.0, discovered, normalized_tls_name, nothing)
 end
+
+function Base.show(io::IO, server::Server)
+    print(io, "Server(url=")
+    show(io, _redacted_server_url(server.url))
+    print(io, ", reconnects=", server.reconnects,
+          ", last_attempt=", server.last_attempt,
+          ", discovered=", server.discovered,
+          ", tls_name=")
+    show(io, server.tls_name)
+    print(io, ", last_auth_error=")
+    show(io, server.last_auth_error)
+    print(io, ")")
+end
+Base.show(io::IO, ::MIME"text/plain", server::Server) = show(io, server)
 
 EnumX.@enumx ConnectionEventKind begin
     CONNECTED
@@ -546,6 +571,26 @@ struct ConnectionEvent
     generation::Int
 end
 
+function Base.show(io::IO, event::ConnectionEvent)
+    print(io, "ConnectionEvent(kind=", event.kind,
+          ", status=", event.status,
+          ", server=")
+    show(io, event.server)
+    print(io, ", url=")
+    if isnothing(event.url)
+        show(io, nothing)
+    else
+        show(io, _redacted_server_url(event.url))
+    end
+    print(io, ", attempt=", event.attempt,
+          ", delay=")
+    show(io, event.delay)
+    print(io, ", error=")
+    show(io, event.error)
+    print(io, ", generation=", event.generation, ")")
+end
+Base.show(io::IO, ::MIME"text/plain", event::ConnectionEvent) = show(io, event)
+
 Base.@kwdef mutable struct ServerInfo
     max_payload::Union{Int,Nothing} = nothing
     tls_required::Union{Bool,Nothing} = nothing
@@ -566,6 +611,20 @@ struct AuthRequest
     attempt::Int
     reconnect::Bool
 end
+
+function Base.show(io::IO, request::AuthRequest)
+    print(io, "AuthRequest(server=")
+    show(io, request.server)
+    print(io, ", url=")
+    show(io, _redacted_server_url(request.url))
+    print(io, ", nonce=")
+    show(io, request.nonce)
+    print(io, ", info=")
+    show(io, request.info)
+    print(io, ", attempt=", request.attempt,
+          ", reconnect=", request.reconnect, ")")
+end
+Base.show(io::IO, ::MIME"text/plain", request::AuthRequest) = show(io, request)
 
 function _merge_server_info!(dest::ServerInfo, src::ServerInfo)
     isnothing(src.max_payload) || (dest.max_payload = src.max_payload)

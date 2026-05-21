@@ -2,6 +2,9 @@
 
 This recipe creates a work-queue stream, publishes jobs with message IDs, and processes them with a durable pull consumer.
 
+Numeric timeout, delay, ack-wait, and duplicate-window values in this recipe
+are seconds.
+
 ```julia
 using Natter
 using Natter.JetStream

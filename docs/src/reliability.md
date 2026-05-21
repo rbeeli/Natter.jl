@@ -2,6 +2,9 @@
 
 Natter.jl is designed for long-running clients. Reconnect is enabled by default, active subscriptions are replayed after reconnect, and default core publish replay is bounded by `pending_size`. Set `pending_size=0` to disable reconnect publish buffering entirely.
 
+Numeric timeout, interval, wait, jitter, and delay values in this guide are
+seconds.
+
 ## Production Connection
 
 ```julia
@@ -22,6 +25,7 @@ client = connect([
     max_reconnect_attempts=-1,
     pending_size=16 * 1024 * 1024,
     write_timeout=5.0,
+    close_timeout=5.0,
     record_stats=true,
     sub_pending_msgs_limit=8192,
     sub_pending_bytes_limit=128 * 1024 * 1024,
@@ -40,7 +44,7 @@ client = connect([
 
 `retry_on_initial_connect=true` makes startup tolerate NATS not being reachable yet. `max_reconnect_attempts=-1` means unlimited reconnect attempts, including initial retries when that mode is enabled. When several URLs are configured, Natter randomizes the server attempt order for both initial connect and reconnect so new clients spread across the pool. Set `randomize_servers=false` only when the listed order is the intended failover policy.
 
-`write_timeout` bounds blocking transport writes and flushes. Set `write_timeout=Inf` to disable the write watchdog for workloads that prefer the lowest write-path overhead and handle stalled transports externally.
+`write_timeout` bounds blocking transport writes and flushes, in seconds. Set `write_timeout=Inf` to disable the write watchdog for workloads that prefer the lowest write-path overhead and handle stalled transports externally.
 
 ## Reconnect Semantics
 
@@ -56,7 +60,7 @@ Core publish replay is best-effort and should be treated as at-least-once for re
 
 JetStream protocol async publishes are stricter: pending `js_publish_future` futures are cleared on reconnect and are not put into the core reconnect buffer. `fetch(future)` throws `ConnectionReconnectingError` for those cleared futures. Applications that need to resend should do so after reconnect and should set `msg_id` to make the retry idempotent at the stream.
 
-Customize reconnect delay when needed:
+Customize reconnect delay when needed. The callback returns seconds:
 
 ```julia
 client = connect("nats://nats.internal:4222";
@@ -155,7 +159,7 @@ client = connect("nats://nats.example.com:4222";
 
 ## Cleanup
 
-Use `drain` for graceful service shutdown:
+Use `drain` for graceful service shutdown. The timeout is seconds:
 
 ```julia
 try
@@ -166,4 +170,4 @@ catch err
 end
 ```
 
-Use `close(client; throw_errors=true)` in tests or strict shutdown paths where cleanup failures must fail the caller.
+Use `close(client; throw_errors=true)` in tests or strict shutdown paths where cleanup failures must fail the caller. `close_timeout` bounds close cleanup waits, in seconds.

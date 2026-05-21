@@ -44,6 +44,8 @@ docker run --rm -p 4222:4222 nats:2.11-alpine -js
 
 ## Connect
 
+Numeric timeout and duration values in these examples are seconds.
+
 ```julia
 client = connect("nats://127.0.0.1:4222";
     name="orders-api",

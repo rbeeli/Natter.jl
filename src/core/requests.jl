@@ -262,7 +262,8 @@ function _wait_request_reply(mux::RequestMux, waiter::RequestWaiter, timeout::Re
     value::Msg
 end
 
-function _request_raw(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0,
+function _request_raw(client::Client, subject::AbstractString, data=nothing;
+                      timeout::Real=client.options.request_timeout,
                       headers=nothing, cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
@@ -284,7 +285,8 @@ function _request_raw(client::Client, subject::AbstractString, data=nothing; tim
     end
 end
 
-function request(client::Client, subject::AbstractString, data=nothing; timeout::Real=1.0,
+function request(client::Client, subject::AbstractString, data=nothing;
+                 timeout::Real=client.options.request_timeout,
                  headers=nothing, cancel_token::MaybeCancellationToken=nothing)
     msg = _request_raw(client, subject, data; timeout, headers, cancel_token)
     code = _status_header(msg)
