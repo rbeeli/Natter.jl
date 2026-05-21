@@ -108,6 +108,8 @@ end
         parse(Float64, get(ENV, "NATTER_INTEGRATION_CONNECT_TIMEOUT", "10.0"))
     chaos_iterations() = parse(Int, get(ENV, "NATTER_CHAOS_ITERATIONS", "3"))
     stress_seconds() = parse(Float64, get(ENV, "NATTER_STRESS_SECONDS", "15.0"))
+    stress_keys() = parse(Int, get(ENV, "NATTER_STRESS_KEYS", "500"))
+    stress_watchers() = parse(Int, get(ENV, "NATTER_STRESS_WATCHERS", "3"))
 
     function publish_and_flush(client, subject::AbstractString, data=nothing; timeout::Real=integration_timeout(), kwargs...)
         publish(client, subject, data; kwargs...)

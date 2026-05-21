@@ -3,12 +3,16 @@ name: Stress
 on:
   workflow_dispatch:
   schedule:
-    - cron: '17 3 * * 0'
+    - cron: '17 3 * * *'
+
+concurrency:
+  group: stress-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   live-server-stress:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -35,6 +39,9 @@ jobs:
           NATTER_RUN_INTEGRATION: 'true'
           NATTER_RUN_JETSTREAM: 'true'
           NATTER_RUN_STRESS: 'true'
-          NATTER_STRESS_SECONDS: '25.0'
+          NATTER_INTEGRATION_TIMEOUT: '10.0'
+          NATTER_STRESS_SECONDS: '45.0'
+          NATTER_STRESS_KEYS: '2000'
+          NATTER_STRESS_WATCHERS: '4'
       - if: failure()
         run: docker logs nats
