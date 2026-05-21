@@ -209,6 +209,10 @@ publish(client, "events.created", "payload";
 response = request(client, "events.lookup", "event-1001";
     headers=("trace-id" => "abc-123",),
 )
+
+hdrs = Headers()
+hdrs["trace-id"] = "abc-123"
+push!(hdrs, "trace-id" => "def-456")
 ```
 
 Read received headers with case-insensitive lookup:

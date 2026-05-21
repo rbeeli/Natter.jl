@@ -49,13 +49,28 @@ function Base.getindex(headers::Headers, key::AbstractString)
     entry.values
 end
 
-function Base.setindex!(headers::Headers, values::Vector{String}, key::AbstractString)
+_header_value_vector(values::Vector{String}) = values
+_header_value_vector(value::AbstractString) = String[String(value)]
+_header_value_vector(value::AbstractVector{UInt8}) = String[String(value)]
+function _header_value_vector(values_input::Union{AbstractVector,Tuple})
+    values = String[]
+    sizehint!(values, length(values_input))
+    _append_header_values!(values, values_input)
+end
+_header_value_vector(value) = String[String(value)]
+
+function _set_header_values!(headers::Headers, key::AbstractString, values::Vector{String})
     canonical = _canonical_header_key(key)
     entry = get(headers.data, canonical, nothing)
     name = isnothing(entry) ? String(key) : entry.name
     headers.data[canonical] = _HeaderEntry(name, values)
     headers
 end
+
+Base.setindex!(headers::Headers, values::Vector{String}, key::AbstractString) =
+    _set_header_values!(headers, key, values)
+Base.setindex!(headers::Headers, value, key::AbstractString) =
+    _set_header_values!(headers, key, _header_value_vector(value))
 
 function Base.get(headers::Headers, key::AbstractString, default)
     entry = get(headers.data, _canonical_header_key(key), nothing)
@@ -120,6 +135,15 @@ end
 
 _append_header_values!(values::Vector{String}, value::AbstractVector{UInt8}) =
     (push!(values, String(value)); values)
+
+function _append_header!(headers::Headers, key::AbstractString, value)
+    values = get!(headers, key, String[])
+    _append_header_values!(values, value)
+    headers
+end
+
+Base.push!(headers::Headers, pair::Pair) = _append_header!(headers, String(first(pair)), last(pair))
+Base.push!(headers::Headers, key::AbstractString, value) = _append_header!(headers, key, value)
 
 _headers_from_pairs(::Nothing) = Headers()
 _headers_from_pairs(pair::Pair) = _headers_from_pairs((pair,))

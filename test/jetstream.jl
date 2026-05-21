@@ -2113,6 +2113,75 @@ end
     end
 end
 
+@testitem "JetStream ordered push close waits tracked cleanup tasks" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=IOBuffer(),
+    )
+    js = jetstream(client; timeout=0.1)
+    handler = N._JetStreamPushControlHandler()
+    sub = subscribe(client, "_INBOX.ordered"; _control_handler=handler)
+    psub = N.PushSubscription(js, sub, "ORDERS", "OLD", ReentrantLock(), false, false, nothing, handler)
+    started = Channel{Nothing}(1)
+    release = Base.Event()
+    task = @lock psub.close_lock begin
+        N._spawn_ordered_push_task_locked!(psub, :ordered_delete_consumer) do
+            put!(started, nothing)
+            wait(release)
+        end
+    end
+    take!(started)
+    @test task in (@lock psub.close_lock copy(psub.ordered_cleanup_tasks))
+
+    closer = Threads.@spawn close(psub; timeout=1.0)
+    try
+        @test timedwait(0.05; pollint=0.001) do
+            istaskdone(closer)
+        end == :timed_out
+        notify(release)
+        @test TestHelpers.fetch_task_result(closer) === nothing
+        @test istaskdone(task)
+        @test isempty(@lock psub.close_lock copy(psub.ordered_cleanup_tasks))
+    finally
+        istaskdone(closer) || notify(release)
+        close(psub)
+    end
+end
+
+@testitem "JetStream ordered push reset scheduling after close clears reset state" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+
+    const N = Natter
+
+    client = TestHelpers.fake_client(;
+        status=N.ConnectionStatus.CONNECTED,
+        info=N.ServerInfo(; headers=true, version="2.10.0"),
+        write_io=IOBuffer(),
+    )
+    js = jetstream(client; timeout=0.1)
+    handler = N._JetStreamPushControlHandler()
+    @lock handler.lock begin
+        handler.ordered = true
+        handler.ordered_resetting = true
+    end
+    sub = subscribe(client, "_INBOX.ordered"; _control_handler=handler)
+    psub = N.PushSubscription(js, sub, "ORDERS", "OLD", ReentrantLock(), false, true, nothing, handler)
+    base_config = N._js_config_payload(ConsumerConfig(filter_subject="orders.created"))
+
+    N._schedule_ordered_push_reset!(psub, base_config, 42)
+
+    @test isnothing(psub.ordered_reset_task)
+    @test !(@lock handler.lock handler.ordered_resetting)
+    close(sub)
+end
+
 @testitem "JetStream ordered push subscribe rejects unsupported options before write" setup=[TestHelpers] begin
     using Natter
     using Natter.JetStream

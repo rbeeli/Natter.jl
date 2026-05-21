@@ -106,7 +106,7 @@ function _push_subscribe(js::JetStreamContext, subject::AbstractString; stream::
         control_handler.flow_control[] = _push_flow_control_enabled(info)
         control_handler.last_seen[] = time()
         psub = PushSubscription(js, sub, String(stream), String(info.name), ReentrantLock(), delete_on_close, false,
-                                false, nothing, nothing, control_handler, info)
+                                false, nothing, nothing, Task[], control_handler, info)
         if ordered
             base_config = ordered_base_config::Dict{String,Any}
             @lock control_handler.lock begin
@@ -212,22 +212,24 @@ function _close_push_subscription(psub::PushSubscription; timeout::Real=psub.js.
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
     deadline = time() + timeout
-    already_closed = @lock psub.close_lock begin
+    already_closed, ordered_tasks = @lock psub.close_lock begin
         was_closed = psub.closed
         psub.closed = true
-        was_closed
+        was_closed, copy(psub.ordered_cleanup_tasks)
     end
     errors = Any[]
     if !already_closed
+        _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task;
+                    interrupt=true, deadline)
+        for task in ordered_tasks
+            _wait_task!(errors, "stop ordered push cleanup $(psub.consumer)", task;
+                        interrupt=true, deadline)
+        end
         try
             close(psub.sub)
         catch err
             push!(errors, err)
         end
-        _wait_task!(errors, "stop push heartbeat monitor $(psub.consumer)", psub.heartbeat_task;
-                    interrupt=true, deadline)
-        _wait_task!(errors, "stop ordered push reset $(psub.consumer)", psub.ordered_reset_task;
-                    interrupt=true, deadline)
     end
     server_deleted = _push_server_deleted(psub)
     if psub.delete_on_close && !server_deleted

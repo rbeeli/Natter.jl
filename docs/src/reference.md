@@ -28,7 +28,7 @@ Conventions:
 | `SubscriptionStats` | Snapshot of one subscription's queued, processing, delivered, received, and dropped counters. |
 | `Msg` | Owned core message with `subject`, `reply`, byte-vector `data`, and optional headers. |
 | `BorrowedMsg` | Callback-only core message whose `data` is a borrowed byte view valid only for the callback call. |
-| `Headers` | Case-insensitive header dictionary of `String => Vector{String}`. |
+| `Headers` | Case-insensitive header dictionary of `String => Vector{String}`; scalar assignment replaces values, and `push!` appends values. |
 | `PublishFrame` | Prepared core publish frame from `prepare_publish`. |
 | `Subscription` | Core subscription handle. |
 | `CancellationSource`, `CancellationToken` | Cooperative cancellation source and token for blocking operations. |

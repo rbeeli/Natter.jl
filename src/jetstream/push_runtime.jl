@@ -9,6 +9,7 @@ mutable struct PushSubscription{C<:Client,J<:JetStreamContext{C},S<:Subscription
     server_deleted::Bool
     heartbeat_task::Union{Task,Nothing}
     ordered_reset_task::Union{Task,Nothing}
+    ordered_cleanup_tasks::Vector{Task}
     control_handler::Union{_JetStreamPushControlHandler,Nothing}
     info::Union{ConsumerInfo,Nothing}
 end
@@ -18,7 +19,7 @@ function PushSubscription(js::J, sub::S, stream::AbstractString, consumer::Abstr
                           heartbeat_task::Union{Task,Nothing},
                           control_handler::Union{_JetStreamPushControlHandler,Nothing}) where {C<:Client,J<:JetStreamContext{C},S<:Subscription{C}}
     PushSubscription{C,J,S}(js, sub, String(stream), String(consumer), close_lock, delete_on_close, closed,
-                            false, heartbeat_task, nothing, control_handler, nothing)
+                            false, heartbeat_task, nothing, Task[], control_handler, nothing)
 end
 
 PushSubscription(js::JetStreamContext, sub::Subscription, stream::AbstractString, consumer::AbstractString,
@@ -449,6 +450,38 @@ function _ordered_delete_consumer_task(psub::PushSubscription, consumer::String)
     nothing
 end
 
+function _untrack_ordered_push_task!(psub::PushSubscription, task::Task)
+    @lock psub.close_lock begin
+        index = findfirst(t -> t === task, psub.ordered_cleanup_tasks)
+        isnothing(index) || deleteat!(psub.ordered_cleanup_tasks, index)
+    end
+    nothing
+end
+
+function _spawn_ordered_push_task_locked!(psub::PushSubscription, name::Symbol, f::F) where {F}
+    started = Base.Event()
+    task = _spawn_work(name) do
+        wait(started)
+        try
+            f()
+        finally
+            _untrack_ordered_push_task!(psub, current_task())
+        end
+    end
+    push!(psub.ordered_cleanup_tasks, task)
+    notify(started)
+    task
+end
+_spawn_ordered_push_task_locked!(f::F, psub::PushSubscription, name::Symbol) where {F} =
+    _spawn_ordered_push_task_locked!(psub, name, f)
+
+function _spawn_ordered_delete_consumer_locked!(psub::PushSubscription, consumer::String)
+    isempty(consumer) && return nothing
+    _spawn_ordered_push_task_locked!(psub, :ordered_delete_consumer) do
+        _ordered_delete_consumer_task(psub, consumer)
+    end
+end
+
 function _ordered_push_reset_task(psub::PushSubscription, base_config::Dict{String,Any}, start_seq::Int)
     handler = psub.control_handler
     remap = nothing
@@ -468,6 +501,7 @@ function _ordered_push_reset_task(psub::PushSubscription, base_config::Dict{Stri
             if !psub.closed
                 psub.consumer = info.name
                 psub.info = info
+                _spawn_ordered_delete_consumer_locked!(psub, old_consumer)
                 false
             else
                 true
@@ -480,9 +514,6 @@ function _ordered_push_reset_task(psub::PushSubscription, base_config::Dict{Stri
                 _consumer_missing(err) || _report_error(psub.js.client, CleanupError("delete closed ordered push consumer $(info.name)", err))
             end
             return nothing
-        end
-        _spawn_work(:ordered_delete_consumer) do
-            _ordered_delete_consumer_task(psub, old_consumer)
         end
     catch err
         if !isnothing(remap)
@@ -501,8 +532,17 @@ function _ordered_push_reset_task(psub::PushSubscription, base_config::Dict{Stri
 end
 
 function _schedule_ordered_push_reset!(psub::PushSubscription, base_config::Dict{String,Any}, start_seq::Int)
-    psub.ordered_reset_task = _spawn_work(:ordered_push_reset) do
-        _ordered_push_reset_task(psub, base_config, start_seq)
+    scheduled = @lock psub.close_lock begin
+        if psub.closed
+            false
+        else
+            task = _spawn_ordered_push_task_locked!(psub, :ordered_push_reset) do
+                _ordered_push_reset_task(psub, base_config, start_seq)
+            end
+            psub.ordered_reset_task = task
+            true
+        end
     end
+    scheduled || _finish_ordered_reset!(psub.control_handler)
     nothing
 end

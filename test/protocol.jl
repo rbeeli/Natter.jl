@@ -100,6 +100,24 @@ using TestItems
     N._delete_header!(mixed_headers, "TRACE")
     @test isempty(mixed_headers)
 
+    ergonomic_headers = Headers()
+    ergonomic_headers["Trace"] = "abc"
+    @test ergonomic_headers["trace"] == ["abc"]
+    @test only(collect(keys(ergonomic_headers))) == "Trace"
+    ergonomic_headers["trace"] = ["def", "ghi"]
+    @test ergonomic_headers["TRACE"] == ["def", "ghi"]
+    @test only(collect(keys(ergonomic_headers))) == "Trace"
+    ergonomic_headers["Bytes"] = TestHelpers.bytes("ok")
+    @test ergonomic_headers["bytes"] == ["ok"]
+    ergonomic_headers["Tuple"] = ("one", "two")
+    push!(ergonomic_headers, "tuple" => "three")
+    push!(ergonomic_headers, "TUPLE", ["four", "five"])
+    @test ergonomic_headers["tuple"] == ["one", "two", "three", "four", "five"]
+    values = ["stored"]
+    ergonomic_headers["Alias"] = values
+    push!(values, "without-copy")
+    @test ergonomic_headers["alias"] == ["stored", "without-copy"]
+
     parsed_mixed_headers = N._parse_headers(TestHelpers.bytes("NATS/1.0\r\nTrace:abc\r\ntrace:def\r\n\r\n"))
     @test length(parsed_mixed_headers) == 1
     @test parsed_mixed_headers["TRACE"] == ["abc", "def"]
