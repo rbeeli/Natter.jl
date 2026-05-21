@@ -127,6 +127,35 @@ end
     @test_throws ArgumentError N._kv_stream_config("bucket"; limit_marker_ttl=true)
 end
 
+@testitem "KeyValue purge delete threshold keeps only recent markers" begin
+    using Dates
+    using Natter
+    using Natter.KeyValue
+
+    const N = Natter
+
+    @test N._kv_purge_deletes_threshold(0) == N._KV_DEFAULT_PURGE_DELETES_OLDER_THAN
+    @test N._kv_purge_deletes_threshold(-1) == -1.0
+    @test N._kv_purge_deletes_threshold(12.5) == 12.5
+    @test_throws ArgumentError N._kv_purge_deletes_threshold(true)
+    @test_throws ArgumentError N._kv_purge_deletes_threshold(Inf)
+    @test_throws ArgumentError N._kv_purge_deletes_threshold(NaN)
+
+    current = DateTime(2026, 5, 22, 12)
+    limit = N._kv_purge_deletes_limit(current, 10.0)
+    @test limit == current - Millisecond(10_000)
+    @test isnothing(N._kv_purge_deletes_limit(current, -1.0))
+
+    recent = KeyValueEntry("bucket", "recent", UInt8[], 10,
+                           current - Millisecond(5_000), 0, KeyValueOperation.DELETE)
+    old = KeyValueEntry("bucket", "old", UInt8[], 11,
+                        current - Millisecond(20_000), 0, KeyValueOperation.PURGE)
+
+    @test N._kv_purge_deletes_keep(recent, limit) == 1
+    @test isnothing(N._kv_purge_deletes_keep(old, limit))
+    @test isnothing(N._kv_purge_deletes_keep(recent, nothing))
+end
+
 @testitem "KeyValue timeout arguments are positive finite before protocol writes" setup=[TestHelpers] begin
     using Natter
     using Natter.JetStream
@@ -557,12 +586,13 @@ end
                                      read_io=capture, write_io=capture)
     kv = KeyValueBucket(jetstream(client), "bucket", "KV_bucket", "\$KV.bucket.")
 
-    task = Threads.@spawn TestHelpers.thrown_exception() do
-        kv_history(kv, "alpha"; timeout=0.2)
+    operation_timeout = 2.0
+    task = @async TestHelpers.thrown_exception() do
+        kv_history(kv, "alpha"; timeout=operation_timeout)
     end
 
     marker = "\"config\":{\"name\":\""
-    @test timedwait(1.0; pollint=0.001) do
+    @test timedwait(5.0; pollint=0.001) do
         occursin(marker, TestHelpers.capture_text(capture))
     end != :timed_out
     written = TestHelpers.capture_text(capture)

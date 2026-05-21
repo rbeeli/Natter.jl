@@ -772,6 +772,12 @@ function _kv_purge_deletes_threshold(older_than::Real)::Float64
     seconds == 0 ? _KV_DEFAULT_PURGE_DELETES_OLDER_THAN : seconds
 end
 
+_kv_purge_deletes_limit(current::DateTime, threshold::Float64)::Union{DateTime,Nothing} =
+    threshold > 0 ? current - Millisecond(round(Int, threshold * 1000)) : nothing
+
+_kv_purge_deletes_keep(entry::KeyValueEntry, limit::Union{DateTime,Nothing})::Union{Int,Nothing} =
+    !isnothing(limit) && entry.created > limit ? 1 : nothing
+
 function kv_purge_deletes(kv::KeyValueBucket; older_than::Real=_KV_DEFAULT_PURGE_DELETES_OLDER_THAN,
                           timeout::Real=kv.js.timeout, cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
@@ -801,9 +807,9 @@ function kv_purge_deletes(kv::KeyValueBucket; older_than::Real=_KV_DEFAULT_PURGE
     _close_keyvalue_watcher(watcher; timeout=_kv_cleanup_timeout(deadline))
 
     current = DateTime(1970, 1, 1) + Millisecond(round(Int, time() * 1000))
-    limit = threshold > 0 ? current - Millisecond(round(Int, threshold * 1000)) : nothing
+    limit = _kv_purge_deletes_limit(current, threshold)
     for entry in markers
-        keep = !isnothing(limit) && entry.created > limit ? 1 : nothing
+        keep = _kv_purge_deletes_keep(entry, limit)
         stream_purge(kv.js, kv.stream; filter_subject="$(kv.prefix)$(entry.key)", keep,
                      timeout=_remaining_timeout_or_throw(deadline, "key-value delete marker purge"; cancel_token),
                      cancel_token)
