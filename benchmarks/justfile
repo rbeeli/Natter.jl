@@ -6,6 +6,7 @@ messages := env_var_or_default("NATTER_BENCH_MESSAGES", "200000")
 requests := env_var_or_default("NATTER_BENCH_REQUESTS", "20000")
 payload_bytes := env_var_or_default("NATTER_BENCH_PAYLOAD_BYTES", "64")
 timeout := env_var_or_default("NATTER_BENCH_TIMEOUT", "90")
+min_seconds := env_var_or_default("NATTER_BENCH_MIN_SECONDS", "5.0")
 concurrency := env_var_or_default("NATTER_BENCH_CONCURRENCY", "44")
 artifacts := env_var_or_default("NATTER_BENCH_ARTIFACTS", "benchmarks/results")
 pythonpath := env_var_or_default("NATS_PYTHONPATH", "/mnt/data/repos/nats.py/nats/src")
@@ -37,6 +38,7 @@ natter:
         --payload-bytes "{{payload_bytes}}" \
         --concurrency "{{concurrency}}" \
         --timeout "{{timeout}}" \
+        --min-seconds "{{min_seconds}}" \
         --alloc-iterations "{{alloc_iterations}}" \
         --output "$artifacts_dir/natter-trial-$i.md" \
         --json "$artifacts_dir/natter-trial-$i.json"; \
@@ -56,6 +58,7 @@ python:
         --requests "{{requests}}" \
         --payload-bytes "{{payload_bytes}}" \
         --timeout "{{timeout}}" \
+        --min-seconds "{{min_seconds}}" \
         --json "$artifacts_dir/python-nats-trial-$i.json"; \
     done; \
     julia --project=. benchmarks/aggregate_median.jl --client python --output "$artifacts_dir/python-nats.json" -- "$artifacts_dir"/python-nats-trial-*.json
@@ -75,6 +78,7 @@ rust:
           --requests "{{requests}}" \
           --payload-bytes "{{payload_bytes}}" \
           --timeout "{{timeout}}" \
+          --min-seconds "{{min_seconds}}" \
           --json "$artifacts_dir/rust-nats-trial-$i.json"; \
       done; \
     else \
@@ -83,8 +87,8 @@ rust:
         -v "$repos_root:$repos_root" \
         -w "$root/benchmarks/clients/rust_nats" \
         -e CARGO_TARGET_DIR="$artifacts_dir/rust-target" \
-        rust:1.88-bookworm bash -euo pipefail -c 'cargo build --release; for i in $(seq 1 "$1"); do "$CARGO_TARGET_DIR/release/natter-rust-nats-bench" --url "$2" --messages "$3" --requests "$4" --payload-bytes "$5" --timeout "$6" --json "$7/rust-nats-trial-$i.json"; done; chown -R "$8:$9" "$7"/rust-nats-trial-*.json "$CARGO_TARGET_DIR"' \
-        bash "{{trials}}" "{{url}}" "{{messages}}" "{{requests}}" "{{payload_bytes}}" "{{timeout}}" "$artifacts_dir" "$(id -u)" "$(id -g)"; \
+        rust:1.88-bookworm bash -euo pipefail -c 'trap '\''chown -R "$9:${10}" "$8"/rust-nats-trial-*.json "$CARGO_TARGET_DIR" 2>/dev/null || true'\'' EXIT; cargo build --release; for i in $(seq 1 "$1"); do "$CARGO_TARGET_DIR/release/natter-rust-nats-bench" --url "$2" --messages "$3" --requests "$4" --payload-bytes "$5" --timeout "$6" --min-seconds "$7" --json "$8/rust-nats-trial-$i.json"; done' \
+        bash "{{trials}}" "{{url}}" "{{messages}}" "{{requests}}" "{{payload_bytes}}" "{{timeout}}" "{{min_seconds}}" "$artifacts_dir" "$(id -u)" "$(id -g)"; \
     fi; \
     cd "$root"; \
     julia --project=. benchmarks/aggregate_median.jl --client rust --output "$artifacts_dir/rust-nats.json" -- "$artifacts_dir"/rust-nats-trial-*.json
@@ -104,6 +108,7 @@ go:
         -requests "{{requests}}" \
         -payload-bytes "{{payload_bytes}}" \
         -timeout "{{timeout}}" \
+        -min-seconds "{{min_seconds}}" \
         -json "$artifacts_dir/go-nats-trial-$i.json"; \
     done; \
     cd "$root"; \

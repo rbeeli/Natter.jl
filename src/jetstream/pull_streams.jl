@@ -458,27 +458,65 @@ function Base.close(stream::PullMessageStream; timeout::Real=stream.subscription
     nothing
 end
 
-function Base.take!(stream::PullMessageStream)
+function _pull_stream_take_ready_locked(stream::PullMessageStream)::Union{Msg,Nothing}
+    isready(stream.messages) || return nothing
+    msg = take!(stream.messages)
+    @lock stream.state.lock begin
+        stream.state.buffered_messages = max(0, stream.state.buffered_messages - 1)
+        stream.state.buffered_bytes = max(0, stream.state.buffered_bytes - _pull_stream_msg_bytes(msg))
+    end
+    notify(stream.message_condition)
+    msg
+end
+
+function _wait_pull_stream_message_locked(stream::PullMessageStream,
+                                          timeout::Float64,
+                                          cancel_token::MaybeCancellationToken)::Bool
+    if isinf(timeout) && isnothing(cancel_token)
+        while !isready(stream.messages) && isopen(stream.messages)
+            wait(stream.message_condition)
+        end
+        return isready(stream.messages)
+    end
+
+    if isinf(timeout)
+        _wait_until_notified_locked(stream.message_condition; cancel_token) do
+            isready(stream.messages) || !isopen(stream.messages)
+        end
+        return isready(stream.messages)
+    end
+
+    deadline = time() + timeout
+    while !isready(stream.messages) && isopen(stream.messages)
+        remaining = _remaining_timeout(deadline)
+        remaining > 0 || return false
+        ready = _wait_until_condition_locked(stream.message_condition, remaining;
+                                             cancel_token) do
+            isready(stream.messages) || !isopen(stream.messages)
+        end
+        ready || return false
+    end
+    isready(stream.messages)
+end
+
+function _take_pull_stream(stream::PullMessageStream, wait_timeout::Float64,
+                           cancel_token::MaybeCancellationToken)
     while true
-        msg = EMPTY_MSG
-        ready = @lock stream.message_lock begin
-            while !isready(stream.messages) && isopen(stream.messages)
-                wait(stream.message_condition)
-            end
-            if isready(stream.messages)
-                msg = take!(stream.messages)
-                @lock stream.state.lock begin
-                    stream.state.buffered_messages = max(0, stream.state.buffered_messages - 1)
-                    stream.state.buffered_bytes = max(0, stream.state.buffered_bytes - _pull_stream_msg_bytes(msg))
-                end
-                notify(stream.message_condition)
-                true
+        msg = nothing
+        wait_result = @lock stream.message_lock begin
+            ready = _wait_pull_stream_message_locked(stream, wait_timeout, cancel_token)
+            if ready
+                msg = _pull_stream_take_ready_locked(stream)
+                isnothing(msg) ? :retry : :ready
+            elseif isopen(stream.messages)
+                :timeout
             else
-                false
+                :closed
             end
         end
-        if ready
-            jsmsg = JetStreamMsg(msg, stream.subscription.js.client)
+        wait_result === :retry && continue
+        if wait_result === :ready
+            jsmsg = JetStreamMsg(msg::Msg, stream.subscription.js.client)
             try
                 _pull_stream_maybe_refill!(stream)
             catch err
@@ -491,10 +529,18 @@ function Base.take!(stream::PullMessageStream)
             end
             return jsmsg
         end
+        wait_result === :timeout && throw(TimeoutError("take! timed out"))
         err = _pull_stream_error(stream.state)
         isnothing(err) || throw(err)
         throw(InvalidStateException("pull message stream is closed", :closed))
     end
+end
+
+function Base.take!(stream::PullMessageStream; timeout::Real=Inf,
+                    cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
+    wait_timeout = _connect_option_positive_or_infinite_float("timeout", timeout)
+    _take_pull_stream(stream, wait_timeout, cancel_token)
 end
 
 function Base.iterate(stream::PullMessageStream, state=nothing)

@@ -37,11 +37,29 @@ func waitFor(fn func() bool, timeout time.Duration) error {
 	return fmt.Errorf("timed out waiting for benchmark condition")
 }
 
+func timedRepeated(unitCount int, minSeconds float64, runRound func() error) (int, int, float64, error) {
+	units := 0
+	rounds := 0
+	runtime.GC()
+	started := time.Now()
+	for {
+		if err := runRound(); err != nil {
+			return 0, 0, 0, err
+		}
+		units += unitCount
+		rounds++
+		seconds := time.Since(started).Seconds()
+		if seconds >= minSeconds {
+			return units, rounds, seconds, nil
+		}
+	}
+}
+
 func connect(url string) (*nats.Conn, error) {
 	return nats.Connect(url, nats.Timeout(2*time.Second), nats.NoReconnect())
 }
 
-func benchPublishBatch(url, subject string, payload []byte, messages int, timeout time.Duration) (map[string]any, error) {
+func benchPublishBatch(url, subject string, payload []byte, messages int, timeout time.Duration, minSeconds float64) (map[string]any, error) {
 	nc, err := connect(url)
 	if err != nil {
 		return nil, err
@@ -58,25 +76,28 @@ func benchPublishBatch(url, subject string, payload []byte, messages int, timeou
 		return nil, err
 	}
 
-	started := time.Now()
-	for i := 0; i < messages; i++ {
-		if err := nc.Publish(subject, payload); err != nil {
-			return nil, err
+	totalMessages, rounds, seconds, err := timedRepeated(messages, minSeconds, func() error {
+		for i := 0; i < messages; i++ {
+			if err := nc.Publish(subject, payload); err != nil {
+				return err
+			}
 		}
-	}
-	if err := nc.FlushTimeout(timeout); err != nil {
+		return nc.FlushTimeout(timeout)
+	})
+	if err != nil {
 		return nil, err
 	}
-	seconds := time.Since(started).Seconds()
 	return map[string]any{
-		"messages":               messages,
+		"messages":               totalMessages,
+		"configured_messages":    messages,
+		"rounds":                 rounds,
 		"seconds":                seconds,
-		"messages_per_second":    float64(messages) / seconds,
-		"payload_mib_per_second": float64(messages*len(payload)) / seconds / 1024.0 / 1024.0,
+		"messages_per_second":    float64(totalMessages) / seconds,
+		"payload_mib_per_second": float64(totalMessages*len(payload)) / seconds / 1024.0 / 1024.0,
 	}, nil
 }
 
-func benchPublishFlushEach(url, subject string, payload []byte, messages int, timeout time.Duration) (map[string]any, error) {
+func benchPublishFlushEach(url, subject string, payload []byte, messages int, timeout time.Duration, minSeconds float64) (map[string]any, error) {
 	nc, err := connect(url)
 	if err != nil {
 		return nil, err
@@ -93,25 +114,31 @@ func benchPublishFlushEach(url, subject string, payload []byte, messages int, ti
 		}
 	}
 
-	started := time.Now()
-	for i := 0; i < messages; i++ {
-		if err := nc.Publish(subject, payload); err != nil {
-			return nil, err
+	totalMessages, rounds, seconds, err := timedRepeated(messages, minSeconds, func() error {
+		for i := 0; i < messages; i++ {
+			if err := nc.Publish(subject, payload); err != nil {
+				return err
+			}
+			if err := nc.FlushTimeout(timeout); err != nil {
+				return err
+			}
 		}
-		if err := nc.FlushTimeout(timeout); err != nil {
-			return nil, err
-		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	seconds := time.Since(started).Seconds()
 	return map[string]any{
-		"messages":               messages,
+		"messages":               totalMessages,
+		"configured_messages":    messages,
+		"rounds":                 rounds,
 		"seconds":                seconds,
-		"messages_per_second":    float64(messages) / seconds,
-		"payload_mib_per_second": float64(messages*len(payload)) / seconds / 1024.0 / 1024.0,
+		"messages_per_second":    float64(totalMessages) / seconds,
+		"payload_mib_per_second": float64(totalMessages*len(payload)) / seconds / 1024.0 / 1024.0,
 	}, nil
 }
 
-func benchCallbackDispatch(url, subject string, payload []byte, messages int, timeout time.Duration) (map[string]any, error) {
+func benchCallbackDispatch(url, subject string, payload []byte, messages int, timeout time.Duration, minSeconds float64) (map[string]any, error) {
 	sub, err := connect(url)
 	if err != nil {
 		return nil, err
@@ -145,30 +172,34 @@ func benchCallbackDispatch(url, subject string, payload []byte, messages int, ti
 	if err := waitFor(func() bool { return received.Load() >= int64(warmup) }, timeout); err != nil {
 		return nil, err
 	}
-	received.Store(0)
+	target := received.Load()
 
-	started := time.Now()
-	for i := 0; i < messages; i++ {
-		if err := pub.Publish(subject, payload); err != nil {
-			return nil, err
+	totalMessages, rounds, seconds, err := timedRepeated(messages, minSeconds, func() error {
+		target += int64(messages)
+		for i := 0; i < messages; i++ {
+			if err := pub.Publish(subject, payload); err != nil {
+				return err
+			}
 		}
-	}
-	if err := pub.FlushTimeout(timeout); err != nil {
+		if err := pub.FlushTimeout(timeout); err != nil {
+			return err
+		}
+		return waitFor(func() bool { return received.Load() >= target }, timeout)
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := waitFor(func() bool { return received.Load() >= int64(messages) }, timeout); err != nil {
-		return nil, err
-	}
-	seconds := time.Since(started).Seconds()
 	return map[string]any{
-		"messages":            messages,
-		"received":            received.Load(),
+		"messages":            totalMessages,
+		"configured_messages": messages,
+		"received":            totalMessages,
+		"rounds":              rounds,
 		"seconds":             seconds,
-		"messages_per_second": float64(messages) / seconds,
+		"messages_per_second": float64(totalMessages) / seconds,
 	}, nil
 }
 
-func benchRequestReply(url, subject string, payload []byte, requests int, timeout time.Duration) (map[string]any, error) {
+func benchRequestReply(url, subject string, payload []byte, requests int, timeout time.Duration, minSeconds float64) (map[string]any, error) {
 	service, err := connect(url)
 	if err != nil {
 		return nil, err
@@ -197,15 +228,19 @@ func benchRequestReply(url, subject string, payload []byte, requests int, timeou
 	}
 
 	latencies := make([]float64, 0, requests)
-	started := time.Now()
-	for i := 0; i < requests; i++ {
-		t := time.Now()
-		if _, err := client.Request(subject, payload, timeout); err != nil {
-			return nil, err
+	totalRequests, rounds, seconds, err := timedRepeated(requests, minSeconds, func() error {
+		for i := 0; i < requests; i++ {
+			t := time.Now()
+			if _, err := client.Request(subject, payload, timeout); err != nil {
+				return err
+			}
+			latencies = append(latencies, float64(time.Since(t).Nanoseconds())/1e6)
 		}
-		latencies = append(latencies, float64(time.Since(t).Nanoseconds())/1e6)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	seconds := time.Since(started).Seconds()
 
 	var sum float64
 	var max float64
@@ -216,9 +251,11 @@ func benchRequestReply(url, subject string, payload []byte, requests int, timeou
 		}
 	}
 	return map[string]any{
-		"requests":            requests,
+		"requests":            totalRequests,
+		"configured_requests": requests,
+		"rounds":              rounds,
 		"seconds":             seconds,
-		"requests_per_second": float64(requests) / seconds,
+		"requests_per_second": float64(totalRequests) / seconds,
 		"latency_ms_mean":     sum / float64(len(latencies)),
 		"latency_ms_p50":      percentile(latencies, 0.50),
 		"latency_ms_p95":      percentile(latencies, 0.95),
@@ -233,8 +270,12 @@ func main() {
 	requests := flag.Int("requests", 20000, "")
 	payloadBytes := flag.Int("payload-bytes", 64, "")
 	timeoutSeconds := flag.Float64("timeout", 90, "")
+	minSeconds := flag.Float64("min-seconds", 5.0, "")
 	jsonPath := flag.String("json", "/tmp/go-nats.json", "")
 	flag.Parse()
+	if *minSeconds <= 0 {
+		panic("-min-seconds must be positive")
+	}
 
 	timeout := time.Duration(*timeoutSeconds * float64(time.Second))
 	payload := make([]byte, *payloadBytes)
@@ -244,16 +285,16 @@ func main() {
 	prefix := fmt.Sprintf("go.perf.%d", time.Now().UnixNano())
 	benchmarks := map[string]any{}
 	var err error
-	if benchmarks["publish_batch"], err = benchPublishBatch(*url, prefix+".publish.batch", payload, *messages, timeout); err != nil {
+	if benchmarks["publish_batch"], err = benchPublishBatch(*url, prefix+".publish.batch", payload, *messages, timeout, *minSeconds); err != nil {
 		panic(err)
 	}
-	if benchmarks["publish_flush_each"], err = benchPublishFlushEach(*url, prefix+".publish.flush", payload, *messages, timeout); err != nil {
+	if benchmarks["publish_flush_each"], err = benchPublishFlushEach(*url, prefix+".publish.flush", payload, *messages, timeout, *minSeconds); err != nil {
 		panic(err)
 	}
-	if benchmarks["callback_dispatch"], err = benchCallbackDispatch(*url, prefix+".callback", payload, *messages, timeout); err != nil {
+	if benchmarks["callback_dispatch"], err = benchCallbackDispatch(*url, prefix+".callback", payload, *messages, timeout, *minSeconds); err != nil {
 		panic(err)
 	}
-	if benchmarks["request_reply"], err = benchRequestReply(*url, prefix+".request", payload, *requests, timeout); err != nil {
+	if benchmarks["request_reply"], err = benchRequestReply(*url, prefix+".request", payload, *requests, timeout, *minSeconds); err != nil {
 		panic(err)
 	}
 
@@ -266,6 +307,7 @@ func main() {
 			"messages":        fmt.Sprint(*messages),
 			"requests":        fmt.Sprint(*requests),
 			"payload_bytes":   fmt.Sprint(*payloadBytes),
+			"min_seconds":     fmt.Sprint(*minSeconds),
 			"flush_semantics": "server_round_trip",
 		},
 		"benchmarks": benchmarks,

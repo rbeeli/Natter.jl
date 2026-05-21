@@ -454,7 +454,8 @@ function _reserve_js_async_publish_future!(state::JetStreamAsyncPublishState{C},
     end
 end
 
-function Base.wait(future::JetStreamPublishFuture)
+function _wait_js_publish_future_value(future::JetStreamPublishFuture,
+                                       cancel_token::MaybeCancellationToken)
     state = future.state
     lock(state.condition)
     value = try
@@ -464,7 +465,7 @@ function Base.wait(future::JetStreamPublishFuture)
                 _resolve_js_publish_future_locked!(future, TimeoutError("JetStream async publish ack timed out"))
                 break
             end
-            _wait_until_notified_locked(state.condition) do
+            _wait_until_notified_locked(state.condition; cancel_token) do
                 future.ready
             end
         end
@@ -476,8 +477,51 @@ function Base.wait(future::JetStreamPublishFuture)
     future
 end
 
-function Base.fetch(future::JetStreamPublishFuture)
-    wait(future)
+function _wait_js_publish_future_value(future::JetStreamPublishFuture,
+                                       timeout::Float64,
+                                       cancel_token::MaybeCancellationToken)
+    wait_deadline = time() + timeout
+    state = future.state
+    lock(state.condition)
+    value = try
+        while !future.ready
+            now = time()
+            remaining = future.deadline - now
+            if remaining <= 0
+                _resolve_js_publish_future_locked!(future, TimeoutError("JetStream async publish ack timed out"))
+                break
+            end
+            wait_remaining = wait_deadline - now
+            wait_remaining > 0 ||
+                throw(TimeoutError("JetStream async publish future wait timed out"))
+            ready = _wait_condition_timeout_queue_locked(state.condition, state.wait_queue,
+                                                         min(remaining, wait_remaining);
+                                                         cancel_token) do
+                future.ready
+            end
+            ready || continue
+        end
+        future.value
+    finally
+        unlock(state.condition)
+    end
+    value isa Exception && throw(value)
+    future
+end
+
+function Base.wait(future::JetStreamPublishFuture; timeout::Real=Inf,
+                   cancel_token::MaybeCancellationToken=nothing)
+    _throw_if_cancelled(cancel_token)
+    wait_timeout = _connect_option_positive_or_infinite_float("timeout", timeout)
+    if isinf(wait_timeout)
+        return _wait_js_publish_future_value(future, cancel_token)
+    end
+    _wait_js_publish_future_value(future, wait_timeout, cancel_token)
+end
+
+function Base.fetch(future::JetStreamPublishFuture; timeout::Real=Inf,
+                    cancel_token::MaybeCancellationToken=nothing)
+    wait(future; timeout, cancel_token)
     future.value::PubAck
 end
 

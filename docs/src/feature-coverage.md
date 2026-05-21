@@ -35,13 +35,13 @@ Statuses:
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
 | Context | Supported | `JetStream.jetstream(client)` or `jetstream(client)` after `using Natter.JetStream`. |
-| Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options, including two default `NoRespondersError` retries. `js_publish_future` uses protocol-level async publish with pending ack accounting, backpressure, completion waiting, per-message ack/error futures, configurable no-responder retries, and explicit pending-future clearing on reconnect rather than replay. |
+| Publish ack | Supported | `js_publish` returns `PubAck` and exposes common dedupe, optimistic constraint, TTL, schedule, and retry options, including two default `NoRespondersError` retries. `js_publish_future` uses protocol-level async publish with pending ack accounting, backpressure, timed/cancellable future waits, per-message ack/error futures, configurable no-responder retries, and explicit pending-future clearing on reconnect rather than replay. |
 | Stream management | Supported | Create, update, info, list, names, page and iterator listing, purge, delete. |
 | Stream config | Supported | `StreamConfig`, nested helpers, and raw `Dict` payloads. Create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. Unknown raw fields tolerate additional nested defaults returned by the server. |
 | Message lookup | Supported | Sequence, last-by-subject, next-by-subject, direct get with validated metadata headers, stored-message sequence/timestamp metadata, and message delete. |
 | Consumer management | Supported | Create, create-or-update, update, info, list, page and iterator listing, delete. |
 | Consumer config | Supported | `ConsumerConfig` and raw `Dict` payloads. Create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. Unknown raw fields tolerate additional nested defaults returned by the server. |
-| Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded close cleanup, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, `messages`, `consume`, and priority request fields. |
+| Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded close cleanup, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, timed/cancellable `messages` reads, `consume`, and priority request fields. |
 | Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, bounded close cleanup, queue groups, callbacks, borrowed callbacks, manual/auto ack, flow control replies, heartbeat reporting, and bounded reconnect chaos coverage. Additional long-duration push chaos remains. |
 | Acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, `term`. |
 | Metadata | Supported | Delivery metadata parsing. |

@@ -90,7 +90,7 @@ js_publish_future_complete(js; timeout=5.0)
 acks = fetch.(futures)
 ```
 
-`fetch(future)` returns `PubAck` or throws the publish error for that message. Use `js_publish_future_pending(js)` to inspect the current pending count.
+`fetch(future)` returns `PubAck` or throws the publish error for that message. Pass `timeout` or `cancel_token` to bound an individual wait without cancelling the future itself. Use `js_publish_future_pending(js)` to inspect the current pending count.
 
 Pending `js_publish_future` futures are not replayed after a reconnect. If the connection enters reconnect, the context clears outstanding async publish futures with `ConnectionReconnectingError`; publish again after reconnect and use `msg_id` when duplicate effects matter. JetStream publish retries server `NoRespondersError` responses twice by default with a 250 ms wait; `retry_attempts` and `retry_wait` tune that behavior and only apply while the same connection generation is still active.
 
@@ -147,6 +147,8 @@ finally
     close(stream)
 end
 ```
+
+When a worker needs bounded shutdown checks, call `take!(stream; timeout=1.0, cancel_token=token)` directly. A timeout or cancellation exits only that receive call; keep using the stream or close it explicitly.
 
 Use `consume` for a callback worker:
 

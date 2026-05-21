@@ -725,6 +725,48 @@ end
     end
 end
 
+@testitem "JetStream publish future waits support timeout and cancellation" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    future = js_publish_future(js, "orders.created", "payload"; timeout=5.0)
+    sub = only(values(client.subscriptions))
+
+    @test_throws TimeoutError fetch(future; timeout=0.01)
+    @test !isready(future)
+    @test js_publish_future_pending(js) == 1
+
+    source = CancellationSource()
+    token = cancellation_token(source)
+    task = Threads.@spawn TestHelpers.thrown_exception() do
+        fetch(future; cancel_token=token)
+    end
+    @test timedwait(0.05; pollint=0.001) do
+        istaskdone(task)
+    end == :timed_out
+    @test cancel!(source)
+    @test timedwait(1.0; pollint=0.001) do
+        istaskdone(task)
+    end == :ok
+    @test fetch(task) isa CancelledError
+    @test !isready(future)
+    @test js_publish_future_pending(js) == 1
+
+    N._dispatch_msg(client, Msg(future.reply, nothing,
+                               TestHelpers.bytes("""{"stream":"ORDERS","seq":9}"""); sid=sub.sid))
+    ack = fetch(future; timeout=1.0)
+    @test ack.stream == "ORDERS"
+    @test ack.seq == 9
+    @test js_publish_future_pending(js) == 0
+
+    close(client)
+end
+
 @testitem "JetStream async publish timeout monitor accepts long deadlines" setup=[TestHelpers] begin
     using Natter
     using Natter.JetStream
@@ -3238,6 +3280,53 @@ end
     finally
         close(stream)
         wait(stream)
+        close(psub)
+    end
+end
+
+@testitem "JetStream continuous pull take supports timeout and cancellation" setup=[TestHelpers] begin
+    using Natter
+    using Natter.JetStream
+
+    const N = Natter
+
+    capture = TestHelpers.WriteCapture()
+    client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
+    js = jetstream(client)
+    TestHelpers.clear_capture!(capture)
+    psub = N.PullSubscription(js, "ORDERS", "WORKER", ReentrantLock(), ReentrantLock(), false, false)
+
+    stream = messages(psub; batch=1, expires=1.0, heartbeat=0, stop_after=1)
+    try
+        @test timedwait(1.0; pollint=0.001) do
+            occursin("CONSUMER.MSG.NEXT", TestHelpers.capture_text(capture))
+        end != :timed_out
+
+        @test_throws TimeoutError take!(stream; timeout=0.01)
+        @test isopen(stream)
+
+        source = CancellationSource()
+        token = cancellation_token(source)
+        task = Threads.@spawn TestHelpers.thrown_exception() do
+            take!(stream; cancel_token=token)
+        end
+        @test timedwait(0.05; pollint=0.001) do
+            istaskdone(task)
+        end == :timed_out
+        @test cancel!(source)
+        @test timedwait(1.0; pollint=0.001) do
+            istaskdone(task)
+        end == :ok
+        @test fetch(task) isa CancelledError
+        @test isopen(stream)
+
+        N._dispatch_msg(client, Msg("orders.created", "\$JS.ACK.ORDERS.WORKER.1.1.1.0.0",
+                                    TestHelpers.bytes("one"); sid=stream.delivery.sid))
+        @test String(take!(stream; timeout=1.0)) == "one"
+        wait(stream)
+        @test !(@lock psub.close_lock psub.active_stream)
+    finally
+        close(stream)
         close(psub)
     end
 end

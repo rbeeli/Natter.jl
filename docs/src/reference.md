@@ -183,9 +183,9 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `jetstream(client; prefix="$JS.API", timeout=5.0, publish_future_max_pending=256)` | `JetStreamContext` | Create a context. |
 | `js_publish(js, subject, data=nothing; kwargs...)` | `PubAck` | Publish and wait for an ack. |
 | `js_publish_future(js, subject, data=nothing; kwargs...)` | `JetStreamPublishFuture` | Publish with the context async publisher and return an ack future. Pending futures are failed, not replayed, on reconnect. |
-| `fetch(future::JetStreamPublishFuture)` | `PubAck` | Wait for the async publish ack or rethrow its error. |
+| `fetch(future::JetStreamPublishFuture; timeout=Inf, cancel_token=nothing)` | `PubAck` | Wait for the async publish ack or rethrow its error. A finite `timeout` bounds only this wait; the future can still complete later. |
 | `js_publish_future_pending(js)` | `Int` | Count async publishes still waiting for acks. |
-| `js_publish_future_complete(js; timeout=...)` | `nothing` | Wait until all pending async publishes on the context complete. |
+| `js_publish_future_complete(js; timeout=..., cancel_token=nothing)` | `nothing` | Wait until all pending async publishes on the context complete. |
 | `stream_create(js, config; timeout=...)` | `StreamInfo` | Create a stream. |
 | `stream_update(js, config; timeout=...)` | `StreamInfo` | Update a stream. |
 | `stream_info(js, name; timeout=...)` | `StreamInfo` | Fetch stream info. |
@@ -209,10 +209,11 @@ Stream config helpers: `Placement`, `ExternalStreamSource`, `SubjectTransform`, 
 | `consumer_delete(js, stream, consumer; timeout=...)` | `Bool` | Delete a consumer. |
 | `pull_subscribe(js, subject; stream=nothing, durable=nothing, config=ConsumerConfig(), timeout=...)` | `PullSubscription` | Create or bind a pull consumer. |
 | `fetch(psub, batch=1; timeout=..., expires=..., heartbeat=nothing, max_bytes=nothing, no_wait=false, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `Vector{JetStreamMsg}` | Fetch a bounded batch. |
-| `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing)` | `PullMessageStream` | Start a bounded refill stream. |
+| `messages(psub; batch=100, max_bytes=nothing, expires=30.0, heartbeat=nothing, threshold_messages=nothing, threshold_bytes=nothing, channel_size=batch, stop_after=nothing, min_pending=nothing, min_ack_pending=nothing, priority_group=nothing, priority=nothing, cancel_token=nothing)` | `PullMessageStream` | Start a bounded refill stream. |
 | `consume(callback, psub; kwargs...)` | `PullMessageStream` | Run a callback over `messages`. |
 | `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=..., ordered=false, borrowed=false)` | `PushSubscription` | Create or bind a push consumer, or create an ordered ephemeral push consumer with `ordered=true`. `borrowed=true` is callback-only and delivers `BorrowedJetStreamMsg`. |
-| `take!(psub::PushSubscription; timeout=1.0)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
+| `take!(stream::PullMessageStream; timeout=Inf, cancel_token=nothing)` | `JetStreamMsg` | Read from a continuous pull stream. Timeout and cancellation stop only the read wait; the stream remains open. |
+| `take!(psub::PushSubscription; timeout=1.0, cancel_token=nothing)` | `JetStreamMsg` | Read from a channel-backed push subscription. |
 | `ack(msg; cancel_token=nothing)`, `ack_sync(msg; timeout=1.0, cancel_token=nothing)`, `nak(msg; delay=nothing, cancel_token=nothing)`, `in_progress(msg; cancel_token=nothing)`, `term(msg; cancel_token=nothing)` | `nothing` or `Msg` | Acknowledge or control redelivery for `AbstractJetStreamMsg` values. |
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
 | `close(psub; timeout=...)`, `close(push; timeout=...)`, `close(stream)` | `nothing` | Close consumer/message handles. Subscription close timeouts bound server cleanup. |

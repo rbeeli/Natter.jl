@@ -19,6 +19,7 @@ const DEFAULT_OUTPUT = get(ENV, "NATTER_PERF_OUTPUT", "performance-report.md")
 const DEFAULT_JSON = get(ENV, "NATTER_PERF_JSON", "performance-report.json")
 const DEFAULT_TIMEOUT = parse(Float64, get(ENV, "NATTER_PERF_TIMEOUT", "90.0"))
 const DEFAULT_ALLOC_ITERATIONS = parse(Int, get(ENV, "NATTER_PERF_ALLOC_ITERATIONS", "10000"))
+const DEFAULT_MIN_SECONDS = parse(Float64, get(ENV, "NATTER_PERF_MIN_SECONDS", "5.0"))
 
 function arg_value(args::Vector{String}, name::String, default::String)::String
     index = findfirst(==(name), args)
@@ -37,6 +38,7 @@ function options(args::Vector{String})
     json = arg_value(args, "--json", DEFAULT_JSON)
     timeout = parse(Float64, arg_value(args, "--timeout", string(DEFAULT_TIMEOUT)))
     alloc_iterations = parse(Int, arg_value(args, "--alloc-iterations", string(DEFAULT_ALLOC_ITERATIONS)))
+    min_seconds = parse(Float64, arg_value(args, "--min-seconds", string(DEFAULT_MIN_SECONDS)))
 
     messages > 0 || throw(ArgumentError("--messages must be positive"))
     requests > 0 || throw(ArgumentError("--requests must be positive"))
@@ -44,8 +46,10 @@ function options(args::Vector{String})
     concurrency > 0 || throw(ArgumentError("--concurrency must be positive"))
     timeout > 0 || throw(ArgumentError("--timeout must be positive"))
     alloc_iterations > 0 || throw(ArgumentError("--alloc-iterations must be positive"))
+    min_seconds > 0 || throw(ArgumentError("--min-seconds must be positive"))
 
-    (; url, messages, requests, payload_bytes, concurrency, output, json, timeout, alloc_iterations)
+    (; url, messages, requests, payload_bytes, concurrency, output, json, timeout,
+     alloc_iterations, min_seconds)
 end
 
 function connect_perf(url::AbstractString; name::AbstractString="natter-perf", kwargs...)
@@ -89,10 +93,18 @@ function allocation_bytes_per_call(f::F, iterations::Int)::Float64 where {F}
     bytes / iterations
 end
 
-function elapsed_seconds(f::F)::Float64 where {F}
+function timed_repeated(f::F, unit_count::Int, min_seconds::Float64) where {F}
+    units = 0
+    rounds = 0
+    GC.gc()
     started = time_ns()
-    f()
-    (time_ns() - started) / 1e9
+    while true
+        f()
+        units += unit_count
+        rounds += 1
+        seconds = (time_ns() - started) / 1e9
+        seconds >= min_seconds && return (; units, rounds, seconds)
+    end
 end
 
 function percentile(values::Vector{Float64}, q::Float64)::Float64
@@ -130,30 +142,33 @@ function benchmark_allocations(client, subject::String, payload::Vector{UInt8}, 
     )
 end
 
-function benchmark_publish_direct(client, subject::String, payload::Vector{UInt8}, messages::Int)
+function benchmark_publish_direct(client, subject::String, payload::Vector{UInt8},
+                                  messages::Int, min_seconds::Float64)
     frame = prepare_publish(subject, payload)
     for _ in 1:min(messages, 100)
         publish(client, frame; mode=PublishMode.DIRECT)
     end
     flush(client; timeout=5.0)
 
-    seconds = elapsed_seconds() do
+    timed = timed_repeated(messages, min_seconds) do
         for _ in 1:messages
             publish(client, frame; mode=PublishMode.DIRECT)
         end
         flush(client; timeout=10.0)
     end
     Dict(
-        "messages" => messages,
+        "messages" => timed.units,
+        "configured_messages" => messages,
+        "rounds" => timed.rounds,
         "payload_bytes" => length(payload),
-        "seconds" => seconds,
-        "messages_per_second" => messages / seconds,
-        "payload_mib_per_second" => messages * length(payload) / seconds / 1024^2,
+        "seconds" => timed.seconds,
+        "messages_per_second" => timed.units / timed.seconds,
+        "payload_mib_per_second" => timed.units * length(payload) / timed.seconds / 1024^2,
     )
 end
 
 function benchmark_publish_buffered_batch(url::String, subject::String, payload::Vector{UInt8},
-                                          messages::Int)
+                                          messages::Int, min_seconds::Float64)
     client = connect_batch_perf(url, subject, payload, messages; name="natter-perf-publish-batch")
     frame = prepare_publish(subject, payload)
     try
@@ -162,25 +177,28 @@ function benchmark_publish_buffered_batch(url::String, subject::String, payload:
         end
         flush(client; timeout=5.0)
 
-        seconds = elapsed_seconds() do
+        timed = timed_repeated(messages, min_seconds) do
             for _ in 1:messages
                 publish(client, frame; mode=PublishMode.QUEUED)
             end
             flush(client; timeout=10.0)
         end
         Dict(
-            "messages" => messages,
+            "messages" => timed.units,
+            "configured_messages" => messages,
+            "rounds" => timed.rounds,
             "payload_bytes" => length(payload),
-            "seconds" => seconds,
-            "messages_per_second" => messages / seconds,
-            "payload_mib_per_second" => messages * length(payload) / seconds / 1024^2,
+            "seconds" => timed.seconds,
+            "messages_per_second" => timed.units / timed.seconds,
+            "payload_mib_per_second" => timed.units * length(payload) / timed.seconds / 1024^2,
         )
     finally
         close(client)
     end
 end
 
-function benchmark_publish_flush_each(client, subject::String, payload::Vector{UInt8}, messages::Int)
+function benchmark_publish_flush_each(client, subject::String, payload::Vector{UInt8},
+                                      messages::Int, min_seconds::Float64)
     frame = prepare_publish(subject, payload)
     warmup = min(messages, 100)
     for _ in 1:warmup
@@ -188,24 +206,27 @@ function benchmark_publish_flush_each(client, subject::String, payload::Vector{U
         flush(client; timeout=5.0)
     end
 
-    seconds = elapsed_seconds() do
+    timed = timed_repeated(messages, min_seconds) do
         for _ in 1:messages
             publish(client, frame; mode=PublishMode.DIRECT)
             flush(client; timeout=10.0)
         end
     end
     Dict(
-        "messages" => messages,
+        "messages" => timed.units,
+        "configured_messages" => messages,
+        "rounds" => timed.rounds,
         "payload_bytes" => length(payload),
-        "seconds" => seconds,
-        "messages_per_second" => messages / seconds,
-        "payload_mib_per_second" => messages * length(payload) / seconds / 1024^2,
+        "seconds" => timed.seconds,
+        "messages_per_second" => timed.units / timed.seconds,
+        "payload_mib_per_second" => timed.units * length(payload) / timed.seconds / 1024^2,
     )
 end
 
 function benchmark_callback_dispatch(url::String, subject::String, payload::Vector{UInt8},
                                      messages::Int, timeout::Float64; mode::Symbol=:direct,
-                                     callback_mode::Symbol=:task)
+                                     callback_mode::Symbol=:task,
+                                     min_seconds::Float64)
     sub_client = connect_perf(url; name="natter-perf-callback-sub")
     pub_client = mode == :buffered_batch ?
                  connect_batch_perf(url, subject, payload, messages; name="natter-perf-callback-pub") :
@@ -232,25 +253,28 @@ function benchmark_callback_dispatch(url::String, subject::String, payload::Vect
             counter[] >= warmup
         end
         result == :timed_out && error("timed out waiting for callback warmup: received $(counter[]) of $warmup")
-        counter[] = 0
+        target = Ref(counter[])
 
-        seconds = elapsed_seconds() do
+        timed = timed_repeated(messages, min_seconds) do
+            target[] += messages
             for _ in 1:messages
                 publish(pub_client, frame; mode=(mode == :direct ? PublishMode.DIRECT : PublishMode.QUEUED))
             end
             flush(pub_client; timeout=10.0)
             result = timedwait(timeout; pollint=0.001) do
-                counter[] >= messages
+                counter[] >= target[]
             end
-            result == :timed_out && error("timed out waiting for callback dispatch: received $(counter[]) of $messages")
+            result == :timed_out && error("timed out waiting for callback dispatch: received $(counter[]) of $(target[])")
         end
 
         close(sub)
         Dict(
-            "messages" => messages,
-            "received" => counter[],
-            "seconds" => seconds,
-            "messages_per_second" => messages / seconds,
+            "messages" => timed.units,
+            "configured_messages" => messages,
+            "received" => timed.units,
+            "rounds" => timed.rounds,
+            "seconds" => timed.seconds,
+            "messages_per_second" => timed.units / timed.seconds,
         )
     finally
         close(pub_client)
@@ -259,10 +283,9 @@ function benchmark_callback_dispatch(url::String, subject::String, payload::Vect
 end
 
 function benchmark_request_latency(url::String, subject::String, payload::Vector{UInt8},
-                                   requests::Int)
+                                   requests::Int, min_seconds::Float64)
     service = connect_perf(url; name="natter-perf-request-service")
     client = connect_perf(url; name="natter-perf-request-client")
-    latencies = Vector{Float64}(undef, requests)
     try
         sub = subscribe(service, subject; callback_mode=:inline) do msg
             isnothing(msg.reply) && return nothing
@@ -275,19 +298,23 @@ function benchmark_request_latency(url::String, subject::String, payload::Vector
             request(client, subject, payload; timeout=5.0)
         end
 
-        seconds = elapsed_seconds() do
+        latencies = Float64[]
+        sizehint!(latencies, requests)
+        timed = timed_repeated(requests, min_seconds) do
             for i in 1:requests
                 started = time_ns()
                 request(client, subject, payload; timeout=5.0)
-                latencies[i] = (time_ns() - started) / 1e6
+                push!(latencies, (time_ns() - started) / 1e6)
             end
         end
 
         close(sub)
         Dict(
-            "requests" => requests,
-            "seconds" => seconds,
-            "requests_per_second" => requests / seconds,
+            "requests" => timed.units,
+            "configured_requests" => requests,
+            "rounds" => timed.rounds,
+            "seconds" => timed.seconds,
+            "requests_per_second" => timed.units / timed.seconds,
             "latency_ms_mean" => mean(latencies),
             "latency_ms_p50" => percentile(latencies, 0.50),
             "latency_ms_p95" => percentile(latencies, 0.95),
@@ -301,7 +328,8 @@ function benchmark_request_latency(url::String, subject::String, payload::Vector
 end
 
 function benchmark_concurrent_publish(url::String, subject::String, payload::Vector{UInt8},
-                                      messages::Int, concurrency::Int; mode::Symbol=:direct)
+                                      messages::Int, concurrency::Int, min_seconds::Float64;
+                                      mode::Symbol=:direct)
     client = mode == :buffered_batch ?
              connect_batch_perf(url, subject, payload, messages; name="natter-perf-concurrent-publish") :
              connect_perf(url; name="natter-perf-concurrent-publish", write_buffer_size=0)
@@ -318,7 +346,7 @@ function benchmark_concurrent_publish(url::String, subject::String, payload::Vec
         end
         flush(client; timeout=5.0)
 
-        seconds = elapsed_seconds() do
+        timed = timed_repeated(total, min_seconds) do
             @sync begin
                 for _ in 1:concurrency
                     Threads.@spawn begin
@@ -331,11 +359,13 @@ function benchmark_concurrent_publish(url::String, subject::String, payload::Vec
             flush(client; timeout=10.0)
         end
         Dict(
-            "messages" => total,
+            "messages" => timed.units,
+            "configured_messages" => messages,
+            "rounds" => timed.rounds,
             "concurrency" => concurrency,
             "julia_threads" => Threads.nthreads(),
-            "seconds" => seconds,
-            "messages_per_second" => total / seconds,
+            "seconds" => timed.seconds,
+            "messages_per_second" => timed.units / timed.seconds,
         )
     finally
         close(client)
@@ -514,7 +544,7 @@ function write_markdown(path::String, report)
         println(io)
         println(io, "Generated: `$(report["generated_at"])`")
         println(io)
-        println(io, "This is a non-gating throughput and latency snapshot. Each benchmark runs its warmup before the timed region, so Julia startup, package loading, JIT compilation, and benchmark warmup are not included in the reported timings. Compare results only across matching publish semantics and similar runners, Julia versions, thread counts, NATS versions, and payload sizes.")
+        println(io, "This is a non-gating throughput and latency snapshot. Each benchmark runs its warmup before the timed region, collects Julia GC, and repeats fast timed regions until the configured minimum duration is reached, so Julia startup, package loading, JIT compilation, and benchmark warmup are not included in the reported timings. Compare results only across matching publish semantics and similar runners, Julia versions, thread counts, NATS versions, and payload sizes.")
         println(io)
         println(io, "## Environment")
         println(io)
@@ -591,20 +621,20 @@ function main(args::Vector{String}=ARGS)
     benchmarks = Dict{String,Any}()
     try
         benchmarks["allocations"] = benchmark_allocations(client, "$prefix.alloc", payload, opts.alloc_iterations)
-        benchmarks["publish_direct"] = benchmark_publish_direct(client, "$prefix.publish.direct", payload, opts.messages)
-        benchmarks["publish_flush_each"] = benchmark_publish_flush_each(client, "$prefix.publish.flush", payload, opts.messages)
+        benchmarks["publish_direct"] = benchmark_publish_direct(client, "$prefix.publish.direct", payload, opts.messages, opts.min_seconds)
+        benchmarks["publish_flush_each"] = benchmark_publish_flush_each(client, "$prefix.publish.flush", payload, opts.messages, opts.min_seconds)
     finally
         close(client)
     end
 
-    benchmarks["publish_buffered_batch"] = benchmark_publish_buffered_batch(opts.url, "$prefix.publish.batch", payload, opts.messages)
-    benchmarks["callback_dispatch_direct_task"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.direct.task", payload, opts.messages, opts.timeout; mode=:direct, callback_mode=:task)
-    benchmarks["callback_dispatch_buffered_batch_task"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.batch.task", payload, opts.messages, opts.timeout; mode=:buffered_batch, callback_mode=:task)
-    benchmarks["callback_dispatch_direct_inline"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.direct.inline", payload, opts.messages, opts.timeout; mode=:direct, callback_mode=:inline)
-    benchmarks["callback_dispatch_buffered_batch_inline"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.batch.inline", payload, opts.messages, opts.timeout; mode=:buffered_batch, callback_mode=:inline)
-    benchmarks["request_reply"] = benchmark_request_latency(opts.url, "$prefix.request", payload, opts.requests)
-    benchmarks["concurrent_publish_direct"] = benchmark_concurrent_publish(opts.url, "$prefix.concurrent.direct", payload, opts.messages, opts.concurrency; mode=:direct)
-    benchmarks["concurrent_publish_buffered_batch"] = benchmark_concurrent_publish(opts.url, "$prefix.concurrent.batch", payload, opts.messages, opts.concurrency; mode=:buffered_batch)
+    benchmarks["publish_buffered_batch"] = benchmark_publish_buffered_batch(opts.url, "$prefix.publish.batch", payload, opts.messages, opts.min_seconds)
+    benchmarks["callback_dispatch_direct_task"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.direct.task", payload, opts.messages, opts.timeout; mode=:direct, callback_mode=:task, min_seconds=opts.min_seconds)
+    benchmarks["callback_dispatch_buffered_batch_task"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.batch.task", payload, opts.messages, opts.timeout; mode=:buffered_batch, callback_mode=:task, min_seconds=opts.min_seconds)
+    benchmarks["callback_dispatch_direct_inline"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.direct.inline", payload, opts.messages, opts.timeout; mode=:direct, callback_mode=:inline, min_seconds=opts.min_seconds)
+    benchmarks["callback_dispatch_buffered_batch_inline"] = benchmark_callback_dispatch(opts.url, "$prefix.callback.batch.inline", payload, opts.messages, opts.timeout; mode=:buffered_batch, callback_mode=:inline, min_seconds=opts.min_seconds)
+    benchmarks["request_reply"] = benchmark_request_latency(opts.url, "$prefix.request", payload, opts.requests, opts.min_seconds)
+    benchmarks["concurrent_publish_direct"] = benchmark_concurrent_publish(opts.url, "$prefix.concurrent.direct", payload, opts.messages, opts.concurrency, opts.min_seconds; mode=:direct)
+    benchmarks["concurrent_publish_buffered_batch"] = benchmark_concurrent_publish(opts.url, "$prefix.concurrent.batch", payload, opts.messages, opts.concurrency, opts.min_seconds; mode=:buffered_batch)
     benchmarks["reconnect"] = benchmark_reconnect(opts.url, "$prefix.reconnect", payload, opts.timeout)
 
     environment = Dict(
@@ -623,6 +653,7 @@ function main(args::Vector{String}=ARGS)
         "requests" => string(opts.requests),
         "payload_bytes" => string(opts.payload_bytes),
         "concurrency" => string(opts.concurrency),
+        "min_seconds" => string(opts.min_seconds),
     )
     report = Dict(
         "generated_at" => string(now(UTC)),
