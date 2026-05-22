@@ -42,7 +42,7 @@ Statuses:
 | Consumer management | Supported | Create, create-or-update, update, info, list, page and iterator listing, delete. |
 | Consumer config | Supported | `ConsumerConfig` and raw `Dict` payloads. Create/update checks that requested fields, including explicit false, zero, and empty values, are reflected by the server response. Unknown raw fields tolerate additional nested defaults returned by the server. |
 | Pull consumers | Supported | Durable/named bind, ephemeral create/delete, bounded close cleanup, bounded `fetch`, `max_bytes`, `no_wait`, heartbeats, timed/cancellable `messages` reads, `consume`, and priority request fields. |
-| Push consumers | Partial | Durable/ephemeral push, ordered ephemeral push, bounded close cleanup, queue groups, callbacks, borrowed callbacks, manual/auto ack, flow control replies, heartbeat reporting, bounded reconnect chaos coverage, and daily ordered reset cleanup stress coverage. Broader push soak remains. |
+| Push consumers | Supported | Durable/ephemeral push, ordered ephemeral push, bounded close cleanup, queue groups, callbacks, borrowed callbacks, manual/auto ack, flow control replies, heartbeat reporting, bounded reconnect chaos coverage, and daily ordered reset cleanup stress coverage. |
 | Acknowledgements | Supported | `ack`, `ack_sync`, `nak`, `in_progress`, `term`. |
 | Metadata | Supported | Delivery metadata parsing. |
 | Ordered consumers | Supported | Public ordered ephemeral push consumers use `push_subscribe(...; ordered=true)`, with flow control, heartbeats, and automatic reset after sequence gaps. Durable names, queue groups, and binding existing consumers are intentionally rejected. |
@@ -58,8 +58,8 @@ Statuses:
 | Bucket options | Supported | History, TTL, max bytes, max value size, storage, replicas, direct reads, compression, metadata, and delete-marker TTL. |
 | Get/put/create/update | Supported | Typed entries, optimistic revision checks, per-key TTL, and typed conflict errors. |
 | Delete/purge | Supported | Delete markers, purge markers, guarded delete/purge, and marker cleanup. |
-| History and keys | Partial | Common paths implemented with daily large-bucket key and paged-history stress coverage. Broader soak and cluster coverage remain. |
-| Watch | Partial | Channel and callback watchers, filters, updates-only, history, ignore deletes, metadata-only, resume revision, bounded close cleanup, ordered-consumer recovery, bounded reconnect chaos coverage, and daily large-watch reconnect stress coverage. Broader soak and cluster coverage remain. |
+| History and keys | Supported | Common paths implemented with daily large-bucket key and paged-history stress coverage. |
+| Watch | Supported | Channel and callback watchers, filters, updates-only, history, ignore deletes, metadata-only, resume revision, bounded close cleanup, ordered-consumer recovery, bounded reconnect chaos coverage, and daily large-watch reconnect stress coverage. |
 | Direct get | Supported | `direct=true` buckets use direct reads by default. |
 | Task concurrency | Supported | KeyValue operations are direct blocking calls that compose with normal Julia tasks and cooperative cancellation where applicable. |
 
