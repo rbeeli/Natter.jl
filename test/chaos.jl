@@ -575,6 +575,8 @@ end
                              reconnect_wait=0.05,
                              reconnect_jitter=0.0,
                              max_reconnect_attempts=-1,
+                             sub_pending_msgs_limit=max(8192, 3 * key_count + 1024),
+                             sub_pending_bytes_limit=256 * 1024 * 1024,
                              record_stats=true)
             js = jetstream(client; timeout=io_timeout)
             bucket = "NATTERSTRESSKV_$(randstring(8))"
