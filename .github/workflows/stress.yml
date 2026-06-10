@@ -19,6 +19,19 @@ jobs:
         with:
           version: '1.10'
       - uses: julia-actions/cache@v2
+      - name: Pull nats-server image
+        run: |
+          set -euo pipefail
+
+          for i in {1..5}; do
+            if docker pull nats:2.11-alpine; then
+              exit 0
+            fi
+            if [ "${i}" -eq 5 ]; then
+              exit 1
+            fi
+            sleep $((i * 10))
+          done
       - run: docker run -d --name nats -p 4222:4222 nats:2.11-alpine -js
       - run: |
           set -euo pipefail
@@ -31,7 +44,9 @@ jobs:
             sleep 1
           done
           if [ "${ready}" != "true" ]; then
-            docker logs nats
+            if docker inspect nats >/dev/null 2>&1; then
+              docker logs nats || true
+            fi
             exit 1
           fi
       - run: julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
@@ -43,5 +58,12 @@ jobs:
           NATTER_STRESS_SECONDS: '45.0'
           NATTER_STRESS_KEYS: '2000'
           NATTER_STRESS_WATCHERS: '4'
-      - if: failure()
-        run: docker logs nats
+      - name: Show nats logs
+        if: failure()
+        run: |
+          if docker inspect nats >/dev/null 2>&1; then
+            docker logs nats || true
+          fi
+      - name: Stop nats
+        if: always()
+        run: docker rm -f nats >/dev/null 2>&1 || true
