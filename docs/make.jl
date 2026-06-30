@@ -1,7 +1,6 @@
 using Documenter
 using DocumenterVitepress
 using Natter
-using TOML
 
 const SOURCE_REPO = get(ENV, "DOCUMENTER_SOURCE_REPO", "https://github.com/rbeeli/Natter.jl")
 const FORMAT_REPO = get(ENV, "DOCUMENTER_FORMAT_REPO", "github.com/rbeeli/Natter.jl")
@@ -10,7 +9,16 @@ const BUILD_VITEPRESS = parse(Bool, get(ENV, "DOCUMENTER_BUILD_VITEPRESS", "fals
 const DEPLOY_DOCS = parse(Bool, get(ENV, "DOCUMENTER_DEPLOY", "false"))
 const DEPLOY_URL_ENV = get(ENV, "DOCUMENTER_DEPLOY_URL", "")
 const DEPLOY_URL = isempty(DEPLOY_URL_ENV) ? nothing : DEPLOY_URL_ENV
-const PACKAGE_VERSION = TOML.parsefile(joinpath(@__DIR__, "..", "Project.toml"))["version"]
+
+function package_version()
+    for line in eachline(joinpath(@__DIR__, "..", "Project.toml"))
+        m = match(r"^\s*version\s*=\s*\"([^\"]+)\"", line)
+        isnothing(m) || return String(m.captures[1])
+    end
+    error("Project.toml version not found")
+end
+
+const PACKAGE_VERSION = package_version()
 
 function deploy_decision()
     decision = Documenter.deploy_folder(

@@ -52,8 +52,29 @@ const DEFAULT_DIRECT_WRITE_THRESHOLD = 256 * 1024
 const DEFAULT_WRITE_BATCH_BYTES = 512 * 1024
 const _MAX_TIMER_DELAY_SECONDS = prevfloat(Float64(typemax(UInt64)) / 1000)
 
+function _project_client_version()::Union{String,Nothing}
+    project_path = normpath(joinpath(@__DIR__, "..", "Project.toml"))
+    isfile(project_path) || return nothing
+    for line in eachline(project_path)
+        m = match(r"^\s*version\s*=\s*\"([^\"]+)\"", line)
+        if !isnothing(m)
+            version = String(m.captures[1])
+            return isempty(version) ? nothing : version
+        end
+    end
+    nothing
+end
+
+function _client_version_string(version=pkgversion(@__MODULE__))::String
+    if isnothing(version)
+        fallback = _project_client_version()
+        return isnothing(fallback) ? "" : fallback
+    end
+    string(version)
+end
+
 function __init__()
-    global CLIENT_VERSION = string(pkgversion(@__MODULE__))
+    global CLIENT_VERSION = _client_version_string()
     nothing
 end
 

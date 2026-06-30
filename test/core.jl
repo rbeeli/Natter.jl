@@ -743,6 +743,7 @@ end
     @test opts.close_callback_timeout == 4.0
     @test opts.randomize_servers
     @test N.CLIENT_VERSION == string(pkgversion(N))
+    @test N._client_version_string(nothing) == string(pkgversion(N))
     @test N.ConnectOptions(write_timeout=Inf).write_timeout == Inf
     @test N.ConnectOptions(close_callback_timeout=0).close_callback_timeout == 0.0
     @test !ismutable(opts)
