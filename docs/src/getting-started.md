@@ -49,7 +49,7 @@ Numeric timeout and duration values in these examples are seconds.
 ```julia
 client = connect("nats://127.0.0.1:4222";
     name="orders-api",
-    connect_timeout=2.0,
+    connect_timeout=10.0,
 )
 ```
 
@@ -105,7 +105,7 @@ service = subscribe(client, "orders.lookup"; callback_mode=:inline) do msg
     respond(client, msg, lookup_order(String(msg)))
 end
 
-response = request(client, "orders.lookup", "order-1001"; timeout=1.0)
+response = request(client, "orders.lookup", "order-1001"; timeout=5.0)
 println(String(response))
 ```
 

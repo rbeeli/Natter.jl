@@ -308,7 +308,8 @@ function _iterate_jetstream_items(pages, page_result)
     nothing
 end
 
-function jetstream(client::Client; prefix::AbstractString="\$JS.API", timeout::Real=5.0,
+function jetstream(client::Client; prefix::AbstractString="\$JS.API",
+                   timeout::Real=DEFAULT_JETSTREAM_TIMEOUT,
                    publish_future_max_pending::Integer=256)
     max_pending = _positive_integer_option("publish_future_max_pending", publish_future_max_pending)
     JetStreamContext(client, String(prefix), _positive_timeout_seconds("timeout", timeout),

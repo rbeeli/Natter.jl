@@ -1,7 +1,7 @@
 name = "Natter"
 uuid = "3e9f9f1d-70e4-4c53-8de9-2d774a7f61d1"
 authors = ["Rino Beeli <40661605+rbeeli@users.noreply.github.com>"]
-version = "0.1.0"
+version = "0.1.1"
 
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"

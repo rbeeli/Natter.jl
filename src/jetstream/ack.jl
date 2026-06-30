@@ -266,7 +266,7 @@ function _ack_publish_raw(client::Client, reply::String, kind::Symbol; delay=not
 end
 
 function _ack_request_raw(client::Client, reply::String, kind::Symbol; delay=nothing,
-                          timeout::Real=1.0,
+                          timeout::Real=DEFAULT_ACK_SYNC_TIMEOUT,
                           cancel_token::MaybeCancellationToken=nothing)::Msg
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
@@ -307,7 +307,8 @@ function _ack_publish(msg::AbstractJetStreamMsg, kind::Symbol; delay=nothing,
     nothing
 end
 
-function _ack_request(msg::AbstractJetStreamMsg, kind::Symbol; delay=nothing, timeout::Real=1.0,
+function _ack_request(msg::AbstractJetStreamMsg, kind::Symbol; delay=nothing,
+                      timeout::Real=DEFAULT_ACK_SYNC_TIMEOUT,
                       cancel_token::MaybeCancellationToken=nothing)::Msg
     _throw_if_cancelled(cancel_token)
     timeout = _positive_timeout_seconds("timeout", timeout)
@@ -326,7 +327,7 @@ end
 
 ack(msg::AbstractJetStreamMsg; cancel_token::MaybeCancellationToken=nothing)::Nothing =
     _ack_publish(msg, :ack; cancel_token)
-ack_sync(msg::AbstractJetStreamMsg; timeout::Real=1.0,
+ack_sync(msg::AbstractJetStreamMsg; timeout::Real=DEFAULT_ACK_SYNC_TIMEOUT,
          cancel_token::MaybeCancellationToken=nothing)::Msg =
     _ack_request(msg, :ack; timeout, cancel_token)
 nak(msg::AbstractJetStreamMsg; delay=nothing, cancel_token::MaybeCancellationToken=nothing)::Nothing =

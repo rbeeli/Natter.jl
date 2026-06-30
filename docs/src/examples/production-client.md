@@ -16,7 +16,7 @@ function make_client()
         "tls://nats-c.internal:4222",
     ];
         name="billing-worker",
-        connect_timeout=2.0,
+        connect_timeout=10.0,
         ping_interval=30.0,
         max_outstanding_pings=2,
         allow_reconnect=true,
@@ -26,8 +26,8 @@ function make_client()
         reconnect_jitter=0.2,
         max_reconnect_attempts=-1,
         pending_size=16 * 1024 * 1024,
-        write_timeout=5.0,
-        close_timeout=5.0,
+        write_timeout=30.0,
+        close_timeout=10.0,
         record_stats=true,
         sub_pending_msgs_limit=8192,
         sub_pending_bytes_limit=128 * 1024 * 1024,
@@ -47,7 +47,7 @@ function make_client()
 end
 
 client = make_client()
-js = jetstream(client; timeout=5.0)
+js = jetstream(client; timeout=10.0)
 
 stream_create(js, StreamConfig(
     name="BILLING",

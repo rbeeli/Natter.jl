@@ -15,7 +15,7 @@ service = subscribe(client, "time.now"; callback_mode=:inline) do msg
     respond(client, msg, string(now(Dates.UTC)))
 end
 
-response = request(client, "time.now", ""; timeout=1.0)
+response = request(client, "time.now", ""; timeout=5.0)
 println(String(response))
 
 drain(service)
@@ -43,7 +43,7 @@ time_response = Ref{Msg}()
 date_response = Ref{Msg}()
 
 @sync begin
-    Threads.@spawn time_response[] = request(client, "time.now", ""; timeout=1.0)
-    Threads.@spawn date_response[] = request(client, "date.today", ""; timeout=1.0)
+    Threads.@spawn time_response[] = request(client, "time.now", ""; timeout=5.0)
+    Threads.@spawn date_response[] = request(client, "date.today", ""; timeout=5.0)
 end
 ```

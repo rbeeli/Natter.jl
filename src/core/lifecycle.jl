@@ -117,7 +117,7 @@ function _throw_not_flushable_status(st::ConnectionStatus.T)
     throw(ConnectionReconnectingError())
 end
 
-function _flush(client::Client; timeout::Real=10.0, deadline=nothing,
+function _flush(client::Client; timeout::Real=DEFAULT_FLUSH_TIMEOUT, deadline=nothing,
                 cancel_token::MaybeCancellationToken=nothing)
     _throw_if_cancelled(cancel_token)
     wait_timeout = isnothing(deadline) ? _positive_timeout_seconds("timeout", timeout) :
@@ -154,10 +154,12 @@ function _flush(client::Client; timeout::Real=10.0, deadline=nothing,
     nothing
 end
 
-flush(client::Client; timeout::Real=10.0, cancel_token::MaybeCancellationToken=nothing) =
+flush(client::Client; timeout::Real=DEFAULT_FLUSH_TIMEOUT,
+      cancel_token::MaybeCancellationToken=nothing) =
     _flush(client; timeout, cancel_token)
 
-ping(client::Client; timeout::Real=10.0, cancel_token::MaybeCancellationToken=nothing) =
+ping(client::Client; timeout::Real=DEFAULT_FLUSH_TIMEOUT,
+     cancel_token::MaybeCancellationToken=nothing) =
     flush(client; timeout, cancel_token)
 
 function drain(client::Client; timeout::Real=client.options.drain_timeout,

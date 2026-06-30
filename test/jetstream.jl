@@ -394,6 +394,7 @@ end
     capture = TestHelpers.WriteCapture()
     client = TestHelpers.fake_client(; status=N.ConnectionStatus.CONNECTED, write_io=capture)
     js = jetstream(client)
+    @test js.timeout == 10.0
     @test_throws ArgumentError stream_list(js; offset=-1)
     @test_throws ArgumentError stream_list_page(js; offset=-1)
     @test_throws ArgumentError consumer_list(js, "ORDERS"; offset=-1)

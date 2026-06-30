@@ -96,15 +96,28 @@ end
     @test N.ConnectOptions().max_reconnect_attempts == -1
     @test N.ConnectOptions().tcp_nodelay
     @test !N.ConnectOptions(tcp_nodelay=false).tcp_nodelay
-    @test N.ConnectOptions().request_timeout == 1.0
+    @test N.DEFAULT_CONNECT_TIMEOUT == 10.0
+    @test N.DEFAULT_REQUEST_TIMEOUT == 5.0
+    @test N.DEFAULT_FLUSH_TIMEOUT == 15.0
+    @test N.DEFAULT_JETSTREAM_TIMEOUT == 10.0
+    @test N.DEFAULT_ACK_SYNC_TIMEOUT == 5.0
+    @test N.DEFAULT_WRITE_TIMEOUT == 30.0
+    @test N.DEFAULT_DRAIN_TIMEOUT == 60.0
+    @test N.DEFAULT_CLOSE_TIMEOUT == 10.0
+    @test N.DEFAULT_CLOSE_CALLBACK_TIMEOUT == 10.0
+    @test N.ConnectOptions().connect_timeout == 10.0
+    @test N.ConnectOptions().request_timeout == 5.0
     @test N.ConnectOptions(request_timeout=2).request_timeout == 2.0
+    @test N.ConnectOptions().write_timeout == 30.0
     @test N.ConnectOptions(pending_size=0).pending_size == 0
     @test N.ConnectOptions().pending_size == 8 * 1024 * 1024
     @test N.ConnectOptions().publish_mode == PublishMode.REPLAYABLE
     @test N.ConnectOptions(publish_mode=PublishMode.QUEUED).publish_mode == PublishMode.QUEUED
     @test N.ConnectOptions().read_buffer_size == 64 * 1024
     @test N.ConnectOptions().sub_pending_msgs_limit == 1024
-    @test N.ConnectOptions().close_timeout == 5.0
+    @test N.ConnectOptions().drain_timeout == 60.0
+    @test N.ConnectOptions().close_timeout == 10.0
+    @test N.ConnectOptions().close_callback_timeout == 10.0
 
     @test N._validate_subject("foo.*.bar") == "foo.*.bar"
     @test N._validate_subject("foo.>") == "foo.>"

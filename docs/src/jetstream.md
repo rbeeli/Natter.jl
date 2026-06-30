@@ -7,7 +7,7 @@ using Natter
 using Natter.JetStream
 
 client = connect("nats://127.0.0.1:4222")
-js = jetstream(client; timeout=5.0)
+js = jetstream(client; timeout=10.0)
 ```
 
 Numeric `timeout`, `expires`, `heartbeat`, `retry_wait`, `delay`, `ack_wait`,
@@ -79,7 +79,7 @@ end
 For high-volume publishing where you want protocol-level async acks, use `js_publish_future`. The context owns one reply subscription, tracks pending acks, and applies backpressure at `publish_future_max_pending`.
 
 ```julia
-js = jetstream(client; timeout=5.0, publish_future_max_pending=512)
+js = jetstream(client; timeout=10.0, publish_future_max_pending=512)
 
 futures = [
     js_publish_future(js, "orders.events.created", """{"id":$id}""";
@@ -89,7 +89,7 @@ futures = [
     for id in 1001:1100
 ]
 
-js_publish_future_complete(js; timeout=5.0)
+js_publish_future_complete(js; timeout=10.0)
 acks = fetch.(futures)
 ```
 
@@ -222,7 +222,7 @@ ordered = push_subscribe(js, "orders.events.created";
 
 ```julia
 ack(msg)
-ack_sync(msg; timeout=1.0)
+ack_sync(msg; timeout=5.0)
 nak(msg; delay=2.0)
 in_progress(msg)
 term(msg)

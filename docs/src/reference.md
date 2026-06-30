@@ -57,8 +57,8 @@ Conventions:
 | `name` | `nothing` | Human-readable connection name. |
 | `auth` | `NoAuth()` | One typed authentication value. |
 | `no_echo` | `false` | Do not receive this connection's own publishes. |
-| `connect_timeout` | `2.0` | Socket and handshake timeout, in seconds. |
-| `request_timeout` | `1.0` | Default timeout for core `request` calls, in seconds, when no per-call timeout is provided. |
+| `connect_timeout` | `10.0` | Socket, handshake, auth, and initial PONG timeout, in seconds. |
+| `request_timeout` | `5.0` | Default timeout for core `request` calls, in seconds, when no per-call timeout is provided. |
 | `ping_interval` | `120.0` | Keepalive interval, in seconds. |
 | `max_outstanding_pings` | `2` | Missed keepalives before reconnect. |
 | `allow_reconnect` | `true` | Enable automatic reconnect. |
@@ -75,7 +75,7 @@ Conventions:
 | `write_buffer_size` | `32 KiB` | Buffered write threshold; `0` disables buffering. |
 | `direct_write_threshold` | `256 KiB` | Direct publishes at or below this size are written as one contiguous frame; larger direct publishes avoid the payload copy. |
 | `write_buffer_latency` | `0.001` | Maximum small-write coalescing delay, in seconds. |
-| `write_timeout` | `10.0` | Maximum transport write/flush block time, in seconds; `Inf` disables the watchdog. |
+| `write_timeout` | `30.0` | Maximum transport write/flush block time, in seconds; `Inf` disables the watchdog. |
 | `write_driver` | `true` | Enable the background writer task used by queued publishes. |
 | `write_queue_msgs` | `8192` | Maximum queued publish commands before producers apply backpressure. |
 | `write_queue_bytes` | `2 MiB` | Maximum queued publish bytes before producers apply backpressure. |
@@ -84,9 +84,9 @@ Conventions:
 | `record_stats` | `false` | Enable client counters returned by `stats(client)`. |
 | `sub_pending_msgs_limit` | `1024` | Default per-subscription queued message limit. |
 | `sub_pending_bytes_limit` | `128 MiB` | Default per-subscription queued byte limit. |
-| `drain_timeout` | `30.0` | Default `drain` timeout, in seconds. |
-| `close_timeout` | `5.0` | Default `close` cleanup timeout, in seconds. |
-| `close_callback_timeout` | `5.0` | Wait for active callbacks during close, in seconds. |
+| `drain_timeout` | `60.0` | Default `drain` timeout, in seconds. |
+| `close_timeout` | `10.0` | Default `close` cleanup timeout, in seconds. |
+| `close_callback_timeout` | `10.0` | Wait for active callbacks during close, in seconds. |
 | `inbox_prefix` | `"_INBOX"` | Prefix for generated inbox subjects. |
 | `error_cb` | warning callback | Receives background, callback, and cleanup errors. |
 | `event_cb` | no-op | Receives `ConnectionEvent` lifecycle events. |
@@ -129,8 +129,8 @@ Every `timeout` and `callback_timeout` value in this table is seconds.
 | `unsubscribe(sub; max_msgs=0)` | `nothing` | Unsubscribe now or after more messages. |
 | `close(sub)` | `nothing` | Alias for immediate unsubscribe. |
 | `request(client, subject, data=nothing; timeout=client.options.request_timeout, headers=nothing)` | `Msg` | Send a request and wait up to `timeout` seconds for one reply. Payloads are `nothing`, strings, or byte vectors. |
-| `flush(client; timeout=10.0)` | `nothing` | Wait up to `timeout` seconds for a server round trip. |
-| `ping(client; timeout=10.0)` | `nothing` | Alias for `flush`; timeout is seconds. |
+| `flush(client; timeout=15.0)` | `nothing` | Wait up to `timeout` seconds for a server round trip. |
+| `ping(client; timeout=15.0)` | `nothing` | Alias for `flush`; timeout is seconds. |
 | `drain(sub; timeout=...)` | `nothing` | Unsubscribe and wait up to `timeout` seconds for queued callback work. |
 | `drain(client; timeout=...)` | `nothing` | Drain subscriptions, flush, and close within `timeout` seconds. |
 | `close(client; timeout=client.options.close_timeout, throw_errors=false, callback_timeout=nothing)` | `nothing` | Close the client; `timeout` and `callback_timeout` are seconds. |
@@ -142,7 +142,7 @@ Every `timeout` and `callback_timeout` value in this table is seconds.
 | `stats(sub)` | `SubscriptionStats` | Per-subscription pending, processing, received, delivered, dropped, and active-state snapshot. |
 | `connected_url(client)` | `Union{String,Nothing}` | Current server URL. |
 
-For explicit concurrent work, call direct APIs inside Julia tasks, for example `Threads.@spawn request(client, "subject"; timeout=1.0)`.
+For explicit concurrent work, call direct APIs inside Julia tasks, for example `Threads.@spawn request(client, "subject"; timeout=5.0)`.
 
 Cancellation helpers: `CancellationSource()`, `cancellation_token(source)`, `cancel!(source)`, and `iscancelled(token)`. Cancelled operations throw `CancelledError`.
 
@@ -189,7 +189,7 @@ TTL, and window duration in this table is seconds.
 
 | Function | Returns | Use |
 | :--- | :--- | :--- |
-| `jetstream(client; prefix="$JS.API", timeout=5.0, publish_future_max_pending=256)` | `JetStreamContext` | Create a context; `timeout` is seconds. |
+| `jetstream(client; prefix="$JS.API", timeout=10.0, publish_future_max_pending=256)` | `JetStreamContext` | Create a context; `timeout` is seconds. |
 | `js_publish(js, subject, data=nothing; kwargs...)` | `PubAck` | Publish and wait for an ack. |
 | `js_publish_future(js, subject, data=nothing; kwargs...)` | `JetStreamPublishFuture` | Publish with the context async publisher and return an ack future. Pending futures are failed, not replayed, on reconnect. |
 | `fetch(future::JetStreamPublishFuture; timeout=Inf, cancel_token=nothing)` | `PubAck` | Wait for the async publish ack or rethrow its error. A finite `timeout` is seconds and bounds only this wait; the future can still complete later. |
@@ -223,7 +223,7 @@ TTL, and window duration in this table is seconds.
 | `push_subscribe(js, subject; stream=nothing, durable=nothing, queue=nothing, callback=nothing, manual_ack=false, config=ConsumerConfig(), timeout=..., ordered=false, borrowed=false)` | `PushSubscription` | Create or bind a push consumer, or create an ordered ephemeral push consumer with `ordered=true`. `borrowed=true` is callback-only and delivers `BorrowedJetStreamMsg`. |
 | `take!(stream::PullMessageStream; timeout=Inf, cancel_token=nothing)` | `JetStreamMsg` | Read from a continuous pull stream. Timeout is seconds; timeout and cancellation stop only the read wait, and the stream remains open. |
 | `take!(psub::PushSubscription; timeout=1.0, cancel_token=nothing)` | `JetStreamMsg` | Read from a channel-backed push subscription; timeout is seconds. |
-| `ack(msg; cancel_token=nothing)`, `ack_sync(msg; timeout=1.0, cancel_token=nothing)`, `nak(msg; delay=nothing, cancel_token=nothing)`, `in_progress(msg; cancel_token=nothing)`, `term(msg; cancel_token=nothing)` | `nothing` or `Msg` | Acknowledge or control redelivery for `AbstractJetStreamMsg` values. `ack_sync` timeout and `nak` delay are seconds. |
+| `ack(msg; cancel_token=nothing)`, `ack_sync(msg; timeout=5.0, cancel_token=nothing)`, `nak(msg; delay=nothing, cancel_token=nothing)`, `in_progress(msg; cancel_token=nothing)`, `term(msg; cancel_token=nothing)` | `nothing` or `Msg` | Acknowledge or control redelivery for `AbstractJetStreamMsg` values. `ack_sync` timeout and `nak` delay are seconds. |
 | `metadata(msg)` | `MsgMetadata` | Parse JetStream delivery metadata. |
 | `close(psub; timeout=...)`, `close(push; timeout=...)`, `close(stream)` | `nothing` | Close consumer/message handles. Subscription close timeouts are seconds and bound server cleanup. |
 
